@@ -119,10 +119,10 @@ Task tasks that would introduce the above are intentionally omitted.
 
 ### Implementation for User Story 2
 
-- [ ] T036 [US2] Edit `docker-compose.yml` to make exposure explicit: `api` is the ONLY service with `ports:`; add `expose:` (internal-network only, no host publish) for `scrapers` (6800), `scrapers-browser` (6800), `pgbouncer` (6432), `redis` (6379), `postgres` (5432), and no ports for `scheduler`/`worker` (FR-013, SC-005)
-- [ ] T037 [US2] Confirm dual-stack binds are wired across artifacts: `api` command `--host ::` (T029/T034), both `scrapyd.conf` `bind_address = ::` (T024/T027), and `pgbouncer` bound dual-stack via `LISTEN_ADDR=*` (from `PGBOUNCER_LISTEN_ADDR`, set on the pgbouncer service in `docker-compose.yml`) (FR-016) [analyze U1]
-- [ ] T038 [US2] Verify Scrapyd auth boundary per quickstart §5: both nodes reject credential-less requests (401) and accept authenticated internal requests (200) (FR-012, SC-004)
-- [ ] T039 [US2] Verify public-exposure boundary per quickstart §5: only `api` is reachable on the host; `scrapers`/`scrapers-browser`/infra are not publicly reachable (FR-013, SC-005)
+- [X] T036 [US2] Edit `docker-compose.yml` to make exposure explicit: `api` is the ONLY service with `ports:`; add `expose:` (internal-network only, no host publish) for `scrapers` (6800), `scrapers-browser` (6800), `pgbouncer` (6432), `redis` (6379), `postgres` (5432), and no ports for `scheduler`/`worker` (FR-013, SC-005)
+- [X] T037 [US2] Confirm dual-stack binds are wired across artifacts: `api` command `--host ::` (T029/T034), both `scrapyd.conf` `bind_address = ::` (T024/T027), and `pgbouncer` bound dual-stack via `LISTEN_ADDR=*` (from `PGBOUNCER_LISTEN_ADDR`, set on the pgbouncer service in `docker-compose.yml`) (FR-016) [analyze U1]
+- [ ] T038 [US2] Verify Scrapyd auth boundary per quickstart §5: both nodes reject credential-less requests (401) and accept authenticated internal requests (200) (FR-012, SC-004)  ⏸ DEFERRED (needs Docker daemon; static config verified <date-not-needed>)
+- [ ] T039 [US2] Verify public-exposure boundary per quickstart §5: only `api` is reachable on the host; `scrapers`/`scrapers-browser`/infra are not publicly reachable (FR-013, SC-005)  ⏸ DEFERRED (needs Docker daemon; static config verified <date-not-needed>)
 
 **Checkpoint**: Security boundary matches the topology contract — public API, internal authenticated Scrapyd, dual-stack internal binds.
 
