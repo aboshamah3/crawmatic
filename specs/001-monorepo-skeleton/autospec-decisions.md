@@ -34,3 +34,8 @@ No questions relayed to the user — the master doc resolved every material ambi
 - [checklist] Q: Checklist focus/depth/audience? → A: Infra/deployment operational readiness; Standard depth; Reviewer (pre-implementation gate). No user clarifying questions needed (args fully specified focus) (source: doc-derived + provided args).
 - Generated checklists/deployment.md (26 items, requirements-quality "unit tests for English").
 - Completion: deployment.md 26/26 pass; requirements.md 16/16 pass. No artifact required amendment — implement gate CLEAR (no unchecked checklist items).
+
+## tasks (opus subagent)
+
+- 45 tasks (T001–T045) across 6 phases: Setup (T001–T011), Foundational shared libs (T012–T016), US1 stack bring-up/MVP (T017–T035), US2 boundaries (T036–T039), US3 env config (T040–T042), Polish (T043–T045).
+- Explicit Scope Boundary section forbids DB models/migrations/auth/scraping-logic tasks. SC-001..SC-006 mapped to specific tasks in a coverage table. No hooks; no human decisions.
