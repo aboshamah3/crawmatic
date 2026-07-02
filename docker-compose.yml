@@ -84,6 +84,11 @@ services:
   # scheduler/worker) runs migrations at startup; they only depend on
   # pgbouncer. Run explicitly via `docker compose run --rm migrate`.
   migrate:
+    # One-shot migration job. Gated behind the "migrate" profile so a plain
+    # `docker compose up` does NOT start it (keeps the default stack at the 8
+    # long-running services and runs migrations only when explicitly invoked,
+    # e.g. `docker compose run --rm migrate` or `docker compose --profile migrate up`).
+    profiles: ["migrate"]
     build:
       context: .
       dockerfile: apps/migrate/Dockerfile

@@ -58,3 +58,22 @@ No questions relayed to the user — doc + SPEC-01 skeleton resolved every mater
 - [analyze] N2 (LOW): plan tree missing models/_smoke.py → A: added.
 - [analyze] G3 (LOW): FR-016 downgrade untested → A: added downgrade round-trip to deferred live T033.
 - Only MEDIUM/LOW fixed (no CRITICAL/HIGH) → full analyze re-run not required by pipeline; self-verified NULLIF consistency across all 6 artifacts (0 bare predicates remain). 100% FR/SC coverage retained.
+
+## implement (sonnet subagents, grouped phases)
+
+34/38 tasks [X]; 4 DEFERRED (live Postgres). Suite: 47 passed, 7 skipped.
+- Phases 1-2 (T001-T005): uuid6+alembic deps, uv.lock, MIGRATION_DATABASE_URL config + .env.example.
+- Phase 3 US2 (T006-T015): ids/base/rls/enums/models + 5 unit tests. Verified live: two shared-first-column uniques → DISTINCT names; structural naive-column guard raises at mapper-config; RLS NULLIF fail-closed.
+- Phases 4-5 (T016-T020; T021 deferred): Money TypeDecorator (reject float/NaN/Inf/over-scale), check_connection, engine-hygiene tests (no-eager-engine, fork-disposal, pooler-safe, Celery hook).
+- Phase 6 US1 (T022-T032; T033/T034 deferred): _smoke_foundation model + first migration (offline render: 2 distinct uq names, TIMESTAMPTZ, NUMERIC(18,4)), alembic env.py (direct URL), single-head guard, apps/migrate one-shot image + compose migrate service.
+- Phase 7 Polish (T035, T037; T036 deferred): final validation, scope sweep (Base.metadata == ['_smoke_foundation'] only).
+
+### DEFERRED — blocked on live Postgres / Docker daemon (unavailable here)
+- T021 connectivity SELECT 1; T033 online upgrade + downgrade round-trip; T034 compose one-shot migrate run; T036 RLS fail-closed live behavior. Artifacts authored + offline/statically validated. Run on a Postgres/Docker host to close.
+
+## converge (opus subagent + inline fix)
+
+- Result: NEW TASK APPENDED — T038: gate the one-shot `migrate` compose service behind `profiles: ["migrate"]` (cross-spec fix: without it `docker compose up` starts a 9th service, contradicting FR-011's explicit-one-shot intent and breaking SPEC-01's exactly-8-services smoke test).
+- Applied T038 inline (trivial one-key YAML edit) + verified: default `docker compose config --services` = 8 (SPEC-01 invariant preserved); `--profile migrate` = 9; test_no_startup_migrations + unit suite pass (46). Marked T038 [X].
+- Static sweep (converge): one alembic head; offline DDL render OK; check_single_head exit 0; Base.metadata == ['_smoke_foundation']; NULLIF fail-closed rendered; app_shared scrapy-free. FR-001..FR-016 + SC-002..SC-006 built/verified here; SC-001 + live SC-007/FR-015/FR-016-downgrade = the 4 daemon-deferred tasks.
+- Converged after applying the single appended task (cycle 1); no implement re-loop needed.
