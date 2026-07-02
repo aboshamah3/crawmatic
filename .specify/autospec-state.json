@@ -9,8 +9,10 @@
     "01": {
       "title": "Monorepo & Services Skeleton",
       "feature_directory": "specs/001-monorepo-skeleton",
-      "status": "in-progress",
-      "steps": {"specify": "done", "clarify": "done", "plan": "done", "checklist": "done", "tasks": "done", "analyze": "done", "implement": "done"}
+      "status": "completed",
+      "deferred_verifications": ["T038 Scrapyd auth live check", "T039 public-exposure live check", "T045 full quickstart end-to-end"],
+      "deferred_reason": "require a running Docker daemon, unavailable in the build environment; artifacts authored + statically validated",
+      "steps": {"specify": "done", "clarify": "done", "plan": "done", "checklist": "done", "tasks": "done", "analyze": "done", "implement": "done", "converge": "done"}
     }
   }
 }

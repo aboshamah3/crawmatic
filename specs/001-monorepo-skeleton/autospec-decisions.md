@@ -70,3 +70,10 @@ Test suite (uv run pytest): **6 passed, 1 skipped** (skip = compose smoke, no da
 - T039: public-exposure boundary (only api on host) — static config verified (single ports: key, under api).
 - T045: full quickstart.md end-to-end 8-component bring-up (SC-001..SC-006 live).
 All three are runtime VERIFICATION of already-authored, statically-validated artifacts. Run `docker compose up --build -d` + quickstart.md on a Docker-capable host to close them. No implementation work remains.
+
+## converge (opus subagent)
+
+- Result: **CONVERGED — no remaining in-scope work.** No new tasks appended (tasks.md unchanged).
+- Re-ran suite: 6 passed, 1 skipped. Static sweep all-pass (compose var/​.env.example parity; single ports: under api; DATABASE_URL→pgbouncer:6432; scrapyd auth+bind_address=::; app_shared no scrapy/twisted/playwright; all 5 Dockerfiles pinned+non-root+uv sync --package).
+- FR-001..FR-020 and SC-002/SC-003 satisfied by authored+statically-valid artifacts (several test-backed). SC-001/SC-004/SC-005/SC-006 live-confirmation = the 3 daemon-deferred items. Did not re-append deferred/out-of-scope tasks.
+- Max two converge cycles allowed; converged on cycle 1, no implement re-loop needed.
