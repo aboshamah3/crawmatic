@@ -153,13 +153,13 @@ Deferred (authored, unchecked):
 
 Independent (run HERE):
 
-- [ ] T039 [P] [US3] `tests/unit/test_identity_models.py`: table names/columns match data-model.md; `users.workspace_id` is nullable (and NOT via `WorkspaceScopedBase`); `api_keys.workspace_id` NOT NULL; enum columns render as plain `VARCHAR` and coerce to strings; `refresh_tokens` has `created_at` but no `updated_at` (FR-002/FR-003).
-- [ ] T040 [P] [US3] `tests/unit/test_rls_identity.py`: `emit_rls_policy("users")` and `emit_rls_policy("api_keys")` each render ENABLE + FORCE + the fail-closed `USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)` predicate (FR-004/FR-019).
-- [ ] T041 [P] [US3] `tests/unit/test_repository_scoping.py`: `scoped_select(User, ws)` renders a `WHERE ... workspace_id = ...` clause; `scoped_get` raises `ValueError` when `workspace_id` is missing/None on a workspace-owned model; `WORKSPACE_OWNED_MODELS == {User, ApiKey}` (FR-018).
-- [ ] T042 [P] [US3] `tests/unit/test_workspace_scoping_guard.py`: the guard flags a planted `session.get(User, id)` and a planted unscoped `select(ApiKey)` (exit non-zero) and passes a properly `scoped_select(...)` / `.where(User.workspace_id == ws)` snippet (exit 0) (FR-020/SC-006).
-- [ ] T043 [P] [US3] `tests/unit/test_migration_offline_auth.py`: `alembic upgrade head --sql` (offline, no DB) renders the four `CREATE TABLE`s + the six RLS statements; `alembic heads` shows exactly one head (FR-004/FR-023).
-- [ ] T044 [US3] Run `uv run python scripts/check_workspace_scoping.py` against the current tree and confirm exit 0; then confirm it exits non-zero on a planted-violation fixture (used by T042). This is the executable validation of SC-006 in this environment (FR-020/SC-006) (depends: T011, T042).
-- [ ] T045 [P] [US3] `tests/unit/test_deps.py`: with fakes/monkeypatch (no live services) exercise the dependency wiring — JWT vs api-key branch selection; missing/expired token → 401; suspended cached status → deny; SUPER_ADMIN without `X-Workspace-Id` → rejected; non-super assuming another workspace → 403 (FR-017/FR-020a/FR-024).
+- [X] T039 [P] [US3] `tests/unit/test_identity_models.py`: table names/columns match data-model.md; `users.workspace_id` is nullable (and NOT via `WorkspaceScopedBase`); `api_keys.workspace_id` NOT NULL; enum columns render as plain `VARCHAR` and coerce to strings; `refresh_tokens` has `created_at` but no `updated_at` (FR-002/FR-003).
+- [X] T040 [P] [US3] `tests/unit/test_rls_identity.py`: `emit_rls_policy("users")` and `emit_rls_policy("api_keys")` each render ENABLE + FORCE + the fail-closed `USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)` predicate (FR-004/FR-019).
+- [X] T041 [P] [US3] `tests/unit/test_repository_scoping.py`: `scoped_select(User, ws)` renders a `WHERE ... workspace_id = ...` clause; `scoped_get` raises `ValueError` when `workspace_id` is missing/None on a workspace-owned model; `WORKSPACE_OWNED_MODELS == {User, ApiKey}` (FR-018).
+- [X] T042 [P] [US3] `tests/unit/test_workspace_scoping_guard.py`: the guard flags a planted `session.get(User, id)` and a planted unscoped `select(ApiKey)` (exit non-zero) and passes a properly `scoped_select(...)` / `.where(User.workspace_id == ws)` snippet (exit 0) (FR-020/SC-006).
+- [X] T043 [P] [US3] `tests/unit/test_migration_offline_auth.py`: `alembic upgrade head --sql` (offline, no DB) renders the four `CREATE TABLE`s + the six RLS statements; `alembic heads` shows exactly one head (FR-004/FR-023).
+- [X] T044 [US3] Run `uv run python scripts/check_workspace_scoping.py` against the current tree and confirm exit 0; then confirm it exits non-zero on a planted-violation fixture (used by T042). This is the executable validation of SC-006 in this environment (FR-020/SC-006) (depends: T011, T042).
+- [X] T045 [P] [US3] `tests/unit/test_deps.py`: with fakes/monkeypatch (no live services) exercise the dependency wiring — JWT vs api-key branch selection; missing/expired token → 401; suspended cached status → deny; SUPER_ADMIN without `X-Workspace-Id` → rejected; non-super assuming another workspace → 403 (FR-017/FR-020a/FR-024).
 
 Deferred (authored, unchecked):
 
@@ -175,7 +175,7 @@ Deferred (authored, unchecked):
 
 **Independent Test**: Suspend a workspace → within the TTL its authenticated requests are rejected; steady-state requests perform no per-request status DB read.
 
-- [ ] T047 [P] [US4] `tests/unit/test_status_cache.py`: with a fake redis, a cache hit returns the cached status with **no** DB read; a miss triggers a single DB read then repopulates with TTL; a redis error **fail-safe denies** (treated as not-active). Also assert `invalidate_user`/`invalidate_workspace` clear the keys for immediate propagation (FR-022/SC-007).
+- [X] T047 [P] [US4] `tests/unit/test_status_cache.py`: with a fake redis, a cache hit returns the cached status with **no** DB read; a miss triggers a single DB read then repopulates with TTL; a redis error **fail-safe denies** (treated as not-active). Also assert `invalidate_user`/`invalidate_workspace` clear the keys for immediate propagation (FR-022/SC-007).
 
 Deferred (authored, unchecked):
 
