@@ -8,6 +8,21 @@
 
 **Input**: SPEC-03 from PROJECT_SPEC.md §35 — secure API foundation: identity, authentication, API keys, and enforced multi-tenant isolation.
 
+## Clarifications
+
+### Session 2026-07-02
+
+All items below were resolved from the master specification (`PROJECT_SPEC.md` §22/§24/§32/§33) and the SPEC-01/02 foundation; no open ambiguity required a stakeholder decision. Numeric lifetimes are sensible, config-tunable defaults chosen at planning time within the doc's security constraints.
+
+- Q: Password hashing algorithm? → A: argon2id with a per-user salt (the doc's first-listed, recommended option; bcrypt is an allowed fallback) (source: doc §33).
+- Q: Access-token vs refresh-token lifetimes? → A: short-lived signed access token (default ~15 min) + longer-lived opaque refresh token (default ~30 days), both env-tunable; exact values are a plan/config detail within "short-lived access + rotating refresh" (source: doc §33 + §24; defaults).
+- Q: Status-cache TTL (suspension propagation window)? → A: a short TTL (default ~30–60 s), env-tunable; SC-007 asserts rejection within the configured TTL, not a fixed number (source: §35 "within cache TTL"; default).
+- Q: Login rate-limit thresholds / backoff? → A: per-account AND per-source-address counters with progressive backoff; concrete thresholds are config-tunable defaults (source: doc §24/§33; defaults).
+- Q: How is the first workspace + SUPER_ADMIN created (no public signup)? → A: via a seed/bootstrap path (migration/admin seed), NOT a public self-service signup flow (out of scope) (source: doc §37 demo seed, §38 "what not to build"; spec Assumptions).
+- Q: Which tables are workspace-owned (get RLS now)? → A: `users` and `api_keys` (RLS in their creating migration via SPEC-02 emit_rls_policy); `workspaces` is the tenant root (no workspace_id, no RLS-by-workspace); `refresh_tokens` is reached only via its owning user (source: §22/§32).
+- Q: JWT claims / hot-path reads? → A: access token carries identity + workspace_id + role/scope claims so context/authorization resolve without a DB read beyond the cached status check (source: §32/§35; default).
+- Q: Live-DB/Redis acceptance items here? → A: DB/Redis-independent logic unit-tested in this env; live RLS-denial, cross-workspace blocking, rate-limit/status-TTL, migration run authored + deferred to a Postgres/Redis host (source: no-docker-daemon constraint).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The users of this feature are: **human operators** who sign in to administer a workspace; **machine clients** (future integrations) that authenticate with API keys; and the **platform itself**, which must guarantee that no request ever reads or writes another workspace's data. This feature delivers the identity tables, the login/refresh/logout flows, API-key issuance and authentication, the per-request workspace context, and — most importantly — the structural isolation (row-level security + query guards + tests) that every later workspace-owned table inherits. It is the first spec to create real workspace-owned tables.
