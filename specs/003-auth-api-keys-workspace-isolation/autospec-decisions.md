@@ -48,3 +48,18 @@ No questions relayed to the user — doc + SPEC-01/02 foundation resolved all am
   1. Login TIMING side-channel (spec had uniform error but not uniform timing) → added to FR-006 + edge case (dummy verify on unknown email).
   2. Pre-auth RLS-bypass (plan's crawmatic_auth BYPASSRLS role) had no governing requirement → added FR-020a + edge case confining elevated access to credential resolution only, unreachable by request-serving queries.
 - Completion: security.md 32/32 pass; requirements.md 16/16 pass. Implement gate CLEAR.
+
+## tasks (opus subagent)
+
+- 53 tasks (T001-T053), 8 phases (Setup, Foundational, US1 sign-in, US2 api-keys, US3 isolation, US4 suspension, Seed/Bootstrap, Polish). FR-001..FR-024 + FR-020a + SC-001..SC-009 coverage tables; Scope Boundary forbids products/competitors/matches. 6 DEFERRED (live PG/Redis). CI guard (SC-006) validated here. Documented forward dep T031→T038 (build order).
+
+## analyze (inline, forked)
+
+0 CRITICAL/HIGH → no user pause. Remediated actionable findings:
+
+- [analyze] C1 (MEDIUM, auth correctness): get_auth_session silently falling back to DATABASE_URL breaks auth — under FORCE RLS a non-BYPASSRLS role returns 0 rows for pre-auth lookups → login/api-key auth silently fail closed → A: T009 now MUST fail fast with a clear error when AUTH_DATABASE_URL is unset (+ unit test), not silently return an authenticate-nobody session.
+- [analyze] I1 (MEDIUM): scope enforcement (FR-013/SC-004) has no scope-gated endpoint in SPEC-03 (api-key CRUD is role-gated admin) → A: annotated FR-013 + T036 that scope refusal is proven at dependency/unit level here (T034/T045) and end-to-end when resource endpoints land in SPEC-04.
+- [analyze] P1 (LOW): GET /v1/api-keys pagination → A: noted api-keys are low-volume; §24 cursor pagination deferred to SPEC-04 high-volume lists.
+- [analyze] O1 (LOW): forward dep T031→T038 already documented in tasks Dependencies (build order: US1 primitives → US2 primitives → status_cache → deps.py → api-keys router). Implement follows this.
+- [analyze] V1/E1/R1 (LOW): acceptable no-action — FR-021 live-only (no-DB env), AUTH_FAILED within §34 "e.g." vocab, single REDIS_URL is the noeviction instance per assumption.
+- Only MEDIUM/LOW fixed (no CRITICAL/HIGH); C1 change localized (T009 + test) + clearly correct → full re-run not required. 100% FR/SC coverage retained.

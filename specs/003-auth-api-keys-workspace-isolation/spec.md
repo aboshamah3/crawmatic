@@ -124,7 +124,7 @@ When a workspace or user is suspended, their existing credentials stop working w
 
 **API keys**
 - **FR-012**: API keys MUST be high-entropy random secrets stored as a fast (SHA-256) hash plus a short non-secret prefix for lookup/display; the full secret MUST be shown only once at creation and never retrievable afterward. (A password KDF MUST NOT be used for API keys.)
-- **FR-013**: API keys MUST carry a set of scopes drawn from the defined scope vocabulary; an authenticated API-key request MUST be limited to its scopes, and a request needing a scope the key lacks MUST be refused.
+- **FR-013**: API keys MUST carry a set of scopes drawn from the defined scope vocabulary; an authenticated API-key request MUST be limited to its scopes, and a request needing a scope the key lacks MUST be refused. (Scope-refusal is enforced by the shared authentication dependency's scope-guard and is proven here at the dependency/unit level; the first *scope-gated resource endpoints* that exercise it end-to-end arrive with the resource APIs in SPEC-04+. The API-key management endpoints in this spec are role-gated administrative operations, not scope-gated.)
 - **FR-014**: API keys MUST support revocation; a revoked (or non-active) key MUST authenticate nothing.
 - **FR-015**: API-key `last_used_at` MUST be tracked in a throttled manner — at most one write per key per minute, buffered in the cache — never a database write per request.
 - **FR-016**: API-key lookup MUST resolve by prefix and then verify the full-secret hash, so a prefix collision cannot authenticate the wrong key.
