@@ -36,3 +36,10 @@ No questions relayed to the user — doc + SPEC-01 skeleton resolved every mater
 - [plan] Demo/smoke → tiny permanent `_smoke_foundation` table + first Alembic migration; DB-independent proof via metadata asserts + offline `alembic upgrade head --sql`; live parts deferred to Postgres host (source: §22/§35 + no-docker constraint).
 - [plan] Migration job → new optional MIGRATION_DATABASE_URL (direct postgres:5432) consumed by alembic/env.py; one-shot apps/migrate image + compose `migrate` service (restart:no); scripts/check_single_head.sh CI guard (source: §4/§6/§22).
 - [plan] Constitution Check → PASS (II/VII/VIII satisfied; app_shared import boundary kept scrapy-free). Artifacts: plan.md, research.md, data-model.md, quickstart.md, contracts/{models-base,ids,money,enums,rls,migration-job,config}.md.
+
+## checklist
+
+- [checklist] Q: focus/depth/audience? → A: DB-foundation correctness & integrity (9 focus areas); Standard depth; Reviewer pre-implementation gate. No user clarifying questions (args fully specified).
+- Generated checklists/data-foundation.md (30 requirements-quality items).
+- Gap found + fixed before checking: migration-failure atomicity/rollback was unspecified → added spec FR-016 + Edge Case (each migration in a transaction, rolls back to prior revision; downgrade path; non-transactional migrations must document non-atomicity — none here).
+- Completion: data-foundation.md 30/30 pass; requirements.md 16/16 pass. Implement gate CLEAR.
