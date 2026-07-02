@@ -121,8 +121,8 @@ Task tasks that would introduce the above are intentionally omitted.
 
 - [X] T036 [US2] Edit `docker-compose.yml` to make exposure explicit: `api` is the ONLY service with `ports:`; add `expose:` (internal-network only, no host publish) for `scrapers` (6800), `scrapers-browser` (6800), `pgbouncer` (6432), `redis` (6379), `postgres` (5432), and no ports for `scheduler`/`worker` (FR-013, SC-005)
 - [X] T037 [US2] Confirm dual-stack binds are wired across artifacts: `api` command `--host ::` (T029/T034), both `scrapyd.conf` `bind_address = ::` (T024/T027), and `pgbouncer` bound dual-stack via `LISTEN_ADDR=*` (from `PGBOUNCER_LISTEN_ADDR`, set on the pgbouncer service in `docker-compose.yml`) (FR-016) [analyze U1]
-- [ ] T038 [US2] Verify Scrapyd auth boundary per quickstart §5: both nodes reject credential-less requests (401) and accept authenticated internal requests (200) (FR-012, SC-004)  ⏸ DEFERRED (needs Docker daemon; static config verified <date-not-needed>)
-- [ ] T039 [US2] Verify public-exposure boundary per quickstart §5: only `api` is reachable on the host; `scrapers`/`scrapers-browser`/infra are not publicly reachable (FR-013, SC-005)  ⏸ DEFERRED (needs Docker daemon; static config verified <date-not-needed>)
+- [ ] T038 [US2] Verify Scrapyd auth boundary per quickstart §5: both nodes reject credential-less requests (401) and accept authenticated internal requests (200) (FR-012, SC-004)  ⏸ DEFERRED (needs Docker daemon; static config verified)
+- [ ] T039 [US2] Verify public-exposure boundary per quickstart §5: only `api` is reachable on the host; `scrapers`/`scrapers-browser`/infra are not publicly reachable (FR-013, SC-005)  ⏸ DEFERRED (needs Docker daemon; static config verified)
 
 **Checkpoint**: Security boundary matches the topology contract — public API, internal authenticated Scrapyd, dual-stack internal binds.
 
@@ -148,9 +148,9 @@ Task tasks that would introduce the above are intentionally omitted.
 
 **Purpose**: Cross-cutting validation that spans all members.
 
-- [ ] T043 [P] Create `tests/unit/test_import_boundaries.py` — assert `app_shared` cannot import `scrapy`/`twisted`/`playwright` and does not depend on `scrape_core` (no reverse edge) (FR-003, data-model.md)
-- [ ] T044 [P] (Optional) Create `tests/integration/test_compose_smoke.py` — bring the stack up and assert all eight components reach running/healthy, aligned with quickstart §2 (SC-001)
-- [ ] T045 Run the full `quickstart.md` validation end-to-end and confirm the SC mapping: SC-001 (one-command 8-up), SC-002 (/health 200), SC-003 (PgBouncer-only), SC-004 (Scrapyd auth), SC-005 (only api public), SC-006 (clean-checkout bring-up)
+- [X] T043 [P] Create `tests/unit/test_import_boundaries.py` — assert `app_shared` cannot import `scrapy`/`twisted`/`playwright` and does not depend on `scrape_core` (no reverse edge) (FR-003, data-model.md)
+- [X] T044 [P] (Optional) Create `tests/integration/test_compose_smoke.py` — bring the stack up and assert all eight components reach running/healthy, aligned with quickstart §2 (SC-001)
+- [ ] T045 Run the full `quickstart.md` validation end-to-end and confirm the SC mapping: SC-001 (one-command 8-up), SC-002 (/health 200), SC-003 (PgBouncer-only), SC-004 (Scrapyd auth), SC-005 (only api public), SC-006 (clean-checkout bring-up)  ⏸ DEFERRED (needs Docker daemon; run full quickstart.md on a Docker-capable host)
 
 ---
 
