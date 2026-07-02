@@ -1,0 +1,10 @@
+{
+  "specs": {
+    "00": {
+      "title": "Project Constitution",
+      "feature_directory": ".specify/memory/constitution.md",
+      "status": "completed",
+      "steps": {"constitution": "done"}
+    }
+  }
+}

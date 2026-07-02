@@ -1,0 +1,27 @@
+installed:
+- agent-context
+settings:
+  auto_execute_hooks: true
+hooks:
+  after_specify:
+  - extension: agent-context
+    command: speckit.agent-context.update
+    # Disabled: project does not use GitHub Copilot (this hook targets
+    # .github/copilot-instructions.md, which has been removed).
+    enabled: false
+    optional: true
+    priority: 10
+    prompt: Execute speckit.agent-context.update?
+    description: Refresh agent context after specification
+    condition: null
+  after_plan:
+  - extension: agent-context
+    command: speckit.agent-context.update
+    # Disabled: project does not use GitHub Copilot (this hook targets
+    # .github/copilot-instructions.md, which has been removed).
+    enabled: false
+    optional: true
+    priority: 10
+    prompt: Execute speckit.agent-context.update?
+    description: Refresh agent context after planning
+    condition: null
