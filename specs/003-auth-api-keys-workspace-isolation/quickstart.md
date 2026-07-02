@@ -42,28 +42,83 @@ bash scripts/check_single_head.sh                    # exactly 1 head
 uv run alembic upgrade head --sql | head -60         # renders the 4 CREATE TABLEs + RLS offline
 ```
 
+### CI gate (FR-020/SC-006, contracts/ci-scoping-guard.md)
+
+This repository has no `.github/workflows/*` (or other CI-runner config)
+yet — `scripts/check_single_head.sh` (SPEC-02) already documents itself
+as "meant to be invoked by CI" the same way. Until a CI runner config
+exists, **this is the CI gate**: whichever CI system is wired up later
+runs exactly the four DB-independent commands above, in that order,
+right after `uv sync` and before any deploy/migrate step —
+
+```yaml
+- name: Install dependencies
+  run: uv sync
+- name: Unit tests
+  run: uv run pytest tests/unit -q
+- name: Workspace-scoping guard
+  run: uv run python scripts/check_workspace_scoping.py
+- name: Single-head migration guard
+  run: bash scripts/check_single_head.sh
+- name: Offline migration render (sanity check, no DB)
+  run: uv run alembic upgrade head --sql
+```
+
+A branch that introduces an unscoped `session.get(User, ...)` /
+`select(ApiKey)` (guard) or forks the migration history (single-head)
+fails this gate before it can reach the one-shot migrate job
+(`contracts/migration-job.md`) or a live deploy.
+
 ---
 
 ## B. Deferred — requires PostgreSQL + Redis (authored, run on a capable host)
 
-Setup (once): create two DB roles — `crawmatic_app` (normal, no BYPASSRLS → `DATABASE_URL`) and `crawmatic_auth` (`BYPASSRLS` → `AUTH_DATABASE_URL`); run the migration; seed the first admin:
+### Setup (once)
+
+Create two DB roles — the request-serving role has **no** BYPASSRLS (so
+`FORCE ROW LEVEL SECURITY` actually confines it) and a dedicated
+pre-auth credential-lookup role **does** bypass it (research D4,
+contracts/migration-identity.md "Two-role note"):
+
+```sql
+-- Run once, as a Postgres superuser, against the target database.
+CREATE ROLE crawmatic_app  LOGIN PASSWORD '...';                 -- NO BYPASSRLS
+CREATE ROLE crawmatic_auth LOGIN PASSWORD '...' BYPASSRLS;       -- pre-auth lookups only
+GRANT CONNECT ON DATABASE crawmatic TO crawmatic_app, crawmatic_auth;
+GRANT USAGE ON SCHEMA public TO crawmatic_app, crawmatic_auth;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO crawmatic_app, crawmatic_auth;
+```
+
+Then set the corresponding URLs and run the migration + seed:
 
 ```bash
+# .env (or exported):
+#   DATABASE_URL=postgresql+psycopg://crawmatic_app:...@pgbouncer:6432/crawmatic
+#   AUTH_DATABASE_URL=postgresql+psycopg://crawmatic_auth:...@pgbouncer:6432/crawmatic
+#   MIGRATION_DATABASE_URL=postgresql+psycopg://<privileged>:...@postgres:5432/crawmatic
+
 uv run alembic upgrade head                          # online, direct-to-Postgres (MIGRATION_DATABASE_URL)
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com BOOTSTRAP_ADMIN_PASSWORD=... \
-  uv run python scripts/seed_bootstrap.py            # first workspace + SUPER_ADMIN
+  uv run python scripts/seed_bootstrap.py            # first workspace + SUPER_ADMIN (idempotent)
 uv run pytest tests/integration -q                   # live suite (skips if no PG/Redis)
 ```
 
+`seed_bootstrap.py` itself only ever needs `MIGRATION_DATABASE_URL` (the
+direct, privileged connection) — `crawmatic_app`/`crawmatic_auth` and
+their URLs matter for the *application* (and for `test_rls_cross_workspace.py`
+below), not for the bootstrap seed.
+
+Each deferred test closes specific FR/SC items once run on a live host:
+
 | Scenario | Test | FR/SC |
 |----------|------|-------|
-| ws-A request reads/writes **0** of ws-B's rows; unscoped query still 0 (RLS); no-context → 0 (fail closed) | `test_rls_cross_workspace.py` | FR-019/FR-021/SC-005 |
-| login → refresh (rotate) → reuse rejected → 2 concurrent rotations, exactly 1 wins → logout revokes | `test_auth_flow.py` | FR-006/FR-009/FR-010/FR-011/SC-002/SC-003 |
-| api-key create (secret shown once) → authenticate → scope-limited (out-of-scope refused) → list (no secret) → revoke → denied | `test_api_key_flow.py` | FR-012/FR-013/FR-014/SC-004 |
+| ws-A request reads/writes **0** of ws-B's rows; unscoped query still 0 (RLS); no-context → 0 (fail closed); two-role path (auth role finds credential, app role blocked) | `test_rls_cross_workspace.py` | FR-019/FR-020a/FR-021/SC-005 |
+| login → refresh (rotate) → reuse rejected → 2 concurrent rotations, exactly 1 wins → logout revokes | `test_auth_flow.py` | FR-006/FR-009/FR-010/FR-011/SC-001/SC-002/SC-003 |
+| api-key create (secret shown once) → authenticate → scope-limited (out-of-scope refused) → list (no secret) → revoke → denied; `last_used_at` written ≤1/key/min under burst | `test_api_key_flow.py` | FR-012/FR-013/FR-014/FR-015/SC-004/SC-008 |
 | login rate limit engages per-account + per-source with backoff; fail-safe deny on cache down | `test_rate_limit.py` | FR-007/SC-009 |
 | suspend workspace/user → rejected within status-cache TTL; steady state **0** per-request status DB reads | `test_status_cache.py` | FR-022/SC-007 |
 | `last_used_at` ≤1 write/key/min under burst | `test_last_used_throttle.py` | FR-015/SC-008 |
-| online migration `upgrade head` creates 4 tables + RLS enabled; seed creates workspace + SUPER_ADMIN | live migration test | FR-004/FR-023 |
+| online `alembic upgrade head` creates all 4 tables with RLS enabled+forced on `users`/`api_keys` (and NOT on `workspaces`/`refresh_tokens`); `seed_bootstrap.py` creates exactly one workspace + one SUPER_ADMIN and is idempotent on re-run | `test_seed_bootstrap.py` (integration) | FR-004/FR-023 |
 
 ---
 

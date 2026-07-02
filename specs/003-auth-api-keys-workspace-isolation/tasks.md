@@ -189,7 +189,7 @@ Deferred (authored, unchecked):
 
 **Purpose**: The administrative bootstrap path for the first workspace + SUPER_ADMIN (spec Assumptions / research D6). No self-service signup endpoint.
 
-- [ ] T049 [P] Create `scripts/seed_bootstrap.py`: idempotent, run via the **direct** privileged connection (`MIGRATION_DATABASE_URL`, bypasses RLS during bootstrap); reads `BOOTSTRAP_ADMIN_EMAIL`, `BOOTSTRAP_ADMIN_PASSWORD`, optional `BOOTSTRAP_WORKSPACE_NAME`/`_SLUG`; creates the first `workspaces` row (if absent) and a `SUPER_ADMIN` `users` row (`workspace_id=NULL`, argon2id-hashed password via `hash_password`) (depends: T007, T014).
+- [X] T049 [P] Create `scripts/seed_bootstrap.py`: idempotent, run via the **direct** privileged connection (`MIGRATION_DATABASE_URL`, bypasses RLS during bootstrap); reads `BOOTSTRAP_ADMIN_EMAIL`, `BOOTSTRAP_ADMIN_PASSWORD`, optional `BOOTSTRAP_WORKSPACE_NAME`/`_SLUG`; creates the first `workspaces` row (if absent) and a `SUPER_ADMIN` `users` row (`workspace_id=NULL`, argon2id-hashed password via `hash_password`) (depends: T007, T014).
 
 Deferred (authored, unchecked):
 
@@ -201,9 +201,9 @@ Deferred (authored, unchecked):
 
 **Purpose**: CI wiring, full local validation, and documentation of the two-role/deferred setup.
 
-- [ ] T051 [P] Wire `scripts/check_workspace_scoping.py` into CI alongside `scripts/check_single_head.sh` (add the step to the CI workflow / document the command in the repo's CI config), per ci-scoping-guard.md (FR-020/SC-006).
-- [ ] T052 Run the full local validation gate (quickstart §A): `uv run pytest tests/unit -q`, `uv run python scripts/check_workspace_scoping.py`, `bash scripts/check_single_head.sh`, `uv run alembic upgrade head --sql | head -60` — confirm all green and the offline render shows the 4 tables + RLS (depends: all Phase 1–7 non-deferred tasks).
-- [ ] T053 [P] Document in `quickstart.md` (or a short note) the deferred-run setup: create `crawmatic_app` (no BYPASSRLS) + `crawmatic_auth` (BYPASSRLS) roles, set `AUTH_DATABASE_URL`, run online migration + seed, then `uv run pytest tests/integration -q` — mapping which SC/FR each deferred test closes.
+- [X] T051 [P] Wire `scripts/check_workspace_scoping.py` into CI alongside `scripts/check_single_head.sh` (add the step to the CI workflow / document the command in the repo's CI config), per ci-scoping-guard.md (FR-020/SC-006).
+- [X] T052 Run the full local validation gate (quickstart §A): `uv run pytest tests/unit -q`, `uv run python scripts/check_workspace_scoping.py`, `bash scripts/check_single_head.sh`, `uv run alembic upgrade head --sql | head -60` — confirm all green and the offline render shows the 4 tables + RLS (depends: all Phase 1–7 non-deferred tasks).
+- [X] T053 [P] Document in `quickstart.md` (or a short note) the deferred-run setup: create `crawmatic_app` (no BYPASSRLS) + `crawmatic_auth` (BYPASSRLS) roles, set `AUTH_DATABASE_URL`, run online migration + seed, then `uv run pytest tests/integration -q` — mapping which SC/FR each deferred test closes.
 
 ---
 
