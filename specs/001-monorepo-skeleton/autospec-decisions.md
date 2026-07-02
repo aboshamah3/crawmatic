@@ -51,3 +51,22 @@ No CRITICAL findings → no user pause. Remediated all actionable findings mysel
 - [analyze] G2 (LOW): FR-011 listed Scrapyd nodes though they have no DB access yet → A: added scope note to FR-011.
 - [analyze] G1 (LOW): "Postgres-not-ready" edge case has no task → A: no action (moot in skeleton — /health is dependency-free, scheduler/worker carry no DB access); deferred to SPEC-02 when real DB access lands.
 - Re-ran analyze (HIGH was fixed): all 5 confirmed resolved. Two new LOW cosmetic issues fixed — N1 (plan.md constitution stamp v1.0.0→v1.0.1), N2 (environment.md FR-013→FR-017 citation). Final: 0 CRITICAL/HIGH, 100% FR/SC coverage.
+
+## implement (sonnet subagents, one per phase)
+
+Ran 6 phase subagents sequentially. 42/45 tasks completed [X]; 3 deferred [ ].
+
+- Phase 1 Setup (T001–T011): uv workspace + 7 member pyprojects + uv.lock (94 pkgs, CPython 3.13.14). Dependency boundaries verified in lock.
+- Phase 2 Foundational (T012–T016): app_shared config/database/task_names + scrape_core. Imports verified; lazy engine (no eager); fail-fast config; comma-pool parsing (NoDecode fix). No scraping deps in app_shared.
+- Phase 3 US1 (T017–T035): 5 app services, 5 pinned non-root Dockerfiles, docker-compose.yml (8 components), health test PASSES. Scrapyd auth via entrypoint sed-substitution of env into scrapyd.conf.
+- Phase 4 US2 (T036–T037 done; T038–T039 deferred): exposure model + dual-stack confirmed (already correctly wired in Phase 3). T038/T039 = live Scrapyd-auth/public-exposure checks, need Docker daemon.
+- Phase 5 US3 (T040–T042): .env.example (compose-var cross-check clean), README bring-up, config unit tests pass.
+- Phase 6 Polish (T043–T044 done; T045 deferred): import-boundary test (subprocess-isolated) passes; compose smoke test skips cleanly without daemon. T045 = live end-to-end quickstart, needs Docker daemon.
+
+Test suite (uv run pytest): **6 passed, 1 skipped** (skip = compose smoke, no daemon).
+
+### DEFERRED — blocked on Docker daemon (unavailable in this environment)
+- T038: Scrapyd auth boundary (401 unauth / 200 auth) — static config verified.
+- T039: public-exposure boundary (only api on host) — static config verified (single ports: key, under api).
+- T045: full quickstart.md end-to-end 8-component bring-up (SC-001..SC-006 live).
+All three are runtime VERIFICATION of already-authored, statically-validated artifacts. Run `docker compose up --build -d` + quickstart.md on a Docker-capable host to close them. No implementation work remains.
