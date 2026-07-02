@@ -28,3 +28,9 @@ No questions relayed to the user — the master doc resolved every material ambi
 - [plan] Pinned images → A: python:3.13.5-slim-bookworm, postgres:17.5-bookworm, edoburu/pgbouncer:v1.23.1-p3, redis:7.4.2-bookworm, ghcr.io/astral-sh/uv:0.7.13; Playwright Chromium baked at build. `@sha256` digest pinning flagged as implement-phase follow-up (source: default — doc required "pinned, no latest" but not tags).
 - [plan] Constitution Check → PASS (I, V, VI, VIII PASS; II, III, IV, VII N/A-deferred to later specs — no data/business logic in skeleton).
 - Artifacts: plan.md, research.md, data-model.md, contracts/{health,service-topology,environment}.md, quickstart.md.
+
+## checklist
+
+- [checklist] Q: Checklist focus/depth/audience? → A: Infra/deployment operational readiness; Standard depth; Reviewer (pre-implementation gate). No user clarifying questions needed (args fully specified focus) (source: doc-derived + provided args).
+- Generated checklists/deployment.md (26 items, requirements-quality "unit tests for English").
+- Completion: deployment.md 26/26 pass; requirements.md 16/16 pass. No artifact required amendment — implement gate CLEAR (no unchecked checklist items).
