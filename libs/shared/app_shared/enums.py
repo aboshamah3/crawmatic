@@ -46,6 +46,35 @@ class RecordStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class WorkspaceStatus(StrEnum):
+    """Lifecycle status of a ``workspaces`` row (SPEC-03 FR-022)."""
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+
+
+class UserRole(StrEnum):
+    """Authorization role of a ``users`` row (SPEC-03 FR-003, §33)."""
+
+    SUPER_ADMIN = "super_admin"
+    WORKSPACE_ADMIN = "workspace_admin"
+    READ_ONLY = "read_only"
+
+
+class UserStatus(StrEnum):
+    """Lifecycle status of a ``users`` row (SPEC-03 FR-022)."""
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+
+
+class ApiKeyStatus(StrEnum):
+    """Lifecycle status of an ``api_keys`` row (SPEC-03 FR-014)."""
+
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

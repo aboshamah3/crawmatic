@@ -161,6 +161,7 @@ _CELERY_HOOK_ENV = {
     "SCRAPYD_BROWSER_URLS": "http://scrapers-browser:6800",
     "SCRAPYD_USERNAME": "scrapyd",
     "SCRAPYD_PASSWORD": "change-me",
+    "JWT_SECRET": "test-jwt-secret",
 }
 
 
@@ -213,6 +214,7 @@ def test_get_engine_passes_prepare_threshold_none_connect_arg(
     monkeypatch.setenv("SCRAPYD_BROWSER_URLS", "http://scrapers-browser:6800")
     monkeypatch.setenv("SCRAPYD_USERNAME", "scrapyd")
     monkeypatch.setenv("SCRAPYD_PASSWORD", "change-me")
+    monkeypatch.setenv("JWT_SECRET", "test-jwt-secret")
 
     from app_shared.config import get_settings
 

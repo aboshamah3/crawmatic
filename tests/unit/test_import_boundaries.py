@@ -3,10 +3,14 @@
 Enforces FR-003 / data-model.md "Entity: Shared Library Member":
 
 * ``app_shared`` (and its submodules ``config``/``database``/``task_names``/
-  ``ids``/``money``/``enums``/``models``/``models.base``/``models.rls``)
-  MUST NOT pull in Scrapy/Twisted/Playwright — those belong only to the
-  Scrapyd-side app members (``scrapers``, ``scrapers-browser``) and their
-  shared ``scrape_core`` library.
+  ``ids``/``money``/``enums``/``models``/``models.base``/``models.rls``/
+  ``models.identity``/``repository``/``security``, plus the SPEC-03
+  ``security`` primitives as they land) MUST NOT pull in
+  Scrapy/Twisted/Playwright — those belong only to the Scrapyd-side app
+  members (``scrapers``, ``scrapers-browser``) and their shared
+  ``scrape_core`` library. ``app_shared`` also MUST NOT pull in FastAPI
+  (framework-agnostic; the FastAPI dependency + routers live only in
+  ``apps/api``).
 * ``app_shared`` MUST NOT depend on ``scrape_core`` — the dependency edge
   runs one way: ``scrape_core`` may import ``app_shared``, never the
   reverse.
@@ -25,7 +29,7 @@ import pathlib
 import subprocess
 import sys
 
-FORBIDDEN_MODULES = ("scrapy", "twisted", "playwright")
+FORBIDDEN_MODULES = ("scrapy", "twisted", "playwright", "fastapi")
 
 # Import every app_shared submodule so a violation hiding in config.py,
 # database.py, task_names.py, or the SPEC-02 primitives (ids/money/enums/
@@ -43,6 +47,9 @@ import app_shared.enums
 import app_shared.models
 import app_shared.models.base
 import app_shared.models.rls
+import app_shared.models.identity
+import app_shared.repository
+import app_shared.security
 
 forbidden = {FORBIDDEN_MODULES!r}
 leaked = sorted(mod for mod in forbidden if mod in sys.modules)

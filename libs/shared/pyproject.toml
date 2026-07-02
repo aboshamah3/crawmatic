@@ -8,6 +8,9 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "pydantic-settings>=2.6,<3",
     "uuid6>=2025.0.1,<2026",
+    "argon2-cffi>=23.1,<24",
+    "pyjwt>=2.9,<3",
+    "redis>=5.0,<6",
 ]
 
 [build-system]

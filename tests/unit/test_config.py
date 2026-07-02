@@ -27,6 +27,7 @@ REQUIRED_ENV = {
     "SCRAPYD_BROWSER_URLS": "http://scrapers-browser:6800",
     "SCRAPYD_USERNAME": "scrapyd",
     "SCRAPYD_PASSWORD": "change-me",
+    "JWT_SECRET": "test-jwt-secret",
 }
 
 

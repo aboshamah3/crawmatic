@@ -72,6 +72,32 @@ class Settings(BaseSettings):
     API_PUBLIC_BASE_URL: str | None = None
     INTERNAL_API_BASE_URL: str | None = None
 
+    # --- Auth / JWT (required — never silently defaulted, SPEC-03 FR-024) ---
+    JWT_SECRET: str
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_TTL_SECONDS: int = 900
+    REFRESH_TOKEN_TTL_SECONDS: int = 2592000
+
+    # --- Status cache (SPEC-03 FR-022) ---
+    STATUS_CACHE_TTL_SECONDS: int = 30
+
+    # --- Login rate limiting (SPEC-03 FR-007) ---
+    LOGIN_RATE_LIMIT_MAX_ATTEMPTS: int = 5
+    LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 60
+
+    # --- API-key last-used throttle (SPEC-03 FR-015) ---
+    API_KEY_LAST_USED_THROTTLE_SECONDS: int = 60
+
+    # --- Auth DB role (optional — direct BYPASSRLS role for pre-auth
+    # credential lookups only; see app_shared.database.get_auth_session).
+    # Deliberately never falls back to DATABASE_URL (SPEC-03 [analyze C1]).
+    AUTH_DATABASE_URL: str | None = None
+
+    # --- Argon2id tuning (optional — argon2-cffi defaults apply when unset) ---
+    ARGON2_TIME_COST: int | None = None
+    ARGON2_MEMORY_COST: int | None = None
+    ARGON2_PARALLELISM: int | None = None
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:

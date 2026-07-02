@@ -23,6 +23,12 @@ from app_shared.models.rls import emit_rls_policy
 # table is test/migration support, not part of the public model surface.
 from app_shared.models import _smoke  # noqa: F401
 
+# The SPEC-03 identity models (workspaces/users/refresh_tokens/api_keys) —
+# re-exported so `Base.metadata` sees all four tables for Alembic
+# autogenerate/offline-render (target_metadata), and so callers can
+# `from app_shared.models import User, ApiKey, ...`.
+from app_shared.models.identity import ApiKey, RefreshToken, User, Workspace
+
 __all__ = [
     "Base",
     "metadata",
@@ -31,4 +37,8 @@ __all__ = [
     "TZDateTime",
     "WorkspaceScopedBase",
     "emit_rls_policy",
+    "Workspace",
+    "User",
+    "RefreshToken",
+    "ApiKey",
 ]
