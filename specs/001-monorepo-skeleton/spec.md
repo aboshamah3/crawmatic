@@ -8,6 +8,19 @@
 
 **Input**: SPEC-01 from PROJECT_SPEC.md §35 — create the repo and service structure only; no business logic beyond health checks.
 
+## Clarifications
+
+### Session 2026-07-02
+
+All items below were resolved directly from the master specification (`PROJECT_SPEC.md`); no open ambiguities required a stakeholder decision.
+
+- Q: What packaging/build model does the monorepo use? → A: A `uv` workspace with one root project definition and one lockfile; each service image installs only its own member's dependency closure, including the future migration job (source: doc §3 Packaging, §5).
+- Q: How is the local stack orchestrated? → A: A container-compose workflow (`docker-compose.yml` at the repo root) with the same images used in deployed environments (source: doc §5).
+- Q: What is the API health endpoint and how is its port set? → A: `GET /health`, bound on the port supplied by the environment (example port 8000) (source: doc §4 api-service, §35 acceptance).
+- Q: How does Postgres connectivity work at the skeleton stage? → A: All application services connect through PgBouncer (transaction-pooling mode, port 6432); no direct Postgres connections; the direct-connect migration job is out of scope here (source: doc §4 pgbouncer, §6).
+- Q: One Redis instance or two at the skeleton stage? → A: A single local Redis instance is acceptable now; the split broker vs. locks/limits instances with `noeviction` are a deployment concern deferred to later specs (source: doc §4 redis).
+- Q: Exact Python version and exact pinned infrastructure image tags? → A: Deferred to `/speckit-plan` as an implementation detail; the plan selects the current stable Python and pins concrete, current image versions (no `latest`) supported by the full stack (source: doc §3 Deployment "Pinned image versions", §4 hardening — version choice not enumerated in doc).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The "users" of this feature are the platform's operators and developers who deploy and run the Crawmatic backend, plus the internal services that must reach one another. This feature delivers the empty but bootable skeleton on which every later spec is built.
