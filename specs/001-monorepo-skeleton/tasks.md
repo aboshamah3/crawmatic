@@ -64,11 +64,11 @@ Task tasks that would introduce the above are intentionally omitted.
 
 **⚠️ CRITICAL**: No user story can be completed until this phase is done — all five app members import `app_shared`.
 
-- [ ] T012 [P] Create `libs/shared/app_shared/__init__.py` (package marker; keep import-light — MUST NOT import scrapy/twisted/playwright, and MUST NOT trigger engine creation at import) (FR-003, FR-020)
-- [ ] T013 [P] Create `libs/shared/app_shared/config.py` — pydantic-settings `Settings` enumerating every variable in `contracts/environment.md` (DATABASE_URL, DB_POOL_SIZE, DB_MAX_OVERFLOW, REDIS_URL, SCRAPYD_HTTP_URLS, SCRAPYD_BROWSER_URLS, SCRAPYD_USERNAME, SCRAPYD_PASSWORD, API_PORT, API_PUBLIC_BASE_URL, INTERNAL_API_BASE_URL); `API_PORT` is the single canonical API-port variable (the container's uvicorn `$PORT` is derived from it by compose — see T029/T034, not a separately-configured var); fail fast with a clear error on missing required vars; parse `SCRAPYD_*_URLS` as comma-separated pools even when length 1 (FR-017, FR-018) [analyze I1]
-- [ ] T014 [P] Create `libs/shared/app_shared/database.py` — lazy per-process SQLAlchemy engine + session helper created on first use (never at import time, never per request), honoring DB_POOL_SIZE/DB_MAX_OVERFLOW and transaction-pooling operation; expose a `dispose_engine()` for the Celery fork hook (FR-020, plan §VIII)
-- [ ] T015 [P] Create `libs/shared/app_shared/task_names.py` — empty string-constant stub for Celery task names (no tasks defined yet) (FR-004, plan §V)
-- [ ] T016 [P] Create `libs/scrape-core/scrape_core/__init__.py` — package marker only; may import `app_shared`, no scraping logic yet (FR-004)
+- [X] T012 [P] Create `libs/shared/app_shared/__init__.py` (package marker; keep import-light — MUST NOT import scrapy/twisted/playwright, and MUST NOT trigger engine creation at import) (FR-003, FR-020)
+- [X] T013 [P] Create `libs/shared/app_shared/config.py` — pydantic-settings `Settings` enumerating every variable in `contracts/environment.md` (DATABASE_URL, DB_POOL_SIZE, DB_MAX_OVERFLOW, REDIS_URL, SCRAPYD_HTTP_URLS, SCRAPYD_BROWSER_URLS, SCRAPYD_USERNAME, SCRAPYD_PASSWORD, API_PORT, API_PUBLIC_BASE_URL, INTERNAL_API_BASE_URL); `API_PORT` is the single canonical API-port variable (the container's uvicorn `$PORT` is derived from it by compose — see T029/T034, not a separately-configured var); fail fast with a clear error on missing required vars; parse `SCRAPYD_*_URLS` as comma-separated pools even when length 1 (FR-017, FR-018) [analyze I1]
+- [X] T014 [P] Create `libs/shared/app_shared/database.py` — lazy per-process SQLAlchemy engine + session helper created on first use (never at import time, never per request), honoring DB_POOL_SIZE/DB_MAX_OVERFLOW and transaction-pooling operation; expose a `dispose_engine()` for the Celery fork hook (FR-020, plan §VIII)
+- [X] T015 [P] Create `libs/shared/app_shared/task_names.py` — empty string-constant stub for Celery task names (no tasks defined yet) (FR-004, plan §V)
+- [X] T016 [P] Create `libs/scrape-core/scrape_core/__init__.py` — package marker only; may import `app_shared`, no scraping logic yet (FR-004)
 
 **Checkpoint**: Shared foundation ready — every app member can import `app_shared` (and scrapers `scrape_core`); user stories can begin.
 
