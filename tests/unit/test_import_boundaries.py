@@ -2,7 +2,8 @@
 
 Enforces FR-003 / data-model.md "Entity: Shared Library Member":
 
-* ``app_shared`` (and its submodules ``config``/``database``/``task_names``)
+* ``app_shared`` (and its submodules ``config``/``database``/``task_names``/
+  ``ids``/``money``/``enums``/``models``/``models.base``/``models.rls``)
   MUST NOT pull in Scrapy/Twisted/Playwright — those belong only to the
   Scrapyd-side app members (``scrapers``, ``scrapers-browser``) and their
   shared ``scrape_core`` library.
@@ -27,7 +28,8 @@ import sys
 FORBIDDEN_MODULES = ("scrapy", "twisted", "playwright")
 
 # Import every app_shared submodule so a violation hiding in config.py,
-# database.py, or task_names.py is caught, not just __init__.py.
+# database.py, task_names.py, or the SPEC-02 primitives (ids/money/enums/
+# models) is caught, not just __init__.py.
 _APP_SHARED_IMPORT_CHECK = f"""
 import sys
 
@@ -35,6 +37,12 @@ import app_shared
 import app_shared.config
 import app_shared.database
 import app_shared.task_names
+import app_shared.ids
+import app_shared.money
+import app_shared.enums
+import app_shared.models
+import app_shared.models.base
+import app_shared.models.rls
 
 forbidden = {FORBIDDEN_MODULES!r}
 leaked = sorted(mod for mod in forbidden if mod in sys.modules)

@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -79,6 +79,19 @@ def get_session() -> Iterator[Session]:
         yield session
     finally:
         session.close()
+
+
+def check_connection() -> None:
+    """Verify connectivity by executing a trivial ``SELECT 1``.
+
+    Opens a session via :func:`get_session` (the per-process, lazily
+    created engine) and runs a schema-independent query. Raises on
+    failure (e.g. ``sqlalchemy.exc.OperationalError`` if the database is
+    unreachable); returns ``None`` on success. Per contracts/config.md
+    (FR-015).
+    """
+    with get_session() as session:
+        session.execute(text("SELECT 1"))
 
 
 def dispose_engine() -> None:
