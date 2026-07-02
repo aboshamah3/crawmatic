@@ -8,6 +8,21 @@
 
 **Input**: SPEC-02 from PROJECT_SPEC.md §35 — create the DB foundation and migration system (reusable patterns only; no domain tables).
 
+## Clarifications
+
+### Session 2026-07-02
+
+All items below were resolved directly from the master specification (`PROJECT_SPEC.md`) and the existing SPEC-01 skeleton; no open ambiguities required a stakeholder decision.
+
+- Q: Sync or async SQLAlchemy, and which driver? → A: Synchronous SQLAlchemy 2.0 over psycopg 3 — the engine/session pattern already established in the SPEC-01 skeleton (`app_shared/database.py`); this spec formalizes it (source: doc §3 stack, SPEC-01 plan). Reactor-safe async/deferToThread writes are a scrape-core concern for a later spec.
+- Q: How are UUIDv7 IDs produced? → A: Application-generated UUIDv7 as the primary-key default; the specific generation library is a plan-level choice (source: doc §21).
+- Q: Money storage and validation? → A: `NUMERIC(18,4)`, `Decimal` in Python, finite-only (reject NaN/Infinity), reject values exceeding scale (no silent rounding), never float (source: doc §19).
+- Q: Enum representation? → A: String-backed columns validated in the application; no database-native enum types (source: doc §22).
+- Q: Migration routing and history? → A: Migrations run only as the dedicated one-shot job connected directly to Postgres (not via PgBouncer); application services never migrate at startup; single linear history with a CI guard that fails on multiple heads (source: doc §22, §4, §6).
+- Q: RLS delivery at the foundation stage? → A: Deliver an RLS-ready workspace-scoped base (adds `workspace_id`) plus a reusable helper that emits RLS policy DDL (enable RLS; fail closed when `app.workspace_id` is absent/empty; `SET LOCAL` transaction-scoped for pooler-safety). The first real workspace-owned table and its policy are SPEC-03 (source: doc §32).
+- Q: What proves the machinery without real domain tables? → A: A demonstration/smoke model + migration exercising UUIDv7 PK, `TIMESTAMPTZ`, and the two-uniques-sharing-a-first-column naming case; the exact form (bookkeeping smoke table vs. metadata-only unit demonstration), the Alembic config specifics, the UUIDv7 library, and the precise set of "core enums" are plan-level implementation details (source: doc §22 conventions + §35 scope; deferred to `/speckit-plan`).
+- Q: How are live-Postgres acceptance items handled here? → A: Authored and unit/statically validated in this environment (no running container engine); the migration-job run and connectivity check execute on a Postgres-capable host. DB-independent behavior (UUIDv7, money validation, naming-convention name generation, no-eager-engine) is fully verifiable here (source: project constraint — no Docker daemon in build env).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The "users" of this feature are the developers who will build every workspace-owned table in later specs and the operators who run schema migrations in each environment. This feature delivers the reusable database machinery — models base, ID/timestamp/money/enum conventions, an RLS-ready workspace base, pooler-safe sessions, and the one-shot migration system — so that every later table is correct-by-construction. It introduces **no domain tables and no business logic**.
