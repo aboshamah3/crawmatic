@@ -113,22 +113,22 @@ Deferred (authored, unchecked):
 
 ### Security primitives (framework-agnostic — `app_shared/security/`)
 
-- [ ] T028 [P] [US2] Create `libs/shared/app_shared/security/api_keys.py` (per security-tokens.md): `API_KEY_PREFIX="ck_"`, `generate_api_key() -> (full_secret, key_prefix, key_hash)` (`secrets.token_urlsafe(32)`), `hash_api_key` (sha256 hex, NOT a KDF), `verify_api_key` (`hmac.compare_digest`), `parse_prefix` — prefix-collision safe (FR-012/FR-016).
-- [ ] T029 [P] [US2] Create `libs/shared/app_shared/security/scopes.py` (per security-scopes.md): `Scope(StrEnum)` full 14-value vocabulary (`products:read`…`webhooks:write`), `validate_scopes(values)` (raises `ValueError` on unknown), `has_scopes(granted, required)` (FR-013).
-- [ ] T030 [P] [US2] Create `libs/shared/app_shared/security/last_used.py` (per security-cache.md): `should_write_last_used(redis, *, key_id, throttle_seconds)` using `SET apikey:lastused:{key_id} 1 NX EX throttle_seconds` → `True` only when the gate was absent, else `False`; **fail-safe `False`** on redis error (best-effort, never blocks/duplicates) (FR-015/SC-008).
+- [X] T028 [P] [US2] Create `libs/shared/app_shared/security/api_keys.py` (per security-tokens.md): `API_KEY_PREFIX="ck_"`, `generate_api_key() -> (full_secret, key_prefix, key_hash)` (`secrets.token_urlsafe(32)`), `hash_api_key` (sha256 hex, NOT a KDF), `verify_api_key` (`hmac.compare_digest`), `parse_prefix` — prefix-collision safe (FR-012/FR-016).
+- [X] T029 [P] [US2] Create `libs/shared/app_shared/security/scopes.py` (per security-scopes.md): `Scope(StrEnum)` full 14-value vocabulary (`products:read`…`webhooks:write`), `validate_scopes(values)` (raises `ValueError` on unknown), `has_scopes(granted, required)` (FR-013).
+- [X] T030 [P] [US2] Create `libs/shared/app_shared/security/last_used.py` (per security-cache.md): `should_write_last_used(redis, *, key_id, throttle_seconds)` using `SET apikey:lastused:{key_id} 1 NX EX throttle_seconds` → `True` only when the gate was absent, else `False`; **fail-safe `False`** on redis error (best-effort, never blocks/duplicates) (FR-015/SC-008).
 
 ### API layer (`apps/api`)
 
-- [ ] T031 [US2] Create `apps/api/app/routers/api_keys.py` (per api-keys.md): `POST /v1/api-keys` (validate scopes → `generate_api_key` → persist `key_prefix`/`key_hash`/`scopes`/`status=active`/`workspace_id=context` → return full secret **once**, 201), `GET /v1/api-keys` (workspace-scoped list via `scoped_select`, **never** the secret/`key_hash`; api-keys are low-volume per workspace so cursor pagination per §24 is deferred to the high-volume resource list endpoints in SPEC-04 — [analyze P1]), `DELETE /v1/api-keys/{id}` (scoped update `status=revoked`,`revoked_at=now()`, idempotent 204) — all guarded by `require_role(WORKSPACE_ADMIN, SUPER_ADMIN)` and operating under the request workspace context (depends: T010, T028, T029, and the auth dependency T038 from Phase 5 for `require_role` — see Dependencies note).
-- [ ] T032 [US2] Register the api-keys router in `apps/api/app/main.py` (`app.include_router(api_keys.router)`) (depends: T031).
+- [X] T031 [US2] Create `apps/api/app/routers/api_keys.py` (per api-keys.md): `POST /v1/api-keys` (validate scopes → `generate_api_key` → persist `key_prefix`/`key_hash`/`scopes`/`status=active`/`workspace_id=context` → return full secret **once**, 201), `GET /v1/api-keys` (workspace-scoped list via `scoped_select`, **never** the secret/`key_hash`; api-keys are low-volume per workspace so cursor pagination per §24 is deferred to the high-volume resource list endpoints in SPEC-04 — [analyze P1]), `DELETE /v1/api-keys/{id}` (scoped update `status=revoked`,`revoked_at=now()`, idempotent 204) — all guarded by `require_role(WORKSPACE_ADMIN, SUPER_ADMIN)` and operating under the request workspace context (depends: T010, T028, T029, and the auth dependency T038 from Phase 5 for `require_role` — see Dependencies note).
+- [X] T032 [US2] Register the api-keys router in `apps/api/app/main.py` (`app.include_router(api_keys.router)`) (depends: T031).
 
 ### Tests for User Story 2
 
 Independent (run HERE):
 
-- [ ] T033 [P] [US2] `tests/unit/test_api_key_security.py`: generation entropy/length + `ck_` prefix; `parse_prefix` round-trip; `hash_api_key` deterministic sha256; `verify_api_key` True for match / False for mismatch; **two keys sharing a forced prefix verify only against their own hash** (FR-012/FR-016).
-- [ ] T034 [P] [US2] `tests/unit/test_scopes.py`: full vocabulary matches §22/data-model.md; `validate_scopes(["products:read"])` ok, `validate_scopes(["bogus:read"])` raises; `has_scopes(["a","b"],["a"]) is True`, `has_scopes(["a"],["a","b"]) is False` (FR-013).
-- [ ] T035 [P] [US2] `tests/unit/test_last_used.py`: with a fake redis, `should_write_last_used` returns `True` once then `False` within the window; returns `False` fail-safe on an injected error (FR-015/SC-008).
+- [X] T033 [P] [US2] `tests/unit/test_api_key_security.py`: generation entropy/length + `ck_` prefix; `parse_prefix` round-trip; `hash_api_key` deterministic sha256; `verify_api_key` True for match / False for mismatch; **two keys sharing a forced prefix verify only against their own hash** (FR-012/FR-016).
+- [X] T034 [P] [US2] `tests/unit/test_scopes.py`: full vocabulary matches §22/data-model.md; `validate_scopes(["products:read"])` ok, `validate_scopes(["bogus:read"])` raises; `has_scopes(["a","b"],["a"]) is True`, `has_scopes(["a"],["a","b"]) is False` (FR-013).
+- [X] T035 [P] [US2] `tests/unit/test_last_used.py`: with a fake redis, `should_write_last_used` returns `True` once then `False` within the window; returns `False` fail-safe on an injected error (FR-015/SC-008).
 
 Deferred (authored, unchecked):
 
@@ -146,8 +146,8 @@ Deferred (authored, unchecked):
 
 ### Implementation
 
-- [ ] T037 [P] [US3] Create `libs/shared/app_shared/security/status_cache.py` (per security-cache.md): `get_user_status` / `get_workspace_status` (keys `status:user:{id}` / `status:ws:{wsid}`, TTL `STATUS_CACHE_TTL_SECONDS`; hit → cached, miss → single DB read + repopulate → 0 per-request DB reads in steady state); `invalidate_user` / `invalidate_workspace`; **fail-safe deny** (treat as not-active) on redis error (FR-022).
-- [ ] T038 [US3] Create `apps/api/app/deps.py` (per workspace-context.md, research D5): the authentication dependency — extract `Authorization: Bearer`, `ck_`-prefixed → api-key path (`parse_prefix` → `get_auth_session` lookup → `verify_api_key` → `status=active` → fire `should_write_last_used`), else JWT path (`decode_access_token`); cached status check (`status_cache`, fail-safe deny → 401/403); resolve+authorize workspace (own `workspace_id`, or SUPER_ADMIN's explicit `X-Workspace-Id` role-authorized — assuming a workspace is NOT an RLS bypass); open the request txn + `set_workspace_context`; expose `require_scopes(*scopes)` (403 via `has_scopes`) and `require_role(*roles)` guards (depends: T009, T016, T028, T029, T030, T037).
+- [X] T037 [P] [US3] Create `libs/shared/app_shared/security/status_cache.py` (per security-cache.md): `get_user_status` / `get_workspace_status` (keys `status:user:{id}` / `status:ws:{wsid}`, TTL `STATUS_CACHE_TTL_SECONDS`; hit → cached, miss → single DB read + repopulate → 0 per-request DB reads in steady state); `invalidate_user` / `invalidate_workspace`; **fail-safe deny** (treat as not-active) on redis error (FR-022).
+- [X] T038 [US3] Create `apps/api/app/deps.py` (per workspace-context.md, research D5): the authentication dependency — extract `Authorization: Bearer`, `ck_`-prefixed → api-key path (`parse_prefix` → `get_auth_session` lookup → `verify_api_key` → `status=active` → fire `should_write_last_used`), else JWT path (`decode_access_token`); cached status check (`status_cache`, fail-safe deny → 401/403); resolve+authorize workspace (own `workspace_id`, or SUPER_ADMIN's explicit `X-Workspace-Id` role-authorized — assuming a workspace is NOT an RLS bypass); open the request txn + `set_workspace_context`; expose `require_scopes(*scopes)` (403 via `has_scopes`) and `require_role(*roles)` guards (depends: T009, T016, T028, T029, T030, T037).
 
 ### Tests for User Story 3
 

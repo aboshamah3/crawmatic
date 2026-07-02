@@ -8,20 +8,23 @@ readiness variant reuses the process-wide lazy engine from
 that.
 
 SPEC-03 adds the `/v1/auth/*` router (login/refresh/logout,
-contracts/api-auth.md, US1) — those endpoints do use the shared lazy
-DB/Redis singletons (never a per-request engine), consistent with the
-same FR-020 discipline.
+contracts/api-auth.md, US1) and the `/v1/api-keys` router
+(contracts/api-keys.md, US2, guarded by the `apps.api.app.deps` auth
+seam) — those endpoints do use the shared lazy DB/Redis singletons
+(never a per-request engine), consistent with the same FR-020
+discipline.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.routers import auth
+from app.routers import api_keys, auth
 
 app = FastAPI(title="crawmatic-api")
 
 app.include_router(auth.router)
+app.include_router(api_keys.router)
 
 
 @app.get("/health")
