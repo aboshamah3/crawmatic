@@ -38,9 +38,9 @@ The only table any migration may create in this spec is `_smoke_foundation` (the
 
 **Purpose**: Add the two new dependencies (`uuid6`, `alembic`) and refresh the lockfile so every later task can import them.
 
-- [ ] T001 [P] Add `uuid6>=2025.0.1,<2026` (pinned per research.md D1) to the `dependencies` list in `libs/shared/pyproject.toml` (the `app_shared` package pins it because `ids.py` imports it).
-- [ ] T002 [P] Add `alembic>=1.13,<2` to the `dev` dependency group in the root `/srv/crawmatic/crawmatic/pyproject.toml` so the `alembic` CLI (offline `--sql` render + `alembic heads` single-head guard) is runnable here; note it will also become the `apps/migrate` runtime dep in T029.
-- [ ] T003 Refresh the lockfile: run `uv lock` from repo root so `uv.lock` records `uuid6` and `alembic` (depends on T001, T002). Verify `uv sync` succeeds.
+- [X] T001 [P] Add `uuid6>=2025.0.1,<2026` (pinned per research.md D1) to the `dependencies` list in `libs/shared/pyproject.toml` (the `app_shared` package pins it because `ids.py` imports it).
+- [X] T002 [P] Add `alembic>=1.13,<2` to the `dev` dependency group in the root `/srv/crawmatic/crawmatic/pyproject.toml` so the `alembic` CLI (offline `--sql` render + `alembic heads` single-head guard) is runnable here; note it will also become the `apps/migrate` runtime dep in T029.
+- [X] T003 Refresh the lockfile: run `uv lock` from repo root so `uv.lock` records `uuid6` and `alembic` (depends on T001, T002). Verify `uv sync` succeeds.
 
 **Checkpoint**: `uv run python -c "import uuid6, alembic"` succeeds.
 
@@ -52,8 +52,8 @@ The only table any migration may create in this spec is `_smoke_foundation` (the
 
 **⚠️ CRITICAL**: `MIGRATION_DATABASE_URL` must exist before `alembic/env.py` (T025) can build its direct engine.
 
-- [ ] T004 Extend `Settings` in `libs/shared/app_shared/config.py`: add optional field `MIGRATION_DATABASE_URL: str | None = None` (direct-to-Postgres, used only by the migration job / Alembic `env.py`; apps keep `DATABASE_URL` → pooler). Keep every existing field unchanged. Per contracts/config.md.
-- [ ] T005 [P] Update `/srv/crawmatic/crawmatic/.env.example`: add `MIGRATION_DATABASE_URL=postgresql+psycopg://crawmatic:crawmatic@postgres:5432/crawmatic` with a comment documenting the split — **apps use `DATABASE_URL` (pgbouncer:6432, pooler); the migration job uses `MIGRATION_DATABASE_URL` (postgres:5432, direct)**. Per contracts/config.md / research.md D6.
+- [X] T004 Extend `Settings` in `libs/shared/app_shared/config.py`: add optional field `MIGRATION_DATABASE_URL: str | None = None` (direct-to-Postgres, used only by the migration job / Alembic `env.py`; apps keep `DATABASE_URL` → pooler). Keep every existing field unchanged. Per contracts/config.md.
+- [X] T005 [P] Update `/srv/crawmatic/crawmatic/.env.example`: add `MIGRATION_DATABASE_URL=postgresql+psycopg://crawmatic:crawmatic@postgres:5432/crawmatic` with a comment documenting the split — **apps use `DATABASE_URL` (pgbouncer:6432, pooler); the migration job uses `MIGRATION_DATABASE_URL` (postgres:5432, direct)**. Per contracts/config.md / research.md D6.
 
 **Checkpoint**: `Settings` constructs with and without `MIGRATION_DATABASE_URL` set; existing `tests/unit/test_config.py` still passes.
 

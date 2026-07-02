@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 2
 
+    # --- Migration job (optional — direct-to-Postgres, bypasses the pooler) ---
+    # Used ONLY by the one-shot migration job / Alembic env.py (host must be
+    # postgres:5432, never pgbouncer:6432 — advisory locks and concurrent
+    # index builds are unsafe under transaction pooling). App services keep
+    # using DATABASE_URL (pooler) and never set/need this.
+    MIGRATION_DATABASE_URL: str | None = None
+
     # --- Redis (required) ---
     REDIS_URL: str
 

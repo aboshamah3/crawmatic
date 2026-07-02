@@ -15,4 +15,5 @@ members = ["apps/*", "libs/*"]
 dev = [
     "pytest>=8.3,<9",
     "httpx>=0.28,<1",
+    "alembic>=1.13,<2",
 ]
