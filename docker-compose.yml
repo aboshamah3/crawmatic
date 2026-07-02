@@ -1,0 +1,122 @@
+# Brings up all eight components of the skeleton (plan.md, contracts/service-topology.md).
+#
+# Exposure (FR-013, SC-005): only `api` publishes a host port in this
+# phase (`ports:`); every other service uses `expose:` only (internal
+# network). Phase 4 (US2) further hardens/verifies this boundary.
+#
+# DB routing (FR-011, SC-003): app services reach Postgres only through
+# `pgbouncer:6432`; DATABASE_URL in `.env` must never target
+# `postgres:5432` directly.
+#
+# API port (analyze I1): API_PORT is the single canonical port variable.
+# `PORT` on the `api` service is derived from it (`environment: PORT:
+# ${API_PORT}`), and the published host port uses the same value, so
+# host / container-listen / healthcheck ports never diverge.
+
+services:
+  postgres:
+    image: postgres:17.5-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.23.1-p3
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      POOL_MODE: ${PGBOUNCER_POOL_MODE}
+      AUTH_TYPE: ${PGBOUNCER_AUTH_TYPE}
+      LISTEN_ADDR: ${PGBOUNCER_LISTEN_ADDR}
+      LISTEN_PORT: "6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "6432"
+
+  redis:
+    image: redis:7.4.2-bookworm
+    expose:
+      - "6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      PORT: ${API_PORT}
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ['PORT'] + '/health', timeout=2)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: apps/scheduler/Dockerfile
+    env_file: .env
+    depends_on:
+      pgbouncer:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/workers/Dockerfile
+    env_file: .env
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_started
+
+  scrapers:
+    build:
+      context: .
+      dockerfile: apps/scrapers/Dockerfile
+    env_file: .env
+    environment:
+      SCRAPYD_USERNAME: ${SCRAPYD_USERNAME}
+      SCRAPYD_PASSWORD: ${SCRAPYD_PASSWORD}
+    expose:
+      - "6800"
+
+  scrapers-browser:
+    build:
+      context: .
+      dockerfile: apps/scrapers-browser/Dockerfile
+    env_file: .env
+    environment:
+      SCRAPYD_USERNAME: ${SCRAPYD_USERNAME}
+      SCRAPYD_PASSWORD: ${SCRAPYD_PASSWORD}
+    expose:
+      - "6800"
+
+volumes:
+  postgres_data:
