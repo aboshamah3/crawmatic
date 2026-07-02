@@ -21,3 +21,10 @@ No questions relayed to the user — the master doc resolved every material ambi
 - [clarify] Q: Postgres connectivity at skeleton? → A: all services via PgBouncer transaction pooling (6432); migration direct-connect out of scope (source: doc §4, §6).
 - [clarify] Q: Redis instances at skeleton? → A: single local instance now; split broker/locks noeviction deferred (source: doc §4 redis).
 - [clarify] Q: Exact Python version + pinned image tags? → A: Deferred to plan (implementation detail; plan picks current stable Python + concrete pinned images) (source: doc §3/§4 — not enumerated in doc).
+
+## plan (opus subagent)
+
+- [plan] Python version → A: 3.13 (`requires-python = ">=3.13,<3.14"`), supported across FastAPI/Celery 5.5/Scrapy 2.13/Twisted 24.x/scrapy-playwright/SQLAlchemy 2.0/psycopg 3.2 as of 2026-07 (source: default — doc left version unspecified).
+- [plan] Pinned images → A: python:3.13.5-slim-bookworm, postgres:17.5-bookworm, edoburu/pgbouncer:v1.23.1-p3, redis:7.4.2-bookworm, ghcr.io/astral-sh/uv:0.7.13; Playwright Chromium baked at build. `@sha256` digest pinning flagged as implement-phase follow-up (source: default — doc required "pinned, no latest" but not tags).
+- [plan] Constitution Check → PASS (I, V, VI, VIII PASS; II, III, IV, VII N/A-deferred to later specs — no data/business logic in skeleton).
+- Artifacts: plan.md, research.md, data-model.md, contracts/{health,service-topology,environment}.md, quickstart.md.

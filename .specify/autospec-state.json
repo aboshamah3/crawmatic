@@ -10,7 +10,7 @@
       "title": "Monorepo & Services Skeleton",
       "feature_directory": "specs/001-monorepo-skeleton",
       "status": "in-progress",
-      "steps": {"specify": "done", "clarify": "done"}
+      "steps": {"specify": "done", "clarify": "done", "plan": "done"}
     }
   }
 }
