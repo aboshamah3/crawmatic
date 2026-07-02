@@ -1,0 +1,17 @@
+[project]
+name = "app_shared"
+version = "0.1.0"
+description = "Shared cross-cutting library: env config, DB engine/session helpers, Celery task-name constants. MUST NOT depend on scrapy/twisted/playwright or scrape_core."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "sqlalchemy>=2.0,<3",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic-settings>=2.6,<3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app_shared"]

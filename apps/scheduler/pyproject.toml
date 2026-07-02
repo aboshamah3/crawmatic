@@ -1,0 +1,18 @@
+[project]
+name = "scheduler"
+version = "0.1.0"
+description = "Scheduler process; boots to a running loop, no business logic in the skeleton. Must NOT depend on scrapy/twisted/playwright."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "app_shared",
+]
+
+[tool.uv.sources]
+app_shared = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

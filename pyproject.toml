@@ -1,0 +1,18 @@
+[project]
+name = "crawmatic"
+version = "0.1.0"
+description = "Crawmatic monorepo workspace root (uv workspace; not an installable package)"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["apps/*", "libs/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "httpx>=0.28,<1",
+]

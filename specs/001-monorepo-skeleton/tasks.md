@@ -42,17 +42,17 @@ Task tasks that would introduce the above are intentionally omitted.
 
 **Purpose**: Establish the uv workspace, per-member packaging declarations, and the single lockfile so every later phase can `uv sync --package <member>`.
 
-- [ ] T001 Create root uv workspace file `pyproject.toml` with `[tool.uv.workspace] members = ["apps/*", "libs/*"]`, `requires-python = ">=3.13,<3.14"`, and shared dev tooling (pytest); no runtime deps at root (plan.md Structure Decision, FR-002)
-- [ ] T002 [P] Create `apps/api/pyproject.toml` declaring member `api` deps: fastapi, uvicorn, `app_shared` (workspace) — must NOT declare scrapy/twisted/playwright (FR-002, FR-003)
-- [ ] T003 [P] Create `apps/scheduler/pyproject.toml` declaring member `scheduler` deps: `app_shared` only (FR-002, FR-003)
-- [ ] T004 [P] Create `apps/workers/pyproject.toml` declaring member `workers` deps: celery, redis, `app_shared` — no scrapy/twisted/playwright (FR-002, FR-003)
-- [ ] T005 [P] Create `apps/scrapers/pyproject.toml` declaring member `scrapers` deps: scrapy, scrapyd, `scrape_core`, `app_shared` (FR-001, FR-004)
-- [ ] T006 [P] Create `apps/scrapers-browser/pyproject.toml` declaring member `scrapers-browser` deps: scrapy, scrapyd, scrapy-playwright, playwright, `scrape_core`, `app_shared` (FR-001, FR-004, FR-009)
-- [ ] T007 [P] Create `libs/shared/pyproject.toml` declaring member `app_shared` deps: sqlalchemy, psycopg, pydantic-settings — MUST NOT depend on scrapy/twisted/playwright and MUST NOT depend on `scrape_core` (FR-003)
-- [ ] T008 [P] Create `libs/scrape-core/pyproject.toml` declaring member `scrape_core`; MAY depend on `app_shared`, never the reverse (FR-003, FR-004)
-- [ ] T009 [P] Create `.dockerignore` at repo root excluding `.git`, `.venv`, `__pycache__`, `.env`, `specs/`, test caches from build contexts
-- [ ] T010 [P] Scaffold `alembic/versions/.gitkeep` — empty Alembic directory, NO `env.py`/`alembic.ini`/migrations authored (data-model.md; migrations deferred to SPEC-02)
-- [ ] T011 Generate the single workspace lockfile `uv.lock` by running `uv lock` at repo root (depends on T001–T008) (FR-002)
+- [X] T001 Create root uv workspace file `pyproject.toml` with `[tool.uv.workspace] members = ["apps/*", "libs/*"]`, `requires-python = ">=3.13,<3.14"`, and shared dev tooling (pytest); no runtime deps at root (plan.md Structure Decision, FR-002)
+- [X] T002 [P] Create `apps/api/pyproject.toml` declaring member `api` deps: fastapi, uvicorn, `app_shared` (workspace) — must NOT declare scrapy/twisted/playwright (FR-002, FR-003)
+- [X] T003 [P] Create `apps/scheduler/pyproject.toml` declaring member `scheduler` deps: `app_shared` only (FR-002, FR-003)
+- [X] T004 [P] Create `apps/workers/pyproject.toml` declaring member `workers` deps: celery, redis, `app_shared` — no scrapy/twisted/playwright (FR-002, FR-003)
+- [X] T005 [P] Create `apps/scrapers/pyproject.toml` declaring member `scrapers` deps: scrapy, scrapyd, `scrape_core`, `app_shared` (FR-001, FR-004)
+- [X] T006 [P] Create `apps/scrapers-browser/pyproject.toml` declaring member `scrapers-browser` deps: scrapy, scrapyd, scrapy-playwright, playwright, `scrape_core`, `app_shared` (FR-001, FR-004, FR-009)
+- [X] T007 [P] Create `libs/shared/pyproject.toml` declaring member `app_shared` deps: sqlalchemy, psycopg, pydantic-settings — MUST NOT depend on scrapy/twisted/playwright and MUST NOT depend on `scrape_core` (FR-003)
+- [X] T008 [P] Create `libs/scrape-core/pyproject.toml` declaring member `scrape_core`; MAY depend on `app_shared`, never the reverse (FR-003, FR-004)
+- [X] T009 [P] Create `.dockerignore` at repo root excluding `.git`, `.venv`, `__pycache__`, `.env`, `specs/`, test caches from build contexts
+- [X] T010 [P] Scaffold `alembic/versions/.gitkeep` — empty Alembic directory, NO `env.py`/`alembic.ini`/migrations authored (data-model.md; migrations deferred to SPEC-02)
+- [X] T011 Generate the single workspace lockfile `uv.lock` by running `uv lock` at repo root (depends on T001–T008) (FR-002)
 
 **Checkpoint**: `uv sync` resolves; the workspace graph and per-member closures are locked.
 
