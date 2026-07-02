@@ -20,11 +20,11 @@ Returns DDL statement strings for use inside an Alembic migration (`for stmt in 
 
 1. `ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;`
 2. `ALTER TABLE {table} FORCE ROW LEVEL SECURITY;`  ← policy applies even to the table owner.
-3. `CREATE POLICY {policy} ON {table} USING ({col} = current_setting('app.workspace_id', true)::uuid);`
+3. `CREATE POLICY {policy} ON {table} USING ({col} = NULLIF(current_setting('app.workspace_id', true), '')::uuid);`
 
 ## Semantics (guarantee)
 
-- **Fail-closed**: when `app.workspace_id` is unset/empty, `current_setting('app.workspace_id', true)` returns `NULL`; `col = NULL` is `NULL` (not true) → **zero rows** match (§32, spec Edge Case). Never "all rows".
+- **Fail-closed on absent AND empty**: `current_setting('app.workspace_id', true)` returns `NULL` when the GUC is unset and `''` when set to empty. `NULLIF(…, '')` maps **both** to `NULL`, so `''::uuid` never raises and `col = NULL` is `NULL` (not true) → **zero rows** match (§32 "absent or empty … matches zero rows"). Never "all rows", never an error. The `NULLIF` wrapper is required: a bare `current_setting(...)::uuid` would raise `invalid input syntax for type uuid: ""` on an empty context instead of failing closed.
 - **Pooler-safe context**: callers set context per transaction with `SET LOCAL app.workspace_id = '<uuid>'` (transaction-scoped; survives PgBouncer transaction pooling).
 
 ## Scope in SPEC-02
@@ -33,5 +33,5 @@ Returns DDL statement strings for use inside an Alembic migration (`for stmt in 
 
 ## Tests
 
-- `tests/unit/test_rls_policy.py` — asserts the rendered strings contain `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, and the fail-closed predicate `current_setting('app.workspace_id', true)::uuid`.
-- (Live-DB, marked for a PG host) applying the policy to a throwaway table and confirming zero rows without context, correct rows with `SET LOCAL`.
+- `tests/unit/test_rls_policy.py` — asserts the rendered strings contain `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, and the fail-closed predicate `NULLIF(current_setting('app.workspace_id', true), '')::uuid` (explicitly asserts the `NULLIF(..., '')` wrapper is present so empty context cannot raise).
+- (Live-DB, marked for a PG host) applying the policy to a throwaway table and confirming zero rows with **no** context and with an **empty** context, correct rows with `SET LOCAL`.

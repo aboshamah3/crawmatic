@@ -18,7 +18,7 @@
       "title": "Database Foundation",
       "feature_directory": "specs/002-database-foundation",
       "status": "in-progress",
-      "steps": {"specify": "done", "clarify": "done", "plan": "done", "checklist": "done", "tasks": "done"}
+      "steps": {"specify": "done", "clarify": "done", "plan": "done", "checklist": "done", "tasks": "done", "analyze": "done"}
     }
   }
 }

@@ -16,7 +16,7 @@ Deliver the reusable database machinery that makes every later table correct-by-
 
 **Storage**: PostgreSQL 17. App services connect through PgBouncer (`pgbouncer:6432`, transaction pooling); the migration job connects **directly** to `postgres:5432`.
 
-**Testing**: pytest (existing dev group). DB-independent unit tests run here; live-DB tests are authored and skipped when no `TEST_DATABASE_URL` / Postgres host is present.
+**Testing**: pytest (existing dev group). DB-independent unit tests run here; live-DB tests are authored and skipped when no reachable Postgres / `MIGRATION_DATABASE_URL` is present. (Single canonical gate variable: `MIGRATION_DATABASE_URL` — not a separate `TEST_DATABASE_URL`.)
 
 **Target Platform**: Linux server / containers (compose locally, Railway-style platform in prod).
 
@@ -35,7 +35,7 @@ Deliver the reusable database machinery that makes every later table correct-by-
 | Principle | Relevance | How this plan satisfies it |
 |-----------|-----------|----------------------------|
 | **I. API-First / Service boundaries** | `app_shared` import boundary | New modules (`models/`, `ids.py`, `money.py`, `enums.py`) live in `app_shared` and import only sqlalchemy/psycopg/uuid6/stdlib — never scrapy/twisted/playwright. The existing import-boundary test is extended to cover the new submodules. Alembic (`alembic/env.py`) lives at repo root, not inside `app_shared`, and imports `app_shared` one-way. PASS |
-| **II. Workspace Isolation (NON-NEGOTIABLE)** | RLS-ready base | Deliver `WorkspaceScopedBase`/mixin (adds `workspace_id UUID NOT NULL`) + `emit_rls_policy()` helper that renders `ENABLE ROW LEVEL SECURITY` + `FORCE` + a fail-closed policy `USING (workspace_id = current_setting('app.workspace_id', true)::uuid)`. `SET LOCAL` transaction-scoped (PgBouncer-safe). No real workspace table created here (first use SPEC-03); helper is unit/statically validated (rendered DDL string asserted). PASS (RLS-ready) |
+| **II. Workspace Isolation (NON-NEGOTIABLE)** | RLS-ready base | Deliver `WorkspaceScopedBase`/mixin (adds `workspace_id UUID NOT NULL`) + `emit_rls_policy()` helper that renders `ENABLE ROW LEVEL SECURITY` + `FORCE` + a fail-closed policy `USING (workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)` (NULLIF so absent AND empty context → zero rows, never raising `''::uuid`). `SET LOCAL` transaction-scoped (PgBouncer-safe). No real workspace table created here (first use SPEC-03); helper is unit/statically validated (rendered DDL string asserted). PASS (RLS-ready) |
 | **III. Variant-level pricing** | N/A this spec | No pricing/matching logic in the foundation. Base does not preclude it. PASS (N/A) |
 | **IV. Database-driven config** | N/A this spec | No config tables here. PASS (N/A) |
 | **V. Disciplined Scraping Runtime (NON-NEGOTIABLE)** | Import boundary only | No scraping code. `app_shared` stays scrapy-free (see I). PASS (N/A) |
@@ -80,7 +80,8 @@ libs/shared/app_shared/
 ├── models/
 │   ├── __init__.py      # NEW: re-export Base, TimestampMixin, WorkspaceScopedBase, metadata
 │   ├── base.py          # NEW: MetaData(naming_convention); DeclarativeBase; UUIDv7 pk mixin; TimestampMixin (naive guard); WorkspaceScopedBase
-│   └── rls.py           # NEW: emit_rls_policy() -> DDL / Alembic-op helper (fail-closed)
+│   ├── rls.py           # NEW: emit_rls_policy() -> DDL / Alembic-op helper (fail-closed)
+│   └── _smoke.py        # NEW: _smoke_foundation demonstration model (non-domain; proves the machinery, T022)
 ├── task_names.py, __init__.py   # existing
 
 alembic.ini                         # NEW (repo root)

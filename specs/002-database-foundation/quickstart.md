@@ -20,7 +20,7 @@ Expected coverage / outcomes:
 2. **UUIDv7** (FR-003) — `tests/unit/test_ids.py`: `new_uuid7()` is a stdlib `UUID`, `.version == 7`, sequential calls are time-ordered. See [contracts/ids.md](./contracts/ids.md).
 3. **Money boundary** (FR-005, SC-004) — `tests/unit/test_money.py`: `float`, `NaN`, `Infinity`, and over-scale (`Decimal("1.23456")`) are rejected; `Decimal("19.99")` / `Decimal("0.0001")` round-trip exactly as `Decimal`. See [contracts/money.md](./contracts/money.md).
 4. **Naive-timestamp guard** (FR-004) — `tests/unit/test_base_model.py`: assigning a naive `datetime` to a `TZDateTime` column raises `ValueError`; the demo model exposes a UUIDv7 pk and tz-aware `created_at`/`updated_at`.
-5. **RLS DDL fail-closed** (FR-007) — `tests/unit/test_rls_policy.py`: `emit_rls_policy("t")` renders `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, and `current_setting('app.workspace_id', true)::uuid`. See [contracts/rls.md](./contracts/rls.md).
+5. **RLS DDL fail-closed** (FR-007) — `tests/unit/test_rls_policy.py`: `emit_rls_policy("t")` renders `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, and the fail-closed `NULLIF(current_setting('app.workspace_id', true), '')::uuid` predicate (empty context → zero rows, never an error). See [contracts/rls.md](./contracts/rls.md).
 6. **Import boundary intact** (Principle I/V) — `tests/unit/test_import_boundaries.py`: the new `app_shared` submodules (`models`, `ids`, `money`, `enums`) import no scrapy/twisted/playwright and no `scrape_core`.
 7. **No eager engine** (FR-008, SC-005) — importing `app_shared.database` creates no engine (existing test still passes).
 

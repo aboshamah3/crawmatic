@@ -43,3 +43,18 @@ No questions relayed to the user — doc + SPEC-01 skeleton resolved every mater
 - Generated checklists/data-foundation.md (30 requirements-quality items).
 - Gap found + fixed before checking: migration-failure atomicity/rollback was unspecified → added spec FR-016 + Edge Case (each migration in a transaction, rolls back to prior revision; downgrade path; non-transactional migrations must document non-atomicity — none here).
 - Completion: data-foundation.md 30/30 pass; requirements.md 16/16 pass. Implement gate CLEAR.
+
+## analyze (inline, forked)
+
+0 CRITICAL/HIGH → no user pause. Remediated all actionable findings myself:
+
+- [analyze] I2 (MEDIUM, NON-NEGOTIABLE Principle II): RLS predicate `''::uuid` would RAISE on an empty `app.workspace_id` instead of failing closed → A: changed emitter to `NULLIF(current_setting('app.workspace_id', true), '')::uuid` so absent AND empty both → NULL → zero rows. Fixed contracts/rls.md, tasks T008/T014, and aligned research.md/plan.md/data-model.md/quickstart.md (removed all bare-predicate drift).
+- [analyze] I1 (MEDIUM): FR-004 "naive columns forbidden at base level" only enforced at value level (TZDateTime) → A: added a structural mapper-config guard (event listener raising when a mapped column is a timezone-naive DateTime) in T007 + a test in T013 that a naive-column model raises at class/mapper config.
+- [analyze] G1 (LOW): fork-disposal (FR-009) untested → A: T020 now asserts dispose_engine() resets singletons + worker_process_init hook wired (mocked engine, no DB).
+- [analyze] G2 (LOW): pooler-safe config (FR-010) unasserted → A: T020 asserts connect_args prepare_threshold is None.
+- [analyze] A1 (LOW): check_connection signature undecided → A: pinned `-> None` (raises on failure) in T018.
+- [analyze] A2 (LOW): enum mechanism ambiguous → A: pinned plain String column + application-side validation (per §22), not Enum(native_enum=False); T009/T015 updated.
+- [analyze] N1 (LOW): env-var name drift → A: standardized on MIGRATION_DATABASE_URL in plan.md (dropped TEST_DATABASE_URL).
+- [analyze] N2 (LOW): plan tree missing models/_smoke.py → A: added.
+- [analyze] G3 (LOW): FR-016 downgrade untested → A: added downgrade round-trip to deferred live T033.
+- Only MEDIUM/LOW fixed (no CRITICAL/HIGH) → full analyze re-run not required by pipeline; self-verified NULLIF consistency across all 6 artifacts (0 bare predicates remain). 100% FR/SC coverage retained.

@@ -123,12 +123,12 @@ Fields (both non-null, timezone-aware):
 Returns DDL statement strings (for `op.execute(...)` inside an Alembic migration):
 1. `ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;`
 2. `ALTER TABLE {table} FORCE ROW LEVEL SECURITY;`
-3. `CREATE POLICY {policy} ON {table} USING ({col} = current_setting('app.workspace_id', true)::uuid);`
+3. `CREATE POLICY {policy} ON {table} USING ({col} = NULLIF(current_setting('app.workspace_id', true), '')::uuid);`  ← `NULLIF(…, '')` so BOTH absent and empty context → NULL → zero rows (never raises `''::uuid`)
 
 **Validation / invariants**
 - Fail-closed: unset/empty `app.workspace_id` → `current_setting(..., true)` = `NULL` → predicate matches zero rows (FR-007, §32, spec Edge Case).
 - Transaction-scoped context via `SET LOCAL app.workspace_id = '<uuid>'` (PgBouncer-safe).
-- Unit-validated by asserting the rendered strings contain `ENABLE ROW LEVEL SECURITY`, `FORCE`, and `current_setting('app.workspace_id', true)::uuid`. No real table receives this policy in SPEC-02.
+- Unit-validated by asserting the rendered strings contain `ENABLE ROW LEVEL SECURITY`, `FORCE`, and the fail-closed `NULLIF(current_setting('app.workspace_id', true), '')::uuid` predicate. No real table receives this policy in SPEC-02.
 
 ---
 
