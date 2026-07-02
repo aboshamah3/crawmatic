@@ -63,3 +63,21 @@ No questions relayed to the user — doc + SPEC-01/02 foundation resolved all am
 - [analyze] O1 (LOW): forward dep T031→T038 already documented in tasks Dependencies (build order: US1 primitives → US2 primitives → status_cache → deps.py → api-keys router). Implement follows this.
 - [analyze] V1/E1/R1 (LOW): acceptable no-action — FR-021 live-only (no-DB env), AUTH_FAILED within §34 "e.g." vocab, single REDIS_URL is the noeviction instance per assumption.
 - Only MEDIUM/LOW fixed (no CRITICAL/HIGH); C1 change localized (T009 + test) + clearly correct → full re-run not required. 100% FR/SC coverage retained.
+
+## implement (sonnet subagents, 5 dependency-coherent groups)
+
+47/53 tasks [X]; 6 DEFERRED (live PG/Redis). Suite: 185 passed, 24 skipped.
+- A Setup+Foundational (T001-T013): deps, config, identity enums+models, migration 55da7d6d939d w/ RLS on users+api_keys, repository scoped helpers, AST CI guard, get_auth_session fail-fast (C1).
+- B US1 sign-in (T014-T025): argon2id passwords + timing-uniform dummy_verify (measured 1.03 ratio), tokens+atomic rotation SQL, JWT, rate limiter, auth router.
+- C US2 + auth seam (T028-T035,T037,T038,T031,T032): api-key primitives (collision-safe), scopes, last-used throttle, status_cache (fail-safe deny), deps.py single auth seam, api-keys router.
+- D US3 isolation tests + US4 (T039-T045,T047): identity/RLS/repository/guard/deps/status-cache unit tests; guard catches planted violations.
+- E Seed + Polish (T049,T051-T053): seed_bootstrap, CI-guard doc, validation gate, deferred-run docs.
+
+### DEFERRED — live Postgres/Redis (authored + skip cleanly; not gaps)
+T026 auth flow, T027 login rate limit, T036 api-key flow, T046 cross-workspace RLS denial, T048 status-cache TTL/zero-read, T050 seed+online migration. Run on a PG/Redis host to close SC-001..SC-005/SC-007/SC-009 live proofs + FR-021.
+
+## converge (opus subagent)
+
+- Result: CONVERGED — no new tasks (tasks.md unchanged). Rigorous static sweep all PASS:
+  guard exit 0 + catches planted violation; one alembic head; offline render = 4 identity tables + 6 RLS statements (ENABLE+FORCE+NULLIF) on users AND api_keys; all 4 sanctioned BYPASSRLS pre-auth lookups noqa-annotated, no unannotated unscoped access; app_shared fastapi/scrapy-free; SUPER_ADMIN requires explicit role-authorized workspace (not RLS bypass); get_auth_session fail-fast; login always pays argon2 cost; atomic UPDATE...RETURNING rotation; Base.metadata = _smoke_foundation + 4 identity tables only (no native enums, no SPEC-04 tables).
+- FR-001..FR-024 + FR-020a built/verified here (FR-021 live-deferred); SC-006 executes green here; other SC live-proofs in the 6 deferred suites. Converged cycle 1, no implement re-loop.

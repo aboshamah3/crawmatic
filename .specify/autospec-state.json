@@ -54,7 +54,7 @@
     "03": {
       "title": "Auth, API Keys & Workspace Isolation",
       "feature_directory": "specs/003-auth-api-keys-workspace-isolation",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -62,8 +62,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T026 auth flow",
+        "T027 login rate limit",
+        "T036 api-key flow",
+        "T046 cross-workspace RLS denial",
+        "T048 status-cache TTL/zero-read",
+        "T050 seed+online migration"
+      ],
+      "deferred_reason": "require a live Postgres/Redis (no container engine in build env); artifacts authored + skip cleanly; DB/Redis-independent logic fully unit-tested here (185 passed, 24 skipped)"
     }
   }
 }
