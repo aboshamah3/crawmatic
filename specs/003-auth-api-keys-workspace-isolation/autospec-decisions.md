@@ -27,3 +27,15 @@ No questions relayed to the user — doc + SPEC-01/02 foundation resolved all am
 - [clarify] Q: Which tables workspace-owned (RLS now)? → A: users + api_keys; workspaces=tenant root; refresh_tokens via owning user (source: §22/§32).
 - [clarify] Q: JWT claims? → A: identity + workspace_id + role/scope so no hot-path DB read beyond cached status (source: §32/§35).
 - [clarify] Q: Live-DB/Redis items here? → A: unit-test DB-independent logic; defer live items to PG/Redis host (source: no-docker constraint).
+
+## plan (opus subagent)
+
+- [plan] Pinned libs → argon2-cffi (passwords), pyjwt HS256 (access JWT), stdlib secrets/hashlib/hmac (API-key + refresh SHA-256 + constant-time verify), redis-py. Crypto/models/helpers in app_shared (framework-agnostic); FastAPI dep+routers in apps/api.
+- [plan] Tokens → stateless access JWT (sub/workspace_id/role/scopes/exp ~15m); opaque refresh stored SHA-256 only (~30d).
+- [plan] Atomic refresh rotation → single `UPDATE refresh_tokens SET revoked_at=now() WHERE token_hash=:h AND revoked_at IS NULL AND expires_at>now() RETURNING` — exactly-once under concurrency, no session advisory locks (PgBouncer-safe); same statement rejects rotated-reuse/expiry/logout.
+- [plan] RLS + nullable-workspace SUPER_ADMIN → emit_rls_policy unchanged on users+api_keys in creating migration; NULL-workspace SUPER_ADMIN rows never match fail-closed predicate (no bypass). **Pre-auth credential lookups (user-by-email, api-key-by-prefix) run via a dedicated `crawmatic_auth` BYPASSRLS role (AUTH_DATABASE_URL); request-serving `crawmatic_app` role NEVER bypasses RLS.** ⚠ analyze should scrutinize this BYPASSRLS role (Principle II).
+- [plan] CI guard → scripts/check_workspace_scoping.py (stdlib ast scan of apps/+libs/); flags session.get(User/ApiKey) + unscoped select; imports workspace-owned set from app_shared.repository so sets can't drift; noqa + allowlist for false positives. Runnable here.
+- [plan] Context → per-transaction `SELECT set_config('app.workspace_id', :wsid, true)` (bind-safe, pooler-safe).
+- [plan] Redis (noeviction) → per-account+per-source login rate limit (progressive backoff, fail-safe deny); user/workspace status cache (short TTL, 0 per-request status DB read, fail-safe deny); last-used `SET NX EX` gate (≤1 write/key/min).
+- [plan] Bootstrap → idempotent scripts/seed_bootstrap.py (env-driven, direct migration connection); no public signup.
+- [plan] Constitution Check → PASS (pre+post). Principle II satisfied structurally; VIII via Redis throttling. Artifacts: plan.md, research.md (D1-D10), data-model.md, quickstart.md, contracts/{api-auth,api-keys,security-passwords,security-tokens,security-jwt,security-scopes,security-cache,workspace-context,repository-scoping,ci-scoping-guard,migration-identity}.md.
