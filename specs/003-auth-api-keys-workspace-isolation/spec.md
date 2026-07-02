@@ -98,6 +98,8 @@ When a workspace or user is suspended, their existing credentials stop working w
 - What happens when two API keys share a prefix? Lookup by prefix must still resolve to the correct key by verifying the full-secret hash; a prefix collision must not authenticate the wrong key.
 - What happens to `last_used_at` updates under bursty traffic? They are coalesced (buffered) so at most one write occurs per key per minute; correctness-critical counters must not be evicted from the cache.
 - What happens when the status/rate-limit cache is briefly unavailable? Login rate-limiting and status checks must fail safe (deny/challenge) rather than silently allowing unlimited attempts.
+- What happens during the pre-authentication lookup, before any workspace context exists (resolving a user by email / an API key by prefix)? That path may require crossing the row-level-security boundary to find the credential, but that elevated access MUST be confined to the credential lookup and unreachable by request-serving business-data queries (FR-020a) — it is not a general isolation bypass.
+- What happens on a login attempt for a non-existent email? The system performs an equivalent credential-verification cost (dummy verification) so timing does not reveal whether the email exists (FR-006).
 
 ## Requirements *(mandatory)*
 
@@ -111,7 +113,7 @@ When a workspace or user is suspended, their existing credentials stop working w
 
 **Passwords & login**
 - **FR-005**: Passwords MUST be stored using a password key-derivation function (argon2id, or bcrypt) with a per-user salt; plaintext passwords MUST never be stored or logged.
-- **FR-006**: Sign-in MUST verify credentials and, on success, issue a short-lived access credential and a refresh credential; on failure it MUST return a uniform error that does not reveal which factor was wrong.
+- **FR-006**: Sign-in MUST verify credentials and, on success, issue a short-lived access credential and a refresh credential; on failure it MUST return a uniform error that does not reveal which factor was wrong. The failure path MUST also avoid a timing side-channel that discloses account existence — an unknown email MUST incur an equivalent credential-verification cost (e.g. a dummy password-hash verification) so response timing does not distinguish "unknown email" from "wrong password".
 - **FR-007**: Sign-in MUST be rate-limited per account AND per source address using shared counters with progressive backoff; the rate-limit state MUST live in the correctness-critical (non-evicting) cache.
 
 **Refresh tokens**
@@ -132,6 +134,7 @@ When a workspace or user is suspended, their existing credentials stop working w
 - **FR-018**: The system MUST provide workspace-scoped repository/query helpers that require a workspace context and forbid fetching a workspace-owned row by id alone.
 - **FR-019**: Row-level security policies on workspace-owned tables MUST deny cross-workspace rows even when an application-level filter is missing, and MUST fail closed (zero rows) when no workspace context is set.
 - **FR-020**: The system MUST include a continuous-integration guard that fails the build when an unscoped fetch-by-id or unscoped select on a workspace-owned model is introduced.
+- **FR-020a**: The pre-authentication credential-lookup path (which necessarily runs before any workspace context can exist — resolving a user by email or an API key by prefix) MUST be limited to resolving the credential itself. Any elevated privilege it requires to read across workspaces (e.g. a row-level-security bypass) MUST be confined to that credential lookup and MUST NOT be reachable by request-serving/business-data queries, which always run under the normal workspace-scoped, non-bypassing path.
 - **FR-021**: The system MUST include automated tests proving cross-workspace reads and writes are blocked, including the case where the application filter is omitted (row-level security still blocks).
 
 **Status & endpoints**

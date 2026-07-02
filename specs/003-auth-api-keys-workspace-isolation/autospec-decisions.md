@@ -39,3 +39,12 @@ No questions relayed to the user — doc + SPEC-01/02 foundation resolved all am
 - [plan] Redis (noeviction) → per-account+per-source login rate limit (progressive backoff, fail-safe deny); user/workspace status cache (short TTL, 0 per-request status DB read, fail-safe deny); last-used `SET NX EX` gate (≤1 write/key/min).
 - [plan] Bootstrap → idempotent scripts/seed_bootstrap.py (env-driven, direct migration connection); no public signup.
 - [plan] Constitution Check → PASS (pre+post). Principle II satisfied structurally; VIII via Redis throttling. Artifacts: plan.md, research.md (D1-D10), data-model.md, quickstart.md, contracts/{api-auth,api-keys,security-passwords,security-tokens,security-jwt,security-scopes,security-cache,workspace-context,repository-scoping,ci-scoping-guard,migration-identity}.md.
+
+## checklist
+
+- [checklist] Q: focus/depth/audience? → A: security & isolation (10 focus areas); Rigorous depth; Reviewer pre-implementation gate. No user clarifying questions (args fully specified).
+- Generated checklists/security.md (32 requirements-quality items).
+- 2 gaps found + fixed before checking:
+  1. Login TIMING side-channel (spec had uniform error but not uniform timing) → added to FR-006 + edge case (dummy verify on unknown email).
+  2. Pre-auth RLS-bypass (plan's crawmatic_auth BYPASSRLS role) had no governing requirement → added FR-020a + edge case confining elevated access to credential resolution only, unreachable by request-serving queries.
+- Completion: security.md 32/32 pass; requirements.md 16/16 pass. Implement gate CLEAR.
