@@ -17,6 +17,12 @@ from app_shared.models.base import (
 )
 from app_shared.models.rls import emit_rls_policy
 
+# Import so `SmokeFoundation` registers on `Base.metadata` — required for
+# both Alembic autogenerate/offline-render (`target_metadata`) and the
+# first migration (T026) to see the table. Not re-exported: the demo
+# table is test/migration support, not part of the public model surface.
+from app_shared.models import _smoke  # noqa: F401
+
 __all__ = [
     "Base",
     "metadata",

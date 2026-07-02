@@ -76,6 +76,23 @@ services:
       retries: 5
       start_period: 15s
 
+  # One-shot Alembic migration job (SPEC-02 US1, contracts/migration-job.md):
+  # connects DIRECTLY to postgres:5432 via MIGRATION_DATABASE_URL (never the
+  # pgbouncer:6432 pooler — advisory locks / concurrent index builds are
+  # unsafe under transaction pooling). `restart: "no"` — it runs once and
+  # exits; it is never a long-running service. No app service (api/
+  # scheduler/worker) runs migrations at startup; they only depend on
+  # pgbouncer. Run explicitly via `docker compose run --rm migrate`.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/migrate/Dockerfile
+    env_file: .env
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   scheduler:
     build:
       context: .
