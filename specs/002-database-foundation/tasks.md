@@ -155,9 +155,9 @@ The only table any migration may create in this spec is `_smoke_foundation` (the
 
 **Purpose**: Prove the whole DB-independent surface green here and hand off the live items.
 
-- [ ] T035 Run the full DB-independent quickstart (quickstart.md §A) here: `uv run pytest tests/unit -q` (all green), `uv run alembic upgrade head --sql` (renders expected DDL), `bash scripts/check_single_head.sh` (exit 0). Fix any failure before marking done.
+- [X] T035 Run the full DB-independent quickstart (quickstart.md §A) here: `uv run pytest tests/unit -q` (all green), `uv run alembic upgrade head --sql` (renders expected DDL), `bash scripts/check_single_head.sh` (exit 0). Fix any failure before marking done.
 - [ ] T036 [P] ⏸ DEFERRED (needs live Postgres) — RLS fail-closed *behavioral* check (optional, marked): on a PG host, apply `emit_rls_policy()` to a throwaway table; with no `SET LOCAL app.workspace_id` a select returns ZERO rows, with `SET LOCAL app.workspace_id = '<uuid>'` only matching rows return (FR-007 live confirmation, spec Edge Case). Author as a marked integration test; leave unchecked.
-- [ ] T037 [P] Final scope sweep: grep the diff to confirm NO real domain table (`workspaces`/`users`/`products`/…) was introduced, no Postgres-native ENUM, no RLS applied to a real table, and the only `create_table` target is `_smoke_foundation` (Scope Boundary section).
+- [X] T037 [P] Final scope sweep: grep the diff to confirm NO real domain table (`workspaces`/`users`/`products`/…) was introduced, no Postgres-native ENUM, no RLS applied to a real table, and the only `create_table` target is `_smoke_foundation` (Scope Boundary section).
 
 ---
 
