@@ -49,7 +49,12 @@ import app_shared.models.base
 import app_shared.models.rls
 import app_shared.models.identity
 import app_shared.repository
+import app_shared.redis_client
 import app_shared.security
+import app_shared.security.passwords
+import app_shared.security.tokens
+import app_shared.security.jwt
+import app_shared.security.rate_limit
 
 forbidden = {FORBIDDEN_MODULES!r}
 leaked = sorted(mod for mod in forbidden if mod in sys.modules)

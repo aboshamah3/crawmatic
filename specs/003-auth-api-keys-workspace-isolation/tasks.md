@@ -75,26 +75,26 @@ description: "Dependency-ordered tasks for Auth, API Keys & Workspace Isolation"
 
 ### Security primitives (framework-agnostic — `app_shared/security/`)
 
-- [ ] T014 [P] [US1] Create `libs/shared/app_shared/security/passwords.py` (per security-passwords.md): `hash_password` / `verify_password` (returns bool, never raises) / `needs_rehash` on `argon2.PasswordHasher` seeded from `Settings.ARGON2_*`; expose a module-level dummy hash for the unknown-email timing-uniform path (FR-005/FR-006).
-- [ ] T015 [P] [US1] Create `libs/shared/app_shared/security/tokens.py` (per security-tokens.md): `generate_refresh_token() -> (raw, sha256_hash)`, `hash_token(raw)`; document the atomic rotation SQL (`UPDATE refresh_tokens SET revoked_at=now() WHERE token_hash=:h AND revoked_at IS NULL AND expires_at>now() RETURNING id, user_id`) as the caller contract (FR-008/FR-009/FR-010/FR-011).
-- [ ] T016 [P] [US1] Create `libs/shared/app_shared/security/jwt.py` (per security-jwt.md): `encode_access_token(...)` / `decode_access_token(...)` (PyJWT, HS256, verify signature+exp), claims `sub, workspace_id(nullable), role, scopes?, type="access", iat, exp, jti` (FR-024).
-- [ ] T017 [P] [US1] Create `libs/shared/app_shared/security/rate_limit.py` (per security-cache.md): `check_and_increment_login(redis, *, email, source_ip, max_attempts, window_seconds)` — INCR+EXPIRE per-account `rl:login:acct:{sha256(email)}` AND per-source `rl:login:src:{ip}`, progressive-backoff lock key, refuse if either over threshold, **fail-safe deny** on any redis error, no factor disclosure in result (FR-007/SC-009).
+- [X] T014 [P] [US1] Create `libs/shared/app_shared/security/passwords.py` (per security-passwords.md): `hash_password` / `verify_password` (returns bool, never raises) / `needs_rehash` on `argon2.PasswordHasher` seeded from `Settings.ARGON2_*`; expose a module-level dummy hash for the unknown-email timing-uniform path (FR-005/FR-006).
+- [X] T015 [P] [US1] Create `libs/shared/app_shared/security/tokens.py` (per security-tokens.md): `generate_refresh_token() -> (raw, sha256_hash)`, `hash_token(raw)`; document the atomic rotation SQL (`UPDATE refresh_tokens SET revoked_at=now() WHERE token_hash=:h AND revoked_at IS NULL AND expires_at>now() RETURNING id, user_id`) as the caller contract (FR-008/FR-009/FR-010/FR-011).
+- [X] T016 [P] [US1] Create `libs/shared/app_shared/security/jwt.py` (per security-jwt.md): `encode_access_token(...)` / `decode_access_token(...)` (PyJWT, HS256, verify signature+exp), claims `sub, workspace_id(nullable), role, scopes?, type="access", iat, exp, jti` (FR-024).
+- [X] T017 [P] [US1] Create `libs/shared/app_shared/security/rate_limit.py` (per security-cache.md): `check_and_increment_login(redis, *, email, source_ip, max_attempts, window_seconds)` — INCR+EXPIRE per-account `rl:login:acct:{sha256(email)}` AND per-source `rl:login:src:{ip}`, progressive-backoff lock key, refuse if either over threshold, **fail-safe deny** on any redis error, no factor disclosure in result (FR-007/SC-009).
 
 ### API layer (`apps/api`)
 
-- [ ] T018 [P] [US1] Create `apps/api/app/errors.py`: the uniform auth error builder `{ "error": { "code": "AUTH_FAILED", "message": "Authentication failed." } }` (HTTP 401) and structured `RATE_LIMITED` (429) helpers, so every failure path emits an identical, factor-agnostic body (FR-006/SC-001).
-- [ ] T019 [US1] Create `apps/api/app/routers/__init__.py` and `apps/api/app/routers/auth.py` with `POST /v1/auth/login` (rate-limit gate first → look up user by email via `get_auth_session` → `verify_password` always, dummy-verify on unknown email → check user/workspace status → issue access JWT + persist refresh `token_hash`), `POST /v1/auth/refresh` (atomic `UPDATE…RETURNING` rotation → new pair, else uniform 401), `POST /v1/auth/logout` (revoke by `token_hash`, idempotent 204) — all failures via `errors.py` (depends: T009, T014, T015, T016, T017, T018).
-- [ ] T020 [US1] Register the auth router in `apps/api/app/main.py` (`app.include_router(auth.router)`) (depends: T019).
+- [X] T018 [P] [US1] Create `apps/api/app/errors.py`: the uniform auth error builder `{ "error": { "code": "AUTH_FAILED", "message": "Authentication failed." } }` (HTTP 401) and structured `RATE_LIMITED` (429) helpers, so every failure path emits an identical, factor-agnostic body (FR-006/SC-001).
+- [X] T019 [US1] Create `apps/api/app/routers/__init__.py` and `apps/api/app/routers/auth.py` with `POST /v1/auth/login` (rate-limit gate first → look up user by email via `get_auth_session` → `verify_password` always, dummy-verify on unknown email → check user/workspace status → issue access JWT + persist refresh `token_hash`), `POST /v1/auth/refresh` (atomic `UPDATE…RETURNING` rotation → new pair, else uniform 401), `POST /v1/auth/logout` (revoke by `token_hash`, idempotent 204) — all failures via `errors.py` (depends: T009, T014, T015, T016, T017, T018).
+- [X] T020 [US1] Register the auth router in `apps/api/app/main.py` (`app.include_router(auth.router)`) (depends: T019).
 
 ### Tests for User Story 1
 
 Independent (run HERE):
 
-- [ ] T021 [P] [US1] `tests/unit/test_passwords.py`: `hash_password(x) != x`; two hashes of same input differ (random salt); verify round-trip True; wrong password False; `needs_rehash` False on fresh hash (FR-005).
-- [ ] T022 [P] [US1] `tests/unit/test_refresh_tokens.py`: `generate_refresh_token` entropy/length; `hash_token` deterministic sha256; rotation predicate logic (rotated/expired/revoked → rejected) against an in-memory stand-in (FR-008/FR-009/FR-011).
-- [ ] T023 [P] [US1] `tests/unit/test_jwt.py`: encode→decode round-trips all claims; expired token → decode raises; wrong-secret token → decode raises; `type == "access"` (FR-024).
-- [ ] T024 [P] [US1] `tests/unit/test_uniform_login_error.py`: the login error builder produces byte-identical bodies/status for unknown-email vs wrong-password (FR-006/SC-001).
-- [ ] T025 [P] [US1] `tests/unit/test_rate_limit.py`: with a fake/in-memory redis, refuses over `max_attempts` (per-account and per-source independently), and **fail-safe denies** on an injected client error (FR-007/SC-009).
+- [X] T021 [P] [US1] `tests/unit/test_passwords.py`: `hash_password(x) != x`; two hashes of same input differ (random salt); verify round-trip True; wrong password False; `needs_rehash` False on fresh hash (FR-005).
+- [X] T022 [P] [US1] `tests/unit/test_refresh_tokens.py`: `generate_refresh_token` entropy/length; `hash_token` deterministic sha256; rotation predicate logic (rotated/expired/revoked → rejected) against an in-memory stand-in (FR-008/FR-009/FR-011).
+- [X] T023 [P] [US1] `tests/unit/test_jwt.py`: encode→decode round-trips all claims; expired token → decode raises; wrong-secret token → decode raises; `type == "access"` (FR-024).
+- [X] T024 [P] [US1] `tests/unit/test_uniform_login_error.py`: the login error builder produces byte-identical bodies/status for unknown-email vs wrong-password (FR-006/SC-001).
+- [X] T025 [P] [US1] `tests/unit/test_rate_limit.py`: with a fake/in-memory redis, refuses over `max_attempts` (per-account and per-source independently), and **fail-safe denies** on an injected client error (FR-007/SC-009).
 
 Deferred (authored, unchecked):
 
