@@ -48,7 +48,7 @@ Deliver the empty-but-bootable multi-service skeleton on which every later spec 
 
 ## Constitution Check
 
-*GATE: evaluated against `.specify/memory/constitution.md` v1.0.0 (8 principles). Re-checked after Phase 1 — still PASS.*
+*GATE: evaluated against `.specify/memory/constitution.md` v1.0.1 (8 principles). Re-checked after Phase 1 — still PASS.*
 
 | Principle | Status for this skeleton | Justification |
 |-----------|--------------------------|---------------|

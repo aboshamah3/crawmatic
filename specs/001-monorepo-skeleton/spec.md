@@ -90,7 +90,7 @@ An operator supplies configuration (database URL, Redis URL, Scrapyd node URLs, 
 - **FR-008**: The Scrapyd HTTP service MUST boot, be reachable on the internal network, and carry its Scrapy project at build time (no reliance on runtime spider uploads).
 - **FR-009**: The Scrapyd browser service MUST boot, be reachable on the internal network, and include the browser runtime at build time, with low browser concurrency.
 - **FR-010**: Postgres, PgBouncer, and Redis MUST run as part of the local stack.
-- **FR-011**: Every application service (API, scheduler, worker, both Scrapyd nodes) MUST connect to Postgres through PgBouncer and MUST NOT connect to Postgres directly. (The one-shot migration job that connects directly is out of scope for this spec and introduced later.)
+- **FR-011**: Every application service (API, scheduler, worker, both Scrapyd nodes) MUST connect to Postgres through PgBouncer and MUST NOT connect to Postgres directly. (The one-shot migration job that connects directly is out of scope for this spec and introduced later. Scope note: the Scrapyd nodes carry no database access in SPEC-01 — they satisfy this trivially; their PgBouncer-only routing is exercised when their DB access is introduced in a later spec.)
 - **FR-012**: Both Scrapyd nodes MUST require basic authentication, and any component that will call Scrapyd MUST be able to authenticate; unauthenticated requests MUST be rejected.
 - **FR-013**: Only the API service MUST be publicly exposed; the Scrapyd nodes and other internal services MUST NOT be reachable from the public internet.
 - **FR-014**: All infrastructure and base images used by the stack MUST be version-pinned (no floating/`latest` tags).

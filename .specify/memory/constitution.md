@@ -1,9 +1,13 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: (template, unversioned) → 1.0.0
+Version change: (template, unversioned) → 1.0.0 → 1.0.1
 Bump rationale: Initial ratification. First concrete constitution derived from
   PROJECT_SPEC.md (Price Monitoring Backend, 41 sections). MAJOR baseline.
+  PATCH 1.0.1 (2026-07-02, via /autospec SPEC-01 analyze C1): clarified Principle I so
+  shared Scrapy code is named as living in `libs/scrape-core` (matching PROJECT_SPEC §5),
+  with `libs/shared`/`app_shared` scoped to scraping-free cross-service code and the
+  one-way dependency rule stated. No principle added/removed; wording alignment only.
 
 Principles defined (8):
   I.    API-First, Service-Oriented Architecture
@@ -53,9 +57,12 @@ deploys as distinct services: `api-service`, `scheduler-service`, `worker-servic
 Scrapyd/Scrapy scrape; the scheduler claims due work; the database is the source of truth.
 Only `api-service` is publicly exposed — Scrapyd and internal services MUST NOT be reachable
 from the public internet (§6). Code shared by both Scrapy projects (extraction, item models,
-validation, confidence scoring, DB pipelines, rate limiter) MUST live in `libs/shared` and be
-imported by both, so the HTTP and browser projects differ only in download handler and
-spider entrypoint (§5).
+validation, confidence scoring, DB pipelines, rate limiter) MUST live in a dedicated shared
+library member — `libs/scrape-core` (`scrape_core`) — imported by both Scrapy projects, so the
+HTTP and browser projects differ only in download handler and spider entrypoint (§5).
+`libs/shared` (`app_shared`) holds cross-service, scraping-free code (config, DB session,
+enums, ids, money, task-name constants) and MUST NOT import Scrapy/Twisted/Playwright;
+`scrape-core` MAY depend on `app_shared`, never the reverse (§5).
 
 Rationale: a clean service boundary is what lets the project scale horizontally, expose a
 stable contract to future integrations, and keep scraping concerns out of the API.
@@ -244,4 +251,4 @@ Isolation, Disciplined Scraping Runtime, Internal-Only & Legally Compliant Acces
 or deviation MUST be justified in writing against the principle it strains; unjustified
 violations block merge.
 
-**Version**: 1.0.0 | **Ratified**: 2026-06-27 | **Last Amended**: 2026-06-27
+**Version**: 1.0.1 | **Ratified**: 2026-06-27 | **Last Amended**: 2026-07-02

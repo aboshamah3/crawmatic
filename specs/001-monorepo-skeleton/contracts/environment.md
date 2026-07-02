@@ -31,7 +31,7 @@ Every service loads its configuration from the environment at startup (FR-017); 
 
 | Variable | Example | Notes |
 |----------|---------|-------|
-| `API_PORT` / `PORT` | `8000` | API listen port; only host-published port (FR-013). |
+| `API_PORT` | `8000` | **Canonical** API port — the only API-port variable a developer sets. It is simultaneously the host-published port and (via compose `environment: PORT=${API_PORT}`) the container's uvicorn `--port $PORT`, so listen/publish/healthcheck ports never diverge (FR-017; public-exposure boundary is FR-013). The container-internal `PORT` is derived, not separately configured. |
 | `API_PUBLIC_BASE_URL` | `https://api.example.com` | External base URL. |
 | `INTERNAL_API_BASE_URL` | `http://api:8000` | Internal base URL. |
 
@@ -44,6 +44,7 @@ Every service loads its configuration from the environment at startup (FR-017); 
 | `POSTGRES_DB` | `crawmatic` | Local DB name. |
 | `PGBOUNCER_AUTH_TYPE` | `trust` | **Local only**; deployed envs MUST use `scram-sha-256` with a real userlist (spec Assumptions, §4). |
 | `PGBOUNCER_POOL_MODE` | `transaction` | Transaction pooling (§4). |
+| `PGBOUNCER_LISTEN_ADDR` | `*` | Dual-stack (IPv4+IPv6) bind for PgBouncer; maps to the pgbouncer image's `LISTEN_ADDR` (FR-016). |
 
 ## Rules
 

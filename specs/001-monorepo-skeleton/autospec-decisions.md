@@ -39,3 +39,15 @@ No questions relayed to the user — the master doc resolved every material ambi
 
 - 45 tasks (T001–T045) across 6 phases: Setup (T001–T011), Foundational shared libs (T012–T016), US1 stack bring-up/MVP (T017–T035), US2 boundaries (T036–T039), US3 env config (T040–T042), Polish (T043–T045).
 - Explicit Scope Boundary section forbids DB models/migrations/auth/scraping-logic tasks. SC-001..SC-006 mapped to specific tasks in a coverage table. No hooks; no human decisions.
+
+## analyze (inline, forked)
+
+No CRITICAL findings → no user pause. Remediated all actionable findings myself (analyze is read-only):
+
+- [analyze] I1 (HIGH): API_PORT vs PORT could diverge at boot → A: made `API_PORT` the single canonical var; compose injects `PORT=${API_PORT}` and publishes `"${API_PORT}:${API_PORT}"`. Fixed tasks T013/T029/T034 + contracts/environment.md.
+- [analyze] U1 (MEDIUM): pgbouncer dual-stack mechanism unspecified → A: added `PGBOUNCER_LISTEN_ADDR=*` (maps to image LISTEN_ADDR) to environment.md + tasks T037/T040.
+- [analyze] C1 (MEDIUM): constitution Principle I named `libs/shared` for shared Scrapy code (doc §5 says `libs/scrape-core`) → A: PATCHed constitution to 1.0.1 naming scrape-core + one-way dep rule (aligns with PROJECT_SPEC §5; master doc unchanged).
+- [analyze] A1 (LOW): browser concurrency was an unquantified adjective → A: pinned `max_proc=1`, `CONCURRENT_REQUESTS=2`, `PLAYWRIGHT_MAX_CONTEXTS=1` in tasks T027/T028.
+- [analyze] G2 (LOW): FR-011 listed Scrapyd nodes though they have no DB access yet → A: added scope note to FR-011.
+- [analyze] G1 (LOW): "Postgres-not-ready" edge case has no task → A: no action (moot in skeleton — /health is dependency-free, scheduler/worker carry no DB access); deferred to SPEC-02 when real DB access lands.
+- Re-ran analyze (HIGH was fixed): all 5 confirmed resolved. Two new LOW cosmetic issues fixed — N1 (plan.md constitution stamp v1.0.0→v1.0.1), N2 (environment.md FR-013→FR-017 citation). Final: 0 CRITICAL/HIGH, 100% FR/SC coverage.
