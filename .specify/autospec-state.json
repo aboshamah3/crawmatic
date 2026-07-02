@@ -21,6 +21,12 @@
       "deferred_verifications": ["T021 live SELECT 1 connectivity", "T033 alembic upgrade head + downgrade round-trip (online)", "T034 docker compose run --rm migrate one-shot", "T036 RLS fail-closed live behavior"],
       "deferred_reason": "require a live Postgres / running Docker daemon, unavailable in the build environment; artifacts authored + offline/statically validated (alembic offline render, single-head guard, NULLIF fail-closed rendered DDL, metadata sweep)",
       "steps": {"specify": "done", "clarify": "done", "plan": "done", "checklist": "done", "tasks": "done", "analyze": "done", "implement": "done", "converge": "done"}
+    },
+    "03": {
+      "title": "Auth, API Keys & Workspace Isolation",
+      "feature_directory": "specs/003-auth-api-keys-workspace-isolation",
+      "status": "in-progress",
+      "steps": {"specify": "done"}
     }
   }
 }
