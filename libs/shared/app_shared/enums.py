@@ -263,6 +263,84 @@ class ScrapeErrorCode(StrEnum):
     LEGAL_REVIEW_REQUIRED = "LEGAL_REVIEW_REQUIRED"
 
 
+class ScrapeScope(StrEnum):
+    """Refresh/job scope of a ``scrape_jobs`` row (SPEC-08 §22 "Refresh scopes").
+
+    Shared with ``refresh_rules`` in a later spec. This spec's endpoints
+    (run-match / run-variant) produce only ``MATCH`` and ``VARIANT``; the
+    remaining members are forward-compat for later scope-run endpoints.
+    """
+
+    WORKSPACE = "WORKSPACE"
+    COMPETITOR = "COMPETITOR"
+    PRODUCT = "PRODUCT"
+    VARIANT = "VARIANT"
+    PRODUCT_GROUP = "PRODUCT_GROUP"
+    MATCH = "MATCH"
+
+
+class ScrapeJobType(StrEnum):
+    """Trigger-type provenance of a ``scrape_jobs`` row (SPEC-08 §22).
+
+    Direct API runs (this spec) record ``MANUAL``; the remaining members
+    are forward-compat for the scheduler/retry/discovery features owned
+    by later specs.
+    """
+
+    MANUAL = "MANUAL"
+    SCHEDULED = "SCHEDULED"
+    API_TRIGGERED = "API_TRIGGERED"
+    RETRY_FAILED = "RETRY_FAILED"
+    DISCOVERY = "DISCOVERY"
+
+
+class ScrapeJobStatus(StrEnum):
+    """Lifecycle status of a ``scrape_jobs`` row (SPEC-08 §22, D6).
+
+    ``PENDING`` at creation -> ``RUNNING`` (dispatch begins) -> a
+    deterministic terminal status (``COMPLETED``/``PARTIAL_FAILED``/
+    ``FAILED``). ``CANCELLED`` is a vocabulary member but not produced by
+    this spec's endpoints.
+    """
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    PARTIAL_FAILED = "PARTIAL_FAILED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class ScrapeJobSource(StrEnum):
+    """Trigger-source provenance of a ``scrape_jobs`` row (SPEC-08 §22).
+
+    Direct API runs (this spec) record ``API``; the remaining members are
+    forward-compat for the scheduler/internal/plugin triggers owned by
+    later specs.
+    """
+
+    API = "API"
+    SCHEDULER = "SCHEDULER"
+    INTERNAL = "INTERNAL"
+    PLUGIN = "PLUGIN"
+
+
+class ScrapeTargetStatus(StrEnum):
+    """Lifecycle status of a ``scrape_job_targets`` row (SPEC-08 §22).
+
+    ``PENDING`` at creation -> ``STARTED`` -> a terminal status
+    (``COMPLETED``/``FAILED``/``SKIPPED``). ``mark_target``
+    (``app_shared.jobs.targets``) is the single writer of these
+    transitions.
+    """
+
+    PENDING = "PENDING"
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

@@ -25,6 +25,7 @@ class Scope(StrEnum):
     MATCHES_WRITE = "matches:write"
     JOBS_RUN = "jobs:run"
     JOBS_READ = "jobs:read"
+    JOBS_WRITE = "jobs:write"
     RESULTS_READ = "results:read"
     ALERTS_READ = "alerts:read"
     WEBHOOKS_READ = "webhooks:read"

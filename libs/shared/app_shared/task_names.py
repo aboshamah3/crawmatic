@@ -7,11 +7,14 @@ That indirection is the dependency boundary that keeps
 scrapy/twisted/playwright out of the worker/API import closures
 (Constitution V: Disciplined Scraping Runtime).
 
-No task names are defined yet in this skeleton phase. Later specs add
-constants here, e.g.:
-
-    # SCRAPE_PRODUCT = "workers.scrape_product"
-    # MATCH_PRODUCTS = "workers.match_products"
-
 This module intentionally imports nothing from ``celery``.
 """
+
+from __future__ import annotations
+
+# --- Jobs & orchestration (SPEC-08 FR-011, FR-015, D8) ---
+# Enqueued via ``app_shared.messaging.enqueue`` by the API/pipeline; consumed
+# by ``apps/workers/app/workers/tasks_jobs.py``.
+SCRAPE_DISPATCH_JOB = "scrape_dispatch.dispatch_job"
+SCRAPE_RECOVER_STALLED = "maintenance.recover_stalled_batches"
+SCRAPE_FINALIZE_JOBS = "maintenance.finalize_jobs"

@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     ARGON2_MEMORY_COST: int | None = None
     ARGON2_PARALLELISM: int | None = None
 
+    # --- Jobs & orchestration dispatch tuning (SPEC-08 FR-011, FR-015,
+    # Principle IV — DB/env-tunable, never hardcoded literals) ---
+    SCRAPE_DISPATCH_HTTP_BATCH_MIN: int = 50
+    SCRAPE_DISPATCH_HTTP_BATCH_MAX: int = 200
+    SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
