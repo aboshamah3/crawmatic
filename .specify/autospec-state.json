@@ -122,6 +122,14 @@
         "T034 live-DB e2e quickstart request flows"
       ],
       "deferred_reason": "require a live Postgres (no container engine in build env); artifacts authored + skip cleanly; DB-independent logic fully unit-tested here (502 passed; scoping guard OK; single head f4c8a391d5c9)"
+    },
+    "06": {
+      "title": "Scrape Profiles & Extraction Rules",
+      "feature_directory": "specs/006-scrape-profiles-extraction",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
