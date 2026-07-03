@@ -341,6 +341,61 @@ class ScrapeTargetStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+class AlertType(StrEnum):
+    """Deterministic alert classification of a variant's price position (SPEC-09 §23, FR-004).
+
+    Produced by the pure ``app_shared.alerts.engine`` ordered decision
+    tree; ``NO_COMPETITOR_DATA`` when there is no comparable competitor
+    price, ``RISK``/``HIGH_PRICE`` when the client price is above the
+    highest/cheapest competitor, ``CHANCE_TO_INCREASE_PRICE`` when the
+    client price is more than 5% below the competitor average,
+    ``NORMAL`` within the 1%-5% band, ``CLOSE_TO_COMPETITORS`` under 1%.
+    """
+
+    NO_COMPETITOR_DATA = "NO_COMPETITOR_DATA"
+    RISK = "RISK"
+    HIGH_PRICE = "HIGH_PRICE"
+    CHANCE_TO_INCREASE_PRICE = "CHANCE_TO_INCREASE_PRICE"
+    NORMAL = "NORMAL"
+    CLOSE_TO_COMPETITORS = "CLOSE_TO_COMPETITORS"
+
+
+class AlertSeverity(StrEnum):
+    """Severity derived solely from ``AlertType`` via the fixed map (SPEC-09 FR-011)."""
+
+    NONE = "NONE"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+class AlertStatus(StrEnum):
+    """Lifecycle status of a ``variant_alert_states`` row (SPEC-09 §22).
+
+    ``ACTIVE`` while the current type is non-``NORMAL``; ``RESOLVED``
+    (with ``resolved_at`` stamped) once the type returns to ``NORMAL``.
+    """
+
+    ACTIVE = "ACTIVE"
+    RESOLVED = "RESOLVED"
+
+
+class AlertEventType(StrEnum):
+    """Ordered alert-transition classification of a ``price_alert_events`` row (SPEC-09 D5).
+
+    ``UNCHANGED`` is part of the vocabulary but is never persisted — a
+    row is written only on a type/severity change (CREATED/UPDATED/
+    RESOLVED/REOPENED).
+    """
+
+    CREATED = "CREATED"
+    UPDATED = "UPDATED"
+    RESOLVED = "RESOLVED"
+    REOPENED = "REOPENED"
+    UNCHANGED = "UNCHANGED"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

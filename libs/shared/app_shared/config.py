@@ -116,6 +116,14 @@ class Settings(BaseSettings):
     SCRAPE_DISPATCH_HTTP_BATCH_MAX: int = 200
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
 
+    # --- Price-analysis recompute dedup (SPEC-09 FR-012, FR-015, D4, D7 —
+    # DB/env-tunable, never a hardcoded literal, Principle IV). TTL on the
+    # emission-side Redis ``SET NX`` key (``analysis:enqueued:{job}:{variant}``)
+    # — comfortably longer than a single job's lifetime so late-arriving
+    # completions of the same job still dedup. The ``price_analysis`` queue
+    # name itself is a code constant in ``celery_app.py``, not config. ---
+    PRICE_ANALYSIS_DEDUP_TTL_SECONDS: int = 21600
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
