@@ -1,14 +1,17 @@
-"""Import-boundary tests for the shared-library dependency direction (T043).
+"""Import-boundary tests for the shared-library dependency direction (T043, T045).
 
 Enforces FR-003 / data-model.md "Entity: Shared Library Member":
 
 * ``app_shared`` (and its submodules ``config``/``database``/``task_names``/
   ``ids``/``money``/``enums``/``models``/``models.base``/``models.rls``/
   ``models.identity``/``models.catalog``/``models.competitors_matches``/
-  ``pagination``/``catalog``/``repository``/``security``/``url_safety``/
-  ``url_pattern``/``matches``/``matches.upsert``, plus the SPEC-03
-  ``security`` primitives, the SPEC-04 catalog core, and the SPEC-05
-  competitors/matches core as they land) MUST NOT pull in
+  ``models.scrape_profiles``/``pagination``/``catalog``/``repository``/
+  ``security``/``url_safety``/``url_pattern``/``matches``/
+  ``matches.upsert``/``profiles``/``profiles.validation``/
+  ``profiles.confidence``/``profiles.resolution``/``profiles.repository``/
+  ``profiles.upsert``, plus the SPEC-03 ``security`` primitives, the
+  SPEC-04 catalog core, the SPEC-05 competitors/matches core, and the
+  SPEC-06 scrape-profiles core as they land) MUST NOT pull in
   Scrapy/Twisted/Playwright — those belong only to the Scrapyd-side app
   members (``scrapers``, ``scrapers-browser``) and their shared
   ``scrape_core`` library. ``app_shared`` also MUST NOT pull in FastAPI
@@ -53,6 +56,7 @@ import app_shared.models.rls
 import app_shared.models.identity
 import app_shared.models.catalog
 import app_shared.models.competitors_matches
+import app_shared.models.scrape_profiles
 import app_shared.pagination
 import app_shared.catalog
 import app_shared.repository
@@ -66,6 +70,12 @@ import app_shared.url_safety
 import app_shared.url_pattern
 import app_shared.matches
 import app_shared.matches.upsert
+import app_shared.profiles
+import app_shared.profiles.validation
+import app_shared.profiles.confidence
+import app_shared.profiles.resolution
+import app_shared.profiles.repository
+import app_shared.profiles.upsert
 
 forbidden = {FORBIDDEN_MODULES!r}
 leaked = sorted(mod for mod in forbidden if mod in sys.modules)
