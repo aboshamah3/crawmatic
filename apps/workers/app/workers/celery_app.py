@@ -4,10 +4,14 @@ SPEC-08 (FR-011, FR-015, FR-016, D7) registers the first DB-touching
 tasks — ``dispatch_job`` (``scrape_dispatch`` queue) and
 ``finalize_jobs``/``refresh_job_counters``/``recover_stalled_batches``
 (``maintenance`` queue), both in ``app.workers.tasks_jobs`` — plus the
-queues/routes they run on. This module only establishes the Celery app
-(broker/result-backend from ``REDIS_URL``), the queue/route wiring, and
-the fork-safety hook required before any DB-touching task exists
-(plan.md §VIII, FR-020, FR-007).
+queues/routes they run on. SPEC-09 (FR-012, D4) adds
+``recompute_variant`` on its own ``price_analysis`` queue, in
+``app.workers.tasks_analysis`` (the task module itself lands in a later
+phase — its queue/route/include wiring is pre-registered here, mirroring
+how SPEC-08 pre-registered ``app.workers.tasks_jobs``). This module only
+establishes the Celery app (broker/result-backend from ``REDIS_URL``),
+the queue/route wiring, and the fork-safety hook required before any
+DB-touching task exists (plan.md §VIII, FR-020, FR-007).
 
 Fork-safety: Celery's prefork pool workers are created via ``fork()``.
 If a parent process had already created the lazy SQLAlchemy engine
@@ -29,6 +33,7 @@ from celery.signals import worker_process_init
 from app_shared.config import get_settings
 from app_shared.database import dispose_engine
 from app_shared.task_names import (
+    PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
@@ -42,7 +47,7 @@ app = Celery(
     # No result backend required for the skeleton; using the same Redis
     # instance keeps configuration minimal without expanding scope.
     backend=None,
-    include=["app.workers.tasks_jobs"],
+    include=["app.workers.tasks_jobs", "app.workers.tasks_analysis"],
 )
 
 # --- Jobs & orchestration queues/routes (SPEC-08 FR-011, FR-015) -----------
@@ -51,14 +56,21 @@ app = Celery(
 # carries the periodic finalize/counter-refresh/stall-recovery scans. Kept
 # separate from the default queue so dispatch/maintenance workers can be
 # scaled and deployed independently of any other worker traffic.
+#
+# `price_analysis` (SPEC-09 FR-012, D4) carries `recompute_variant` — kept
+# on its own queue, separate from `scrape_dispatch`/`maintenance` and from
+# the Scrapyd/reactor runtime (Principle V, §26), so it can be scaled and
+# deployed independently.
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
+    "price_analysis": {},
 }
 app.conf.task_routes = {
     SCRAPE_DISPATCH_JOB: {"queue": "scrape_dispatch"},
     SCRAPE_RECOVER_STALLED: {"queue": "maintenance"},
     SCRAPE_FINALIZE_JOBS: {"queue": "maintenance"},
+    PRICE_ANALYSIS_RECOMPUTE: {"queue": "price_analysis"},
 }
 
 

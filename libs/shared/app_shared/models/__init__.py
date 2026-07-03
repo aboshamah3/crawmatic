@@ -65,6 +65,14 @@ from app_shared.models.observations import MatchCurrentPrice, PriceObservation, 
 # `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 
+# The SPEC-09 alert/price-comparison models — re-exported so
+# `Base.metadata` sees all three tables for Alembic autogenerate/offline-
+# render (target_metadata), and so callers can `from app_shared.models
+# import VariantPriceState, VariantAlertState, PriceAlertEvent`. All
+# workspace-owned: registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
+
 __all__ = [
     "Base",
     "metadata",
@@ -90,4 +98,7 @@ __all__ = [
     "MatchCurrentPrice",
     "ScrapeJob",
     "ScrapeJobTarget",
+    "VariantPriceState",
+    "VariantAlertState",
+    "PriceAlertEvent",
 ]
