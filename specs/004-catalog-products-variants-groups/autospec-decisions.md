@@ -30,6 +30,14 @@ Master doc: `/srv/crawmatic/PROJECT_SPEC.md`
 - [plan] Migration → one revision, down_revision=55da7d6d939d (current head), RLS on all 4 tables in creating migration, single head; offline render.
 - [plan] Constitution Check → PASS (all 8; II/III/VII/VIII satisfied). Artifacts: plan.md, research.md (D1-D10), data-model.md, quickstart.md, contracts/{api-products,api-variants,api-product-groups,models-catalog,catalog-bulk-upsert,default-variant,pagination,workspace-consistency,migration-catalog}.md.
 
+## analyze (inline, forked)
+
+0 CRITICAL/HIGH → no user pause. Remediated all 3 findings:
+- [analyze] F2 (MEDIUM): FR-006 last-variant invariant had no triggering operation (no variant DELETE; PATCH doesn't touch variant count) → A: reworded FR-006 as a structural service-layer guard (ensure_at_least_one, unit-tested); removed the untestable zero-variant 409 path from T018.
+- [analyze] F1 (LOW): FR-014 omitted GET product-groups/{id} (tasks/plan had it) → A: added "get" to the groups enumeration.
+- [analyze] F3 (LOW): T011 lacked the {items,next_cursor} envelope more/none-branch assertion (SC-009) → A: added envelope-builder assertion (limit+1 rows → cursor set; ≤limit → null).
+- Only MEDIUM/LOW (no CRITICAL/HIGH); clarification-only changes → full re-run not required. 100% FR/SC coverage retained.
+
 ## checklist
 
 Run substance INLINE (context conservation). Generated checklists/catalog.md (29 requirements-quality items). Gap found + fixed before checking: bulk-upsert identity for a product with NO external_id/sku was unspecified (would silently duplicate on re-push) → added to FR-011 + 2 edge cases (always-insert documented limitation; nested Woo/Salla product+variant resolution order). Completion: catalog.md 29/29 pass; requirements.md 16/16 pass. Implement gate CLEAR.
