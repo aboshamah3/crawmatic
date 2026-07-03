@@ -47,3 +47,12 @@ speckit-analyze: 0 CRITICAL, 0 HIGH, 1 MEDIUM, 4 LOW. 100% FR→task coverage (2
 - [analyze] C1 (LOW): plan mislabeled Principles VII & VIII "(NON-NEGOTIABLE)"; constitution marks only II/V/VI → removed the tag on VII/VIII. (source: constitution v1.0.1)
 - [analyze] U1 (LOW): `mode` arg semantics unspecified → contracts/spider-args.md now states mode is reserved/pass-through (only HTTP⇒DIRECT_HTTP honored; other modes are later specs). (source: plan scope)
 - [analyze] U2 (LOW): redirect-hop vs request_attempt count unreconciled → FR-013 now states a redirect chain = one attempt (one request_attempt row), url = originally requested URL. (source: spec FR-013/US2)
+
+## implement
+
+All 9 phases implemented via sequential sonnet subagents (one per phase); 52/52 tasks [X]; unit suite 891 passed; integration 6 files collect+skip cleanly; migration renders (single head 2db33dea5e14); `scrapy list` shows generic_price_spider. Per-phase commits Phase 1..9.
+
+Follow-ups surfaced during implement for converge to reconcile:
+- [implement] SafeResolver DNS-rebinding rejection is wrapped by Twisted into CannotResolveHostError → classify_exception returns UNKNOWN_ERROR, not BLOCKED. Contradicts FR-005/US2 acceptance scenario 1 (SSRF rejection must record BLOCKED). Only the SsrfGuardMiddleware path guarantees BLOCKED. → CONVERGE must fix classification so resolver-path SSRF rejection surfaces as BLOCKED. (Phase 8)
+- [implement] generic_price_spider does not yet attach the resolved robots_policy to request.meta, so RobotsPolicyMiddleware defaults to RESPECT for every request. → CONVERGE should wire robots_policy from the resolved competitor/profile onto request.meta. (Phase 4)
+- [implement] apps/scrapers duplicates SPEC-06's resolution_cache_key format at the call site (cannot import apps/api). Works (shares the warm cache) but is a maintainability risk — consider hoisting the cache-key helper into libs/shared. → CONVERGE to assess. (Phase 3)
