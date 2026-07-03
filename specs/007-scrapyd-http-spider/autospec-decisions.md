@@ -56,3 +56,11 @@ Follow-ups surfaced during implement for converge to reconcile:
 - [implement] SafeResolver DNS-rebinding rejection is wrapped by Twisted into CannotResolveHostError → classify_exception returns UNKNOWN_ERROR, not BLOCKED. Contradicts FR-005/US2 acceptance scenario 1 (SSRF rejection must record BLOCKED). Only the SsrfGuardMiddleware path guarantees BLOCKED. → CONVERGE must fix classification so resolver-path SSRF rejection surfaces as BLOCKED. (Phase 8)
 - [implement] generic_price_spider does not yet attach the resolved robots_policy to request.meta, so RobotsPolicyMiddleware defaults to RESPECT for every request. → CONVERGE should wire robots_policy from the resolved competitor/profile onto request.meta. (Phase 4)
 - [implement] apps/scrapers duplicates SPEC-06's resolution_cache_key format at the call site (cannot import apps/api). Works (shares the warm cache) but is a maintainability risk — consider hoisting the cache-key helper into libs/shared. → CONVERGE to assess. (Phase 3)
+
+## converge
+
+Cycle 1: appended Phase 10 T053-T055 (2 HIGH: SSRF→BLOCKED classification, robots_policy meta wiring; 1 LOW: cache-codec dedup) — all three were the parent-flagged implement follow-ups, verified genuine.
+Cycle 1 implement: T053 required a deeper fix than the naive error_code/cause-chain (Twisted discards the original exception) → added a hostname-keyed rejection_registry side-channel consulted by classify_exception. T054 threaded Competitor.robots_policy onto request.meta. T055 hoisted the resolution-cache value codec into app_shared.profiles.resolution.
+Cycle 2 (final): CLEAN — all three gaps verified closed in code + tests; whole-feature re-assessment found zero in-scope actionable gaps. No new tasks.
+
+Final suite: unit 910 passed; integration 3 passed/130 skipped/0 errors; import boundaries 4/4; scoping guard OK; single head 2db33dea5e14.

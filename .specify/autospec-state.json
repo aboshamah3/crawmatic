@@ -151,7 +151,7 @@
     "07": {
       "title": "Scrapyd HTTP Spider MVP",
       "feature_directory": "specs/007-scrapyd-http-spider",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -159,8 +159,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T044 spider JSON-LD fixture end-to-end (seed\u2192serve\u2192run\u2192observation/current-price/attempt)",
+        "T045 SSRF live: private-IP + public\u2192internal 302 refused pre-body, recorded BLOCKED",
+        "T046 strategies live: CSS/regex method+confidence; discount-only rejected",
+        "T047 authenticated schedule.json jobid; unauth rejected; retried dispatch no double-run",
+        "T048 batch live: N observations persist with commit count << N; DB off reactor thread",
+        "T049 cross-workspace isolation (app scoping + RLS); no-context \u2192 0 rows"
+      ],
+      "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 6 integration tests authored + skip cleanly. DB/reactor/network-independent logic fully unit-tested here (910 passed; integration 3 passed/130 skipped/0 errors; scoping guard OK; single head 2db33dea5e14)"
     }
   }
 }
