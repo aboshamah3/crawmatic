@@ -15,6 +15,7 @@ import pytest
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import ApiKey, User
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
@@ -28,8 +29,9 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
     # SPEC-04 (T006) widened this set with the four catalog models; SPEC-05
     # (T005) widened it further with Competitor/CompetitorProductMatch;
     # SPEC-07 (T009) widens it again with the three observation/current-
-    # price models — updated here alongside app_shared.repository so the
-    # suite stays in sync with the runtime set.
+    # price models; SPEC-08 (T009) widens it once more with the two jobs/
+    # orchestration models — updated here alongside app_shared.repository
+    # so the suite stays in sync with the runtime set.
     assert WORKSPACE_OWNED_MODELS == frozenset(
         {
             User,
@@ -43,6 +45,8 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             PriceObservation,
             RequestAttempt,
             MatchCurrentPrice,
+            ScrapeJob,
+            ScrapeJobTarget,
         }
     )
 

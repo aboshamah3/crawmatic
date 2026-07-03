@@ -27,6 +27,7 @@ from app_shared.models.base import Base
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import ApiKey, User
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
@@ -51,6 +52,8 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         PriceObservation,
         RequestAttempt,
         MatchCurrentPrice,
+        ScrapeJob,
+        ScrapeJobTarget,
     }
 )
 

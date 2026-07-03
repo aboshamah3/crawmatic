@@ -58,6 +58,13 @@ from app_shared.models.scrape_profiles import ScrapeProfile
 # in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 
+# The SPEC-08 jobs/orchestration models — re-exported so `Base.metadata`
+# sees both tables for Alembic autogenerate/offline-render
+# (target_metadata), and so callers can `from app_shared.models import
+# ScrapeJob, ScrapeJobTarget`. Both workspace-owned: registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+
 __all__ = [
     "Base",
     "metadata",
@@ -81,4 +88,6 @@ __all__ = [
     "PriceObservation",
     "RequestAttempt",
     "MatchCurrentPrice",
+    "ScrapeJob",
+    "ScrapeJobTarget",
 ]

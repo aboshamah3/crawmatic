@@ -104,6 +104,7 @@ class ScrapydDispatchClient:
         match_ids: Any,
         mode: str,
         batch_index: int | str,
+        node_url: str | None = None,
     ) -> str:
         """Schedule ``spider`` in ``project`` on Scrapyd; return the ``jobid``.
 
@@ -111,6 +112,11 @@ class ScrapydDispatchClient:
         docstring for the claim/commit/release ordering that guarantees a
         retried dispatch never double-runs a batch and a *failed* dispatch never
         poisons the key.
+
+        ``node_url`` (SPEC-08 FR-012, FR-014) targets a specific
+        deterministically-selected Scrapyd node; when ``None`` this falls
+        back to ``SCRAPYD_HTTP_URLS[0]`` (back-compat with the SPEC-07
+        thin ``dispatch_generic_price_spider`` task).
         """
         key = dispatch_key(scrape_job_id, batch_index)
 
@@ -136,6 +142,7 @@ class ScrapydDispatchClient:
                 scrape_job_id=scrape_job_id,
                 match_ids=match_ids,
                 mode=mode,
+                node_url=node_url,
             )
         except BaseException:
             # release: never leave a poisoned key behind a failed attempt.
@@ -156,8 +163,9 @@ class ScrapydDispatchClient:
         scrape_job_id: str,
         match_ids: Any,
         mode: str,
+        node_url: str | None = None,
     ) -> str:
-        base = self._settings.SCRAPYD_HTTP_URLS[0].rstrip("/")
+        base = (node_url or self._settings.SCRAPYD_HTTP_URLS[0]).rstrip("/")
         url = f"{base}/schedule.json"
         auth = (self._settings.SCRAPYD_USERNAME, self._settings.SCRAPYD_PASSWORD)
         # Spider args forwarded UNCHANGED (US4 scenario 3).

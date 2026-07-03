@@ -20,6 +20,7 @@ FULL_VOCABULARY = {
     "matches:write",
     "jobs:run",
     "jobs:read",
+    "jobs:write",
     "results:read",
     "alerts:read",
     "webhooks:read",
@@ -31,7 +32,16 @@ FULL_VOCABULARY = {
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 16
+    assert len(FULL_VOCABULARY) == 17
+
+
+def test_jobs_write_scope_is_in_the_vocabulary() -> None:
+    """SPEC-08 T018 (FR-006/FR-007/FR-010): `jobs:write` is minted alongside
+    the pre-existing `jobs:read`/`jobs:run` for the run-match/run-variant
+    endpoints (which require write, following the `matches:*` precedent)."""
+    assert Scope("jobs:write") == Scope.JOBS_WRITE
+    assert "jobs:write" in {member.value for member in Scope}
+    assert validate_scopes(["jobs:write"]) == ["jobs:write"]
 
 
 def test_validate_scopes_accepts_known_scope() -> None:
