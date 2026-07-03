@@ -7,6 +7,35 @@ threshold (buffer size or elapsed time), plus a final flush at
 routes through the single reactor-safe DB seam
 (:mod:`scrape_core.db`, ``run_in_thread`` + ``workspace_txn``); no DB
 call ever runs on the reactor thread (Principle V, US5).
+
+US5 hardening (T041) — this module has exactly **one** call site for
+``run_in_thread`` (:func:`BatchedPersistencePipeline._flush`), and all
+three flush triggers route through it, never a direct/synchronous DB
+call on the reactor thread:
+
+1. **Size-based**: :meth:`BatchedPersistencePipeline.process_item`
+   calls :meth:`~BatchedPersistencePipeline._flush` once the buffer
+   reaches ``_max_items``.
+2. **Time-based**: the ``LoopingCall`` started in
+   :meth:`~BatchedPersistencePipeline.open_spider` ticks
+   :meth:`~BatchedPersistencePipeline._time_based_flush`, which calls
+   :meth:`~BatchedPersistencePipeline._flush` when the buffer is
+   non-empty.
+3. **Final flush**: :meth:`~BatchedPersistencePipeline.close_spider`
+   calls :meth:`~BatchedPersistencePipeline._flush` on any remaining
+   partial buffer and awaits every in-flight ``Deferred`` (including
+   this one) before the spider actually closes.
+
+There is no ``time.sleep``, no direct/synchronous ``session.commit()``,
+and no blocking Redis call anywhere in this pipeline — the batch build
+in :func:`_flush_batch` is pure Python + SQLAlchemy object construction
+that only touches the database once it is already running inside the
+``run_in_thread`` thread-pool thread. ``_flush`` also swaps
+``self._buffer`` for a fresh list *before* dispatching the batch, so
+the buffer is emptied immediately regardless of whether that flush
+later succeeds or fails (see :func:`_flush`'s docstring and
+:meth:`BatchedPersistencePipeline._on_flush_failure`) — a failed flush
+loses only its own batch, never blocks or wedges subsequent flushes.
 """
 
 from __future__ import annotations
@@ -170,6 +199,11 @@ class BatchedPersistencePipeline:
 
     @classmethod
     def from_crawler(cls, crawler: Any) -> "BatchedPersistencePipeline":
+        # T041 guard rail: thresholds are always read from config
+        # (`Settings.SCRAPE_FLUSH_MAX_ITEMS`/`SCRAPE_FLUSH_INTERVAL_SECONDS`,
+        # env/DB-tunable), never hardcoded literals here -- a Scrapy-level
+        # settings override (`crawler.settings`) still wins if present, so
+        # a spider/project can tune it without touching this module.
         settings = get_settings()
         max_items = crawler.settings.getint(
             "SCRAPE_FLUSH_MAX_ITEMS", settings.SCRAPE_FLUSH_MAX_ITEMS

@@ -157,12 +157,12 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 ### Implementation for User Story 5
 
-- [ ] T041 [US5] Harden `libs/scrape-core/scrape_core/pipelines.py` — confirm the time-based `LoopingCall` flush, the size-based flush, and the `close_spider` final flush all route through `scrape_core.db.run_in_thread` (no synchronous commit / `time.sleep` / blocking Redis on the reactor thread), and thresholds are read from config. Depends on T021.
+- [X] T041 [US5] Harden `libs/scrape-core/scrape_core/pipelines.py` — confirm the time-based `LoopingCall` flush, the size-based flush, and the `close_spider` final flush all route through `scrape_core.db.run_in_thread` (no synchronous commit / `time.sleep` / blocking Redis on the reactor thread), and thresholds are read from config. Depends on T021.
 
 ### Tests for User Story 5
 
-- [ ] T042 [P] [US5] Create `tests/unit/test_persistence_batching.py` — flush at N items, at T seconds, and final flush at close; N items → ≪ N flushes; buffer emptied; DB routed through the (mocked) `deferToThread` seam.
-- [ ] T043 [P] [US5] Create `tests/unit/test_reactor_safe_db.py` — `run_in_thread` returns a Deferred / offloads (no blocking call on the calling thread); `workspace_txn` sets workspace context.
+- [X] T042 [P] [US5] Create `tests/unit/test_persistence_batching.py` — flush at N items, at T seconds, and final flush at close; N items → ≪ N flushes; buffer emptied; DB routed through the (mocked) `deferToThread` seam.
+- [X] T043 [P] [US5] Create `tests/unit/test_reactor_safe_db.py` — `run_in_thread` returns a Deferred / offloads (no blocking call on the calling thread); `workspace_txn` sets workspace context.
 
 **Checkpoint**: Reactor-safety and batched-flush guarantees are verified. US5 is independently testable.
 
