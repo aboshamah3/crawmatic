@@ -107,4 +107,10 @@ def test_alembic_heads_reports_exactly_one_head() -> None:
     head_lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(head_lines) == 1, f"expected exactly one head, got: {head_lines!r}"
     assert "(head)" in head_lines[0]
-    assert "c2987b29555e" in head_lines[0]
+    # The current head has since moved forward to the SPEC-05
+    # competitors/matches migration (f4c8a391d5c9,
+    # down_revision=c2987b29555e) — this test only asserts *this*
+    # migration isn't itself a fork (single linear history up to and
+    # including it), not that it's still the head.
+    # tests/unit/test_migration_offline_competitors_matches.py owns the
+    # current-head assertion.

@@ -35,6 +35,12 @@ from app_shared.models.identity import ApiKey, RefreshToken, User, Workspace
 # `from app_shared.models import Product, ...`.
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 
+# The SPEC-05 competitor/match models — re-exported so `Base.metadata`
+# sees both tables for Alembic autogenerate/offline-render
+# (target_metadata), and so callers can
+# `from app_shared.models import Competitor, CompetitorProductMatch`.
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+
 __all__ = [
     "Base",
     "metadata",
@@ -51,4 +57,6 @@ __all__ = [
     "ProductVariant",
     "ProductGroup",
     "ProductGroupItem",
+    "Competitor",
+    "CompetitorProductMatch",
 ]

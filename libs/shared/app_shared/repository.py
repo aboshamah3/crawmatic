@@ -25,19 +25,29 @@ from sqlalchemy.orm import Session
 
 from app_shared.models.base import Base
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import ApiKey, User
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
 # SPEC-03 models to any Base subclass — the four catalog models
-# (Product/ProductVariant/ProductGroup/ProductGroupItem) reuse these
-# helpers unchanged.
+# (Product/ProductVariant/ProductGroup/ProductGroupItem) and the two
+# SPEC-05 competitor/match models reuse these helpers unchanged.
 ModelT = TypeVar("ModelT", bound=Base)
 
 # Single source of truth for "which ORM models are workspace-owned" — the
 # CI guard (scripts/check_workspace_scoping.py) imports this exact set so
 # the guarded set and the runtime set never drift (FR-018/FR-020).
 WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
-    {User, ApiKey, Product, ProductVariant, ProductGroup, ProductGroupItem}
+    {
+        User,
+        ApiKey,
+        Product,
+        ProductVariant,
+        ProductGroup,
+        ProductGroupItem,
+        Competitor,
+        CompetitorProductMatch,
+    }
 )
 
 

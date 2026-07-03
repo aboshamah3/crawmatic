@@ -13,6 +13,7 @@ import uuid
 import pytest
 
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import ApiKey, User
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
@@ -23,11 +24,21 @@ from app_shared.repository import (
 
 
 def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
-    # SPEC-04 (T006) widens this set with the four catalog models —
+    # SPEC-04 (T006) widened this set with the four catalog models; SPEC-05
+    # (T005) widens it further with Competitor/CompetitorProductMatch —
     # updated here alongside app_shared.repository so the suite stays
     # in sync with the runtime set.
     assert WORKSPACE_OWNED_MODELS == frozenset(
-        {User, ApiKey, Product, ProductVariant, ProductGroup, ProductGroupItem}
+        {
+            User,
+            ApiKey,
+            Product,
+            ProductVariant,
+            ProductGroup,
+            ProductGroupItem,
+            Competitor,
+            CompetitorProductMatch,
+        }
     )
 
 
