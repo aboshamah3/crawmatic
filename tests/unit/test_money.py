@@ -15,7 +15,7 @@ from decimal import Decimal
 
 import pytest
 
-from app_shared.money import Money
+from app_shared.money import Money, parse_money
 
 _MONEY = Money()
 
@@ -73,3 +73,77 @@ def test_zero_scale_boundary_decimal_is_accepted() -> None:
     # Exactly 4 decimal places is the boundary, not over-scale.
     bound = _MONEY.process_bind_param(Decimal("0.0001"), dialect=None)
     assert bound == Decimal("0.0001")
+
+
+# --- `parse_money` pure boundary (SPEC-06 US4 T044, FR-022, SC-006) -----------
+#
+# `parse_money` is the extracted pure §19 money boundary reused by both
+# `Money.process_bind_param` (non_negative=False, unchanged historical
+# behavior, exercised above via the `Money` wrapper) and
+# `app_shared.profiles.validation` (non_negative=True). These tests drive
+# `parse_money` directly, including its `non_negative` option.
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("19.99"), Decimal("0.0001"), Decimal("0"), Decimal("0.00"), 42, "19.99"],
+    ids=["decimal-19.99", "decimal-0.0001", "decimal-0", "decimal-0.00", "int-42", "str-19.99"],
+)
+def test_parse_money_accepts_finite_in_scale_non_negative_decimal(value: Decimal | int | str) -> None:
+    result = parse_money(value, non_negative=True)
+    assert isinstance(result, Decimal)
+    assert result == Decimal(value)
+
+
+def test_parse_money_default_non_negative_is_false() -> None:
+    # non_negative defaults to False, matching Money.process_bind_param's
+    # historical (unchanged) behavior — a negative value is accepted.
+    assert parse_money(Decimal("-19.99")) == Decimal("-19.99")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")],
+    ids=["nan", "infinity", "neg-infinity"],
+)
+def test_parse_money_rejects_non_finite(value: Decimal) -> None:
+    with pytest.raises(ValueError):
+        parse_money(value)
+
+
+def test_parse_money_rejects_over_scale_not_rounded() -> None:
+    with pytest.raises(ValueError):
+        parse_money(Decimal("1.23456"))
+
+
+def test_parse_money_accepts_exactly_scale_4_boundary() -> None:
+    assert parse_money(Decimal("1.2345")) == Decimal("1.2345")
+
+
+def test_parse_money_rejects_negative_when_non_negative_true() -> None:
+    with pytest.raises(ValueError):
+        parse_money(Decimal("-0.01"), non_negative=True)
+
+
+def test_parse_money_accepts_negative_when_non_negative_false() -> None:
+    assert parse_money(Decimal("-0.01"), non_negative=False) == Decimal("-0.01")
+
+
+def test_parse_money_rejects_float_input() -> None:
+    with pytest.raises(TypeError):
+        parse_money(1.1)
+
+
+def test_parse_money_rejects_bool_input() -> None:
+    with pytest.raises(TypeError):
+        parse_money(True)
+
+
+def test_parse_money_rejects_non_numeric_type() -> None:
+    with pytest.raises(TypeError):
+        parse_money(object())
+
+
+def test_parse_money_rejects_invalid_decimal_string() -> None:
+    with pytest.raises(ValueError):
+        parse_money("not-a-number")

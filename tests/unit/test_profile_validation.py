@@ -6,13 +6,17 @@ reject corpus; and the **positive empty-extraction case** — a profile
 with a valid mode/adapter but no selectors/xpath/regex is ACCEPTED, not
 rejected (spec Edge Cases "all extraction fields empty").
 
-The `validation_rules`/`confidence_rules`/money corpus is added in
-US4/T043 (`Extend tests/unit/test_profile_validation.py`) — a minimal
-smoke case for each is still included here since `validate_profile`
-already wires them into the facade.
+The `validation_rules`/`confidence_rules`/money corpus (SPEC-06 US4
+T043): `required_currency` 3-letter accept/reject; `min_price`/
+`max_price` money finite + scale <= 4 + non-negative + `min <= max`
+accept/reject; `reject_if_text_contains`/`prefer_text_contains`
+list[str] accept / non-list reject; `confidence_rules` values in
+`[0, 1]` accept / outside reject.
 """
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 import pytest
 
@@ -190,6 +194,174 @@ def test_confidence_rules_valid_bundle_passes() -> None:
 
 def test_confidence_rules_none_passes() -> None:
     validate_confidence_rules(None)
+
+
+# --- validation_rules full corpus (SPEC-06 US4 T043, FR-008/FR-022) -----------
+
+
+@pytest.mark.parametrize("currency", ["USD", "eur", "GbP", "JPY"])
+def test_required_currency_accepts_3_letter_codes(currency: str) -> None:
+    validate_validation_rules({"required_currency": currency})
+
+
+@pytest.mark.parametrize(
+    "currency",
+    ["US", "USDD", "US1", "", "1SD", "US$", "usd1"],
+)
+def test_required_currency_rejects_non_3_letter_alpha_codes(currency: str) -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"required_currency": currency})
+    assert exc_info.value.field == "validation_rules.required_currency"
+    assert exc_info.value.code == "INVALID_CURRENCY"
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        {"min_price": "1.00"},
+        {"max_price": "999.99"},
+        {"min_price": "1.00", "max_price": "999.99"},
+        {"min_price": "1.00", "max_price": "1.00"},  # min == max, boundary-ok
+        {"min_price": Decimal("0.0001"), "max_price": Decimal("0.0002")},
+        {"min_price": 0, "max_price": 10},
+    ],
+)
+def test_min_max_price_accepts_finite_in_scale_non_negative_ordered_money(bundle: dict) -> None:
+    validate_validation_rules(bundle)
+
+
+def test_min_price_rejects_non_finite() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"min_price": Decimal("NaN")})
+    assert exc_info.value.field == "validation_rules.min_price"
+    assert exc_info.value.code == "INVALID_MONEY"
+
+
+def test_max_price_rejects_infinity() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"max_price": Decimal("Infinity")})
+    assert exc_info.value.field == "validation_rules.max_price"
+    assert exc_info.value.code == "INVALID_MONEY"
+
+
+def test_min_price_rejects_over_scale_not_rounded() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"min_price": Decimal("1.23456")})
+    assert exc_info.value.field == "validation_rules.min_price"
+    assert exc_info.value.code == "INVALID_MONEY"
+
+
+def test_max_price_rejects_negative() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"max_price": Decimal("-1.00")})
+    assert exc_info.value.field == "validation_rules.max_price"
+    assert exc_info.value.code == "INVALID_MONEY"
+
+
+def test_min_price_rejects_float_input() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"min_price": 1.5})
+    assert exc_info.value.field == "validation_rules.min_price"
+    assert exc_info.value.code == "INVALID_MONEY"
+
+
+def test_min_gt_max_price_is_rejected() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"min_price": "10.00", "max_price": "1.00"})
+    assert exc_info.value.field == "validation_rules"
+    assert exc_info.value.code == "MIN_GT_MAX"
+
+
+@pytest.mark.parametrize("field", ["reject_if_text_contains", "prefer_text_contains"])
+@pytest.mark.parametrize(
+    "value",
+    [[], ["sold out"], ["sold out", "unavailable", "backorder"]],
+    ids=["empty-list", "single", "multiple"],
+)
+def test_text_contains_fields_accept_list_of_str(field: str, value: list[str]) -> None:
+    validate_validation_rules({field: value})
+
+
+@pytest.mark.parametrize("field", ["reject_if_text_contains", "prefer_text_contains"])
+@pytest.mark.parametrize(
+    "bad_value",
+    ["not-a-list", 42, {"a": "b"}, ["ok", 5], [None], [["nested"]]],
+    ids=["string", "int", "dict", "mixed-int", "none-item", "nested-list"],
+)
+def test_text_contains_fields_reject_non_list_or_non_str_items(field: str, bad_value) -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({field: bad_value})
+    assert exc_info.value.field == f"validation_rules.{field}"
+    assert exc_info.value.code == "INVALID_TEXT_LIST"
+
+
+def test_validation_rules_full_bundle_accepted() -> None:
+    validate_validation_rules(
+        {
+            "required_currency": "USD",
+            "min_price": "1.00",
+            "max_price": "999.99",
+            "reject_if_text_contains": ["sold out"],
+            "prefer_text_contains": ["in stock"],
+        }
+    )
+
+
+def test_validation_rules_rejects_unknown_keys() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules({"unexpected_key": True})
+    assert exc_info.value.field == "validation_rules"
+    assert exc_info.value.code == "INVALID_SHAPE"
+
+
+def test_validation_rules_rejects_non_dict_shape() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_validation_rules("not-a-dict")
+    assert exc_info.value.field == "validation_rules"
+    assert exc_info.value.code == "INVALID_SHAPE"
+
+
+# --- confidence_rules full corpus (SPEC-06 US4 T043, FR-009) -------------------
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        {"css": 0.0},
+        {"css": 1.0},
+        {"css": 0.5},
+        {"css": 0.85, "regex": 0.75, "jsonld": 0.95},
+        {},
+    ],
+)
+def test_confidence_rules_accepts_values_in_unit_interval(bundle: dict) -> None:
+    validate_confidence_rules(bundle)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-0.01, 1.01, -1, 2, 100],
+)
+def test_confidence_rules_rejects_values_outside_unit_interval(value) -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_confidence_rules({"css": value})
+    assert exc_info.value.field == "confidence_rules.css"
+    assert exc_info.value.code == "CONFIDENCE_OUT_OF_RANGE"
+
+
+@pytest.mark.parametrize("value", ["not-a-number", None, [0.5], {"nested": 0.5}, True, False])
+def test_confidence_rules_rejects_non_numeric_values(value) -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_confidence_rules({"css": value})
+    assert exc_info.value.field == "confidence_rules.css"
+    assert exc_info.value.code == "INVALID_SHAPE"
+
+
+def test_confidence_rules_rejects_non_dict_shape() -> None:
+    with pytest.raises(ProfileValidationError) as exc_info:
+        validate_confidence_rules("not-a-dict")
+    assert exc_info.value.field == "confidence_rules"
+    assert exc_info.value.code == "INVALID_SHAPE"
 
 
 # --- positive empty-extraction case (spec Edge Cases) -------------------------
