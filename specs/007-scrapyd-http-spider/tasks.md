@@ -185,9 +185,9 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 **Purpose**: Boundary enforcement and final validation across stories.
 
-- [ ] T050 [P] Extend `tests/unit/test_import_boundaries.py` — cover the new `scrape_core.*` modules; assert `app_shared.models.observations` and `app_shared.scrapyd.client` import **no** scrapy/twisted/fastapi (one-way `apps → libs`; `scrape_core` may import `app_shared`, never the reverse).
-- [ ] T051 Run the unit suite and offline migration render per quickstart.md — `uv run pytest tests/unit -q` and `SPECIFY_FEATURE_DIRECTORY=specs/007-scrapyd-http-spider uv run alembic upgrade head --sql` (expect the two `PARTITION BY RANGE` parents, current+next partitions, `unique(workspace_id, match_id)`, and RLS on all three; single head).
-- [ ] T052 Confirm `apps/scrapers/price_monitor/settings.py` `SPIDER_MODULES`/packaging makes `generic_price_spider` discoverable under Scrapyd (deployment sanity; no live run required here).
+- [X] T050 [P] Extend `tests/unit/test_import_boundaries.py` — cover the new `scrape_core.*` modules; assert `app_shared.models.observations` and `app_shared.scrapyd.client` import **no** scrapy/twisted/fastapi (one-way `apps → libs`; `scrape_core` may import `app_shared`, never the reverse).
+- [X] T051 Run the unit suite and offline migration render per quickstart.md — `uv run pytest tests/unit -q` and `SPECIFY_FEATURE_DIRECTORY=specs/007-scrapyd-http-spider uv run alembic upgrade head --sql` (expect the two `PARTITION BY RANGE` parents, current+next partitions, `unique(workspace_id, match_id)`, and RLS on all three; single head).
+- [X] T052 Confirm `apps/scrapers/price_monitor/settings.py` `SPIDER_MODULES`/packaging makes `generic_price_spider` discoverable under Scrapyd (deployment sanity; no live run required here).
 
 ---
 
