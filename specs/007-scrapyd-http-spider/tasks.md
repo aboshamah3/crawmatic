@@ -116,15 +116,15 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 ### Implementation for User Story 3
 
-- [ ] T032 [P] [US3] Create `libs/scrape-core/scrape_core/extraction/css.py` — pure `parsel` CSS selectors for price/old_price/currency/stock/title → `ExtractionCandidate` (default confidence 0.85 from shared config). Depends on T017.
-- [ ] T033 [P] [US3] Create `libs/scrape-core/scrape_core/extraction/regex.py` — DB regex rules → `ExtractionCandidate` (0.75); single unlabeled-number heuristic (0.40). Depends on T017.
-- [ ] T034 [US3] Extend `libs/scrape-core/scrape_core/extraction/pipeline.py` to the full ordered chain JSON-LD → CSS → regex (first hit wins, else `PRICE_NOT_FOUND`). Depends on T032, T033.
-- [ ] T035 [US3] Extend `libs/scrape-core/scrape_core/validation.py` with the full rule set: currency match/`required_currency` → mismatch marks `comparable=false` + `CURRENCY_MISMATCH` (still saved, no FX), `min_price`/`max_price` bounds, and `reject_if_text_contains` against `matched_text` (old/installment/discount/"save X"/shipping). Per contracts/price-validation.md. Depends on T020.
+- [X] T032 [P] [US3] Create `libs/scrape-core/scrape_core/extraction/css.py` — pure `parsel` CSS selectors for price/old_price/currency/stock/title → `ExtractionCandidate` (default confidence 0.85 from shared config). Depends on T017.
+- [X] T033 [P] [US3] Create `libs/scrape-core/scrape_core/extraction/regex.py` — DB regex rules → `ExtractionCandidate` (0.75); single unlabeled-number heuristic (0.40). Depends on T017.
+- [X] T034 [US3] Extend `libs/scrape-core/scrape_core/extraction/pipeline.py` to the full ordered chain JSON-LD → CSS → regex (first hit wins, else `PRICE_NOT_FOUND`). Depends on T032, T033.
+- [X] T035 [US3] Extend `libs/scrape-core/scrape_core/validation.py` with the full rule set: currency match/`required_currency` → mismatch marks `comparable=false` + `CURRENCY_MISMATCH` (still saved, no FX), `min_price`/`max_price` bounds, and `reject_if_text_contains` against `matched_text` (old/installment/discount/"save X"/shipping). Per contracts/price-validation.md. Depends on T020.
 
 ### Tests for User Story 3
 
-- [ ] T036 [US3] Extend `tests/unit/test_extraction_jsonld_css_regex.py` — CSS-only (0.85) and regex-only (0.75) fixtures extract; fallback order JSON-LD → CSS → regex; single unlabeled number → 0.40. Depends on T024.
-- [ ] T037 [P] [US3] Create `tests/unit/test_price_validation.py` — Decimal exactness; float/NaN/Infinity/over-scale/non-positive rejected (never rounded → `INVALID_PRICE_FORMAT`); currency mismatch → `comparable=false` + `CURRENCY_MISMATCH`; min/max; `reject_if_text_contains`; confidence < 0.75 → `LOW_CONFIDENCE_PRICE`.
+- [X] T036 [US3] Extend `tests/unit/test_extraction_jsonld_css_regex.py` — CSS-only (0.85) and regex-only (0.75) fixtures extract; fallback order JSON-LD → CSS → regex; single unlabeled number → 0.40. Depends on T024.
+- [X] T037 [P] [US3] Create `tests/unit/test_price_validation.py` — Decimal exactness; float/NaN/Infinity/over-scale/non-positive rejected (never rounded → `INVALID_PRICE_FORMAT`); currency mismatch → `comparable=false` + `CURRENCY_MISMATCH`; min/max; `reject_if_text_contains`; confidence < 0.75 → `LOW_CONFIDENCE_PRICE`.
 
 **Checkpoint**: All three strategies + full validation/confidence gate work. US3 is independently testable.
 
