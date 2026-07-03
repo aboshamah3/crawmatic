@@ -28,3 +28,12 @@ No questions relayed to the user — all resolved doc-first / from repo context.
 
 - [plan] Q: FR-015 update scrape job target state — where does the backing table live? → A: Deferred as a seam. scrape_job_targets belongs to the later orchestration spec (SPEC-08); spec Assumptions + master-doc table enumeration place it outside this slice. Recorded as a documented, scoped Constitution-Check deviation, not silently dropped. (source: spec Assumptions + doc §22/§35.08)
 - [plan] Reactor-safe DB seam realized as sync SQLAlchemy in deferToThread reusing SPEC-02 session/RLS; extraction pure parsel/stdlib; migration down_revision a4f205e8d7de (single head). (source: plan.md)
+
+## checklist
+
+Generated checklists/security.md (28 requirements-quality items, release-gate). 26/28 passed as-written; 2 items surfaced real artifact gaps, remediated in spec.md before checking:
+
+- [checklist] CHK008 (RLS gap): DB-level RLS on the 3 new tables was only in plan, not spec → added FR-023 (RLS enabled+forced, fail-closed) to spec. (source: constitution II NON-NEGOTIABLE + plan Constitution Check)
+- [checklist] CHK028 (spec/plan conflict): FR-015 said spider MUST update scrape_job_targets, but plan defers that table to SPEC-08 → reworded FR-015 to "record terminal outcome via attempts/observations; dedicated scrape_job_targets write deferred". Resolves the conflict analyze would flag. (source: plan Complexity Tracking + spec Assumptions)
+
+Both spec checklists now fully checked (requirements.md 16/16, security.md 28/28).

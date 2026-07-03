@@ -264,7 +264,11 @@ commit count << N, or explicit flush-boundary assertions).
   `match_current_prices` (unique on `workspace_id, match_id`) with a soft reference to the
   observation; on failure it MUST write a `success=false` observation and MUST NOT overwrite the
   current price with a bad value.
-- **FR-015**: The spider MUST update the scrape job target state for each processed match.
+- **FR-015**: The spider MUST record each processed match's terminal outcome (success/failure with
+  error code) via its `request_attempt` and `price_observation` rows, carrying `scrape_job_id` as a
+  nullable soft reference. The dedicated `scrape_job_targets` state row write is **deferred** to the
+  job-orchestration spec (SPEC-08), whose table is out of scope here; this spec provides exactly the
+  per-match outcome data a job-target updater will consume. (See plan Complexity Tracking.)
 - **FR-016**: Persistence MUST be batched (flush by item count or elapsed time — default every 50
   items or 2 seconds, tunable via config — and a final flush at spider close), never one commit per
   item.
@@ -286,6 +290,11 @@ commit count << N, or explicit flush-boundary assertions).
   access) MUST live in `libs/scrape-core`; the Scrapyd service app (`apps/scrapers`) packages the
   Scrapy project. The one-way dependency rule (`apps → libs`; `scrape-core` may depend on `shared`,
   not vice versa) MUST hold.
+- **FR-023**: The three new tables (`price_observations`, `request_attempts`,
+  `match_current_prices`) MUST be workspace-owned with database-level Row-Level Security enabled and
+  forced, fail-closed (deny when no workspace context is set), consistent with the RLS pattern
+  established by earlier specs — so DB-level isolation is the second, non-bypassable layer beneath
+  the application's workspace scoping (Constitution Principle II, NON-NEGOTIABLE).
 
 ### Key Entities *(include if feature involves data)*
 
