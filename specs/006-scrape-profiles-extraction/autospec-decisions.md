@@ -22,4 +22,16 @@ Scope boundaries confirmed from doc §35: access_policies/proxy_providers/domain
 
 ## clarify
 
+## analyze
+
+speckit-analyze: 0 CRITICAL, 0 HIGH. 100% FR/SC coverage (23/23 FR, 8/8 SC), constitution-aligned, factual claims verified against codebase (single head f4c8a391d5c9, assignment columns pre-exist, parse_money not yet present). 5 LOW/MEDIUM polish findings — all remediated in-place (analyze is read-only, orchestrator applied edits):
+- [analyze] G1 (MEDIUM, coverage): edge case "empty-extraction profile is accepted" lacked a positive unit assertion → added to T017 in tasks.md.
+- [analyze] C2 (LOW, mapping): SC-002 coverage row omitted T032/T033 → added.
+- [analyze] D1 (LOW, duplication): FR-008/FR-022 money overlap → FR-022 now states it is the general §19 rule FR-008 specializes (one shared validator).
+- [analyze] A1 (LOW, ambiguity): FR-011 "single-number 0.40/reject" → reworded to "single bare number 0.40 — below the default minimum, so rejected".
+- [analyze] M1 (LOW, terminology): normalized `matches.scrape_profile_id` shorthand → real column `competitor_product_matches.scrape_profile_id` in clarifications/US2/Key Entities.
+No CRITICAL/HIGH fixed, so no analyze re-run required.
+
+## clarify
+
 - [clarify] Ambiguity scan across the full taxonomy found no critical spec-level ambiguities: all high-impact questions were already resolved doc-first in the `## Clarifications` section, and every residual gap (cache-TTL value, FK promotion vs soft ref, delete policy block-vs-null, ReDoS-detection depth, cookie deny heuristic, global-profile seeding mechanism) is explicitly plan-level and traceable to PROJECT_SPEC §9/§16-20/§22. No stakeholder question required; no spec edits made. Requirements checklist remains 16/16. (source: doc §9/§16-20/§22 + prior-spec precedent)
