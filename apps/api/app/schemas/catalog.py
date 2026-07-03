@@ -26,9 +26,10 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from app_shared.enums import ProductStatus, VariantStatus
+from app_shared.catalog.consistency import ExactlyOneOfViolation, exactly_one_of
+from app_shared.enums import GroupStatus, ProductStatus, VariantStatus
 
 # Kept in sync with app_shared.money.MONEY_SCALE (NUMERIC(18,4)) — money
 # is validated identically at both the API boundary (here) and the DB
@@ -396,6 +397,90 @@ class VariantBulkUpsertResult(BaseModel):
 
     upserted: int
     variants: list[VariantResponse]
+
+
+# --- Group DTOs (US3, `contracts/api-product-groups.md`) --------------------
+
+
+class GroupCreate(BaseModel):
+    """`POST /v1/product-groups` request body. ``unique(workspace_id, name)``
+    duplicate -> `409` (enforced by the router, not here)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str | None = None
+    status: GroupStatus = GroupStatus.ACTIVE
+
+
+class GroupUpdate(BaseModel):
+    """`PATCH /v1/product-groups/{id}` — every field optional (partial update)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    status: GroupStatus | None = None
+
+
+class GroupItemResponse(BaseModel):
+    """A `product_group_items` row as returned by the API."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    product_group_id: uuid.UUID
+    product_id: uuid.UUID | None
+    product_variant_id: uuid.UUID | None
+    created_at: datetime
+
+
+class GroupResponse(BaseModel):
+    """A `product_groups` row (with its member items) as returned by the API."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    description: str | None
+    status: GroupStatus
+    created_at: datetime
+    updated_at: datetime
+    items: list[GroupItemResponse] = []
+
+
+class GroupListResponse(BaseModel):
+    """`{items, next_cursor}` envelope for `GET /v1/product-groups`."""
+
+    items: list[GroupResponse]
+    next_cursor: str | None
+
+
+class GroupItemCreate(BaseModel):
+    """`POST /v1/product-groups/{id}/items` request body.
+
+    Exactly one of `product_id` / `product_variant_id` must be set — the
+    "exactly one" rule is the pure `app_shared.catalog.consistency.exactly_one_of`
+    core, reused here (not re-implemented) so the API boundary and any
+    future non-HTTP caller share one rule (`contracts/workspace-consistency.md`
+    Layer 2). The referenced entity must additionally resolve inside the
+    caller's workspace — that check runs in the router (composite-FK-backed,
+    422/404 on cross-workspace/nonexistent), since it requires a DB lookup
+    this pure schema validator cannot perform.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: uuid.UUID | None = None
+    product_variant_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _check_exactly_one(self) -> "GroupItemCreate":
+        try:
+            exactly_one_of(self.product_id, self.product_variant_id)
+        except ExactlyOneOfViolation as exc:
+            raise ValueError(str(exc)) from exc
+        return self
 
 
 # --- Shared: delete-outcome ---------------------------------------------

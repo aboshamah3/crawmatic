@@ -164,6 +164,14 @@ def bulk_upsert_products(
     any product arriving with zero explicit variants -> a bounded number
     of variant upsert statements. Runs entirely inside the request's
     workspace-scoped session/transaction (FR-016).
+
+    Limitation (FR-011): a product supplied with neither ``external_id``
+    nor ``sku`` has no identity for ``ON CONFLICT`` matching, so it is
+    always inserted fresh on every call -- re-pushing an unmodified
+    identity-less product creates a duplicate row rather than being a
+    no-op. Callers that want idempotent upsert semantics must supply at
+    least one of those two fields on every product they intend to keep
+    in sync (see ``app.schemas.catalog.ProductBulkUpsertItem``).
     """
     session, principal = principal_ctx
     assert isinstance(principal, Principal)

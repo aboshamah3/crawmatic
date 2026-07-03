@@ -111,8 +111,8 @@ description: "Dependency-ordered task list for SPEC-04 Catalog — Products, Var
 
 **Independent Test**: Two populated workspaces → workspace-A caller reads/writes 0 of workspace-B's rows (including when the app filter is omitted, and 0 rows with no context set); read-only credential write → refused, write credential → succeeds; scoping guard fails on an introduced unscoped `select(Product)`.
 
-- [ ] T029 [P] [US4] Unit test `tests/unit/test_catalog_scoping_guard.py`: `scripts/check_workspace_scoping.py` exits 0 on the current tree (four models registered) AND flags a planted unscoped `select(Product)` (and `scoped_get` omission). (FR-002, SC-006)
-- [ ] T030 [P] [US4] Unit test `tests/unit/test_catalog_scope_gating.py`: each catalog route declares the correct `require_scopes` (read vs write per family) — assert via app route/dependency inspection AND a `TestClient` call with a fake principal lacking the scope → 403. (FR-016, SC-005)
+- [X] T029 [P] [US4] Unit test `tests/unit/test_catalog_scoping_guard.py`: `scripts/check_workspace_scoping.py` exits 0 on the current tree (four models registered) AND flags a planted unscoped `select(Product)` (and `scoped_get` omission). (FR-002, SC-006)
+- [X] T030 [P] [US4] Unit test `tests/unit/test_catalog_scope_gating.py`: each catalog route declares the correct `require_scopes` (read vs write per family) — assert via app route/dependency inspection AND a `TestClient` call with a fake principal lacking the scope → 403. (FR-016, SC-005)
 - [ ] T031 [P] [US4] ⏸ DEFERRED (needs live Postgres) Author `tests/integration/test_workspace_isolation_live.py`: workspace-A caller gets 0 rows of workspace-B catalog by id and in lists; app-filter-omitted query returns 0 other-workspace rows (RLS); no-context → 0 rows (fail closed); read-only credential write → 403, write credential → 200; composite-FK cross-workspace reference rejected. (FR-003, FR-016, SC-004, SC-005)
 
 **Checkpoint**: Scope-gating + guard proven here; live cross-workspace/RLS row denial deferred.
@@ -125,9 +125,9 @@ description: "Dependency-ordered task list for SPEC-04 Catalog — Products, Var
 
 **Independent Test**: Create a group; add a product and a variant; list groups; remove an item; confirm workspace-scoped membership and that re-adding the same product/variant is rejected.
 
-- [ ] T032 [US3] Extend `apps/api/app/schemas/catalog.py` with group DTOs: `GroupCreate` (name req), `GroupUpdate`, `GroupResponse` (with items), `GroupItemCreate` (exactly one of `product_id` | `product_variant_id`), `GroupItemResponse`, `{items, next_cursor}` group list envelope, delete-outcome. (FR-013)
-- [ ] T033 [US3] Create `apps/api/app/routers/product_groups.py` (per contracts/api-product-groups.md): `POST/GET/GET{id}/PATCH/DELETE /v1/product-groups` and `POST /v1/product-groups/{id}/items` + `DELETE /v1/product-groups/{id}/items/{item_id}`. Scope mapping — group create/update/delete + add/remove require `products:write` (add-variant item also `variants:write`), reads require `products:read`. `unique(workspace_id, name)` dup → 409; duplicate membership (partial unique) → 409; item reference resolved in-workspace via `consistency.py` → 422/404 on cross-ws/nonexistent; DELETE returns `{id, outcome}`. (FR-009, FR-013, FR-014, FR-016, FR-017)
-- [ ] T034 [US3] Register the product-groups router in `apps/api/app/main.py` under `/v1`. (FR-014)
+- [X] T032 [US3] Extend `apps/api/app/schemas/catalog.py` with group DTOs: `GroupCreate` (name req), `GroupUpdate`, `GroupResponse` (with items), `GroupItemCreate` (exactly one of `product_id` | `product_variant_id`), `GroupItemResponse`, `{items, next_cursor}` group list envelope, delete-outcome. (FR-013)
+- [X] T033 [US3] Create `apps/api/app/routers/product_groups.py` (per contracts/api-product-groups.md): `POST/GET/GET{id}/PATCH/DELETE /v1/product-groups` and `POST /v1/product-groups/{id}/items` + `DELETE /v1/product-groups/{id}/items/{item_id}`. Scope mapping — group create/update/delete + add/remove require `products:write` (add-variant item also `variants:write`), reads require `products:read`. `unique(workspace_id, name)` dup → 409; duplicate membership (partial unique) → 409; item reference resolved in-workspace via `consistency.py` → 422/404 on cross-ws/nonexistent; DELETE returns `{id, outcome}`. (FR-009, FR-013, FR-014, FR-016, FR-017)
+- [X] T034 [US3] Register the product-groups router in `apps/api/app/main.py` under `/v1`. (FR-014)
 - [ ] T035 [P] [US3] ⏸ DEFERRED (needs live Postgres) Author `tests/integration/test_groups_live.py`: create group + add product/variant items; re-adding same item rejected (duplicate membership); remove item; all references workspace-local on a real DB. (SC-008)
 
 **Checkpoint**: Grouping functional (unit + schema level); live membership uniqueness deferred.
@@ -136,8 +136,8 @@ description: "Dependency-ordered task list for SPEC-04 Catalog — Products, Var
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T036 [P] Document the identity-less-product always-insert limitation (callers must supply external_id/sku to upsert) in the bulk-upsert schema/router docstrings in `apps/api/app/schemas/catalog.py` and `apps/api/app/routers/products.py`. (FR-011)
-- [ ] T037 Run the DB-independent validation from `specs/004-catalog-products-variants-groups/quickstart.md`: full `tests/unit` suite green + `scripts/check_workspace_scoping.py` exit 0 + `scripts/check_single_head.sh` single head + import-boundary green.
+- [X] T036 [P] Document the identity-less-product always-insert limitation (callers must supply external_id/sku to upsert) in the bulk-upsert schema/router docstrings in `apps/api/app/schemas/catalog.py` and `apps/api/app/routers/products.py`. (FR-011)
+- [X] T037 Run the DB-independent validation from `specs/004-catalog-products-variants-groups/quickstart.md`: full `tests/unit` suite green + `scripts/check_workspace_scoping.py` exit 0 + `scripts/check_single_head.sh` single head + import-boundary green.
 - [ ] T038 [P] ⏸ DEFERRED (needs live Postgres) Run the online migration on a Postgres host: `alembic upgrade head` creates the four tables + partial indexes + RLS; `alembic downgrade` reverses cleanly. (FR-001)
 - [ ] T039 [P] ⏸ DEFERRED (needs live Postgres) Execute the live-DB section of `specs/004-catalog-products-variants-groups/quickstart.md` (end-to-end request flows: scope refusal 403 / write 200, create→default-variant, bulk idempotency, group membership, cross-workspace + RLS denial). (SC-002, SC-004, SC-005, SC-008)
 

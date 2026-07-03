@@ -18,13 +18,18 @@ SPEC-04 US1 adds the `/v1/products` and `/v1/variants` routers
 (contracts/api-products.md, contracts/api-variants.md) — product/variant
 CRUD with the default-variant guarantee, on the same auth seam and
 FR-020 discipline.
+
+SPEC-04 US3 adds the `/v1/product-groups` router
+(contracts/api-product-groups.md) — named product/variant grouping,
+reusing the `products:write`/`variants:write` scopes (no new scope),
+same auth seam.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.routers import api_keys, auth, products, variants
+from app.routers import api_keys, auth, product_groups, products, variants
 
 app = FastAPI(title="crawmatic-api")
 
@@ -32,6 +37,7 @@ app.include_router(auth.router)
 app.include_router(api_keys.router)
 app.include_router(products.router)
 app.include_router(variants.router)
+app.include_router(product_groups.router)
 
 
 @app.get("/health")
