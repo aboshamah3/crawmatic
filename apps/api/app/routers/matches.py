@@ -17,8 +17,14 @@ would otherwise surface a raw `IntegrityError` (FR-006). `product_id` is
 never client-supplied; it is derived from the resolved variant's parent
 (research D4).
 
-Bulk-upsert (`POST /v1/matches/bulk-upsert`, US3) lands in a later phase
-of this feature and is intentionally absent here.
+Bulk-upsert (`POST /v1/matches/bulk-upsert`, US3, `contracts/matches-bulk-upsert.md`)
+is a set-based, idempotent upsert on the same 4-column arbiter: every
+row's URL is safety-validated + normalized (unsafe rows are reported in
+`rejected[]`, not aborting the rest of the batch, FR-013), variants and
+competitors are resolved/consistency-checked via bounded scoped lookups
+(never per-row), and the whole safe batch lands in exactly **one**
+`INSERT ... ON CONFLICT DO UPDATE` (`app_shared.matches.upsert`, SC-006)
+that never touches the health fields on re-push.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,6 +40,14 @@ from app_shared.catalog.consistency import (
     CrossWorkspaceReference,
     MissingReference,
     assert_refs_in_workspace,
+)
+from app_shared.matches.upsert import (
+    build_matches_upsert,
+    dedup_last_wins,
+    match_conflict_key,
+    prepare_match_urls,
+    resolve_match_variants,
+    variant_lookup_keys,
 )
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
@@ -45,6 +59,8 @@ from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 from app.deps import Principal, require_scopes
 from app.schemas.matches import (
     DeleteOutcome,
+    MatchBulkUpsertRequest,
+    MatchBulkUpsertResult,
     MatchCreate,
     MatchListResponse,
     MatchResponse,
@@ -211,6 +227,164 @@ def create_match(
         ) from exc
 
     return MatchResponse.model_validate(match)
+
+
+# --- bulk-upsert (US3, contracts/matches-bulk-upsert.md) --------------------
+
+
+def _resolve_variant_maps(
+    session: Session,
+    workspace_id: uuid.UUID,
+    external_ids: set[str],
+    skus: set[str],
+    variant_ids: set[uuid.UUID],
+) -> tuple[
+    dict[str, tuple[uuid.UUID, uuid.UUID]],
+    dict[str, tuple[uuid.UUID, uuid.UUID]],
+    dict[uuid.UUID, uuid.UUID],
+]:
+    """One scoped ``IN (...)`` variant lookup covering every identity kind
+    named by the batch (`contracts/matches-bulk-upsert.md` "Resolve variants").
+
+    Returns ``(by_external_id, by_sku, by_id)`` -- the first two map a
+    variant identity to ``(variant_id, product_id)``; ``by_id`` maps an
+    explicit ``product_variant_id`` to its parent ``product_id``. The
+    lookup is workspace-scoped (`scoped_select`), so a cross-workspace or
+    nonexistent identity simply yields no row -- `resolve_match_variants`
+    reports it as unresolved.
+    """
+    by_external_id: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
+    by_sku: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
+    by_id: dict[uuid.UUID, uuid.UUID] = {}
+    if not (external_ids or skus or variant_ids):
+        return by_external_id, by_sku, by_id
+
+    conditions = []
+    if external_ids:
+        conditions.append(ProductVariant.external_id.in_(external_ids))
+    if skus:
+        conditions.append(ProductVariant.sku.in_(skus))
+    if variant_ids:
+        conditions.append(ProductVariant.id.in_(variant_ids))
+
+    rows = (
+        session.execute(scoped_select(ProductVariant, workspace_id).where(or_(*conditions)))
+        .scalars()
+        .all()
+    )
+    for variant in rows:
+        if variant.external_id:
+            by_external_id[variant.external_id] = (variant.id, variant.product_id)
+        if variant.sku:
+            by_sku[variant.sku] = (variant.id, variant.product_id)
+        by_id[variant.id] = variant.product_id
+    return by_external_id, by_sku, by_id
+
+
+@router.post("/bulk-upsert", response_model=MatchBulkUpsertResult, status_code=200)
+def bulk_upsert_matches(
+    payload: MatchBulkUpsertRequest,
+    principal_ctx: tuple = Depends(require_scopes("matches:write")),
+) -> MatchBulkUpsertResult:
+    """Set-based bulk upsert (`contracts/matches-bulk-upsert.md`, FR-013, SC-006).
+
+    Flow, per the contract: `prepare_match_urls` (collect `rejected`) ->
+    `dedup_last_wins` (in-batch last-wins on the 4-col match key) ->
+    resolve variants via one scoped `IN (...)` lookup (unresolved -> a
+    single `422`) -> competitor consistency pre-check (one narrow
+    `IN (...)` lookup + `assert_refs_in_workspace`) ->
+    `build_matches_upsert` executed once. Never a per-row loop.
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    if not payload.matches:
+        return MatchBulkUpsertResult(upserted=0, matches=[], rejected=[])
+
+    row_dicts = [item.model_dump() for item in payload.matches]
+
+    safe, rejected = prepare_match_urls(row_dicts)
+    deduped = list(dedup_last_wins(safe, match_conflict_key))
+
+    external_ids, skus, variant_ids = variant_lookup_keys(deduped)
+    by_external_id, by_sku, by_id = _resolve_variant_maps(
+        session, ws, external_ids, skus, variant_ids
+    )
+    resolved, unresolved = resolve_match_variants(
+        deduped, by_external_id=by_external_id, by_sku=by_sku, by_id=by_id
+    )
+    if unresolved:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "UNRESOLVED_VARIANT",
+                    "message": (
+                        "One or more match rows reference a "
+                        "product_variant_id/variant_external_id/variant_sku "
+                        "that does not resolve to a variant in this workspace."
+                    ),
+                    "count": len(unresolved),
+                }
+            },
+        )
+
+    if resolved:
+        competitor_ids = {row["competitor_id"] for row in resolved}
+        resolved_competitors = _workspace_map(session, Competitor, list(competitor_ids))
+        try:
+            assert_refs_in_workspace(ws, competitor_ids, resolved_competitors)
+        except MissingReference as exc:
+            raise _not_found("Competitor not found.") from exc
+        except CrossWorkspaceReference as exc:
+            raise _workspace_mismatch(
+                "Competitor belongs to a different workspace."
+            ) from exc
+
+    if not resolved:
+        return MatchBulkUpsertResult(upserted=0, matches=[], rejected=rejected)
+
+    final_rows = [
+        {
+            "workspace_id": ws,
+            "product_id": row["product_id"],
+            "product_variant_id": row["product_variant_id"],
+            "competitor_id": row["competitor_id"],
+            "competitor_url": row["competitor_url"],
+            "normalized_competitor_url": row["normalized_competitor_url"],
+            "url_pattern": row["url_pattern"],
+            "url_pattern_version": row["url_pattern_version"],
+            "competitor_variant_identifier": row.get("competitor_variant_identifier"),
+            "competitor_variant_sku": row.get("competitor_variant_sku"),
+            "competitor_variant_options": row.get("competitor_variant_options"),
+            "external_title": row.get("external_title"),
+            "scrape_profile_id": row.get("scrape_profile_id"),
+            "access_policy_id": row.get("access_policy_id"),
+            "priority": row.get("priority") or "NORMAL",
+            "status": row.get("status") or "ACTIVE",
+        }
+        for row in resolved
+    ]
+
+    stmt = build_matches_upsert(final_rows).returning(CompetitorProductMatch.id)
+    match_ids = [row.id for row in session.execute(stmt).all()]
+    session.flush()
+
+    matches = (
+        session.execute(
+            scoped_select(CompetitorProductMatch, ws).where(
+                CompetitorProductMatch.id.in_(match_ids)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return MatchBulkUpsertResult(
+        upserted=len(matches),
+        matches=[MatchResponse.model_validate(m) for m in matches],
+        rejected=rejected,
+    )
 
 
 @router.get("", response_model=MatchListResponse)

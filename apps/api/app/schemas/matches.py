@@ -135,3 +135,83 @@ class MatchListResponse(BaseModel):
 
     items: list[MatchResponse]
     next_cursor: str | None
+
+
+# --- Bulk-upsert DTOs (US3, `contracts/matches-bulk-upsert.md`) -------------
+
+
+class MatchBulkUpsertItem(BaseModel):
+    """One record in `POST /v1/matches/bulk-upsert`.
+
+    Same field shape as `MatchCreate` — the variant is named by exactly
+    one of `product_variant_id`/`variant_external_id`/`variant_sku`
+    (resolved in-workspace by the router, one scoped lookup for the
+    whole batch); `competitor_id` + `competitor_url` are always
+    required. `competitor_url` is safety-validated + normalized per row
+    (FR-009/FR-013) — an unsafe URL is reported in the response's
+    `rejected[]`, not raised as an error, so it never aborts the rest of
+    the batch. Health fields are never client-settable (FR-017).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_variant_id: uuid.UUID | None = None
+    variant_external_id: str | None = None
+    variant_sku: str | None = None
+
+    competitor_id: uuid.UUID
+    competitor_url: str
+
+    competitor_variant_identifier: str | None = None
+    competitor_variant_sku: str | None = None
+    competitor_variant_options: dict[str, Any] | None = None
+    external_title: str | None = None
+    scrape_profile_id: uuid.UUID | None = None
+    access_policy_id: uuid.UUID | None = None
+    priority: MatchPriority = MatchPriority.NORMAL
+    status: MatchStatus = MatchStatus.ACTIVE
+
+    @model_validator(mode="after")
+    def _check_exactly_one_variant_ref(self) -> "MatchBulkUpsertItem":
+        supplied = [
+            self.product_variant_id is not None,
+            bool(self.variant_external_id),
+            bool(self.variant_sku),
+        ]
+        if sum(supplied) != 1:
+            raise ValueError(
+                "exactly one of product_variant_id/variant_external_id/"
+                "variant_sku must be supplied"
+            )
+        return self
+
+
+class MatchBulkUpsertRequest(BaseModel):
+    """`POST /v1/matches/bulk-upsert` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    matches: list[MatchBulkUpsertItem]
+
+
+class MatchRejectedItem(BaseModel):
+    """One entry in `MatchBulkUpsertResult.rejected` (FR-013 reject-and-report)."""
+
+    index: int
+    code: str
+    reason: str
+    url: str
+
+
+class MatchBulkUpsertResult(BaseModel):
+    """`POST /v1/matches/bulk-upsert` response.
+
+    `upserted` counts the safe rows actually written by the single
+    set-based `ON CONFLICT ... DO UPDATE` statement (SC-006); `rejected`
+    reports every unsafe-URL row by original batch index, never aborting
+    the rest of the batch (FR-013).
+    """
+
+    upserted: int
+    matches: list[MatchResponse]
+    rejected: list[MatchRejectedItem]
