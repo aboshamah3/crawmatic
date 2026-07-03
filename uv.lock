@@ -1023,6 +1023,7 @@ source = { editable = "libs/scrape-core" }
 dependencies = [
     { name = "app-shared" },
     { name = "parsel" },
+    { name = "scrapy" },
     { name = "twisted" },
 ]
 
@@ -1030,6 +1031,7 @@ dependencies = [
 requires-dist = [
     { name = "app-shared", editable = "libs/shared" },
     { name = "parsel", specifier = ">=1.11,<2" },
+    { name = "scrapy", specifier = ">=2.13,<3" },
     { name = "twisted", specifier = ">=24.3,<27" },
 ]
 

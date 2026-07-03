@@ -7,6 +7,7 @@ dependencies = [
     "app_shared",
     "parsel>=1.11,<2",
     "twisted>=24.3,<27",
+    "scrapy>=2.13,<3",
 ]
 
 [tool.uv.sources]

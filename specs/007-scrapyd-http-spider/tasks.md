@@ -93,16 +93,16 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 ### Implementation for User Story 2
 
-- [ ] T025 [P] [US2] Create `libs/scrape-core/scrape_core/safety/__init__.py` and `libs/scrape-core/scrape_core/safety/fetch.py` — `validate_resolved_target(url, *, resolver, allowlist=None)`: run the save-time `app_shared.url_safety.validate_competitor_url` (scheme allow-list, userinfo rejection, IP-literal deny), then resolve via the **injected** `resolver` and reject any unsafe resolved IP (reuse `_reject_ip`) unless explicitly allowlisted. Per contracts/fetch-url-safety.md.
-- [ ] T026 [P] [US2] Create `libs/scrape-core/scrape_core/safety/resolver.py` — `SafeResolver`, a Twisted resolver wrapper installed via the `DNS_RESOLVER` setting that resolves then **refuses to return an unsafe IP** (defeats DNS rebinding at connect time).
-- [ ] T027 [US2] Create `libs/scrape-core/scrape_core/safety/middleware.py` — `SsrfGuardMiddleware`: `process_request` re-checks scheme/userinfo before fetch; redirect handling re-validates **every** hop; a rejection short-circuits to a flagged failure item (no body download, `BLOCKED`). Depends on T025.
-- [ ] T028 [US2] Create `libs/scrape-core/scrape_core/robots.py` — `RobotsPolicyMiddleware`, a custom **per-request** downloader middleware resolving `robots_policy` (`RESPECT`/`REVIEW_REQUIRED`/`IGNORE_AFTER_APPROVAL`) from the loaded competitor config (never Scrapy's process-global `ROBOTSTXT_OBEY`); injectable robots fetcher for fixtures. Per contracts/robots-middleware.md.
-- [ ] T029 [US2] Extend `apps/scrapers/price_monitor/settings.py` — set `DNS_RESOLVER=scrape_core.safety.resolver.SafeResolver` and add `SsrfGuardMiddleware` + `RobotsPolicyMiddleware` to `DOWNLOADER_MIDDLEWARES`. Depends on T027, T028, T023.
+- [X] T025 [P] [US2] Create `libs/scrape-core/scrape_core/safety/__init__.py` and `libs/scrape-core/scrape_core/safety/fetch.py` — `validate_resolved_target(url, *, resolver, allowlist=None)`: run the save-time `app_shared.url_safety.validate_competitor_url` (scheme allow-list, userinfo rejection, IP-literal deny), then resolve via the **injected** `resolver` and reject any unsafe resolved IP (reuse `_reject_ip`) unless explicitly allowlisted. Per contracts/fetch-url-safety.md.
+- [X] T026 [P] [US2] Create `libs/scrape-core/scrape_core/safety/resolver.py` — `SafeResolver`, a Twisted resolver wrapper installed via the `DNS_RESOLVER` setting that resolves then **refuses to return an unsafe IP** (defeats DNS rebinding at connect time).
+- [X] T027 [US2] Create `libs/scrape-core/scrape_core/safety/middleware.py` — `SsrfGuardMiddleware`: `process_request` re-checks scheme/userinfo before fetch; redirect handling re-validates **every** hop; a rejection short-circuits to a flagged failure item (no body download, `BLOCKED`). Depends on T025.
+- [X] T028 [US2] Create `libs/scrape-core/scrape_core/robots.py` — `RobotsPolicyMiddleware`, a custom **per-request** downloader middleware resolving `robots_policy` (`RESPECT`/`REVIEW_REQUIRED`/`IGNORE_AFTER_APPROVAL`) from the loaded competitor config (never Scrapy's process-global `ROBOTSTXT_OBEY`); injectable robots fetcher for fixtures. Per contracts/robots-middleware.md.
+- [X] T029 [US2] Extend `apps/scrapers/price_monitor/settings.py` — set `DNS_RESOLVER=scrape_core.safety.resolver.SafeResolver` and add `SsrfGuardMiddleware` + `RobotsPolicyMiddleware` to `DOWNLOADER_MIDDLEWARES`. Depends on T027, T028, T023.
 
 ### Tests for User Story 2
 
-- [ ] T030 [P] [US2] Create `tests/unit/test_fetch_url_safety.py` — injected public IP accepted; private/loopback/link-local/unique-local/metadata resolved IP rejected; each redirect hop re-validated; scheme/userinfo rejected pre-fetch; production path (no allowlist) uses the real resolver seam.
-- [ ] T031 [P] [US2] Create `tests/unit/test_robots_middleware.py` — `RESPECT` skips a disallowed path (`BLOCKED`); `IGNORE_AFTER_APPROVAL` fetches; policy read per-request from config, not global.
+- [X] T030 [P] [US2] Create `tests/unit/test_fetch_url_safety.py` — injected public IP accepted; private/loopback/link-local/unique-local/metadata resolved IP rejected; each redirect hop re-validated; scheme/userinfo rejected pre-fetch; production path (no allowlist) uses the real resolver seam.
+- [X] T031 [P] [US2] Create `tests/unit/test_robots_middleware.py` — `RESPECT` skips a disallowed path (`BLOCKED`); `IGNORE_AFTER_APPROVAL` fetches; policy read per-request from config, not global.
 
 **Checkpoint**: Unsafe fetches are refused at connection time and per redirect hop; robots policy is per-competitor. US2 is independently testable.
 

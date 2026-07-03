@@ -84,12 +84,20 @@ def classify_http_status(status_code: int) -> ScrapeErrorCode | None:
 def classify_exception(exc: BaseException) -> ScrapeErrorCode:
     """Classify a fetch-time exception into a §34 error code.
 
-    Recognizes timeout and DNS-resolution failures by exception class
-    name (duck-typed/string-based deliberately, so this module never
-    needs to import Twisted/Scrapy exception types — pure stdlib, safe
-    to unit-test off-reactor with plain ``Exception`` subclasses).
-    Anything unrecognized maps to ``UNKNOWN_ERROR``.
+    Checks for an explicit ``error_code`` attribute first — the SSRF
+    guard (``scrape_core.safety.middleware.SsrfRejectedError``) and the
+    robots middleware (``scrape_core.robots.RobotsBlockedError``) both
+    set one so their rejection surfaces as ``BLOCKED`` without relying
+    on class-name sniffing. Otherwise recognizes timeout and
+    DNS-resolution failures by exception class name (duck-typed/
+    string-based deliberately, so this module never needs to import
+    Twisted/Scrapy exception types — pure stdlib, safe to unit-test
+    off-reactor with plain ``Exception`` subclasses). Anything
+    unrecognized maps to ``UNKNOWN_ERROR``.
     """
+    error_code = getattr(exc, "error_code", None)
+    if isinstance(error_code, ScrapeErrorCode):
+        return error_code
     name = type(exc).__name__.lower()
     if "timeout" in name:
         return ScrapeErrorCode.TIMEOUT
