@@ -175,7 +175,7 @@
     "08": {
       "title": "Jobs & Orchestration",
       "feature_directory": "specs/008-jobs-orchestration",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -184,8 +184,17 @@
         "tasks": "done",
         "analyze": "done",
         "implement": "done",
-        "converge": "in-progress"
-      }
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T044 run-match live e2e (seed→dispatch→schedule.json carries workspace_id/scrape_job_id/match_ids→status/results)",
+        "T045 run-variant live (one unique target per active match; zero-active→COMPLETED total_targets=0 no dispatch)",
+        "T046 counters/finalize live (aggregate GROUP BY; COMPLETED/PARTIAL_FAILED/FAILED; completed_at)",
+        "T047 cross-workspace isolation live (app scoping + RLS + composite-FK IntegrityError; no-context→0 rows)",
+        "T048 dispatch/Scrapyd live (authenticated schedule.json per batch; retried dispatch no double-run; node_url routing)"
+      ],
+      "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 5 integration tests authored + skip cleanly. DB/Redis/Scrapyd-independent logic fully unit-tested here (1026 unit passed; integration 3 passed/148 skipped/0 errors; scoping guard OK; single head a6b0234cd4ad). 53 tasks (added T052/T053 from analyze U1 remediation); converge found no gaps.",
+      "converge_result": "CONVERGED — no remaining work; tasks.md unchanged (no convergence phase appended)"
     }
   }
 }
