@@ -138,12 +138,12 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 ### Implementation for User Story 4
 
-- [ ] T038 [P] [US4] Create `libs/shared/app_shared/scrapyd/__init__.py` and `libs/shared/app_shared/scrapyd/client.py` — `ScrapydDispatchClient.schedule(project, spider, *, workspace_id, scrape_job_id, match_ids, mode, batch_index) -> jobid`: POST `schedule.json` with HTTP **basic auth** (`SCRAPYD_USERNAME`/`SCRAPYD_PASSWORD`, `SCRAPYD_HTTP_URLS`), args passed through unchanged; **idempotency** via stable `dispatch_key = f"dispatched:{scrape_job_id}:{batch_index}"` guarded by Redis `SET NX` (reuse `app_shared.redis_client`) — an existing key returns the persisted jobid without re-scheduling. No scrapy/twisted. Per contracts/scrapyd-dispatch.md.
-- [ ] T039 [US4] Create `apps/workers/app/workers/tasks_dispatch.py` — a thin Celery task `dispatch_generic_price_spider(workspace_id, scrape_job_id, match_ids, mode, batch_index)` delegating to `app_shared.scrapyd.client` (full scheduler/orchestration is a later spec). Depends on T038.
+- [X] T038 [P] [US4] Create `libs/shared/app_shared/scrapyd/__init__.py` and `libs/shared/app_shared/scrapyd/client.py` — `ScrapydDispatchClient.schedule(project, spider, *, workspace_id, scrape_job_id, match_ids, mode, batch_index) -> jobid`: POST `schedule.json` with HTTP **basic auth** (`SCRAPYD_USERNAME`/`SCRAPYD_PASSWORD`, `SCRAPYD_HTTP_URLS`), args passed through unchanged; **idempotency** via stable `dispatch_key = f"dispatched:{scrape_job_id}:{batch_index}"` guarded by Redis `SET NX` (reuse `app_shared.redis_client`) — an existing key returns the persisted jobid without re-scheduling. No scrapy/twisted. Per contracts/scrapyd-dispatch.md.
+- [X] T039 [US4] Create `apps/workers/app/workers/tasks_dispatch.py` — a thin Celery task `dispatch_generic_price_spider(workspace_id, scrape_job_id, match_ids, mode, batch_index)` delegating to `app_shared.scrapyd.client` (full scheduler/orchestration is a later spec). Depends on T038.
 
 ### Tests for User Story 4
 
-- [ ] T040 [P] [US4] Create `tests/unit/test_scrapyd_dispatch.py` — `schedule()` sends basic auth + args → jobid; missing/wrong creds → 401, no schedule; `SET NX` guard: second dispatch of the same key is a no-op (fake Redis).
+- [X] T040 [P] [US4] Create `tests/unit/test_scrapyd_dispatch.py` — `schedule()` sends basic auth + args → jobid; missing/wrong creds → 401, no schedule; `SET NX` guard: second dispatch of the same key is a no-op (fake Redis).
 
 **Checkpoint**: Authenticated, idempotent dispatch works. US4 is independently testable.
 
