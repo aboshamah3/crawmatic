@@ -29,6 +29,7 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from twisted.internet.defer import Deferred, fail as defer_fail, succeed
 from twisted.python.failure import Failure
 
@@ -39,6 +40,23 @@ from scrape_core.items import ScrapeResult
 from scrape_core.pipelines import BatchedPersistencePipeline, _flush_batch
 
 WORKSPACE_ID = uuid.uuid4()
+
+
+@pytest.fixture(autouse=True)
+def _stub_target_terminalization(monkeypatch: Any) -> None:
+    """Stub out the SPEC-08 T052 `mark_target`/`enqueue` seam here.
+
+    This file's job is `_flush_batch`'s SPEC-07 persistence behavior
+    (observations/attempts/current-price upsert) — the seeded
+    `ScrapeResult`s in this file carry a real `scrape_job_id` but no real
+    `scrape_job_targets` row exists behind the `_FakeSession`, so
+    `mark_target`'s real `session.execute(...).scalar_one_or_none()`
+    would blow up against the recording fake. The target-terminalization
+    behavior itself is exercised in
+    `tests/unit/test_pipeline_target_terminalization.py` (T053).
+    """
+    monkeypatch.setattr(pipelines_mod, "mark_target", lambda *a, **k: None)
+    monkeypatch.setattr(pipelines_mod, "enqueue", lambda *a, **k: None)
 
 
 def _make_result(

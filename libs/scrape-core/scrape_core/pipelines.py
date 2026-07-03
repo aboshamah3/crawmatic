@@ -8,6 +8,21 @@ routes through the single reactor-safe DB seam
 (:mod:`scrape_core.db`, ``run_in_thread`` + ``workspace_txn``); no DB
 call ever runs on the reactor thread (Principle V, US5).
 
+SPEC-08 T052 (FR-017/018/019, SC-007, ``contracts/lifecycle-counters.md``)
+wires this pipeline into the jobs-orchestration result path: every item
+that carries a non-null ``scrape_job_id`` also terminalizes its
+``scrape_job_targets`` row (COMPLETED on success, FAILED with
+``error_code`` otherwise) via ``app_shared.jobs.targets.mark_target``,
+in the SAME ``workspace_txn`` transaction as the observation/attempt
+writes — no extra reactor hop, no second ``run_in_thread``. Once that
+transaction commits, ``_flush_batch`` enqueues ``SCRAPE_FINALIZE_JOBS``
+(``app_shared.messaging.enqueue``, queue ``maintenance``) once per
+distinct affected ``scrape_job_id`` so ``finalize_jobs`` resolves
+counters/status event-driven, without depending on the SPEC-13 beat.
+This keeps ``scrape-core`` import-clean: only ``app_shared.jobs.targets``
++ ``app_shared.messaging`` are added, neither of which imports fastapi/
+apps.workers/scrapy/twisted/playwright.
+
 US5 hardening (T041) — this module has exactly **one** call site for
 ``run_in_thread`` (:func:`BatchedPersistencePipeline._flush`), and all
 three flush triggers route through it, never a direct/synchronous DB
@@ -52,8 +67,12 @@ from twisted.python.failure import Failure
 
 from app_shared.catalog.upsert import dedup_last_wins
 from app_shared.config import get_settings
+from app_shared.enums import ScrapeTargetStatus
 from app_shared.ids import new_uuid7
+from app_shared.jobs.targets import mark_target
+from app_shared.messaging import enqueue
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.task_names import SCRAPE_FINALIZE_JOBS
 
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.items import ScrapeResult
@@ -95,6 +114,15 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     **successful** items only — a failure/rejected item is simply absent
     from that insert, so ``ON CONFLICT`` never fires for it and the
     current price is never overwritten with a bad value (FR-014).
+
+    SPEC-08 T052: for every item that carries a non-null
+    ``scrape_job_id``, also terminalizes its ``scrape_job_targets`` row
+    (COMPLETED on ``item.success``, else FAILED with ``item.error_code``)
+    via ``mark_target`` — in this SAME transaction, no second
+    ``run_in_thread``/reactor hop. Once the transaction commits, enqueues
+    ``SCRAPE_FINALIZE_JOBS`` (``maintenance`` queue) exactly once per
+    distinct affected ``scrape_job_id`` in the batch, so counters/status
+    finalize event-driven (FR-017/018/019, SC-007).
     """
     observations: list[PriceObservation] = []
     attempts: list[RequestAttempt] = []
@@ -167,6 +195,8 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 }
             )
 
+    affected_job_ids: dict[Any, None] = {}  # insertion-ordered de-dup set
+
     with workspace_txn(workspace_id) as session:
         session.add_all(observations)
         session.add_all(attempts)
@@ -185,6 +215,29 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 index_elements=["workspace_id", "match_id"], set_=set_
             )
             session.execute(stmt)
+
+        # T052: terminalize each item's target in this SAME transaction --
+        # no second run_in_thread/reactor hop. An item with no
+        # scrape_job_id (e.g. a non-orchestrated/ad-hoc scrape) marks
+        # nothing.
+        for item in batch:
+            if item.scrape_job_id is None:
+                continue
+            mark_target(
+                session,
+                workspace_id=item.workspace_id,
+                scrape_job_id=item.scrape_job_id,
+                match_id=item.match_id,
+                status=ScrapeTargetStatus.COMPLETED if item.success else ScrapeTargetStatus.FAILED,
+                error_code=None if item.success else item.error_code,
+            )
+            affected_job_ids[item.scrape_job_id] = None
+
+    # Only after the transaction above has committed cleanly -- enqueue one
+    # SCRAPE_FINALIZE_JOBS per distinct affected job so finalize_jobs()
+    # never races the target rows it is about to aggregate.
+    for job_id in affected_job_ids:
+        enqueue(SCRAPE_FINALIZE_JOBS, queue="maintenance")
 
 
 class BatchedPersistencePipeline:

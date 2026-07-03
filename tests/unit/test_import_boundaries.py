@@ -1,28 +1,37 @@
 """Import-boundary tests for the shared-library dependency direction (T043,
-T045, T050).
+T045, T050, SPEC-08 T049).
 
 Enforces FR-003 / data-model.md "Entity: Shared Library Member":
 
 * ``app_shared`` (and its submodules ``config``/``database``/``task_names``/
   ``ids``/``money``/``enums``/``models``/``models.base``/``models.rls``/
   ``models.identity``/``models.catalog``/``models.competitors_matches``/
-  ``models.scrape_profiles``/``models.observations``/``pagination``/
-  ``catalog``/``repository``/``security``/``url_safety``/``url_pattern``/
-  ``matches``/``matches.upsert``/``profiles``/``profiles.validation``/
-  ``profiles.confidence``/``profiles.resolution``/``profiles.repository``/
-  ``profiles.upsert``/``scrapyd``/``scrapyd.client``, plus the SPEC-03
-  ``security`` primitives, the SPEC-04 catalog core, the SPEC-05
-  competitors/matches core, the SPEC-06 scrape-profiles core, and the
-  SPEC-07 observations models + Scrapyd dispatch client as they land)
-  MUST NOT pull in Scrapy/Twisted/Playwright — those belong only to the
-  Scrapyd-side app members (``scrapers``, ``scrapers-browser``) and their
-  shared ``scrape_core`` library. ``app_shared`` also MUST NOT pull in
-  FastAPI (framework-agnostic; the FastAPI dependency + routers live only
-  in ``apps/api``).
+  ``models.scrape_profiles``/``models.observations``/``models.jobs``/
+  ``pagination``/``catalog``/``repository``/``security``/``url_safety``/
+  ``url_pattern``/``matches``/``matches.upsert``/``profiles``/
+  ``profiles.validation``/``profiles.confidence``/``profiles.resolution``/
+  ``profiles.repository``/``profiles.upsert``/``scrapyd``/
+  ``scrapyd.client``/``messaging``/``jobs``/``jobs.batching``/
+  ``jobs.nodes``/``jobs.lifecycle``/``jobs.targets``/``jobs.service``,
+  plus the SPEC-03 ``security`` primitives, the SPEC-04 catalog core, the
+  SPEC-05 competitors/matches core, the SPEC-06 scrape-profiles core, the
+  SPEC-07 observations models + Scrapyd dispatch client, and the SPEC-08
+  jobs/orchestration core + messaging seam as they land) MUST NOT pull in
+  Scrapy/Twisted/Playwright — those belong only to the Scrapyd-side app
+  members (``scrapers``, ``scrapers-browser``) and their shared
+  ``scrape_core`` library. ``app_shared`` also MUST NOT pull in FastAPI
+  (framework-agnostic; the FastAPI dependency + routers live only in
+  ``apps/api``). ``app_shared.messaging`` is the one seam allowed to pull
+  in ``celery`` (the ban is scrapy/twisted/playwright/fastapi only).
 * ``app_shared`` MUST NOT depend on ``scrape_core`` — the dependency edge
   runs one way: ``scrape_core`` may import ``app_shared`` (and, unlike
   ``app_shared``, scrape_core MAY import Scrapy/Twisted — that's the
   scraping runtime it wraps), never the reverse.
+* ``apps/api/app/routers/jobs.py`` (SPEC-08) imports
+  ``app_shared.jobs.service``/``app_shared.messaging`` to create jobs and
+  enqueue dispatch work, but MUST NOT import ``apps.workers`` — the API
+  never pulls in the worker's (and its future scrapy-adjacent) import
+  closure (Constitution I).
 
 Each check runs the import in a **fresh subprocess** (rather than just
 inspecting ``sys.modules`` in-process) so that whatever the current test
@@ -82,6 +91,14 @@ import app_shared.profiles.repository
 import app_shared.profiles.upsert
 import app_shared.scrapyd
 import app_shared.scrapyd.client
+import app_shared.models.jobs
+import app_shared.messaging
+import app_shared.jobs
+import app_shared.jobs.batching
+import app_shared.jobs.nodes
+import app_shared.jobs.lifecycle
+import app_shared.jobs.targets
+import app_shared.jobs.service
 
 forbidden = {FORBIDDEN_MODULES!r}
 leaked = sorted(mod for mod in forbidden if mod in sys.modules)
@@ -95,6 +112,41 @@ if "scrape_core" in sys.modules:
 
 sys.exit(0)
 """
+
+# SPEC-08 T049: the API jobs router imports the pure app_shared.jobs.service
+# + app_shared.messaging seams to create jobs / enqueue dispatch work, but
+# MUST NEVER import apps/workers (Constitution I — the API's import closure
+# must never pull in the worker's).
+_JOBS_ROUTER_IMPORT_CHECK = """
+import sys
+
+import app.routers.jobs as jobs_router
+import app_shared.jobs.service
+import app_shared.messaging
+
+leaked = sorted(
+    mod
+    for mod in sys.modules
+    if mod == "workers" or mod.startswith("workers.") or mod == "app.workers"
+    or mod.startswith("app.workers.")
+)
+if leaked:
+    print("LEAKED:" + ",".join(leaked))
+    sys.exit(1)
+
+sys.exit(0)
+"""
+
+_JOBS_ROUTER_ENV = {
+    "DATABASE_URL": "postgresql+psycopg://crawmatic:crawmatic@pgbouncer:6432/crawmatic",
+    "REDIS_URL": "redis://redis:6379/0",
+    "SCRAPYD_HTTP_URLS": "http://scrapers:6800",
+    "SCRAPYD_BROWSER_URLS": "http://scrapers-browser:6800",
+    "SCRAPYD_USERNAME": "scrapyd",
+    "SCRAPYD_PASSWORD": "change-me",
+    "JWT_SECRET": "test-jwt-secret",
+}
+
 
 # Light check on the allowed direction: scrape_core MAY import app_shared
 # without any conflict (no circular import, no boundary violation) even
@@ -200,6 +252,45 @@ def test_scrape_core_may_import_app_shared() -> None:
         "scrape_core failed to import, or did not pull in app_shared:\n"
         f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     )
+
+
+def test_jobs_router_never_imports_apps_workers() -> None:
+    """SPEC-08 T049: importing the jobs router never pulls in apps/workers."""
+    import os
+
+    env = {**os.environ, **_JOBS_ROUTER_ENV}
+    result = subprocess.run(
+        [sys.executable, "-c", _JOBS_ROUTER_IMPORT_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=str(pathlib.Path(__file__).resolve().parents[2]),
+    )
+    assert result.returncode == 0, (
+        "app.routers.jobs pulled in apps/workers:\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+
+    # Static check: the router source never references apps.workers/
+    # app.workers at all, so the boundary can't be reintroduced later via a
+    # lazy/deferred import the runtime check wouldn't catch.
+    router_path = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "apps"
+        / "api"
+        / "app"
+        / "routers"
+        / "jobs.py"
+    )
+    contents = router_path.read_text(encoding="utf-8")
+    assert "apps.workers" not in contents and "app.workers" not in contents, (
+        f"{router_path} references apps/workers — forbidden dependency edge"
+    )
+    # Job creation (and, transitively through it, the app_shared.messaging
+    # enqueue-by-name seam) is delegated to app_shared.jobs.service -- the
+    # router itself never needs a direct app_shared.messaging import.
+    assert "app_shared.jobs.service" in contents
 
 
 def test_scrape_core_new_modules_import_cleanly_with_app_shared() -> None:
