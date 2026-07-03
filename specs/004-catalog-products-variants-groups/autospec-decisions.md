@@ -18,4 +18,18 @@ Master doc: `/srv/crawmatic/PROJECT_SPEC.md`
 
 ## clarify
 
+## plan (opus subagent)
+
+- [plan] Models → app_shared/models/catalog.py (Product/ProductVariant/ProductGroup/ProductGroupItem on WorkspaceScopedBase; group-item created_at-only). Enums ProductStatus/VariantStatus/GroupStatus (active/archived) in enums.py; no GroupItemStatus (§22 has none). Added all 4 to WORKSPACE_OWNED_MODELS (guard covers them).
+- [plan] Partial uniques + ON CONFLICT → partial unique Index(postgresql_where=... IS NOT NULL); bulk upsert targets each via pg_insert.on_conflict_do_update(index_elements, index_where matching predicate). Batch partitioned by identity kind → ≤3 statements/table (still set-based, VIII).
+- [plan] Default variant → pure derive_default_variant (title=product title, fallback "Default"; inherits sku/url/price/currency) + ensure_at_least_one.
+- [plan] Bulk upsert → set-based, identity order external_id→sku→(product_id,title), in-batch last-wins dedup, bounded statements, default-variant for zero-variant products; compile-to-SQL unit-testable.
+- [plan] Cursor pagination → opaque base64(json) keyset over (created_at,id), default 50/cap 500, app_shared/pagination.py (framework-agnostic).
+- [plan] FK workspace-consistency → composite FKs (workspace_id, ref_id)→parent(workspace_id, id) (parents get unique(workspace_id, id)) — structural — plus pure app pre-check for clean 404/422.
+- [plan] Schemas → apps/api/app/schemas/catalog.py (keeps app_shared FastAPI-free); pure core takes/returns dicts.
+- [plan] Migration → one revision, down_revision=55da7d6d939d (current head), RLS on all 4 tables in creating migration, single head; offline render.
+- [plan] Constitution Check → PASS (all 8; II/III/VII/VIII satisfied). Artifacts: plan.md, research.md (D1-D10), data-model.md, quickstart.md, contracts/{api-products,api-variants,api-product-groups,models-catalog,catalog-bulk-upsert,default-variant,pagination,workspace-consistency,migration-catalog}.md.
+
+## clarify
+
 Run doc-first INLINE (context conservation — identical no-op doc-first pattern as SPEC-01/02/03; SPEC-04 doc coverage equally complete). No questions to user. Doc-resolved clarifications recorded in spec.md `## Clarifications` (Session 2026-07-03): workspace-owned/RLS on all 4 tables; default-variant behavior (title=plan-level); set-based bulk upsert + identity order + last-wins (partial-unique ON CONFLICT=plan-level); NUMERIC(18,4)+3-letter currency; archive-by-status deletion; cursor pagination 50/500 (encoding=plan-level); scope-gating products/variants read/write (group items reuse write scopes); FK workspace-consistency in app layer; live items deferred. Requirements checklist re-validated: 16/16 still pass.
