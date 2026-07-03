@@ -28,13 +28,21 @@ SPEC-05 US1 adds the `/v1/competitors` router
 (contracts/api-competitors.md) — competitor CRUD with domain uniqueness
 per workspace, on the same auth seam and FR-020 discipline, gated by the
 existing `competitors:read`/`competitors:write` scopes (no new scope).
+
+SPEC-05 US2 adds the `/v1/matches` router (contracts/api-matches.md) —
+single-record match CRUD with save-time URL-safety validation
+(`app_shared.url_safety`) and versioned URL normalization/pattern
+derivation (`app_shared.url_pattern`), on the same auth seam and FR-020
+discipline, gated by the existing `matches:read`/`matches:write` scopes
+(no new scope). `POST /v1/matches/bulk-upsert` (US3) lands in a later
+phase of this feature.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.routers import api_keys, auth, competitors, product_groups, products, variants
+from app.routers import api_keys, auth, competitors, matches, product_groups, products, variants
 
 app = FastAPI(title="crawmatic-api")
 
@@ -44,6 +52,7 @@ app.include_router(products.router)
 app.include_router(variants.router)
 app.include_router(product_groups.router)
 app.include_router(competitors.router)
+app.include_router(matches.router)
 
 
 @app.get("/health")
