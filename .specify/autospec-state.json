@@ -203,7 +203,8 @@
       "steps": {
         "specify": "done",
         "clarify": "done",
-        "plan": "in-progress"
+        "plan": "done",
+        "checklist": "in-progress"
       }
     }
   }
