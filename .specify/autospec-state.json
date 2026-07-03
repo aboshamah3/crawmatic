@@ -147,6 +147,14 @@
         "T048 live-DB/Redis e2e quickstart"
       ],
       "deferred_reason": "require a live Postgres/Redis (no container engine in build env); artifacts authored + skip cleanly; DB/Redis-independent logic fully unit-tested here (745 passed; integration 3 passed/120 skipped/0 errors; scoping guard OK; single head a4f205e8d7de)"
+    },
+    "07": {
+      "title": "Scrapyd HTTP Spider MVP",
+      "feature_directory": "specs/007-scrapyd-http-spider",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
