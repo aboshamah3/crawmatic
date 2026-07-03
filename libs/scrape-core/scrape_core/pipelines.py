@@ -23,6 +23,19 @@ This keeps ``scrape-core`` import-clean: only ``app_shared.jobs.targets``
 + ``app_shared.messaging`` are added, neither of which imports fastapi/
 apps.workers/scrapy/twisted/playwright.
 
+SPEC-09 US3 T029 (FR-012/015, SC-007, ``contracts/recompute-triggers.md``
+trigger (a)) adds, after that same commit, one ``PRICE_ANALYSIS_RECOMPUTE``
+enqueue per distinct affected ``(workspace_id, scrape_job_id,
+product_variant_id)`` in the batch. For items carrying a non-null
+``scrape_job_id`` a Redis ``SET NX`` key
+(``analysis:enqueued:{scrape_job_id}:{product_variant_id}``, TTL
+``Settings.PRICE_ANALYSIS_DEDUP_TTL_SECONDS``) is claimed first so many
+completed matches of one variant within one job collapse to a single
+recompute; ad-hoc items with no ``scrape_job_id`` enqueue directly, no
+dedup key. This adds only ``app_shared.redis_client`` (already used
+elsewhere in ``app_shared``) to the import closure — still no fastapi/
+apps.workers.
+
 US5 hardening (T041) — this module has exactly **one** call site for
 ``run_in_thread`` (:func:`BatchedPersistencePipeline._flush`), and all
 three flush triggers route through it, never a direct/synchronous DB
@@ -41,11 +54,13 @@ call on the reactor thread:
    partial buffer and awaits every in-flight ``Deferred`` (including
    this one) before the spider actually closes.
 
-There is no ``time.sleep``, no direct/synchronous ``session.commit()``,
-and no blocking Redis call anywhere in this pipeline — the batch build
-in :func:`_flush_batch` is pure Python + SQLAlchemy object construction
-that only touches the database once it is already running inside the
-``run_in_thread`` thread-pool thread. ``_flush`` also swaps
+There is no ``time.sleep`` and no direct/synchronous ``session.commit()``
+anywhere on the reactor thread — the batch build in :func:`_flush_batch`
+is pure Python + SQLAlchemy object construction that only touches the
+database (and, post-commit, Redis/the Celery producer for the
+``SCRAPE_FINALIZE_JOBS``/``PRICE_ANALYSIS_RECOMPUTE`` enqueues) once it is
+already running inside the ``run_in_thread`` thread-pool thread, never on
+the reactor thread itself. ``_flush`` also swaps
 ``self._buffer`` for a fresh list *before* dispatching the batch, so
 the buffer is emptied immediately regardless of whether that flush
 later succeeds or fails (see :func:`_flush`'s docstring and
@@ -72,7 +87,8 @@ from app_shared.ids import new_uuid7
 from app_shared.jobs.targets import mark_target
 from app_shared.messaging import enqueue
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
-from app_shared.task_names import SCRAPE_FINALIZE_JOBS
+from app_shared.redis_client import get_redis_client
+from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE, SCRAPE_FINALIZE_JOBS
 
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.items import ScrapeResult
@@ -238,6 +254,38 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     # never races the target rows it is about to aggregate.
     for job_id in affected_job_ids:
         enqueue(SCRAPE_FINALIZE_JOBS, queue="maintenance")
+
+    # SPEC-09 US3 T029 (contracts/recompute-triggers.md trigger (a)): also
+    # after the same commit, enqueue one PRICE_ANALYSIS_RECOMPUTE per
+    # distinct affected (workspace_id, scrape_job_id, product_variant_id)
+    # in the batch. For items that belong to a job, claim a Redis SET NX
+    # dedup key first so many completed matches of one variant within one
+    # job collapse to a single recompute (SC-007) -- a contention reducer,
+    # not a correctness guard, since recompute_variant is idempotent.
+    # Ad-hoc items with no scrape_job_id enqueue directly, no dedup key.
+    dedup_ttl = get_settings().PRICE_ANALYSIS_DEDUP_TTL_SECONDS
+    seen_variant_jobs: set[tuple[Any, Any, Any]] = set()
+    for item in batch:
+        key = (item.workspace_id, item.scrape_job_id, item.product_variant_id)
+        if key in seen_variant_jobs:
+            continue
+        seen_variant_jobs.add(key)
+
+        if item.scrape_job_id is not None:
+            redis_key = f"analysis:enqueued:{item.scrape_job_id}:{item.product_variant_id}"
+            if not get_redis_client().set(redis_key, "1", nx=True, ex=dedup_ttl):
+                continue  # another completed match of this variant already enqueued this job
+
+        enqueue(
+            PRICE_ANALYSIS_RECOMPUTE,
+            queue="price_analysis",
+            kwargs={
+                "workspace_id": str(item.workspace_id),
+                "product_variant_id": str(item.product_variant_id),
+                "product_id": str(item.product_id),
+                "scrape_job_id": None if item.scrape_job_id is None else str(item.scrape_job_id),
+            },
+        )
 
 
 class BatchedPersistencePipeline:

@@ -206,16 +206,13 @@ class FakeAlertsSession:
                 setattr(row, field, value)
         return _FakeExecResult(matched)
 
-    def _execute_upsert(self, stmt: Insert) -> _FakeExecResult:
-        model = self._model_for_table(stmt.table)
-        rows = self._rows.setdefault(model, [])
-
-        insert_values = {
-            col.name: (bind.value if hasattr(bind, "value") else bind)
-            for col, bind in stmt._values.items()
-        }
-
-        conflict = stmt._post_values_clause
+    def _upsert_one_row(
+        self,
+        model: type,
+        rows: list[Any],
+        insert_values: dict[str, Any],
+        conflict: Any,
+    ) -> Any:
         key_fields = list(conflict.inferred_target_elements) if conflict is not None else []
 
         existing = None
@@ -239,9 +236,39 @@ class FakeAlertsSession:
             if hasattr(obj, "updated_at") and getattr(obj, "updated_at", None) is None:
                 obj.updated_at = now
             rows.append(obj)
-            return _FakeExecResult([obj])
+            return obj
 
         if conflict is not None:
             for col_name, raw_value in conflict.update_values_to_set:
                 setattr(existing, col_name, _resolve_set_value(raw_value, insert_values))
-        return _FakeExecResult([existing])
+        return existing
+
+    def _execute_upsert(self, stmt: Insert) -> _FakeExecResult:
+        model = self._model_for_table(stmt.table)
+        rows = self._rows.setdefault(model, [])
+        conflict = stmt._post_values_clause
+
+        # Single-row `.values({...})` -> `stmt._values` (a dict of
+        # Column -> BindParameter). Multi-row `.values([{...}, {...}])`
+        # (e.g. `app_shared.catalog.upsert.build_variants_upsert`, always
+        # called with a list even for one row) -> `stmt._values` is
+        # `None` and `stmt._multi_values` holds a one-tuple wrapping the
+        # list of per-row dicts of Column -> raw value (no
+        # `BindParameter` wrapping in that shape).
+        if stmt._values is not None:
+            insert_values = {
+                col.name: (bind.value if hasattr(bind, "value") else bind)
+                for col, bind in stmt._values.items()
+            }
+            obj = self._upsert_one_row(model, rows, insert_values, conflict)
+            return _FakeExecResult([obj])
+
+        row_dicts = stmt._multi_values[0] if stmt._multi_values else []
+        results = []
+        for row_dict in row_dicts:
+            insert_values = {
+                col.name: (bind.value if hasattr(bind, "value") else bind)
+                for col, bind in row_dict.items()
+            }
+            results.append(self._upsert_one_row(model, rows, insert_values, conflict))
+        return _FakeExecResult(results)

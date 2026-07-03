@@ -110,6 +110,12 @@ class FakeOrmSession:
         self.added.append(obj)
         self._rows.setdefault(type(obj), []).append(obj)
 
+    def delete(self, obj: Any) -> None:
+        self.deleted.append(obj)
+        rows = self._rows.get(type(obj))
+        if rows is not None and obj in rows:
+            rows.remove(obj)
+
     def flush(self) -> None:
         self.flush_count += 1
         for obj in self.added:

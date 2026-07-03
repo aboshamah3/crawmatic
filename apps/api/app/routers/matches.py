@@ -49,6 +49,7 @@ from app_shared.catalog.consistency import (
     MissingReference,
     assert_refs_in_workspace,
 )
+from app_shared.enums import MatchStatus
 from app_shared.matches.upsert import (
     build_matches_upsert,
     dedup_last_wins,
@@ -57,11 +58,13 @@ from app_shared.matches.upsert import (
     resolve_match_variants,
     variant_lookup_keys,
 )
+from app_shared.messaging import enqueue
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.profiles.repository import assert_profile_assignable, profile_visibility_map
 from app_shared.repository import scoped_get, scoped_select
+from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 from app_shared.url_pattern import derive_match_url_fields
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
@@ -105,6 +108,25 @@ def _unsafe_url(exc: UnsafeUrlError) -> HTTPException:
 def _duplicate_match(message: str) -> HTTPException:
     return HTTPException(
         status_code=409, detail={"error": {"code": "DUPLICATE_MATCH", "message": message}}
+    )
+
+
+def _enqueue_price_analysis_recompute(
+    *, workspace_id: uuid.UUID, product_variant_id: uuid.UUID, product_id: uuid.UUID
+) -> None:
+    """Trigger (c), `contracts/recompute-triggers.md` — the comparable set
+    changed (a match archived/paused), so the variant's benchmarks/alert
+    must be recomputed without waiting for a scrape. `scrape_job_id=None`
+    (no job context); enqueue by name only, never `apps/workers`."""
+    enqueue(
+        PRICE_ANALYSIS_RECOMPUTE,
+        queue="price_analysis",
+        kwargs={
+            "workspace_id": str(workspace_id),
+            "product_variant_id": str(product_variant_id),
+            "product_id": str(product_id),
+            "scrape_job_id": None,
+        },
     )
 
 
@@ -502,6 +524,7 @@ def update_match(
     if match is None:
         raise _not_found("Match not found.")
 
+    prior_status = match.status
     updates = payload.model_dump(exclude_unset=True)
 
     if "competitor_url" in updates:
@@ -536,6 +559,24 @@ def update_match(
             "normalized_competitor_url))."
         ) from exc
 
+    # SPEC-09 US3 T031 (FR-015, contracts/recompute-triggers.md trigger
+    # (c)): the match transitioned into an archived/paused (non-active)
+    # status -- the comparable set changed, so recompute the variant's
+    # benchmarks/alert without waiting for a scrape. A status PATCH that
+    # doesn't change the effective status (e.g. re-PATCHing the same
+    # non-active status, or any transition that stays ACTIVE) enqueues
+    # nothing.
+    if (
+        "status" in updates
+        and match.status != prior_status
+        and match.status != MatchStatus.ACTIVE
+    ):
+        _enqueue_price_analysis_recompute(
+            workspace_id=principal.workspace_id,
+            product_variant_id=match.product_variant_id,
+            product_id=match.product_id,
+        )
+
     return MatchResponse.model_validate(match)
 
 
@@ -551,11 +592,22 @@ def delete_match(
     if match is None:
         raise _not_found("Match not found.")
 
+    variant_id = match.product_variant_id
+    product_id = match.product_id
+
     # No dependent history exists in this spec (observations/attempts are
     # SPEC-07+) -> hard delete (FR-016). Structured so a future
     # archive-by-status path only needs to swap the branch below for
     # `match.status = MatchStatus.ARCHIVED`.
     session.delete(match)
     session.flush()
+
+    # SPEC-09 US3 T031 (contracts/recompute-triggers.md trigger (c)): this
+    # endpoint is this router's archive path -- deleting a match changes
+    # the variant's comparable set, so recompute without waiting for a
+    # scrape.
+    _enqueue_price_analysis_recompute(
+        workspace_id=principal.workspace_id, product_variant_id=variant_id, product_id=product_id
+    )
 
     return DeleteOutcome(id=match_id, outcome="hard_deleted")

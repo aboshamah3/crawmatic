@@ -42,9 +42,33 @@ from scrape_core.pipelines import BatchedPersistencePipeline, _flush_batch
 WORKSPACE_ID = uuid.uuid4()
 
 
+class _FakeSettings:
+    """Stand-in for `app_shared.config.Settings` -- just the one field
+    `_flush_batch` reads for the SPEC-09 T029 recompute-dedup trigger, no
+    real env/pydantic validation."""
+
+    PRICE_ANALYSIS_DEDUP_TTL_SECONDS = 21600
+
+
+class _FakeRedis:
+    """Minimal `redis.Redis`-shaped fake honoring `SET NX` (mirrors the
+    `FakeRedis` pattern in `test_jobs_dispatch_task.py`)."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    def set(self, name: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
+        if nx and name in self.store:
+            return None
+        self.store[name] = value
+        return True
+
+
 @pytest.fixture(autouse=True)
 def _stub_target_terminalization(monkeypatch: Any) -> None:
-    """Stub out the SPEC-08 T052 `mark_target`/`enqueue` seam here.
+    """Stub out the SPEC-08 T052 `mark_target`/`enqueue` seam here, and the
+    SPEC-09 T029 `get_settings`/`get_redis_client` seam `_flush_batch` also
+    reads unconditionally now.
 
     This file's job is `_flush_batch`'s SPEC-07 persistence behavior
     (observations/attempts/current-price upsert) — the seeded
@@ -53,10 +77,14 @@ def _stub_target_terminalization(monkeypatch: Any) -> None:
     `mark_target`'s real `session.execute(...).scalar_one_or_none()`
     would blow up against the recording fake. The target-terminalization
     behavior itself is exercised in
-    `tests/unit/test_pipeline_target_terminalization.py` (T053).
+    `tests/unit/test_pipeline_target_terminalization.py` (T053), and the
+    recompute-trigger behavior in `test_recompute_triggers_pipeline.py`
+    (SPEC-09 T032).
     """
     monkeypatch.setattr(pipelines_mod, "mark_target", lambda *a, **k: None)
     monkeypatch.setattr(pipelines_mod, "enqueue", lambda *a, **k: None)
+    monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
+    monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: _FakeRedis())
 
 
 def _make_result(

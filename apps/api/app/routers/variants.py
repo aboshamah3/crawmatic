@@ -21,10 +21,12 @@ from app_shared.catalog.consistency import (
     assert_refs_in_workspace,
 )
 from app_shared.catalog.upsert import plan_upsert
+from app_shared.messaging import enqueue
 from app_shared.models.alerts import VariantPriceState
 from app_shared.models.catalog import Product, ProductVariant
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
+from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 
 from app.deps import Principal, require_scopes
 from app.schemas.alerts import PriceComparisonResponse
@@ -37,6 +39,28 @@ from app.schemas.catalog import (
 )
 
 router = APIRouter(prefix="/v1/variants", tags=["variants"])
+
+
+def _enqueue_price_analysis_recompute(
+    *, workspace_id: uuid.UUID, product_variant_id: uuid.UUID, product_id: uuid.UUID
+) -> None:
+    """Trigger (b), `contracts/recompute-triggers.md` — enqueue by name only.
+
+    `scrape_job_id=None`: this fires outside any scrape job (a direct
+    client price/currency change), so there is no per-job dedup key
+    (D7). Never imports `apps/workers` — the seam is
+    `app_shared.messaging.enqueue` (Constitution I).
+    """
+    enqueue(
+        PRICE_ANALYSIS_RECOMPUTE,
+        queue="price_analysis",
+        kwargs={
+            "workspace_id": str(workspace_id),
+            "product_variant_id": str(product_variant_id),
+            "product_id": str(product_id),
+            "scrape_job_id": None,
+        },
+    )
 
 
 @router.get("", response_model=VariantListResponse)
@@ -164,6 +188,7 @@ def update_variant(
     # "price" (schema/API name) maps to the "current_price" ORM column.
     if "price" in updates:
         updates["current_price"] = updates.pop("price")
+    price_or_currency_changed = "current_price" in updates or "currency" in updates
     for field, value in updates.items():
         setattr(variant, field, value)
 
@@ -183,6 +208,17 @@ def update_variant(
                 }
             },
         ) from exc
+
+    # SPEC-09 US3 T030 (FR-015/FR-016, contracts/recompute-triggers.md
+    # trigger (b)): a client price/currency change is reflected immediately
+    # -- no waiting for a scrape. A PATCH touching only other fields (e.g.
+    # `title`) enqueues nothing.
+    if price_or_currency_changed:
+        _enqueue_price_analysis_recompute(
+            workspace_id=principal.workspace_id,
+            product_variant_id=variant.id,
+            product_id=variant.product_id,
+        )
 
     return VariantResponse.model_validate(variant)
 
@@ -326,6 +362,18 @@ def bulk_upsert_variants(
         if variant_ids
         else []
     )
+
+    # SPEC-09 US3 T030 (contracts/recompute-triggers.md trigger (b)): every
+    # row in this bulk-upsert batch carries a `current_price`/`currency`
+    # (both required fields, see `variant_rows` above), so the simplest
+    # correct behavior is to enqueue once per upserted variant --
+    # idempotent + low volume (the contract explicitly allows this over
+    # diffing prior values).
+    for variant in variants:
+        _enqueue_price_analysis_recompute(
+            workspace_id=ws, product_variant_id=variant.id, product_id=variant.product_id
+        )
+
     return VariantBulkUpsertResult(
         upserted=len(variants), variants=[VariantResponse.model_validate(v) for v in variants]
     )

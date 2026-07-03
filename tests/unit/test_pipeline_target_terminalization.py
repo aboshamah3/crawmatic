@@ -12,6 +12,16 @@ plus the same `_FakeSession`/`_FakeWorkspaceTxn` pattern
 `tests/unit/test_persistence_batching.py` (SPEC-07) already uses for
 `_flush_batch` — no real DB, no real Celery/Redis, no running Twisted
 reactor.
+
+SPEC-09 US3 T029 also wires a `PRICE_ANALYSIS_RECOMPUTE` enqueue into the
+same post-commit continuation (`contracts/recompute-triggers.md` trigger
+(a); see `test_recompute_triggers_pipeline.py` for its dedicated
+coverage) -- `_install_fakes` here additionally stubs `get_settings`/
+`get_redis_client` so every `_flush_batch` call in this file (which now
+unconditionally reads `Settings.PRICE_ANALYSIS_DEDUP_TTL_SECONDS`) stays
+fully fake, and the few assertions below that inspect `enqueue.calls`
+are narrowed to `SCRAPE_FINALIZE_JOBS` so they remain about this file's
+own concern (target terminalization), not the new trigger.
 """
 
 from __future__ import annotations
@@ -141,22 +151,48 @@ class _RecordingEnqueue:
         self.calls.append({"name": name, "queue": queue, "kwargs": kwargs})
 
 
-def _install_fakes(monkeypatch: Any) -> tuple[_FakeSession, _FakeWorkspaceTxn, _RecordingMarkTarget, _RecordingEnqueue]:
+class _FakeSettings:
+    """Stand-in for `app_shared.config.Settings` -- just the one field
+    `_flush_batch` reads (SPEC-09 T029), no real env/pydantic validation."""
+
+    PRICE_ANALYSIS_DEDUP_TTL_SECONDS = 21600
+
+
+class _FakeRedis:
+    """Minimal `redis.Redis`-shaped fake honoring `SET NX` (mirrors the
+    `FakeRedis` pattern in `test_jobs_dispatch_task.py`/`test_jobs_stall_recovery.py`)."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    def set(self, name: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
+        if nx and name in self.store:
+            return None
+        self.store[name] = value
+        return True
+
+
+def _install_fakes(
+    monkeypatch: Any,
+) -> tuple[_FakeSession, _FakeWorkspaceTxn, _RecordingMarkTarget, _RecordingEnqueue, _FakeRedis]:
     session = _FakeSession()
     txn = _FakeWorkspaceTxn(session)
     mark_target = _RecordingMarkTarget()
     enqueue = _RecordingEnqueue()
+    fake_redis = _FakeRedis()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", txn)
     monkeypatch.setattr(pipelines_mod, "mark_target", mark_target)
     monkeypatch.setattr(pipelines_mod, "enqueue", enqueue)
-    return session, txn, mark_target, enqueue
+    monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
+    monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: fake_redis)
+    return session, txn, mark_target, enqueue, fake_redis
 
 
 # --- success -> COMPLETED; failure -> FAILED w/ error_code -------------------
 
 
 def test_successful_item_marks_its_target_completed(monkeypatch: Any) -> None:
-    session, _txn, mark_target, _enqueue = _install_fakes(monkeypatch)
+    session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
     job_id = uuid.uuid4()
     match_id = uuid.uuid4()
     item = _make_result(success=True, match_id=match_id, scrape_job_id=job_id)
@@ -176,7 +212,7 @@ def test_successful_item_marks_its_target_completed(monkeypatch: Any) -> None:
 
 
 def test_failed_item_marks_its_target_failed_with_error_code(monkeypatch: Any) -> None:
-    _session, _txn, mark_target, _enqueue = _install_fakes(monkeypatch)
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
     job_id = uuid.uuid4()
     match_id = uuid.uuid4()
     item = _make_result(
@@ -197,17 +233,21 @@ def test_failed_item_marks_its_target_failed_with_error_code(monkeypatch: Any) -
 
 
 def test_item_with_null_scrape_job_id_marks_nothing(monkeypatch: Any) -> None:
-    _session, _txn, mark_target, enqueue = _install_fakes(monkeypatch)
+    _session, _txn, mark_target, enqueue, _redis = _install_fakes(monkeypatch)
     item = _make_result(success=True, scrape_job_id=None)
 
     _flush_batch(WORKSPACE_ID, [item])
 
     assert mark_target.calls == []
-    assert enqueue.calls == []
+    # No scrape_job_id -> no SCRAPE_FINALIZE_JOBS (this file's own concern).
+    # SPEC-09 T029 still enqueues PRICE_ANALYSIS_RECOMPUTE directly for the
+    # ad-hoc item (no job -> no dedup key) -- see
+    # test_recompute_triggers_pipeline.py for that trigger's own coverage.
+    assert [c for c in enqueue.calls if c["name"] == SCRAPE_FINALIZE_JOBS] == []
 
 
 def test_mixed_batch_marks_only_items_with_a_scrape_job_id(monkeypatch: Any) -> None:
-    _session, _txn, mark_target, _enqueue = _install_fakes(monkeypatch)
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
     job_id = uuid.uuid4()
     with_job = _make_result(success=True, scrape_job_id=job_id)
     without_job = _make_result(success=True, scrape_job_id=None)
@@ -222,7 +262,7 @@ def test_mixed_batch_marks_only_items_with_a_scrape_job_id(monkeypatch: Any) -> 
 
 
 def test_target_marking_happens_inside_the_single_workspace_txn(monkeypatch: Any) -> None:
-    _session, txn, mark_target, _enqueue = _install_fakes(monkeypatch)
+    _session, txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
     item = _make_result(success=True)
 
     _flush_batch(WORKSPACE_ID, [item])
@@ -237,7 +277,7 @@ def test_target_marking_happens_inside_the_single_workspace_txn(monkeypatch: Any
 
 
 def test_one_finalize_enqueue_per_distinct_scrape_job_id(monkeypatch: Any) -> None:
-    _session, _txn, _mark_target, enqueue = _install_fakes(monkeypatch)
+    _session, _txn, _mark_target, enqueue, _redis = _install_fakes(monkeypatch)
     job_a = uuid.uuid4()
     job_b = uuid.uuid4()
     batch = [
@@ -248,16 +288,19 @@ def test_one_finalize_enqueue_per_distinct_scrape_job_id(monkeypatch: Any) -> No
 
     _flush_batch(WORKSPACE_ID, batch)
 
-    assert len(enqueue.calls) == 2
-    for call in enqueue.calls:
-        assert call["name"] == SCRAPE_FINALIZE_JOBS
+    finalize_calls = [c for c in enqueue.calls if c["name"] == SCRAPE_FINALIZE_JOBS]
+    assert len(finalize_calls) == 2
+    for call in finalize_calls:
         assert call["queue"] == "maintenance"
 
 
 def test_no_finalize_enqueue_when_no_item_carries_a_scrape_job_id(monkeypatch: Any) -> None:
-    _session, _txn, _mark_target, enqueue = _install_fakes(monkeypatch)
+    _session, _txn, _mark_target, enqueue, _redis = _install_fakes(monkeypatch)
     batch = [_make_result(success=True, scrape_job_id=None) for _ in range(3)]
 
     _flush_batch(WORKSPACE_ID, batch)
 
-    assert enqueue.calls == []
+    # No scrape_job_id anywhere in the batch -> no SCRAPE_FINALIZE_JOBS
+    # (this file's own concern; SPEC-09 T029's ad-hoc PRICE_ANALYSIS_RECOMPUTE
+    # enqueues are covered separately by test_recompute_triggers_pipeline.py).
+    assert [c for c in enqueue.calls if c["name"] == SCRAPE_FINALIZE_JOBS] == []
