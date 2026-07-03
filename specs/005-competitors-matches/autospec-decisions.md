@@ -27,3 +27,10 @@ Run doc-first INLINE (context conservation). No questions to user. Doc-resolved 
 - [plan] Q: Constraint naming under Postgres 63-byte cap? → A: explicit short `cpm`-prefixed constraint names on competitor_product_matches (mirrors product_group_items precedent) (source: plan-level).
 - [plan] Q: Reuse vs new code? → A: reuse WorkspaceScopedBase, emit_rls_policy, enum_column, WORKSPACE_OWNED_MODELS/scoped_select/scoped_get, SPEC-04 keyset pagination, catalog.upsert.dedup_last_wins, catalog.consistency.assert_refs_in_workspace, existing Scope.COMPETITORS_*/MATCHES_*, AST CI guard. New pure app_shared modules: url_safety.py, url_pattern.py (URL_PATTERN_ALGORITHM_VERSION=1), matches/upsert.py.
 - [plan] Migration down_revision = c2987b29555e (verified current head). Artifacts: plan.md, research.md (9 decisions), data-model.md, quickstart.md, contracts/ (8 files).
+
+## analyze (inline)
+
+- [analyze] Report: 0 CRITICAL, 0 HIGH; 100% FR/SC coverage (25/25), 0 duplication, constitution PASS.
+- [analyze] I1 (MEDIUM, applied): FR-010 reworded to split the **normalized URL** rules (keep scheme+query — it is the identity/unique-key value; lowercase, strip www/default-port/fragment/trailing-slash) from the **pattern** rules (drop scheme+query, :id/* generalization, preserve locale). Original text bundled pattern-only ops under "normalization rules" for both, risking a broken unique key. plan.md/data-model.md/T016 already encoded the correct behavior; this is a spec-text clarification only.
+- [analyze] A1 (LOW, no change): id-like thresholds deliberately plan-level, pinned in T016 (len≥8 mixed-alnum; len≥4 & digit-ratio≥0.5).
+- [analyze] C1 (LOW, no change): metadata literal 169.254.169.254 listed separately though inside 169.254/16 — intentional defense-in-depth call-out; T014 covers both.
