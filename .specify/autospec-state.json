@@ -74,6 +74,14 @@
         "T050 seed+online migration"
       ],
       "deferred_reason": "require a live Postgres/Redis (no container engine in build env); artifacts authored + skip cleanly; DB/Redis-independent logic fully unit-tested here (185 passed, 24 skipped)"
+    },
+    "04": {
+      "title": "Catalog: Products, Variants, Groups",
+      "feature_directory": "specs/004-catalog-products-variants-groups",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
