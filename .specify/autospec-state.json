@@ -180,7 +180,8 @@
         "specify": "done",
         "clarify": "done",
         "plan": "done",
-        "checklist": "in-progress"
+        "checklist": "done",
+        "tasks": "in-progress"
       }
     }
   }
