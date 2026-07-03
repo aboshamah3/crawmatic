@@ -107,17 +107,31 @@ def test_competitor_workspace_id_fk_to_workspaces() -> None:
     assert "fk_competitors_workspace_id_workspaces" in fks
 
 
-def test_competitor_optional_profile_policy_and_caps_no_fk() -> None:
+def test_competitor_optional_profile_policy_and_caps_nullable() -> None:
     table = Competitor.__table__
     assert table.c.default_scrape_profile_id.nullable is True
     assert table.c.default_access_policy_id.nullable is True
     assert table.c.max_concurrent_requests.nullable is True
     assert table.c.max_requests_per_minute.nullable is True
-    fks = _fk_constraints(table)
-    # No FK targets default_scrape_profile_id/default_access_policy_id.
+
+
+def test_competitor_default_access_policy_id_has_no_fk() -> None:
+    # access_policies lands in a later spec (SPEC-10) — still no FK.
+    fks = _fk_constraints(Competitor.__table__)
     referencing_cols = {c.name for fk in fks.values() for c in fk.columns}
-    assert "default_scrape_profile_id" not in referencing_cols
     assert "default_access_policy_id" not in referencing_cols
+
+
+def test_competitor_default_scrape_profile_id_fk_on_delete_set_null() -> None:
+    # SPEC-06 promotes this column to a plain FK -> scrape_profiles(id)
+    # ON DELETE SET NULL (research D5, FR-012/FR-023).
+    fks = _fk_constraints(Competitor.__table__)
+    key = "fk_competitors_default_scrape_profile_id_scrape_profiles"
+    assert key in fks
+    fk = fks[key]
+    assert [c.name for c in fk.columns] == ["default_scrape_profile_id"]
+    assert all(e.column.table.name == "scrape_profiles" for e in fk.elements)
+    assert fk.ondelete == "SET NULL"
 
 
 def test_competitor_status_enum_defaults() -> None:
@@ -254,16 +268,30 @@ def test_match_workspace_id_fk_to_workspaces() -> None:
     assert "fk_cpm_workspace_workspaces" in fks
 
 
-def test_match_current_price_scrape_profile_access_policy_have_no_fk() -> None:
+def test_match_current_price_and_access_policy_have_no_fk() -> None:
+    # current_price_id/access_policy_id: soft/deferred references, targets
+    # SPEC-09/10 don't exist yet — still no FK.
     table = CompetitorProductMatch.__table__
     fks = _fk_constraints(table)
     referencing_cols = {c.name for fk in fks.values() for c in fk.columns}
     assert "current_price_id" not in referencing_cols
-    assert "scrape_profile_id" not in referencing_cols
     assert "access_policy_id" not in referencing_cols
     assert table.c.current_price_id.nullable is True
-    assert table.c.scrape_profile_id.nullable is True
     assert table.c.access_policy_id.nullable is True
+
+
+def test_match_scrape_profile_id_fk_on_delete_set_null() -> None:
+    # SPEC-06 promotes this column to a plain FK -> scrape_profiles(id)
+    # ON DELETE SET NULL (research D5, FR-012/FR-023).
+    table = CompetitorProductMatch.__table__
+    fks = _fk_constraints(table)
+    key = "fk_cpm_scrape_profile_id_scrape_profiles"
+    assert key in fks
+    fk = fks[key]
+    assert [c.name for c in fk.columns] == ["scrape_profile_id"]
+    assert all(e.column.table.name == "scrape_profiles" for e in fk.elements)
+    assert fk.ondelete == "SET NULL"
+    assert table.c.scrape_profile_id.nullable is True
 
 
 def test_match_enum_columns_render_varchar_32() -> None:

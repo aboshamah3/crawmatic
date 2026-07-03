@@ -36,15 +36,28 @@ class Workspace(Base, TimestampMixin):
     """Tenant root — NOT workspace-scoped, gets NO RLS policy."""
 
     __tablename__ = "workspaces"
+    __table_args__ = (
+        # SPEC-06 promotes this nullable column to a plain FK ->
+        # scrape_profiles(id) ON DELETE SET NULL (added via ALTER in the
+        # SPEC-06 migration, not here — this module only declares ORM
+        # shape). Plain, not composite: a global (workspace_id IS NULL)
+        # profile must be assignable by any workspace.
+        ForeignKeyConstraint(
+            ["default_scrape_profile_id"],
+            ["scrape_profiles.id"],
+            name="fk_workspaces_default_scrape_profile_id_scrape_profiles",
+            ondelete="SET NULL",
+        ),
+    )
 
     name: Mapped[str] = mapped_column(Text(), nullable=False)
     slug: Mapped[str] = mapped_column(Text(), nullable=False, unique=True)
     status: Mapped[WorkspaceStatus] = enum_column(WorkspaceStatus, nullable=False)
-    # No FK — target tables (scrape-profiles / access-policies) land in a
-    # later spec. Plain dangling nullable ids (§22, spec Assumptions).
     default_scrape_profile_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )
+    # No FK — access_policies lands in a later spec (SPEC-10). Plain
+    # dangling nullable id (§22, spec Assumptions).
     default_access_policy_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )

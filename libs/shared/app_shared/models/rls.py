@@ -53,3 +53,53 @@ def emit_rls_policy(
             "NULLIF(current_setting('app.workspace_id', true), '')::uuid);"
         ),
     )
+
+
+def emit_global_readable_rls_policy(
+    table_name: str,
+    *,
+    workspace_column: str = "workspace_id",
+) -> tuple[str, ...]:
+    """Return the DDL statements for a **dual-scope** table's RLS pair (SPEC-06).
+
+    Per ``contracts/rls-global-readable.md`` (research D2/D4, FR-021):
+    unlike :func:`emit_rls_policy` (which makes a ``NULL``-workspace row
+    invisible to everyone, since ``NULL = ctx`` is never true), this
+    emitter is for tables where ``{workspace_column} IS NULL`` marks a
+    **global** row that must be readable by every workspace while
+    remaining unwritable through the tenant path.
+
+    Returns exactly four statements, in order:
+
+    1. ``ALTER TABLE {t} ENABLE ROW LEVEL SECURITY;``
+    2. ``ALTER TABLE {t} FORCE ROW LEVEL SECURITY;``
+    3. A ``FOR SELECT`` policy (``{t}_workspace_read``) using
+       ``({col} IS NULL OR {col} = <ctx>)`` — own rows **or** any global
+       row.
+    4. A ``FOR ALL`` write policy (``{t}_workspace_write``) using
+       ``{col} = <ctx>`` on **both** ``USING`` and ``WITH CHECK`` — a
+       tenant can INSERT/UPDATE/DELETE only its own rows, never a global
+       (``NULL``) one.
+
+    The same fail-closed ``NULLIF(current_setting('app.workspace_id',
+    true), '')::uuid`` context expression as :func:`emit_rls_policy` is
+    reused in both policies: with no workspace context set, ``ctx`` is
+    ``NULL`` — own rows fail closed (0 rows / no writes), but global
+    rows remain visible via the ``IS NULL`` disjunct in the read policy.
+    """
+    ctx = "NULLIF(current_setting('app.workspace_id', true), '')::uuid"
+    read_policy = f"{table_name}_workspace_read"
+    write_policy = f"{table_name}_workspace_write"
+    return (
+        f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;",
+        f"ALTER TABLE {table_name} FORCE ROW LEVEL SECURITY;",
+        (
+            f"CREATE POLICY {read_policy} ON {table_name} FOR SELECT "
+            f"USING ({workspace_column} IS NULL OR {workspace_column} = {ctx});"
+        ),
+        (
+            f"CREATE POLICY {write_policy} ON {table_name} FOR ALL "
+            f"USING ({workspace_column} = {ctx}) "
+            f"WITH CHECK ({workspace_column} = {ctx});"
+        ),
+    )

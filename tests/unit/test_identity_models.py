@@ -51,12 +51,23 @@ def test_workspace_slug_is_unique() -> None:
     )
 
 
-def test_workspace_default_ids_are_nullable_with_no_fk() -> None:
-    table = Workspace.__table__
-    for col_name in ("default_scrape_profile_id", "default_access_policy_id"):
-        column = table.c[col_name]
-        assert column.nullable is True
-        assert len(column.foreign_keys) == 0
+def test_workspace_default_access_policy_id_is_nullable_with_no_fk() -> None:
+    # default_access_policy_id has no FK yet — access_policies lands in a
+    # later spec (SPEC-10).
+    column = Workspace.__table__.c.default_access_policy_id
+    assert column.nullable is True
+    assert len(column.foreign_keys) == 0
+
+
+def test_workspace_default_scrape_profile_id_is_nullable_fk_on_delete_set_null() -> None:
+    # SPEC-06 promotes this column to a plain FK -> scrape_profiles(id)
+    # ON DELETE SET NULL (research D5, FR-012/FR-023).
+    column = Workspace.__table__.c.default_scrape_profile_id
+    assert column.nullable is True
+    assert len(column.foreign_keys) == 1
+    fk = next(iter(column.foreign_keys))
+    assert fk.column.table.name == "scrape_profiles"
+    assert fk.ondelete == "SET NULL"
 
 
 # --- User: workspace-owned (RLS), but OWN nullable workspace_id -------

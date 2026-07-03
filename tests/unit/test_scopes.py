@@ -24,12 +24,14 @@ FULL_VOCABULARY = {
     "alerts:read",
     "webhooks:read",
     "webhooks:write",
+    "scrape_profiles:read",
+    "scrape_profiles:write",
 }
 
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 14
+    assert len(FULL_VOCABULARY) == 16
 
 
 def test_validate_scopes_accepts_known_scope() -> None:

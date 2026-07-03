@@ -15,7 +15,7 @@ from app_shared.models.base import (
     WorkspaceScopedBase,
     metadata,
 )
-from app_shared.models.rls import emit_rls_policy
+from app_shared.models.rls import emit_global_readable_rls_policy, emit_rls_policy
 
 # Import so `SmokeFoundation` registers on `Base.metadata` — required for
 # both Alembic autogenerate/offline-render (`target_metadata`) and the
@@ -41,6 +41,15 @@ from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, P
 # `from app_shared.models import Competitor, CompetitorProductMatch`.
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 
+# The SPEC-06 ScrapeProfile model — re-exported so `Base.metadata` sees
+# the table for Alembic autogenerate/offline-render (target_metadata),
+# and so callers can `from app_shared.models import ScrapeProfile`.
+# Dual-scope (research D2): deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS` — see
+# `app_shared.profiles.repository` for the sanctioned dual-scope query
+# path.
+from app_shared.models.scrape_profiles import ScrapeProfile
+
 __all__ = [
     "Base",
     "metadata",
@@ -49,6 +58,7 @@ __all__ = [
     "TZDateTime",
     "WorkspaceScopedBase",
     "emit_rls_policy",
+    "emit_global_readable_rls_policy",
     "Workspace",
     "User",
     "RefreshToken",
@@ -59,4 +69,5 @@ __all__ = [
     "ProductGroupItem",
     "Competitor",
     "CompetitorProductMatch",
+    "ScrapeProfile",
 ]

@@ -26,9 +26,11 @@ not here — this module only declares ORM shape.
   ``success_rate_7d``, ``current_price_id``, ``last_error_code``,
   ``last_scraped_at``/``last_success_at``/``last_failed_at``) default to
   their FR-017 "nothing scraped yet" state and are never client-settable.
-  ``current_price_id``/``scrape_profile_id``/``access_policy_id`` are
-  plain nullable ``Uuid`` references with **no** FK (targets SPEC-06/09/10
-  don't exist yet).
+  ``current_price_id``/``access_policy_id`` are plain nullable ``Uuid``
+  references with **no** FK (targets SPEC-09/10 don't exist yet).
+  ``scrape_profile_id`` (and ``Competitor.default_scrape_profile_id``)
+  are promoted to a plain FK -> ``scrape_profiles(id)`` ``ON DELETE SET
+  NULL`` by SPEC-06 (added via ``ALTER`` in the SPEC-06 migration).
 
 **Explicit constraint names** (research D5, mirroring the
 ``product_group_items`` precedent in ``app_shared.models.catalog``): the
@@ -85,6 +87,17 @@ class Competitor(Base, WorkspaceScopedBase, TimestampMixin):
             ["workspace_id"],
             ["workspaces.id"],
             name="fk_competitors_workspace_id_workspaces",
+        ),
+        # SPEC-06 promotes this nullable column to a plain FK ->
+        # scrape_profiles(id) ON DELETE SET NULL (added via ALTER in the
+        # SPEC-06 migration, not here). Plain, not composite: a global
+        # (workspace_id IS NULL) profile must be assignable by any
+        # workspace.
+        ForeignKeyConstraint(
+            ["default_scrape_profile_id"],
+            ["scrape_profiles.id"],
+            name="fk_competitors_default_scrape_profile_id_scrape_profiles",
+            ondelete="SET NULL",
         ),
     )
 
@@ -151,6 +164,17 @@ class CompetitorProductMatch(Base, WorkspaceScopedBase, TimestampMixin):
             ["workspace_id"],
             ["workspaces.id"],
             name="fk_cpm_workspace_workspaces",
+        ),
+        # SPEC-06 promotes this nullable column to a plain FK ->
+        # scrape_profiles(id) ON DELETE SET NULL (added via ALTER in the
+        # SPEC-06 migration, not here). Plain, not composite: a global
+        # (workspace_id IS NULL) profile must be assignable by any
+        # workspace.
+        ForeignKeyConstraint(
+            ["scrape_profile_id"],
+            ["scrape_profiles.id"],
+            name="fk_cpm_scrape_profile_id_scrape_profiles",
+            ondelete="SET NULL",
         ),
     )
 
