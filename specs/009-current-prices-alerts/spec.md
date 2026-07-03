@@ -80,7 +80,8 @@ When a client changes a variant's own price or currency (via variant update or b
 - **Unchanged re-run**: Re-running analysis with identical inputs produces identical state and does not spam alert history.
 - **Cross-workspace isolation**: A caller can never read another workspace's price state, alert state, or events; no-workspace-context reads return zero rows.
 - **Dangling soft references**: latest_alert_state_id and observation soft references may point at rows in dropped partitions after retention (SPEC-15); readers tolerate this because the current-state rows carry every field analysis and the comparison endpoint need.
-- **Client price missing**: A variant with no client price cannot be positioned; analysis records NO_COMPETITOR_DATA-equivalent / a defined "not analyzable" state rather than crashing (documented in Assumptions).
+- **Client price missing (defensive)**: `product_variants.current_price` is NOT NULL (SPEC-04), so a real variant always has a client price; if analysis is ever called with a null client price it MUST resolve to NO_COMPETITOR_DATA (not analyzable) rather than raising — a guard, not a reachable catalog state.
+- **Same-type severity change (defensive)**: Severity is a pure function of type (FR-011), so two states with the same type always have the same severity; the transition rule's "same-type severity change → UPDATED" branch is therefore unreachable via the real engine and exists only as a defensive branch in the pure `transition()` function.
 
 ## Requirements *(mandatory)*
 
@@ -97,7 +98,7 @@ When a client changes a variant's own price or currency (via variant update or b
 
 **Analysis engine (pure, deterministic)**
 
-- **FR-007**: The alert decision MUST follow the ordered §23 tree exactly: (1) no comparable prices → NO_COMPETITOR_DATA; (2) client_price > highest → RISK; (3) client_price > cheapest → HIGH_PRICE; (4) compute discount_vs_average = ((average − client_price) / average) × 100; (5) >5 → CHANCE_TO_INCREASE_PRICE; (6) 1..5 inclusive → NORMAL; (7) 0..<1 → CLOSE_TO_COMPETITORS; (8) defensive else → HIGH_PRICE.
+- **FR-007**: The alert decision MUST follow the ordered §23 tree exactly: (0, defensive) a null/absent client price → NO_COMPETITOR_DATA (variant not analyzable — see Assumptions; product_variants.current_price is NOT NULL in SPEC-04, so this branch guards against a degenerate call rather than a reachable catalog state, and MUST NOT raise); (1) no comparable prices → NO_COMPETITOR_DATA; (2) client_price > highest → RISK; (3) client_price > cheapest → HIGH_PRICE; (4) compute discount_vs_average = ((average − client_price) / average) × 100; (5) >5 → CHANCE_TO_INCREASE_PRICE; (6) 1..5 inclusive → NORMAL; (7) 0..<1 → CLOSE_TO_COMPETITORS; (8) defensive else → HIGH_PRICE.
 - **FR-008**: discount_vs_average MUST be computed with Decimal arithmetic and explicitly quantized to 4 decimal places using ROUND_HALF_UP **before** any boundary comparison — never binary float. Prices MUST use Decimal/NUMERIC(18,4) throughout; NaN/Infinity are rejected at the boundary.
 - **FR-009**: Boundary behavior MUST be: exactly 0% below → CLOSE_TO_COMPETITORS; >0% and <1% → CLOSE_TO_COMPETITORS; exactly 1% → NORMAL; exactly 5% → NORMAL; >5% → CHANCE_TO_INCREASE_PRICE.
 - **FR-010**: A competitor is included in comparison only when its match current price has success=true AND comparable=true AND currency = client currency AND price is not null. Any competitor whose currency differs from the client currency MUST be excluded, its match current price marked comparable=false, and a CURRENCY_MISMATCH warning/error stored. No cross-currency comparison (no FX) in v1.

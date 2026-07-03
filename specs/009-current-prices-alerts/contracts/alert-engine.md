@@ -67,6 +67,7 @@ class AlertOutcome:
 ### `decide(client_price, cheapest, average, highest, comparable_count) -> (AlertType,
 Decimal | None)` — the ordered §23 tree
 ```text
+0. client_price is None (defensive)              -> NO_COMPETITOR_DATA, discount=None
 1. comparable_count == 0                         -> NO_COMPETITOR_DATA, discount=None
 2. client_price > highest                        -> RISK
 3. client_price > cheapest                       -> HIGH_PRICE
@@ -77,7 +78,15 @@ Decimal | None)` — the ordered §23 tree
 8. else (unreachable defensive)                  -> HIGH_PRICE
 ```
 All price/threshold compares are `Decimal` vs `Decimal` (never float). Steps 2–3 use `>`
-strictly (equal-to-highest/cheapest falls through to the discount math).
+strictly (equal-to-highest/cheapest falls through to the discount math). Step 0 is
+defensive: `product_variants.current_price` is NOT NULL (SPEC-04), so `analyze` never
+passes a null client price in practice; the guard exists so the pure function degrades to
+NO_COMPETITOR_DATA rather than raising if ever called with `None`.
+
+Note on `transition(...)`: because `severity_for()` makes severity a pure function of type,
+a same-type-with-different-severity input cannot arise from the real engine; the transition
+rule's "same-type severity change → UPDATED" case is a defensive branch, exercised in tests
+only via a hand-constructed input (I1).
 
 ### `severity_for(alert_type) -> AlertSeverity`
 - `return SEVERITY_BY_TYPE[alert_type]` — the only source of severity (FR-011).

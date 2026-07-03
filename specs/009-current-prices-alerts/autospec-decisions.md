@@ -21,3 +21,11 @@ Log of auto-answered questions and informed defaults. Format:
 - [clarify] Q: Persist an event on every (incl. unchanged) analysis? → A: No — only on type/severity change; unchanged advances last_seen_at, no row (source: doc §26 "must not be incremented"/§23 "created when alert changes"; integrated FR-013).
 - [clarify] Q: Exact event-transition rule? → A: ordered CREATED/UPDATED/RESOLVED/REOPENED/none rule pinned in Clarifications for determinism (default — doc names event types but not the transition map; integrated FR-013 + US2 scenarios).
 - [clarify] No questions relayed to user — all ambiguities resolved doc-first / by clear default; none high-impact enough to require a human decision.
+
+## analyze
+
+speckit-analyze: 0 CRITICAL, 0 HIGH, 1 MEDIUM, 1 LOW. No user pause (no CRITICAL). Remediations applied to artifacts:
+
+- [analyze] U1 (MEDIUM, missing-client-price branch untested): the "null client price → non-analyzable" edge had no FR/engine branch/test. Verified product_variants.current_price is NOT NULL (SPEC-04), so it's defensive-only. → Fixed: added defensive step 0 (`client_price is None → NO_COMPETITOR_DATA`, must not raise) to FR-007, contracts/alert-engine.md `decide`, and T014; added a test bullet to T015. Documented in spec Edge Cases as a guard, not a reachable state.
+- [analyze] I1 (LOW, dead severity branch): severity is a pure function of type (FR-011), so "same-type severity change → UPDATED" is unreachable via the real engine. → Documented as a defensive branch in spec Edge Cases + contracts/alert-engine.md `transition` note + T015 test bullet (exercised via hand-constructed input). No behavior change.
+- [analyze] Coverage 100% (20 FR + 8 SC → ≥1 task each); 0 duplication; 0 constitution violations. Not re-running analyze: no CRITICAL/HIGH fixed.
