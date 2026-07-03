@@ -1,6 +1,6 @@
-"""Jobs run/status endpoints (`contracts/api-jobs.md`) — SPEC-08 US1 (MVP).
+"""Jobs run/status endpoints (`contracts/api-jobs.md`) — SPEC-08 US1/US2.
 
-Three `/v1` endpoints on the SPEC-03 auth seam
+Four `/v1` endpoints on the SPEC-03 auth seam
 (`app.deps.get_current_principal` -> `set_workspace_context` already
 applied to the yielded session), scope-gated via
 `app.deps.require_scopes(...)`, all reads through
@@ -9,9 +9,6 @@ second isolation layer. Job creation delegates to
 `app_shared.jobs.service`; dispatch is enqueued through
 `app_shared.messaging` from inside that service call — this router
 never imports `apps/workers` (Principle I).
-
-`POST /v1/jobs/run/variant/{variant_id}` (US2) is added to this same
-router file in a later phase.
 """
 
 from __future__ import annotations
@@ -20,7 +17,8 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app_shared.jobs.service import create_match_job
+from app_shared.jobs.service import create_match_job, create_variant_job
+from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.repository import scoped_get, scoped_select
@@ -52,6 +50,26 @@ def run_match(
 
     job_id, status = create_match_job(
         session, workspace_id=ws, match=match, requested_by=principal.id
+    )
+
+    return JobRunResponse(id=job_id, status=status)
+
+
+@router.post("/run/variant/{variant_id}", response_model=JobRunResponse, status_code=202)
+def run_variant(
+    variant_id: uuid.UUID,
+    principal_ctx: tuple = Depends(require_scopes("jobs:write")),
+) -> JobRunResponse:
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    variant = scoped_get(session, ProductVariant, variant_id, ws)
+    if variant is None:
+        raise _not_found("Variant not found.")
+
+    job_id, status = create_variant_job(
+        session, workspace_id=ws, variant=variant, requested_by=principal.id
     )
 
     return JobRunResponse(id=job_id, status=status)

@@ -1,4 +1,4 @@
-"""Jobs router unit tests (SPEC-08 T031, US1, FR-006/008/009, SC-006).
+"""Jobs router unit tests (SPEC-08 T031/T035, US1/US2, FR-006/007/008/009/020, SC-002, SC-006).
 
 `apps/api/app/routers/jobs.py` — exercised via `TestClient` with
 `app.dependency_overrides[get_current_principal]` swapped for a fake,
@@ -7,10 +7,12 @@ DB-less principal bound to the shared `FakeOrmSession`
 `app_shared.jobs.service.enqueue` (no real DB/Redis/Celery broker). Per
 `contracts/api-jobs.md`: run-match -> 202 + one job/target scoped,
 `MANUAL`/`API`/`requested_by`, enqueue called once; unknown/cross-ws
-match -> 404, no job created, no enqueue; `GET /jobs/{id}` /
-`GET /jobs/{id}/results` -> 200 shapes, missing job -> 404; every route
-declares the correct `require_scopes` (write for run-match, read for
-get/results).
+match -> 404, no job created, no enqueue; run-variant -> 202 + one
+target per ACTIVE match (inactive excluded), unknown/cross-ws variant
+-> 404, no job; zero-active -> 202 `status=COMPLETED`, no enqueue
+(US2, T035); `GET /jobs/{id}` / `GET /jobs/{id}/results` -> 200 shapes,
+missing job -> 404; every route declares the correct `require_scopes`
+(write for run-match/run-variant, read for get/results).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from app_shared.enums import (
     ScrapeScope,
     ScrapeTargetStatus,
 )
+from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
@@ -108,6 +111,40 @@ def _make_match(*, workspace_id: uuid.UUID = WORKSPACE_ID) -> CompetitorProductM
         url_pattern_version=1,
         priority=MatchPriority.NORMAL,
         status=MatchStatus.ACTIVE,
+    )
+    match.id = uuid.uuid4()
+    return match
+
+
+def _make_variant(
+    *, workspace_id: uuid.UUID = WORKSPACE_ID, product_id: uuid.UUID | None = None
+) -> ProductVariant:
+    variant = ProductVariant(
+        workspace_id=workspace_id,
+        product_id=product_id or uuid.uuid4(),
+        title="Variant A",
+    )
+    variant.id = uuid.uuid4()
+    return variant
+
+
+def _make_match_for_variant(
+    *,
+    variant_id: uuid.UUID,
+    workspace_id: uuid.UUID = WORKSPACE_ID,
+    status: MatchStatus = MatchStatus.ACTIVE,
+) -> CompetitorProductMatch:
+    match = CompetitorProductMatch(
+        workspace_id=workspace_id,
+        product_id=uuid.uuid4(),
+        product_variant_id=variant_id,
+        competitor_id=uuid.uuid4(),
+        competitor_url="https://shop.example.com/p/1",
+        normalized_competitor_url="https://shop.example.com/p/1",
+        url_pattern="https://shop.example.com/p/1",
+        url_pattern_version=1,
+        priority=MatchPriority.NORMAL,
+        status=status,
     )
     match.id = uuid.uuid4()
     return match
@@ -226,6 +263,113 @@ def test_run_match_cross_workspace_match_is_404_no_job_no_enqueue(
     assert resp.status_code == 404
     assert resp.json()["detail"]["error"]["code"] == "NOT_FOUND"
     assert fake_session._rows.get(ScrapeJob, []) == []
+    assert fake_enqueue.calls == []
+
+
+# --- POST /v1/jobs/run/variant/{id} (US2, T035) ------------------------------
+
+
+def test_run_variant_returns_202_one_target_per_active_match_inactive_excluded(
+    client: TestClient, fake_session: FakeOrmSession, fake_enqueue: _FakeEnqueue
+) -> None:
+    variant = _make_variant()
+    active_matches = [
+        _make_match_for_variant(variant_id=variant.id) for _ in range(3)
+    ]
+    inactive_match = _make_match_for_variant(variant_id=variant.id, status=MatchStatus.PAUSED)
+    fake_session.seed(variant, *active_matches, inactive_match)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["jobs:write"]
+    )
+
+    resp = client.post(f"/v1/jobs/run/variant/{variant.id}")
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "PENDING"
+    job_id = uuid.UUID(body["id"])
+
+    jobs = fake_session._rows.get(ScrapeJob, [])
+    targets = fake_session._rows.get(ScrapeJobTarget, [])
+    assert len(jobs) == 1
+    assert len(targets) == 3
+
+    job = jobs[0]
+    assert job.id == job_id
+    assert job.type == ScrapeJobType.MANUAL
+    assert job.source == ScrapeJobSource.API
+    assert job.scope == ScrapeScope.VARIANT
+    assert job.product_variant_id == variant.id
+    assert job.total_targets == 3
+
+    target_match_ids = {target.match_id for target in targets}
+    assert target_match_ids == {match.id for match in active_matches}
+    assert inactive_match.id not in target_match_ids
+    for target in targets:
+        assert target.scrape_job_id == job_id
+
+    assert len(fake_enqueue.calls) == 1
+    call = fake_enqueue.calls[0]
+    assert call["name"] == SCRAPE_DISPATCH_JOB
+    assert call["queue"] == "scrape_dispatch"
+    assert call["kwargs"] == {
+        "scrape_job_id": str(job_id),
+        "workspace_id": str(WORKSPACE_ID),
+    }
+
+
+def test_run_variant_unknown_variant_is_404_no_job(
+    client: TestClient, fake_session: FakeOrmSession, fake_enqueue: _FakeEnqueue
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["jobs:write"]
+    )
+
+    resp = client.post(f"/v1/jobs/run/variant/{uuid.uuid4()}")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"]["code"] == "NOT_FOUND"
+    assert fake_session._rows.get(ScrapeJob, []) == []
+    assert fake_enqueue.calls == []
+
+
+def test_run_variant_cross_workspace_variant_is_404_no_job(
+    client: TestClient, fake_session: FakeOrmSession, fake_enqueue: _FakeEnqueue
+) -> None:
+    variant = _make_variant(workspace_id=OTHER_WORKSPACE_ID)
+    fake_session.seed(variant)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["jobs:write"], workspace_id=WORKSPACE_ID
+    )
+
+    resp = client.post(f"/v1/jobs/run/variant/{variant.id}")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"]["code"] == "NOT_FOUND"
+    assert fake_session._rows.get(ScrapeJob, []) == []
+    assert fake_enqueue.calls == []
+
+
+def test_run_variant_zero_active_matches_completes_without_enqueue(
+    client: TestClient, fake_session: FakeOrmSession, fake_enqueue: _FakeEnqueue
+) -> None:
+    variant = _make_variant()
+    inactive_match = _make_match_for_variant(variant_id=variant.id, status=MatchStatus.ARCHIVED)
+    fake_session.seed(variant, inactive_match)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["jobs:write"]
+    )
+
+    resp = client.post(f"/v1/jobs/run/variant/{variant.id}")
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "COMPLETED"
+
+    jobs = fake_session._rows.get(ScrapeJob, [])
+    assert len(jobs) == 1
+    assert jobs[0].total_targets == 0
+    assert fake_session._rows.get(ScrapeJobTarget, []) == []
     assert fake_enqueue.calls == []
 
 
@@ -351,6 +495,7 @@ def _route(path: str, method: str) -> APIRoute:
 
 _EXPECTED_STATIC_SCOPES: list[tuple[str, str, tuple[str, ...]]] = [
     ("POST", "/v1/jobs/run/match/{match_id}", ("jobs:write",)),
+    ("POST", "/v1/jobs/run/variant/{variant_id}", ("jobs:write",)),
     ("GET", "/v1/jobs/{job_id}", ("jobs:read",)),
     ("GET", "/v1/jobs/{job_id}/results", ("jobs:read",)),
 ]
