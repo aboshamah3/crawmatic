@@ -8,6 +8,22 @@
 
 **Input**: SPEC-05 from PROJECT_SPEC.md §35 — link a client's product variants to competitor product URLs, with save-time URL safety, versioned URL normalization, and workspace isolation.
 
+## Clarifications
+
+### Session 2026-07-03
+
+All items below were resolved from the master specification (`PROJECT_SPEC.md` §11/§15/§22/§24/§32) and the SPEC-02/03/04 foundation; no open ambiguity required a stakeholder decision. Plan-level details are noted as such.
+
+- Q: Does save-time SSRF validation resolve DNS? → A: The mandatory, fully-testable core is string/parse validation + IP-literal deny-range checks + userinfo rejection + known-internal-hostname rejection (localhost, `*.internal`/`*.local`, the compose service names, metadata hostnames). Whether save-time also does a best-effort DNS resolution is a plan-level choice; the authoritative DNS re-resolution + redirect re-validation is fetch-time in the SPEC-07 spider (source: §11).
+- Q: Which hostnames count as "internal service hostnames"? → A: at minimum localhost and the platform-internal suffixes/service names (`*.railway.internal`, the docker-compose service names, `*.internal`, `*.local`) plus the cloud metadata hostname; the exact deny-list is a plan-level constant (source: §11 + §4 internal networking).
+- Q: URL-pattern id-like thresholds ("mostly digits", "long mixed alphanumeric")? → A: concrete thresholds (e.g. digit-ratio ≥ some fraction; length ≥ some N) are plan-level; the algorithm is versioned so thresholds can evolve behind a version bump (source: §15).
+- Q: Match unique key / unlimited matches? → A: unique(workspace_id, product_variant_id, competitor_id, normalized_competitor_url); a variant may have unlimited matches; only exact tuple duplicates dedupe (source: §22).
+- Q: FK workspace-consistency + soft/absent refs? → A: composite workspace-local FKs for product/variant/competitor (add unique(workspace_id,id) to competitors; catalog parents already have it); current_price_id is a soft reference (no FK); scrape_profile_id/access_policy_id are plain nullable references (target tables SPEC-06/10) (source: §22/§32).
+- Q: Bulk-upsert error policy for unsafe URLs? → A: unsafe records are rejected and reported back (not silently dropped, not aborting the whole safe set) — set-based upsert on the match unique key for the valid records (source: §24 + §11 "reject at save time"; batch error-reporting shape is plan-level).
+- Q: Match health fields at creation? → A: defaults (health unknown/pending, consecutive_failures=0, null success_rate/current_price/last-* timestamps); populated by SPEC-07/09+ (source: §22).
+- Q: Pattern versioning + backfill? → A: URL_PATTERN_ALGORITHM_VERSION constant stored per row; never mix versions in lookups; version-bump backfill task is out of scope (later maintenance spec) (source: §15).
+- Q: Live-Postgres acceptance items here? → A: DB-independent logic (SSRF validator, URL normalization/pattern, models/RLS render, bulk-upsert construction, pagination, scope-gating, workspace-consistency) unit-tested here; live create/upsert, RLS row denial, cross-workspace, migration run, e2e deferred to a PG host (source: no-docker-daemon constraint).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The users of this feature are workspace operators and their integrations who register the competitor stores they want to monitor and manually link each of their product variants to specific competitor product URLs. This is the "manual match" half of the core monitoring loop: it produces the variant↔competitor-URL links that later specs will scrape and price. Because these URLs are user-supplied and internal services will later connect to them, every URL is safety-validated at save time and normalized into a stable, versioned pattern.

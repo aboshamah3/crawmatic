@@ -104,7 +104,8 @@
       "feature_directory": "specs/005-competitors-matches",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     }
   }
