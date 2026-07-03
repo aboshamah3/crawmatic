@@ -23,13 +23,18 @@ SPEC-04 US3 adds the `/v1/product-groups` router
 (contracts/api-product-groups.md) — named product/variant grouping,
 reusing the `products:write`/`variants:write` scopes (no new scope),
 same auth seam.
+
+SPEC-05 US1 adds the `/v1/competitors` router
+(contracts/api-competitors.md) — competitor CRUD with domain uniqueness
+per workspace, on the same auth seam and FR-020 discipline, gated by the
+existing `competitors:read`/`competitors:write` scopes (no new scope).
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.routers import api_keys, auth, product_groups, products, variants
+from app.routers import api_keys, auth, competitors, product_groups, products, variants
 
 app = FastAPI(title="crawmatic-api")
 
@@ -38,6 +43,7 @@ app.include_router(api_keys.router)
 app.include_router(products.router)
 app.include_router(variants.router)
 app.include_router(product_groups.router)
+app.include_router(competitors.router)
 
 
 @app.get("/health")
