@@ -19,3 +19,11 @@ Master doc: `/srv/crawmatic/PROJECT_SPEC.md`
 ## clarify
 
 Run doc-first INLINE (context conservation). No questions to user. Doc-resolved clarifications in spec.md `## Clarifications` (Session 2026-07-03): save-time SSRF core = string/IP-literal/userinfo/internal-hostname checks (DNS resolution best-effort, authoritative at fetch-time SPEC-07); internal-hostname deny-list plan-level; URL-pattern id-thresholds plan-level (versioned); match unique key + unlimited matches; composite workspace-local FKs + soft/absent refs; bulk unsafe-URL reject-and-report; health defaults; version+backfill-deferred; live items deferred. Requirements checklist re-validated 16/16.
+
+## plan (Opus subagent)
+
+- [plan] Q: Match/health status enum sets? → A: §22 is authoritative over the specify-step shorthand — MatchStatus(ACTIVE/PAUSED/FAILED/ARCHIVED), HealthStatus(HEALTHY/DEGRADED/FAILING/UNKNOWN); CompetitorStatus(ACTIVE/ARCHIVED) for the archive-by-status deletion. (Reconciles the "active/archived only" note in the specify decisions, which was a simplification.) (source: §22).
+- [plan] Q: Save-time DNS resolution? → A: No — save-time validator is pure string/parse + IP-literal deny-range + userinfo + internal-hostname deny-list only; authoritative DNS re-resolution deferred to SPEC-07 spider (research D2) (source: §11).
+- [plan] Q: Constraint naming under Postgres 63-byte cap? → A: explicit short `cpm`-prefixed constraint names on competitor_product_matches (mirrors product_group_items precedent) (source: plan-level).
+- [plan] Q: Reuse vs new code? → A: reuse WorkspaceScopedBase, emit_rls_policy, enum_column, WORKSPACE_OWNED_MODELS/scoped_select/scoped_get, SPEC-04 keyset pagination, catalog.upsert.dedup_last_wins, catalog.consistency.assert_refs_in_workspace, existing Scope.COMPETITORS_*/MATCHES_*, AST CI guard. New pure app_shared modules: url_safety.py, url_pattern.py (URL_PATTERN_ALGORITHM_VERSION=1), matches/upsert.py.
+- [plan] Migration down_revision = c2987b29555e (verified current head). Artifacts: plan.md, research.md (9 decisions), data-model.md, quickstart.md, contracts/ (8 files).
