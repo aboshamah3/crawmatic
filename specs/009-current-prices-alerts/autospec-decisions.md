@@ -14,3 +14,10 @@ Log of auto-answered questions and informed defaults. Format:
 - [specify] Q: Which endpoints are binding vs deferred? → A: Binding: GET variants/{id}/price-comparison, GET alerts/current(+/{variant_id}), GET alert-events. Deferred: product-level comparison, matches/{id}/current-price, observations list, PATCH alerts/current (acknowledge) — not required by acceptance (source: doc §24 endpoint list + roadmap acceptance).
 - [specify] Q: WebhookEvent emission (shown in §25 flow at end of price_analysis)? → A: OUT OF SCOPE — webhooks are SPEC-16; SPEC-09 stops at price_alert_events (source: doc §35 roadmap "16 Webhook Events").
 - [specify] Q: Live infra verification approach? → A: exhaustive unit tests for the pure decision-tree/currency/event-transition/dedup logic + skip-clean integration tests (no Docker/Postgres/Redis/Celery/Scrapyd in build env), consistent with SPEC-01..08 (source: project convention).
+
+## clarify
+
+- [clarify] Q: variant_alert_states.status vocabulary? → A: ACTIVE/RESOLVED (ACTIVE while type non-NORMAL, RESOLVED when →NORMAL/NONE) (default — doc §22 lists field only; informed guess, integrated FR-013 + Assumptions).
+- [clarify] Q: Persist an event on every (incl. unchanged) analysis? → A: No — only on type/severity change; unchanged advances last_seen_at, no row (source: doc §26 "must not be incremented"/§23 "created when alert changes"; integrated FR-013).
+- [clarify] Q: Exact event-transition rule? → A: ordered CREATED/UPDATED/RESOLVED/REOPENED/none rule pinned in Clarifications for determinism (default — doc names event types but not the transition map; integrated FR-013 + US2 scenarios).
+- [clarify] No questions relayed to user — all ambiguities resolved doc-first / by clear default; none high-impact enough to require a human decision.
