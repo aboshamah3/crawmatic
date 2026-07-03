@@ -27,6 +27,7 @@ from app_shared.models.base import Base
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import ApiKey, User
+from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
 # SPEC-03 models to any Base subclass — the four catalog models
@@ -47,6 +48,9 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         ProductGroupItem,
         Competitor,
         CompetitorProductMatch,
+        PriceObservation,
+        RequestAttempt,
+        MatchCurrentPrice,
     }
 )
 

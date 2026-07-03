@@ -6,6 +6,7 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "app_shared",
     "parsel>=1.11,<2",
+    "twisted>=24.3,<27",
 ]
 
 [tool.uv.sources]

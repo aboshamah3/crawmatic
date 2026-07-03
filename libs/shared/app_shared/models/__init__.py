@@ -50,6 +50,14 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 # path.
 from app_shared.models.scrape_profiles import ScrapeProfile
 
+# The SPEC-07 observation/current-price models — re-exported so
+# `Base.metadata` sees all three tables for Alembic autogenerate/offline-
+# render (target_metadata), and so callers can
+# `from app_shared.models import PriceObservation, RequestAttempt,
+# MatchCurrentPrice`. Workspace-owned (unlike ScrapeProfile): registered
+# in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+
 __all__ = [
     "Base",
     "metadata",
@@ -70,4 +78,7 @@ __all__ = [
     "Competitor",
     "CompetitorProductMatch",
     "ScrapeProfile",
+    "PriceObservation",
+    "RequestAttempt",
+    "MatchCurrentPrice",
 ]

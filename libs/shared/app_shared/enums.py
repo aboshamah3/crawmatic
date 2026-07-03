@@ -181,6 +181,88 @@ class VariantStrategy(StrEnum):
     CUSTOM_VARIANT_ADAPTER = "CUSTOM_VARIANT_ADAPTER"
 
 
+class AccessMethod(StrEnum):
+    """Transport method used for a fetch attempt (SPEC-07 §11/§22).
+
+    This slice (``generic_price_spider``) writes only ``DIRECT_HTTP`` —
+    the other members are forward-compat for proxy/browser transports
+    added by later specs.
+    """
+
+    DIRECT_HTTP = "DIRECT_HTTP"
+    DIRECT_HTTP_RETRY = "DIRECT_HTTP_RETRY"
+    PROXY_HTTP = "PROXY_HTTP"
+    PLAYWRIGHT_PROXY = "PLAYWRIGHT_PROXY"
+
+
+class StockStatus(StrEnum):
+    """Stock/availability signal extracted alongside a price (SPEC-07 §22)."""
+
+    IN_STOCK = "IN_STOCK"
+    OUT_OF_STOCK = "OUT_OF_STOCK"
+    UNKNOWN = "UNKNOWN"
+
+
+class ExtractionMethod(StrEnum):
+    """Strategy that produced a price candidate (SPEC-07 §22, contracts/extraction.md).
+
+    This slice writes ``JSON_LD``/``CSS``/``REGEX``/``SINGLE_NUMBER``; the
+    remaining members are forward-compat for later extraction strategies
+    (platform JSON APIs, embedded JSON blobs, XPath, Playwright-rendered
+    pages) so the column never needs a widening migration.
+    """
+
+    JSON_LD = "JSON_LD"
+    CSS = "CSS"
+    REGEX = "REGEX"
+    SINGLE_NUMBER = "SINGLE_NUMBER"
+    PLATFORM_JSON = "PLATFORM_JSON"
+    EMBEDDED_JSON = "EMBEDDED_JSON"
+    XPATH = "XPATH"
+    PLAYWRIGHT = "PLAYWRIGHT"
+
+
+class ScrapeErrorCode(StrEnum):
+    """Structured error-code vocabulary (Constitution §34, contracts/errors.md).
+
+    Shared by ``price_observations``/``request_attempts``/
+    ``match_current_prices.error_code`` and by the scraping-side
+    fetch-failure classification helpers, so debugging, the later
+    strategy optimizer, access-policy tuning, and client reporting
+    share one language. This slice (SPEC-07) emits the first eleven
+    members; the rest are forward-compat placeholders for proxies,
+    Playwright, the strategy optimizer, and rate-limiting/legal-review
+    features owned by later specs — declared now so those specs never
+    need a widening migration on this column.
+    """
+
+    # --- Emitted by this slice (contracts/errors.md) ---
+    HTTP_403 = "HTTP_403"
+    HTTP_404 = "HTTP_404"
+    HTTP_429 = "HTTP_429"
+    TIMEOUT = "TIMEOUT"
+    DNS_ERROR = "DNS_ERROR"
+    PRICE_NOT_FOUND = "PRICE_NOT_FOUND"
+    INVALID_PRICE_FORMAT = "INVALID_PRICE_FORMAT"
+    LOW_CONFIDENCE_PRICE = "LOW_CONFIDENCE_PRICE"
+    CURRENCY_MISMATCH = "CURRENCY_MISMATCH"
+    BLOCKED = "BLOCKED"
+    UNKNOWN_ERROR = "UNKNOWN_ERROR"
+
+    # --- Forward-compat (not exercised by this slice) ---
+    VARIANT_NOT_FOUND = "VARIANT_NOT_FOUND"
+    CURRENCY_NOT_FOUND = "CURRENCY_NOT_FOUND"
+    STOCK_NOT_FOUND = "STOCK_NOT_FOUND"
+    PROXY_FAILED = "PROXY_FAILED"
+    PLAYWRIGHT_FAILED = "PLAYWRIGHT_FAILED"
+    SELECTOR_BROKEN = "SELECTOR_BROKEN"
+    STRATEGY_DEGRADED = "STRATEGY_DEGRADED"
+    RATE_LIMITED = "RATE_LIMITED"
+    LOCKED_ALREADY_RUNNING = "LOCKED_ALREADY_RUNNING"
+    LIMIT_REACHED = "LIMIT_REACHED"
+    LEGAL_REVIEW_REQUIRED = "LEGAL_REVIEW_REQUIRED"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

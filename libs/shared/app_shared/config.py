@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # --- Scrape-profile resolution cache (SPEC-06 FR-019) ---
     PROFILE_RESOLUTION_CACHE_TTL_SECONDS: int = 30
 
+    # --- Batched persistence flush knobs (SPEC-07 FR-017, Principle VIII) ---
+    # The scraping runtime's batched persistence pipeline (consumed via
+    # get_settings(), never imported the other way — app_shared MUST NOT
+    # depend on the scraping-side library) flushes whichever of these
+    # thresholds is reached first (+ a final flush at spider close) —
+    # DB-tunable so a live deployment can retune without a code change.
+    SCRAPE_FLUSH_MAX_ITEMS: int = 50
+    SCRAPE_FLUSH_INTERVAL_SECONDS: float = 2.0
+
     # --- Auth DB role (optional — direct BYPASSRLS role for pre-auth
     # credential lookups only; see app_shared.database.get_auth_session).
     # Deliberately never falls back to DATABASE_URL (SPEC-03 [analyze C1]).
