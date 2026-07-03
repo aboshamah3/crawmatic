@@ -23,6 +23,25 @@ explicitly out of scope here. Distributed rate limiting, in-flight dedup, the do
 optimizer, proxies/access policies, and the browser spider are later specs; this spider uses
 `DIRECT_HTTP` only.
 
+## Clarifications
+
+### Session 2026-07-03
+
+- Q: Which reactor-safe DB mechanism does §8 mandate — async driver or `deferToThread`? → A:
+  Synchronous SQLAlchemy wrapped in `deferToThread` (reuse the existing sync repositories/session
+  from SPEC-02–06), decided once in `libs/scrape-core`. The stack (§3) is sync SQLAlchemy with no
+  async driver, so introducing a parallel async stack would be higher risk for no MVP benefit; the
+  requirement is only that no DB call blocks the reactor thread.
+- Q: Default batched-flush thresholds for the persistence pipeline? → A: Flush every 50 buffered
+  items or every 2 seconds, whichever comes first, plus a final flush at spider close; thresholds
+  are configuration (env/DB-tunable), not hardcoded constants.
+- Q: How are loopback-served fixtures reconciled with the fetch-time SSRF loopback deny rule? → A:
+  Fetch-time IP validation is applied through an injectable seam (the resolver/allowlist is a
+  parameter of the safety check). Happy-path fixture tests inject a public resolved IP (or an
+  explicit test allowlist for the local fixture server); the SSRF deny behavior is tested
+  separately with private/loopback/redirect cases. Production code always validates the real
+  resolved IP with no allowlist.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Extract and persist a price from a product page (Priority: P1)
@@ -211,7 +230,10 @@ commit count << N, or explicit flush-boundary assertions).
 - **FR-005**: The system MUST enforce URL safety at fetch time: allow only `http`/`https`; reject
   userinfo; and deny private, loopback, link-local, unique-local, cloud-metadata, and internal
   addresses validated against the **resolved IP at connection time**, re-validating every redirect
-  hop. This MUST reuse/extend the existing save-time validator (`validate_competitor_url`).
+  hop. This MUST reuse/extend the existing save-time validator (`validate_competitor_url`). The
+  fetch-time IP validation MUST expose an injectable resolver/allowlist seam so tests can drive
+  both the deny path (private/loopback/redirect) and, for local fixtures, an allowed public IP;
+  production code validates the real resolved IP with no allowlist.
 - **FR-006**: The system MUST implement robots handling as a custom per-request downloader
   middleware that resolves `robots_policy` per competitor/domain from cached config, not Scrapy's
   process-global `ROBOTSTXT_OBEY`.
@@ -243,11 +265,13 @@ commit count << N, or explicit flush-boundary assertions).
   observation; on failure it MUST write a `success=false` observation and MUST NOT overwrite the
   current price with a bad value.
 - **FR-015**: The spider MUST update the scrape job target state for each processed match.
-- **FR-016**: Persistence MUST be batched (flush by item count or elapsed time, and a final flush at
-  spider close), never one commit per item.
-- **FR-017**: All DB access inside pipelines/middlewares MUST be reactor-safe (async driver
-  integrated with the reactor, or wrapped in `deferToThread`), and this choice MUST be made once in
-  `libs/scrape-core`. DB connections MUST go through PgBouncer with a small per-process pool.
+- **FR-016**: Persistence MUST be batched (flush by item count or elapsed time — default every 50
+  items or 2 seconds, tunable via config — and a final flush at spider close), never one commit per
+  item.
+- **FR-017**: All DB access inside pipelines/middlewares MUST be reactor-safe. The chosen mechanism
+  (decided once in `libs/scrape-core`) is synchronous SQLAlchemy wrapped in `deferToThread`, reusing
+  the existing sync repositories/session; no DB call may block the reactor thread. DB connections
+  MUST go through PgBouncer with a small per-process pool.
 - **FR-018**: The worker MUST dispatch the spider via an authenticated Scrapyd `schedule.json`
   call; the scraping service MUST require basic auth; unauthenticated/incorrect calls MUST be
   rejected and MUST NOT start a run.

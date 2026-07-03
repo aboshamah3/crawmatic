@@ -15,3 +15,11 @@ Auto-answered questions and assumptions, with sources. Format:
 - [specify] Q: Reactor-safety approach (async driver vs deferToThread)? → A: Left as a plan-phase decision but mandated to be decided ONCE in libs/scrape-core; spec requires only that DB calls are non-blocking on the reactor. (source: doc §8 Reactor safety)
 - [specify] Q: How is the feature demonstrated without real sites? → A: Local fixture HTML pages only; tests make zero real-competitor network calls. (source: doc §35.07 "Use fixture pages first")
 - [specify] Q: Scrapyd dispatch auth? → A: Basic auth on scraping service; worker authenticates every schedule.json; idempotent dispatch guard. (source: doc §4 scrapyd-http-service, §8 Idempotent dispatch)
+
+## clarify
+
+No questions relayed to the user — all resolved doc-first / from repo context. Integrated into spec §Clarifications (Session 2026-07-03):
+
+- [clarify] Q: Reactor-safe DB mechanism — async driver or deferToThread? → A: sync SQLAlchemy wrapped in deferToThread, decided once in libs/scrape-core; reuse existing sync repos. (source: doc §3 stack is sync SQLAlchemy, no async driver; §8 leaves choice open → best-practice/lowest-risk)
+- [clarify] Q: Default batched-flush thresholds? → A: every 50 items or 2s, whichever first, + final flush at close; config-tunable. (source: default; §8 mandates batching, values unspecified)
+- [clarify] Q: How do loopback fixtures coexist with fetch-time loopback deny? → A: injectable resolver/allowlist seam; happy-path tests inject a public IP / allowlist local server; deny path tested separately; prod validates real resolved IP, no allowlist. (source: default derived from §8/§11 fetch-time SSRF + testability)
