@@ -183,7 +183,8 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "in-progress"
+        "implement": "done",
+        "converge": "in-progress"
       }
     }
   }
