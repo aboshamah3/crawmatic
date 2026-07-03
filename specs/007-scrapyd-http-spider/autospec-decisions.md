@@ -23,3 +23,8 @@ No questions relayed to the user — all resolved doc-first / from repo context.
 - [clarify] Q: Reactor-safe DB mechanism — async driver or deferToThread? → A: sync SQLAlchemy wrapped in deferToThread, decided once in libs/scrape-core; reuse existing sync repos. (source: doc §3 stack is sync SQLAlchemy, no async driver; §8 leaves choice open → best-practice/lowest-risk)
 - [clarify] Q: Default batched-flush thresholds? → A: every 50 items or 2s, whichever first, + final flush at close; config-tunable. (source: default; §8 mandates batching, values unspecified)
 - [clarify] Q: How do loopback fixtures coexist with fetch-time loopback deny? → A: injectable resolver/allowlist seam; happy-path tests inject a public IP / allowlist local server; deny path tested separately; prod validates real resolved IP, no allowlist. (source: default derived from §8/§11 fetch-time SSRF + testability)
+
+## plan
+
+- [plan] Q: FR-015 update scrape job target state — where does the backing table live? → A: Deferred as a seam. scrape_job_targets belongs to the later orchestration spec (SPEC-08); spec Assumptions + master-doc table enumeration place it outside this slice. Recorded as a documented, scoped Constitution-Check deviation, not silently dropped. (source: spec Assumptions + doc §22/§35.08)
+- [plan] Reactor-safe DB seam realized as sync SQLAlchemy in deferToThread reusing SPEC-02 session/RLS; extraction pure parsel/stdlib; migration down_revision a4f205e8d7de (single head). (source: plan.md)
