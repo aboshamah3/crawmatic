@@ -36,13 +36,30 @@ derivation (`app_shared.url_pattern`), on the same auth seam and FR-020
 discipline, gated by the existing `matches:read`/`matches:write` scopes
 (no new scope). `POST /v1/matches/bulk-upsert` (US3) lands in a later
 phase of this feature.
+
+SPEC-06 US1 adds the `/v1/scrape-profiles` router
+(contracts/api-scrape-profiles.md) — dual-scope (own + global read,
+own-only write) extraction-profile CRUD + `POST
+/v1/scrape-profiles/bulk-upsert`, on the same auth seam and FR-020
+discipline, gated by the new `scrape_profiles:read`/`scrape_profiles:write`
+scopes. `PUT /v1/scrape-profiles/workspace-default` (assignment, US2)
+lands in a later phase of this feature.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.routers import api_keys, auth, competitors, matches, product_groups, products, variants
+from app.routers import (
+    api_keys,
+    auth,
+    competitors,
+    matches,
+    product_groups,
+    products,
+    scrape_profiles,
+    variants,
+)
 
 app = FastAPI(title="crawmatic-api")
 
@@ -53,6 +70,7 @@ app.include_router(variants.router)
 app.include_router(product_groups.router)
 app.include_router(competitors.router)
 app.include_router(matches.router)
+app.include_router(scrape_profiles.router)
 
 
 @app.get("/health")
