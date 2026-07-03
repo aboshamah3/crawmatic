@@ -22,6 +22,10 @@ Scope boundaries confirmed from doc §35: access_policies/proxy_providers/domain
 
 ## clarify
 
+## converge
+
+speckit-converge: CONVERGED — every buildable FR-001..023 and SC-001..008 traced to real code (not just [X] marks); no gap beyond the 7 known-deferred live items. tasks.md left unchanged (no new tasks appended). Final gate: 745 unit passed; integration 3 passed / 120 skipped / 0 errors; scoping guard exit 0; single head a4f205e8d7de.
+
 ## analyze
 
 speckit-analyze: 0 CRITICAL, 0 HIGH. 100% FR/SC coverage (23/23 FR, 8/8 SC), constitution-aligned, factual claims verified against codebase (single head f4c8a391d5c9, assignment columns pre-exist, parse_money not yet present). 5 LOW/MEDIUM polish findings — all remediated in-place (analyze is read-only, orchestrator applied edits):

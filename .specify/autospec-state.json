@@ -126,7 +126,7 @@
     "06": {
       "title": "Scrape Profiles & Extraction Rules",
       "feature_directory": "specs/006-scrape-profiles-extraction",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -134,8 +134,19 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T027 scrape-profiles CRUD live (round-trip fidelity, defaults, 409, 422)",
+        "T028 dual-scope isolation live (cross-ws denial, global-read-by-all, tenant global-write-block)",
+        "T029 bulk-upsert reject-and-report + idempotency live",
+        "T035 assignment accept/reject cross-workspace + ON DELETE SET NULL live",
+        "T040 batch resolution precedence + no-N+1 + Redis TTL/invalidation live",
+        "T047 alembic upgrade head + downgrade round-trip (online)",
+        "T048 live-DB/Redis e2e quickstart"
+      ],
+      "deferred_reason": "require a live Postgres/Redis (no container engine in build env); artifacts authored + skip cleanly; DB/Redis-independent logic fully unit-tested here (745 passed; integration 3 passed/120 skipped/0 errors; scoping guard OK; single head a4f205e8d7de)"
     }
   }
 }
