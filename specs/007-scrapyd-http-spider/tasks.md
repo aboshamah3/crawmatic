@@ -172,12 +172,12 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 **Purpose**: End-to-end scenarios against a real Postgres/Redis/Scrapyd stack. Authored now and **skip cleanly** where those services are unreachable (no container engine in this build env — SPEC-02→06 deferred-verification pattern). Zero real-competitor network calls; fixtures only (FR-021/SC-007).
 
-- [ ] T044 [P] Create `tests/integration/test_spider_jsonld_fixture_live.py` (US1/SC-001) — seed ws/product/variant/competitor/match/profile; serve JSON-LD fixture (loopback server, resolver allowlisted); run spider; assert 1 success observation + `match_current_prices` upsert + 1 `request_attempt`; workspace-scoped.
-- [ ] T045 [P] Create `tests/integration/test_spider_ssrf_live.py` (US2/SC-002) — match URL resolving to a private IP and a public→internal 302: refused pre-body; no `success=true` observation; failure recorded `BLOCKED`.
-- [ ] T046 [P] Create `tests/integration/test_spider_strategies_live.py` (US3/SC-003) — CSS-only and regex-only fixtures → expected method + confidence; discount/"save X"-only fixture rejected.
-- [ ] T047 [P] Create `tests/integration/test_dispatch_scrapyd_live.py` (US4/SC-005) — authenticated `schedule.json` returns a jobid; unauthenticated rejected; retried dispatch of the same `(scrape_job_id, batch_index)` does not double-run.
-- [ ] T048 [P] Create `tests/integration/test_spider_batch_live.py` (US5/SC-006) — N fixture matches → all N observations persist with commit count ≪ N; DB off the reactor thread.
-- [ ] T049 [P] Create `tests/integration/test_observations_isolation_live.py` (Isolation/Principle II) — cross-workspace read/write blocked (app scoping + RLS); no workspace context → 0 rows.
+- [X] T044 [P] Create `tests/integration/test_spider_jsonld_fixture_live.py` (US1/SC-001) — seed ws/product/variant/competitor/match/profile; serve JSON-LD fixture (loopback server, resolver allowlisted); run spider; assert 1 success observation + `match_current_prices` upsert + 1 `request_attempt`; workspace-scoped.
+- [X] T045 [P] Create `tests/integration/test_spider_ssrf_live.py` (US2/SC-002) — match URL resolving to a private IP and a public→internal 302: refused pre-body; no `success=true` observation; failure recorded `BLOCKED`.
+- [X] T046 [P] Create `tests/integration/test_spider_strategies_live.py` (US3/SC-003) — CSS-only and regex-only fixtures → expected method + confidence; discount/"save X"-only fixture rejected.
+- [X] T047 [P] Create `tests/integration/test_dispatch_scrapyd_live.py` (US4/SC-005) — authenticated `schedule.json` returns a jobid; unauthenticated rejected; retried dispatch of the same `(scrape_job_id, batch_index)` does not double-run.
+- [X] T048 [P] Create `tests/integration/test_spider_batch_live.py` (US5/SC-006) — N fixture matches → all N observations persist with commit count ≪ N; DB off the reactor thread.
+- [X] T049 [P] Create `tests/integration/test_observations_isolation_live.py` (Isolation/Principle II) — cross-workspace read/write blocked (app scoping + RLS); no workspace context → 0 rows.
 
 ---
 
