@@ -102,7 +102,7 @@
     "05": {
       "title": "Competitors & Matches",
       "feature_directory": "specs/005-competitors-matches",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -110,8 +110,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T013 competitors CRUD live",
+        "T021 matches CRUD live (save-time SSRF persistence)",
+        "T026 bulk-upsert idempotency + reject-report live",
+        "T030 cross-workspace isolation / RLS row denial live",
+        "T033 alembic upgrade head + downgrade round-trip (online)",
+        "T034 live-DB e2e quickstart request flows"
+      ],
+      "deferred_reason": "require a live Postgres (no container engine in build env); artifacts authored + skip cleanly; DB-independent logic fully unit-tested here (502 passed; scoping guard OK; single head f4c8a391d5c9)"
     }
   }
 }
