@@ -182,8 +182,9 @@ is not directly user-visible, but the persistence design must be right from the 
 large jobs do not serialize on the pooler or stall the reactor.
 
 **Independent Test**: Run the spider over a batch of N fixture matches; assert all N observations
-persist, that DB writes are dispatched off the reactor thread (async driver or `deferToThread`),
-and that persistence occurs in batched flushes rather than one commit per item (e.g. observed
+persist, that DB writes are dispatched off the reactor thread (sync SQLAlchemy in `deferToThread`,
+per the clarified decision), and that persistence occurs in batched flushes rather than one commit
+per item (e.g. observed
 commit count << N, or explicit flush-boundary assertions).
 
 **Acceptance Scenarios**:
@@ -191,8 +192,8 @@ commit count << N, or explicit flush-boundary assertions).
 1. **Given** a spider run over N matches, **When** items are produced, **Then** the pipeline
    buffers and flushes in batches by size or time, and all N rows are persisted by spider close.
 2. **Given** any DB call inside a pipeline or middleware, **When** it executes, **Then** it does
-   not block the reactor thread (async driver integrated with the reactor, or wrapped in
-   `deferToThread`).
+   not block the reactor thread (synchronous SQLAlchemy wrapped in `deferToThread`, the decided
+   single mechanism).
 3. **Given** a partial batch at spider close, **When** the spider finishes, **Then** the final
    buffer is flushed so no observations are lost.
 
@@ -259,7 +260,9 @@ commit count << N, or explicit flush-boundary assertions).
   respectively), with the partition key included in the primary key, per the §22 partitioned-table
   rules, with an initial migration and at least the current + next month partitions.
 - **FR-013**: For each attempted target, the spider MUST write exactly one `request_attempt` row
-  capturing url, access method, status code, response time, success, and error code/message.
+  capturing url, access method, status code, response time, success, and error code/message. A
+  redirect chain counts as a single attempt (one `request_attempt` row for the whole hop sequence);
+  the recorded `url` is the originally requested URL, even though every hop is safety-re-validated.
 - **FR-014**: On success, the spider MUST write a `price_observation` row and upsert
   `match_current_prices` (unique on `workspace_id, match_id`) with a soft reference to the
   observation; on failure it MUST write a `success=false` observation and MUST NOT overwrite the
@@ -308,7 +311,8 @@ commit count << N, or explicit flush-boundary assertions).
 - **MatchCurrentPrice** (`match_current_prices`, unique on `workspace_id, match_id`): the latest
   known price snapshot for a match — price, old_price, currency, stock_status, comparable, a soft
   `observation_id` reference, success, extraction_method/confidence, scraped_at, updated_at.
-  (Model may already exist from earlier specs; the spider updates it.)
+  (This spec creates the `match_current_prices` model/table — it does not exist yet — and the
+  spider writes/upserts it.)
 - **Match / ScrapeProfile (resolved)**: existing entities the spider reads — the competitor product
   match (URL, currency expectations, robots policy source) and its resolved scrape profile
   (extraction selectors/rules, validation_rules, confidence config, mode).

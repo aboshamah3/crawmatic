@@ -37,3 +37,13 @@ Generated checklists/security.md (28 requirements-quality items, release-gate). 
 - [checklist] CHK028 (spec/plan conflict): FR-015 said spider MUST update scrape_job_targets, but plan defers that table to SPEC-08 → reworded FR-015 to "record terminal outcome via attempts/observations; dedicated scrape_job_targets write deferred". Resolves the conflict analyze would flag. (source: plan Complexity Tracking + spec Assumptions)
 
 Both spec checklists now fully checked (requirements.md 16/16, security.md 28/28).
+
+## analyze
+
+speckit-analyze: 0 CRITICAL, 0 HIGH, 1 MEDIUM, 4 LOW. 100% FR→task coverage (23/23). All findings remediated in artifacts (analyze is read-only; orchestrator applied edits); no re-run required (nothing CRITICAL/HIGH):
+
+- [analyze] I1 (MEDIUM): US5 Independent Test + Acceptance Scenario 2 still said "async driver or deferToThread" → reconciled to "sync SQLAlchemy in deferToThread" (matches FR-017 + Clarifications). (source: spec Clarifications)
+- [analyze] A1 (LOW): spec hedged match_current_prices "may already exist" — verified it does NOT exist in repo → reworded to "this spec creates it". (source: repo grep)
+- [analyze] C1 (LOW): plan mislabeled Principles VII & VIII "(NON-NEGOTIABLE)"; constitution marks only II/V/VI → removed the tag on VII/VIII. (source: constitution v1.0.1)
+- [analyze] U1 (LOW): `mode` arg semantics unspecified → contracts/spider-args.md now states mode is reserved/pass-through (only HTTP⇒DIRECT_HTTP honored; other modes are later specs). (source: plan scope)
+- [analyze] U2 (LOW): redirect-hop vs request_attempt count unreconciled → FR-013 now states a redirect chain = one attempt (one request_attempt row), url = originally requested URL. (source: spec FR-013/US2)

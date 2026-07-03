@@ -9,7 +9,7 @@
 | `workspace_id` | UUID string | yes | scopes **every** DB query (FR-002) |
 | `scrape_job_id` | UUID string | yes | correlation id stored on observations/attempts (nullable column) |
 | `match_ids` | comma-separated UUIDs (or JSON list) | yes | the targets to scrape |
-| `mode` | string | no | transport hint; `HTTP` in this slice |
+| `mode` | string | no | reserved/pass-through in this slice — only `HTTP` (⇒ `DIRECT_HTTP`) is honored; other transport modes (proxy/browser) and their enumerated values are defined by the later access-policy/browser specs. Absent ⇒ `HTTP`. |
 
 ## Lifecycle (per FR-002/003/004/007/020, §8 steps 1–11)
 
