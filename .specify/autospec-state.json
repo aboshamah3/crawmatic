@@ -109,7 +109,8 @@
         "plan": "done",
         "checklist": "done",
         "tasks": "done",
-        "analyze": "done"
+        "analyze": "done",
+        "implement": "done"
       }
     }
   }
