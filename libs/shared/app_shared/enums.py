@@ -75,6 +75,27 @@ class ApiKeyStatus(StrEnum):
     REVOKED = "revoked"
 
 
+class ProductStatus(StrEnum):
+    """Lifecycle status of a ``products`` row (SPEC-04 FR-017)."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class VariantStatus(StrEnum):
+    """Lifecycle status of a ``product_variants`` row (SPEC-04 FR-017)."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class GroupStatus(StrEnum):
+    """Lifecycle status of a ``product_groups`` row (SPEC-04 FR-017)."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

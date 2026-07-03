@@ -4,8 +4,9 @@ Enforces FR-003 / data-model.md "Entity: Shared Library Member":
 
 * ``app_shared`` (and its submodules ``config``/``database``/``task_names``/
   ``ids``/``money``/``enums``/``models``/``models.base``/``models.rls``/
-  ``models.identity``/``repository``/``security``, plus the SPEC-03
-  ``security`` primitives as they land) MUST NOT pull in
+  ``models.identity``/``models.catalog``/``pagination``/``catalog``/
+  ``repository``/``security``, plus the SPEC-03 ``security`` primitives
+  and the SPEC-04 catalog core as they land) MUST NOT pull in
   Scrapy/Twisted/Playwright — those belong only to the Scrapyd-side app
   members (``scrapers``, ``scrapers-browser``) and their shared
   ``scrape_core`` library. ``app_shared`` also MUST NOT pull in FastAPI
@@ -48,6 +49,9 @@ import app_shared.models
 import app_shared.models.base
 import app_shared.models.rls
 import app_shared.models.identity
+import app_shared.models.catalog
+import app_shared.pagination
+import app_shared.catalog
 import app_shared.repository
 import app_shared.redis_client
 import app_shared.security

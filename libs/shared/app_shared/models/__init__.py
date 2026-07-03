@@ -29,6 +29,12 @@ from app_shared.models import _smoke  # noqa: F401
 # `from app_shared.models import User, ApiKey, ...`.
 from app_shared.models.identity import ApiKey, RefreshToken, User, Workspace
 
+# The SPEC-04 catalog models (products/variants/groups/group-items) —
+# re-exported so `Base.metadata` sees all four tables for Alembic
+# autogenerate/offline-render (target_metadata), and so callers can
+# `from app_shared.models import Product, ...`.
+from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
+
 __all__ = [
     "Base",
     "metadata",
@@ -41,4 +47,8 @@ __all__ = [
     "User",
     "RefreshToken",
     "ApiKey",
+    "Product",
+    "ProductVariant",
+    "ProductGroup",
+    "ProductGroupItem",
 ]
