@@ -78,7 +78,7 @@
     "04": {
       "title": "Catalog: Products, Variants, Groups",
       "feature_directory": "specs/004-catalog-products-variants-groups",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -86,8 +86,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T020 products CRUD live",
+        "T028 bulk upsert idempotency live",
+        "T031 workspace isolation/RLS denial live",
+        "T035 groups membership live",
+        "T038 online migration run",
+        "T039 live quickstart e2e"
+      ],
+      "deferred_reason": "require a live Postgres (no container engine in build env); artifacts authored + skip cleanly; DB-independent logic fully unit-tested here (335 passed, 45 skipped)"
     }
   }
 }

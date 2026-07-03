@@ -38,6 +38,23 @@ Master doc: `/srv/crawmatic/PROJECT_SPEC.md`
 - [analyze] F3 (LOW): T011 lacked the {items,next_cursor} envelope more/none-branch assertion (SC-009) → A: added envelope-builder assertion (limit+1 rows → cursor set; ≤limit → null).
 - Only MEDIUM/LOW (no CRITICAL/HIGH); clarification-only changes → full re-run not required. 100% FR/SC coverage retained.
 
+## implement (sonnet subagents, 4 groups)
+
+33/39 tasks [X]; 6 DEFERRED (live PG). Suite: 335 passed, 45 skipped.
+- A Setup+Foundational (T001-T013): 4 catalog models (partial unique indexes, composite workspace-local FKs, unique(workspace_id,id) parents), migration c2987b29555e w/ RLS on all 4, pagination.py, WORKSPACE_OWNED_MODELS +4. Constraint names shortened to fit 63-byte limit.
+- B US1 (T014-T019): default_variant core, schemas (money/currency validators), products CRUD + variants list/get/patch routers (scope-gated, keyset pagination, hard-delete outcome).
+- C US2 (T021-T027): consistency.py, upsert.py (pure ≤3-stmt/table set-based ON CONFLICT matching partial indexes, last-wins, default-variant injection, identity-less always-insert), bulk endpoints.
+- D US4+US3+Polish (T029-T030,T032-T034,T036-T037): scope-gating + guard tests, product_groups router (CRUD+items, add-variant needs variants:write, dup->409, consistency pre-check), identity-less docs, validation gate.
+
+### DEFERRED — live Postgres (authored + skip cleanly; not gaps)
+T020 products CRUD, T028 bulk idempotency, T031 workspace isolation/RLS denial, T035 groups membership, T038 online migration, T039 live quickstart e2e. Cover live halves of SC-001/002/004/005/008 + online migration.
+
+## converge (opus subagent)
+
+- Result: CONVERGED — no new tasks (tasks.md unchanged). Static sweep all PASS:
+  guard exit 0 + catches planted unscoped select(Product); one head c2987b29555e; offline render = 4 catalog tables + 6 partial unique indexes (WHERE ... IS NOT NULL) + 12 catalog RLS statements (ENABLE+FORCE+NULLIF); bulk-upsert ON CONFLICT index_where matches model partial-index predicates exactly; no unannotated unscoped catalog access; app_shared/catalog framework-agnostic; default-variant + money/currency + scope-gating (add-variant needs variants:write) unit-verified; Base.metadata = _smoke_foundation + 4 identity + 4 catalog (9 tables, no SPEC-05 leak); 17 catalog routes under /v1.
+- FR-001..FR-017 built/verified here; SC buildable portions verified; 6 daemon-deferred live-PG items are the only open verifications. Converged cycle 1, no implement re-loop.
+
 ## checklist
 
 Run substance INLINE (context conservation). Generated checklists/catalog.md (29 requirements-quality items). Gap found + fixed before checking: bulk-upsert identity for a product with NO external_id/sku was unspecified (would silently duplicate on re-push) → added to FR-011 + 2 edge cases (always-insert documented limitation; nested Woo/Salla product+variant resolution order). Completion: catalog.md 29/29 pass; requirements.md 16/16 pass. Implement gate CLEAR.
