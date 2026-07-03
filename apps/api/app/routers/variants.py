@@ -21,11 +21,13 @@ from app_shared.catalog.consistency import (
     assert_refs_in_workspace,
 )
 from app_shared.catalog.upsert import plan_upsert
+from app_shared.models.alerts import VariantPriceState
 from app_shared.models.catalog import Product, ProductVariant
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
 
 from app.deps import Principal, require_scopes
+from app.schemas.alerts import PriceComparisonResponse
 from app.schemas.catalog import (
     VariantBulkUpsertResult,
     VariantListResponse,
@@ -83,6 +85,58 @@ def get_variant(
             detail={"error": {"code": "NOT_FOUND", "message": "Variant not found."}},
         )
     return VariantResponse.model_validate(variant)
+
+
+@router.get("/{variant_id}/price-comparison", response_model=PriceComparisonResponse)
+def get_price_comparison(
+    variant_id: uuid.UUID,
+    principal_ctx: tuple = Depends(require_scopes("alerts:read")),
+) -> PriceComparisonResponse:
+    """`GET /v1/variants/{variant_id}/price-comparison` (SPEC-09 US1, FR-017/FR-020).
+
+    404s an unknown/cross-workspace variant (checked first, via
+    `scoped_get`) and, separately, a variant that has never been
+    analyzed yet (no `variant_price_states` row) — both distinguishable
+    only by message, not status code (contracts/api-alerts.md).
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+
+    variant = scoped_get(session, ProductVariant, variant_id, principal.workspace_id)
+    if variant is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "NOT_FOUND", "message": "Variant not found."}},
+        )
+
+    price_state = session.execute(
+        scoped_select(VariantPriceState, principal.workspace_id).where(
+            VariantPriceState.product_variant_id == variant_id
+        )
+    ).scalar_one_or_none()
+    if price_state is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": "No price comparison has been computed yet for this variant.",
+                }
+            },
+        )
+
+    return PriceComparisonResponse(
+        product_variant_id=price_state.product_variant_id,
+        client_price=price_state.client_price,
+        currency=price_state.currency,
+        cheapest_competitor_price=price_state.cheapest_competitor_price,
+        average_competitor_price=price_state.average_competitor_price,
+        highest_competitor_price=price_state.highest_competitor_price,
+        comparable_competitor_count=price_state.comparable_competitor_count,
+        alert_type=price_state.latest_alert_type,
+        alert_severity=price_state.latest_alert_severity,
+        calculated_at=price_state.calculated_at,
+    )
 
 
 @router.patch("/{variant_id}", response_model=VariantResponse)
