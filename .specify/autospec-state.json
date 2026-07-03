@@ -205,7 +205,8 @@
         "clarify": "done",
         "plan": "done",
         "checklist": "done",
-        "tasks": "in-progress"
+        "tasks": "done",
+        "analyze": "in-progress"
       }
     }
   }
