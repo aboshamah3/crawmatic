@@ -98,6 +98,14 @@
         "T039 live quickstart e2e"
       ],
       "deferred_reason": "require a live Postgres (no container engine in build env); artifacts authored + skip cleanly; DB-independent logic fully unit-tested here (335 passed, 45 skipped)"
+    },
+    "05": {
+      "title": "Competitors & Matches",
+      "feature_directory": "specs/005-competitors-matches",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
