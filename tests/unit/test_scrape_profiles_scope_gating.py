@@ -1,7 +1,10 @@
-"""Scrape-profiles scope-gating unit tests (SPEC-06 US1 T025, FR-004, SC-007).
+"""Scrape-profiles scope-gating unit tests (SPEC-06 US1 T025 + US2 T034,
+FR-004, SC-007).
 
 Mirrors `tests/unit/test_matches_scope_gating.py` (SPEC-05) for the new
-`/v1/scrape-profiles` route family (`scrape_profiles:read/write`).
+`/v1/scrape-profiles` route family (`scrape_profiles:read/write`),
+including the US2 `PUT /v1/scrape-profiles/workspace-default` assignment
+endpoint.
 
 Two independent proofs per route:
 
@@ -92,6 +95,7 @@ _EXPECTED_STATIC_SCOPES: list[tuple[str, str, tuple[str, ...]]] = [
     ("PATCH", "/v1/scrape-profiles/{profile_id}", ("scrape_profiles:write",)),
     ("DELETE", "/v1/scrape-profiles/{profile_id}", ("scrape_profiles:write",)),
     ("POST", "/v1/scrape-profiles/bulk-upsert", ("scrape_profiles:write",)),
+    ("PUT", "/v1/scrape-profiles/workspace-default", ("scrape_profiles:write",)),
 ]
 
 
@@ -153,4 +157,14 @@ def test_bulk_upsert_scrape_profiles_without_write_scope_is_403(client: TestClie
         ["scrape_profiles:read"]
     )
     resp = client.post("/v1/scrape-profiles/bulk-upsert", json={"profiles": []})
+    assert resp.status_code == 403
+
+
+def test_put_workspace_default_scrape_profile_without_write_scope_is_403(
+    client: TestClient,
+) -> None:
+    app.dependency_overrides[get_current_principal] = _fake_principal_with_scopes(
+        ["scrape_profiles:read"]
+    )
+    resp = client.put("/v1/scrape-profiles/workspace-default", json={"profile_id": None})
     assert resp.status_code == 403

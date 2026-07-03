@@ -1,4 +1,4 @@
-"""Scrape-profiles endpoints (`contracts/api-scrape-profiles.md`) — SPEC-06 US1.
+"""Scrape-profiles endpoints (`contracts/api-scrape-profiles.md`) — SPEC-06 US1/US2.
 
 Every endpoint runs on the SPEC-03 auth seam (`app.deps.get_current_principal`
 => `set_workspace_context` already applied to the yielded session) and is
@@ -9,8 +9,10 @@ create/update/delete go through `owned_profile_select`/`owned_profile_get`
 (own-only — a global or other-workspace id 404s via the tenant path,
 FR-021). RLS backs both as the second isolation layer.
 
-`PUT /v1/scrape-profiles/workspace-default` (assignment, US2) lands in a
-later phase of this feature (T034) — not implemented here.
+`PUT /v1/scrape-profiles/workspace-default` (assignment, US2 T034) sets
+`workspaces.default_scrape_profile_id` after `assert_profile_assignable`
+(own+global -> OK, cross-workspace -> `422`, dangling -> `404`, `null`
+clears — `contracts/assignment-enforcement.md`).
 """
 
 from __future__ import annotations
@@ -20,9 +22,15 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 
+from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
+from app_shared.models.identity import Workspace
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
-from app_shared.profiles.repository import owned_profile_get, visible_profiles_select
+from app_shared.profiles.repository import (
+    assert_profile_assignable,
+    owned_profile_get,
+    visible_profiles_select,
+)
 from app_shared.profiles.upsert import build_profiles_upsert, prepare_profiles
 from app_shared.profiles.validation import ProfileValidationError, validate_profile
 
@@ -35,6 +43,7 @@ from app.schemas.scrape_profiles import (
     ScrapeProfileListResponse,
     ScrapeProfileResponse,
     ScrapeProfileUpdate,
+    WorkspaceDefaultProfileAssignment,
 )
 
 router = APIRouter(prefix="/v1/scrape-profiles", tags=["scrape-profiles"])
@@ -52,6 +61,13 @@ def _not_found(message: str) -> HTTPException:
 def _duplicate_profile(message: str) -> HTTPException:
     return HTTPException(
         status_code=409, detail={"error": {"code": "DUPLICATE_PROFILE", "message": message}}
+    )
+
+
+def _workspace_mismatch(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"error": {"code": "WORKSPACE_MISMATCH", "message": message}},
     )
 
 
@@ -249,3 +265,43 @@ def bulk_upsert_scrape_profiles(
         profiles=[ScrapeProfileResponse.model_validate(p) for p in profiles],
         rejected=rejected,
     )
+
+
+# --- workspace-default assignment (US2 T034, `contracts/assignment-enforcement.md`) --
+
+
+@router.put(
+    "/workspace-default",
+    response_model=WorkspaceDefaultProfileAssignment,
+    status_code=200,
+)
+def set_workspace_default_scrape_profile(
+    payload: WorkspaceDefaultProfileAssignment,
+    principal_ctx: tuple = Depends(require_scopes("scrape_profiles:write")),
+) -> WorkspaceDefaultProfileAssignment:
+    """Set (or, with `profile_id: null`, clear) the caller's workspace
+    default scrape profile (FR-012/FR-013). `assert_profile_assignable`
+    accepts own-workspace or global; rejects a cross-workspace reference
+    (`422 WORKSPACE_MISMATCH`) or a dangling id (`404 NOT_FOUND`).
+    `Workspace` carries no RLS (root/tenant table) — fetched by plain PK."""
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    try:
+        assert_profile_assignable(session, ws, payload.profile_id)
+    except MissingReference as exc:
+        raise _not_found("Scrape profile not found.") from exc
+    except CrossWorkspaceReference as exc:
+        raise _workspace_mismatch(
+            "Scrape profile belongs to a different workspace."
+        ) from exc
+
+    workspace = session.get(Workspace, ws)
+    if workspace is None:
+        raise _not_found("Workspace not found.")
+
+    workspace.default_scrape_profile_id = payload.profile_id
+    session.flush()
+
+    return WorkspaceDefaultProfileAssignment(profile_id=workspace.default_scrape_profile_id)

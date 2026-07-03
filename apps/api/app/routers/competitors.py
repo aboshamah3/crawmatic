@@ -6,6 +6,12 @@ scope-gated via `app.deps.require_scopes(...)`. All reads/writes go
 through `app_shared.repository.scoped_select`/`scoped_get` — RLS backs
 them as the second isolation layer (FR-002/FR-015), same discipline as
 `routers/products.py` / `routers/product_groups.py`.
+
+`default_scrape_profile_id` (create + update) is checked via
+`app_shared.profiles.repository.assert_profile_assignable`
+(`contracts/assignment-enforcement.md`, SPEC-06 US2 T032): visible
+(own-workspace or global) or `None` -> OK; a cross-workspace reference
+-> `422 WORKSPACE_MISMATCH`; a dangling id -> `404 NOT_FOUND`.
 """
 
 from __future__ import annotations
@@ -15,8 +21,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 
+from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
 from app_shared.models.competitors_matches import Competitor
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
+from app_shared.profiles.repository import assert_profile_assignable
 from app_shared.repository import scoped_get, scoped_select
 
 from app.deps import Principal, require_scopes
@@ -43,6 +51,28 @@ def _duplicate_domain(message: str) -> HTTPException:
     )
 
 
+def _workspace_mismatch(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"error": {"code": "WORKSPACE_MISMATCH", "message": message}},
+    )
+
+
+def _check_scrape_profile_assignable(
+    session: object, workspace_id: uuid.UUID, profile_id: uuid.UUID | None
+) -> None:
+    """`assert_profile_assignable` wrapper mapping to the router's own
+    `404`/`422` error builders (`contracts/assignment-enforcement.md`)."""
+    try:
+        assert_profile_assignable(session, workspace_id, profile_id)  # type: ignore[arg-type]
+    except MissingReference as exc:
+        raise _not_found("Scrape profile not found.") from exc
+    except CrossWorkspaceReference as exc:
+        raise _workspace_mismatch(
+            "Scrape profile belongs to a different workspace."
+        ) from exc
+
+
 @router.post("", response_model=CompetitorResponse, status_code=201)
 def create_competitor(
     payload: CompetitorCreate,
@@ -50,6 +80,10 @@ def create_competitor(
 ) -> CompetitorResponse:
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
+
+    _check_scrape_profile_assignable(
+        session, principal.workspace_id, payload.default_scrape_profile_id
+    )
 
     competitor = Competitor(
         workspace_id=principal.workspace_id,
@@ -133,6 +167,10 @@ def update_competitor(
         raise _not_found("Competitor not found.")
 
     updates = payload.model_dump(exclude_unset=True)
+    if "default_scrape_profile_id" in updates:
+        _check_scrape_profile_assignable(
+            session, principal.workspace_id, updates["default_scrape_profile_id"]
+        )
     for field, value in updates.items():
         setattr(competitor, field, value)
 

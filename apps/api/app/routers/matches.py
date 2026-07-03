@@ -25,6 +25,14 @@ competitors are resolved/consistency-checked via bounded scoped lookups
 (never per-row), and the whole safe batch lands in exactly **one**
 `INSERT ... ON CONFLICT DO UPDATE` (`app_shared.matches.upsert`, SC-006)
 that never touches the health fields on re-push.
+
+`scrape_profile_id` (create + update + bulk-upsert) is checked via
+`app_shared.profiles.repository.assert_profile_assignable`
+(`contracts/assignment-enforcement.md`, SPEC-06 US2 T033): visible
+(own-workspace or global) or `None` -> OK; a cross-workspace reference
+-> `422 WORKSPACE_MISMATCH`; a dangling id -> `404 NOT_FOUND`. The bulk
+path collects the batch's distinct `scrape_profile_id`s and runs **one**
+`profile_visibility_map` lookup, never one query per row.
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ from app_shared.matches.upsert import (
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
+from app_shared.profiles.repository import assert_profile_assignable, profile_visibility_map
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.url_pattern import derive_match_url_fields
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
@@ -97,6 +106,43 @@ def _duplicate_match(message: str) -> HTTPException:
     return HTTPException(
         status_code=409, detail={"error": {"code": "DUPLICATE_MATCH", "message": message}}
     )
+
+
+def _check_scrape_profile_assignable(
+    session: Session, workspace_id: uuid.UUID, profile_id: uuid.UUID | None
+) -> None:
+    """`assert_profile_assignable` wrapper mapping to this router's own
+    `404`/`422` error builders (`contracts/assignment-enforcement.md`)."""
+    try:
+        assert_profile_assignable(session, workspace_id, profile_id)
+    except MissingReference as exc:
+        raise _not_found("Scrape profile not found.") from exc
+    except CrossWorkspaceReference as exc:
+        raise _workspace_mismatch(
+            "Scrape profile belongs to a different workspace."
+        ) from exc
+
+
+def _check_scrape_profile_ids_assignable_bulk(
+    session: Session, workspace_id: uuid.UUID, profile_ids: set[uuid.UUID | None]
+) -> None:
+    """Bulk-path assignability check (`contracts/assignment-enforcement.md`
+    "Bulk path (no N+1)"): one `profile_visibility_map` `IN (...)` lookup
+    over the batch's distinct `scrape_profile_id`s, then a per-id check
+    against the in-memory map — never one query per row."""
+    ids = {profile_id for profile_id in profile_ids if profile_id is not None}
+    if not ids:
+        return
+
+    visibility = profile_visibility_map(session, workspace_id, ids)
+    for profile_id in ids:
+        if profile_id not in visibility:
+            raise _not_found("Scrape profile not found.")
+        actual_workspace_id = visibility[profile_id]
+        if actual_workspace_id is not None and actual_workspace_id != workspace_id:
+            raise _workspace_mismatch(
+                "Scrape profile belongs to a different workspace."
+            )
 
 
 # --- reference resolution (Layer 2, contracts/workspace-consistency.md) -----
@@ -195,6 +241,7 @@ def create_match(
 
     variant = _resolve_variant(session, ws, payload)
     _resolve_competitor(session, ws, payload.competitor_id)
+    _check_scrape_profile_assignable(session, ws, payload.scrape_profile_id)
 
     match = CompetitorProductMatch(
         workspace_id=ws,
@@ -345,6 +392,10 @@ def bulk_upsert_matches(
     if not resolved:
         return MatchBulkUpsertResult(upserted=0, matches=[], rejected=rejected)
 
+    _check_scrape_profile_ids_assignable_bulk(
+        session, ws, {row.get("scrape_profile_id") for row in resolved}
+    )
+
     final_rows = [
         {
             "workspace_id": ws,
@@ -465,6 +516,11 @@ def update_match(
         match.url_pattern = url_pattern
         match.url_pattern_version = url_pattern_version
         del updates["competitor_url"]
+
+    if "scrape_profile_id" in updates:
+        _check_scrape_profile_assignable(
+            session, principal.workspace_id, updates["scrape_profile_id"]
+        )
 
     for field, value in updates.items():
         setattr(match, field, value)
