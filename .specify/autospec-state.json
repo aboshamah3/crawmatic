@@ -199,7 +199,7 @@
     "09": {
       "title": "Current Prices & Alert Logic",
       "feature_directory": "specs/009-current-prices-alerts",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -208,8 +208,18 @@
         "tasks": "done",
         "analyze": "done",
         "implement": "done",
-        "converge": "in-progress"
-      }
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T034 scrape→recompute→comparison live e2e",
+        "T035 alert-event history transitions on real rows (CREATED/UPDATED/RESOLVED/REOPENED)",
+        "T036 cross-workspace + no-context RLS denial across all 3 tables",
+        "T037 currency-mismatch write-back live (comparable=false + CURRENCY_MISMATCH)",
+        "T038 real-Redis per-variant-per-job dedup (single recompute)",
+        "T039 alembic upgrade head partition + RLS creation live"
+      ],
+      "deferred_reason": "require a live Postgres/Redis/Celery (no container engine in build env); 6 integration tests authored + skip cleanly. Pure engine + DB/Redis-independent logic exhaustively unit-tested here (1186 unit passed incl. every §23 boundary/type/transition; integration 3 passed/165 skipped/0 errors; scoping guard OK; single head e4a75b48360c). 42 tasks; converge found no gaps.",
+      "converge_result": "CONVERGED — no remaining work; tasks.md unchanged"
     }
   }
 }
