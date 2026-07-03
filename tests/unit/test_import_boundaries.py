@@ -1,5 +1,5 @@
 """Import-boundary tests for the shared-library dependency direction (T043,
-T045, T050, SPEC-08 T049).
+T045, T050, SPEC-08 T049, SPEC-09 T040).
 
 Enforces FR-003 / data-model.md "Entity: Shared Library Member":
 
@@ -32,6 +32,22 @@ Enforces FR-003 / data-model.md "Entity: Shared Library Member":
   enqueue dispatch work, but MUST NOT import ``apps.workers`` — the API
   never pulls in the worker's (and its future scrapy-adjacent) import
   closure (Constitution I).
+* SPEC-09: ``app_shared.alerts.engine`` (and the ``alerts`` package) is
+  a **pure** module — its own import statements pull in nothing beyond
+  stdlib ``decimal`` + ``app_shared.enums`` (+ optional
+  ``app_shared.money``); asserted via an **AST** parse of the source
+  file's own ``import``/``from ... import`` statements (not a
+  ``sys.modules`` runtime check — ``app_shared.enums`` itself
+  legitimately imports sqlalchemy for ``enum_column``'s
+  ``TypeDecorator``, so a transitive runtime check would false-positive;
+  see contracts/alert-engine.md "Acceptance"). ``app_shared.models.alerts``
+  (SPEC-09 T005) imports no scrapy/twisted/fastapi (sqlalchemy is
+  expected — it is an ORM model module). ``apps/api/app/routers/alerts.py``
+  + the SPEC-09 additions to ``routers/variants.py``/``routers/matches.py``
+  import ``app_shared.messaging``, never ``apps.workers``.
+  ``scrape_core.pipelines`` (trigger (a), SPEC-09 T029) imports
+  ``app_shared.messaging``/``app_shared.redis_client``, never
+  fastapi/apps.workers.
 
 Each check runs the import in a **fresh subprocess** (rather than just
 inspecting ``sys.modules`` in-process) so that whatever the current test
@@ -306,3 +322,155 @@ def test_scrape_core_new_modules_import_cleanly_with_app_shared() -> None:
         "a scrape_core.* module failed to import, or did not pull in "
         f"app_shared:\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
     )
+
+
+# --- SPEC-09 T040 ------------------------------------------------------------
+
+_ALERTS_FORBIDDEN_ROOTS = frozenset({"sqlalchemy", "celery", "fastapi", "scrapy", "redis"})
+
+
+def _imported_root_modules(source_path: pathlib.Path) -> set[str]:
+    """AST-parse ``source_path`` and return the set of top-level root
+    module names it imports (``import a.b.c`` / ``from a.b import c`` both
+    contribute root ``a``). Static, not a runtime ``sys.modules`` check —
+    see the module docstring for why that distinction matters here.
+    """
+    import ast
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                roots.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.level == 0:
+                roots.add(node.module.split(".")[0])
+    return roots
+
+
+def _alerts_package_dir() -> pathlib.Path:
+    import app_shared.alerts
+
+    return pathlib.Path(app_shared.alerts.__file__).parent
+
+
+def test_alerts_engine_is_pure_no_forbidden_imports() -> None:
+    """SPEC-09 T040 / contracts/alert-engine.md "Acceptance": the pure
+    engine module's own import statements never name sqlalchemy, celery,
+    fastapi, scrapy, or redis (stdlib decimal + app_shared.enums, plus
+    optionally app_shared.money, only)."""
+    package_dir = _alerts_package_dir()
+    for source_file in sorted(package_dir.glob("*.py")):
+        roots = _imported_root_modules(source_file)
+        leaked = roots & _ALERTS_FORBIDDEN_ROOTS
+        assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+def test_models_alerts_does_not_import_scrapy_twisted_fastapi() -> None:
+    """SPEC-09 T005/T040: the alerts ORM model module is free to import
+    sqlalchemy (it's an ORM module) but must never import scrapy/twisted/
+    fastapi."""
+    import app_shared.models.alerts
+
+    source_file = pathlib.Path(app_shared.models.alerts.__file__)
+    roots = _imported_root_modules(source_file)
+    leaked = roots & {"scrapy", "twisted", "fastapi"}
+    assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+_ALERTS_ROUTERS_IMPORT_CHECK = """
+import sys
+
+import app.routers.alerts as alerts_router
+import app.routers.variants as variants_router
+import app.routers.matches as matches_router
+import app_shared.messaging
+
+leaked = sorted(
+    mod
+    for mod in sys.modules
+    if mod == "workers" or mod.startswith("workers.") or mod == "app.workers"
+    or mod.startswith("app.workers.")
+)
+if leaked:
+    print("LEAKED:" + ",".join(leaked))
+    sys.exit(1)
+
+sys.exit(0)
+"""
+
+
+def test_alerts_routers_never_import_apps_workers() -> None:
+    """SPEC-09 T040: the alerts router + the SPEC-09 additions to the
+    variants/matches routers import app_shared.messaging to enqueue
+    PRICE_ANALYSIS_RECOMPUTE by name, but MUST NEVER import apps/workers."""
+    import os
+
+    env = {**os.environ, **_JOBS_ROUTER_ENV}
+    result = subprocess.run(
+        [sys.executable, "-c", _ALERTS_ROUTERS_IMPORT_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=str(pathlib.Path(__file__).resolve().parents[2]),
+    )
+    assert result.returncode == 0, (
+        "app.routers.alerts/variants/matches pulled in apps/workers:\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    for relative in (
+        "apps/api/app/routers/alerts.py",
+        "apps/api/app/routers/variants.py",
+        "apps/api/app/routers/matches.py",
+    ):
+        router_path = repo_root / relative
+        contents = router_path.read_text(encoding="utf-8")
+        assert "apps.workers" not in contents and "app.workers" not in contents, (
+            f"{router_path} references apps/workers — forbidden dependency edge"
+        )
+
+
+_PIPELINES_NO_FASTAPI_NO_WORKERS_CHECK = """
+import sys
+
+import scrape_core.pipelines
+import app_shared.messaging
+import app_shared.redis_client
+
+leaked = sorted(
+    mod
+    for mod in sys.modules
+    if mod == "fastapi" or mod.startswith("fastapi.")
+    or mod == "workers" or mod.startswith("workers.")
+    or mod == "app.workers" or mod.startswith("app.workers.")
+)
+if leaked:
+    print("LEAKED:" + ",".join(leaked))
+    sys.exit(1)
+
+sys.exit(0)
+"""
+
+
+def test_scrape_core_pipelines_never_imports_fastapi_or_apps_workers() -> None:
+    """SPEC-09 T029/T040: the trigger (a) additions to scrape_core.pipelines
+    (app_shared.redis_client for the SET NX dedup key, app_shared.messaging
+    for the by-name enqueue) never pull in fastapi or apps/workers."""
+    result = _run_in_subprocess(_PIPELINES_NO_FASTAPI_NO_WORKERS_CHECK)
+    assert result.returncode == 0, (
+        "scrape_core.pipelines pulled in fastapi or apps/workers:\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    pipelines_path = repo_root / "libs" / "scrape-core" / "scrape_core" / "pipelines.py"
+    # AST-based (not substring) -- the module's own docstring discusses
+    # "apps.workers"/"fastapi" in prose, which a naive substring search
+    # would false-positive on.
+    roots = _imported_root_modules(pipelines_path)
+    leaked = roots & {"app", "apps", "workers", "fastapi"}
+    assert not leaked, f"{pipelines_path} imports forbidden module(s): {sorted(leaked)}"
