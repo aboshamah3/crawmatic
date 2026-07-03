@@ -44,6 +44,14 @@ own-only write) extraction-profile CRUD + `POST
 discipline, gated by the new `scrape_profiles:read`/`scrape_profiles:write`
 scopes. `PUT /v1/scrape-profiles/workspace-default` (assignment, US2)
 lands in a later phase of this feature.
+
+SPEC-08 US1 adds the `/v1/jobs` router (contracts/api-jobs.md) —
+`POST /v1/jobs/run/match/{id}` (create + dispatch a single-match scrape
+job) plus `GET /v1/jobs/{id}` / `GET /v1/jobs/{id}/results` (status +
+per-target outcomes), on the same auth seam and FR-020 discipline,
+gated by the new `jobs:read`/`jobs:write` scopes. Job creation
+delegates to `app_shared.jobs.service`; dispatch is enqueued through
+`app_shared.messaging` — this router never imports `apps/workers`.
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ from app.routers import (
     api_keys,
     auth,
     competitors,
+    jobs,
     matches,
     product_groups,
     products,
@@ -71,6 +80,7 @@ app.include_router(product_groups.router)
 app.include_router(competitors.router)
 app.include_router(matches.router)
 app.include_router(scrape_profiles.router)
+app.include_router(jobs.router)
 
 
 @app.get("/health")
