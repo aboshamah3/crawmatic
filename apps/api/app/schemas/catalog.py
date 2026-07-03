@@ -250,6 +250,154 @@ class ProductListResponse(BaseModel):
     next_cursor: str | None
 
 
+# --- Bulk-upsert DTOs (US2, `contracts/catalog-bulk-upsert.md`) --------------
+#
+# Bulk-upsert note (FR-011): a **product** supplied with neither
+# `external_id` nor `sku` has no stable identity key for `ON CONFLICT`
+# matching, so bulk-upsert always inserts it fresh on every push (never
+# matched/updated, and re-pushing an unmodified identity-less product
+# creates a duplicate row rather than being a no-op) -- callers that
+# want idempotent upsert semantics must supply at least one of those two
+# fields on every product they intend to keep in sync.
+
+
+class VariantBulkUpsertItem(BaseModel):
+    """One variant row nested under a product in `POST /v1/products/bulk-upsert`.
+
+    Identity resolution order (FR-011): `external_id` -> `sku` ->
+    `(product_id, title)` (the parent product_id is filled in by the
+    router once the parent product's identity resolves).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    external_id: str | None = None
+    sku: str | None = None
+    barcode: str | None = None
+    title: str
+    option_values: dict[str, Any] | None = None
+    price: Decimal
+    currency: str
+    url: str | None = None
+    status: VariantStatus = VariantStatus.ACTIVE
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def _check_price(cls, v: Any) -> Decimal:
+        return _validate_money(v)
+
+    @field_validator("currency")
+    @classmethod
+    def _check_currency(cls, v: str) -> str:
+        return _validate_currency(v)
+
+
+class ProductBulkUpsertItem(BaseModel):
+    """One product row in `POST /v1/products/bulk-upsert` -- a Woo/Salla-style
+    nested payload where each product optionally carries its own `variants`.
+
+    `price`/`currency` seed the auto-derived default variant exactly like
+    `ProductCreate`, only when `variants` is empty/absent; a product
+    arriving with **zero** variants and no `price`/`currency` cannot be
+    upserted (422) -- see `apps/api/app/routers/products.py`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    external_id: str | None = None
+    sku: str | None = None
+    title: str
+    brand: str | None = None
+    barcode: str | None = None
+    url: str | None = None
+    status: ProductStatus = ProductStatus.ACTIVE
+    price: Decimal | None = None
+    currency: str | None = None
+    variants: list[VariantBulkUpsertItem] | None = None
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def _check_price(cls, v: Any) -> Decimal | None:
+        if v is None:
+            return None
+        return _validate_money(v)
+
+    @field_validator("currency")
+    @classmethod
+    def _check_currency(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_currency(v)
+
+
+class ProductBulkUpsertRequest(BaseModel):
+    """`POST /v1/products/bulk-upsert` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    products: list[ProductBulkUpsertItem]
+
+
+class ProductBulkUpsertResult(BaseModel):
+    """`POST /v1/products/bulk-upsert` response -- every upserted product
+    (each carrying >=1 variant, FR-012 tail)."""
+
+    upserted: int
+    products: list[ProductResponse]
+
+
+class VariantBulkUpsertItemStandalone(BaseModel):
+    """One row in the standalone `POST /v1/variants/bulk-upsert` payload.
+
+    Each row names its parent product explicitly via exactly one of
+    `product_id`, `product_external_id`, or `product_sku` -- resolved
+    set-based (one scoped lookup, never a per-row query) and
+    workspace-consistency pre-checked (`app_shared.catalog.consistency`):
+    a cross-workspace or unresolvable parent reference is rejected
+    (422), never silently dropped or left to a raw FK-violation 500.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: uuid.UUID | None = None
+    product_external_id: str | None = None
+    product_sku: str | None = None
+    external_id: str | None = None
+    sku: str | None = None
+    barcode: str | None = None
+    title: str
+    option_values: dict[str, Any] | None = None
+    price: Decimal
+    currency: str
+    url: str | None = None
+    status: VariantStatus = VariantStatus.ACTIVE
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def _check_price(cls, v: Any) -> Decimal:
+        return _validate_money(v)
+
+    @field_validator("currency")
+    @classmethod
+    def _check_currency(cls, v: str) -> str:
+        return _validate_currency(v)
+
+
+class VariantsBulkUpsertRequest(BaseModel):
+    """`POST /v1/variants/bulk-upsert` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    variants: list[VariantBulkUpsertItemStandalone]
+
+
+class VariantBulkUpsertResult(BaseModel):
+    """`POST /v1/variants/bulk-upsert` response."""
+
+    upserted: int
+    variants: list[VariantResponse]
+
+
 # --- Shared: delete-outcome ---------------------------------------------
 
 

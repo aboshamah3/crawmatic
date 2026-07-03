@@ -15,6 +15,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete
 
 from app_shared.catalog.default_variant import derive_default_variant, ensure_at_least_one
+from app_shared.catalog.upsert import (
+    build_products_upsert,
+    dedup_last_wins,
+    plan_upsert,
+    resolve_identity,
+)
 from app_shared.models.catalog import Product, ProductVariant
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
@@ -22,6 +28,8 @@ from app_shared.repository import scoped_get, scoped_select
 from app.deps import Principal, require_scopes
 from app.schemas.catalog import (
     DeleteOutcome,
+    ProductBulkUpsertRequest,
+    ProductBulkUpsertResult,
     ProductCreate,
     ProductListResponse,
     ProductResponse,
@@ -140,6 +148,173 @@ def create_product(
     session.flush()
 
     return _to_product_response(product, variant_rows)
+
+
+@router.post("/bulk-upsert", response_model=ProductBulkUpsertResult, status_code=200)
+def bulk_upsert_products(
+    payload: ProductBulkUpsertRequest,
+    principal_ctx: tuple = Depends(require_scopes("products:write")),
+) -> ProductBulkUpsertResult:
+    """Set-based bulk upsert (`contracts/catalog-bulk-upsert.md`, FR-010/011/012).
+
+    Woo/Salla-style nested payload: dedup last-wins -> resolve identity
+    (`external_id` -> `sku`) -> a bounded number of
+    `ON CONFLICT ... DO UPDATE` statements via `app_shared.catalog.upsert`
+    (never one statement per product) -> default-variant injection for
+    any product arriving with zero explicit variants -> a bounded number
+    of variant upsert statements. Runs entirely inside the request's
+    workspace-scoped session/transaction (FR-016).
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    if not payload.products:
+        return ProductBulkUpsertResult(upserted=0, products=[])
+
+    for item in payload.products:
+        if not item.variants and (item.price is None or item.currency is None):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "code": "MISSING_PRICE",
+                        "message": (
+                            "A bulk-upsert product arriving with no explicit "
+                            "variants must supply price and currency to seed "
+                            "its default variant "
+                            f"(external_id={item.external_id!r}, sku={item.sku!r})."
+                        ),
+                    }
+                },
+            )
+
+    item_dicts = [item.model_dump() for item in payload.products]
+    deduped_items = list(
+        dedup_last_wins(item_dicts, lambda r: resolve_identity(r, is_variant=False))
+    )
+
+    # Bucket (item, product-column-row) pairs by identity kind so the
+    # RETURNING rows from each bucket's single statement can be matched
+    # back to their originating item -- by identity value for the
+    # ON-CONFLICT buckets (order not relied upon), positionally for the
+    # identity-less bucket (a plain INSERT ... VALUES ... RETURNING with
+    # no ON CONFLICT preserves input row order).
+    buckets: dict[str | None, list[tuple[dict, dict]]] = {}
+    for item in deduped_items:
+        row = {
+            "workspace_id": ws,
+            "external_id": item.get("external_id"),
+            "sku": item.get("sku"),
+            "title": item["title"],
+            "brand": item.get("brand"),
+            "barcode": item.get("barcode"),
+            "url": item.get("url"),
+            "status": item.get("status") or "active",
+        }
+        identity = resolve_identity(item, is_variant=False)
+        kind = identity[0] if identity is not None else None
+        buckets.setdefault(kind, []).append((item, row))
+
+    for item, product_id in _execute_product_buckets(session, buckets):
+        item["_product_id"] = product_id
+    session.flush()
+
+    # Every dict below carries the same explicit key set (`barcode`,
+    # `option_values`, ... default to None when the source doesn't have
+    # them) so a single `.values([...])` batch mixing derived-default and
+    # explicit-nested rows compiles as one consistent multi-row INSERT.
+    variant_rows: list[dict] = []
+    for item in deduped_items:
+        product_id = item.get("_product_id")
+        nested = item.get("variants") or []
+        if not nested:
+            default_variant = derive_default_variant(item)
+            variant_rows.append(
+                {
+                    "workspace_id": ws,
+                    "product_id": product_id,
+                    "external_id": None,
+                    "sku": default_variant["sku"],
+                    "barcode": None,
+                    "title": default_variant["title"],
+                    "option_values": default_variant["option_values"],
+                    "current_price": default_variant["current_price"],
+                    "currency": default_variant["currency"],
+                    "url": default_variant["url"],
+                    "status": default_variant["status"],
+                }
+            )
+        else:
+            for v in nested:
+                variant_rows.append(
+                    {
+                        "workspace_id": ws,
+                        "product_id": product_id,
+                        "external_id": v.get("external_id"),
+                        "sku": v.get("sku"),
+                        "barcode": v.get("barcode"),
+                        "title": v["title"],
+                        "option_values": v.get("option_values"),
+                        "current_price": v["price"],
+                        "currency": v["currency"],
+                        "url": v.get("url"),
+                        "status": v.get("status") or "active",
+                    }
+                )
+
+    # Bounded (<=3) variant upsert statements -- executed for effect only;
+    # the response re-fetches via `_variants_by_product_id` below (a
+    # single scoped IN(...) select, not per-row).
+    for stmt in plan_upsert(variant_rows, is_variant=True):
+        session.execute(stmt)
+    session.flush()
+
+    product_ids = [item["_product_id"] for item in deduped_items]
+    products = (
+        session.execute(scoped_select(Product, ws).where(Product.id.in_(product_ids)))
+        .scalars()
+        .all()
+    )
+    grouped = _variants_by_product_id(session, ws, [p.id for p in products])
+    responses = [_to_product_response(p, grouped.get(p.id, [])) for p in products]
+    return ProductBulkUpsertResult(upserted=len(responses), products=responses)
+
+
+def _execute_product_buckets(
+    session, buckets: dict[str | None, list[tuple[dict, dict]]]
+) -> list[tuple[dict, uuid.UUID]]:
+    """Execute one `ON CONFLICT`/plain-insert statement per identity-kind bucket.
+
+    Returns `(item, product_id)` pairs for every row across every
+    bucket -- bounded at <=3 statements total (one per identity kind),
+    never one statement per product (SC-003).
+    """
+    pairs: list[tuple[dict, uuid.UUID]] = []
+    for kind, bucket in buckets.items():
+        if not bucket:
+            continue
+        items = [pair[0] for pair in bucket]
+        rows = [pair[1] for pair in bucket]
+        stmt = build_products_upsert(rows, kind).returning(
+            Product.id, Product.external_id, Product.sku
+        )
+        returned = session.execute(stmt).all()
+        if kind is None:
+            # Plain insert, no ON CONFLICT -> row order is preserved.
+            for item, ret in zip(items, returned, strict=True):
+                pairs.append((item, ret.id))
+        else:
+            by_identity: dict[tuple[str, str], uuid.UUID] = {}
+            for ret in returned:
+                if ret.external_id:
+                    by_identity[("external_id", ret.external_id)] = ret.id
+                if ret.sku:
+                    by_identity[("sku", ret.sku)] = ret.id
+            for item in items:
+                identity = resolve_identity(item, is_variant=False)
+                pairs.append((item, by_identity[identity]))
+    return pairs
 
 
 @router.get("", response_model=ProductListResponse)

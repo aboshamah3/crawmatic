@@ -12,14 +12,27 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
-from app_shared.models.catalog import ProductVariant
+from app_shared.catalog.consistency import (
+    CrossWorkspaceReference,
+    MissingReference,
+    assert_refs_in_workspace,
+)
+from app_shared.catalog.upsert import plan_upsert
+from app_shared.models.catalog import Product, ProductVariant
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
 
 from app.deps import Principal, require_scopes
-from app.schemas.catalog import VariantListResponse, VariantResponse, VariantUpdate
+from app.schemas.catalog import (
+    VariantBulkUpsertResult,
+    VariantListResponse,
+    VariantResponse,
+    VariantsBulkUpsertRequest,
+    VariantUpdate,
+)
 
 router = APIRouter(prefix="/v1/variants", tags=["variants"])
 
@@ -118,3 +131,147 @@ def update_variant(
         ) from exc
 
     return VariantResponse.model_validate(variant)
+
+
+def _resolve_parent_product_ids(
+    session, workspace_id: uuid.UUID, item_dicts: list[dict]
+) -> tuple[dict[str, uuid.UUID], dict[str, uuid.UUID], dict[uuid.UUID, uuid.UUID]]:
+    """One scoped lookup for external_id/sku parent refs, one narrow id-in(...)
+    lookup for explicit `product_id` refs (contracts/catalog-bulk-upsert.md
+    "Variant->product resolution").
+
+    Returns `(by_external_id, by_sku, workspace_by_explicit_id)` --
+    the last is a `{id: workspace_id}` map (not filtered to this
+    workspace) so `app_shared.catalog.consistency.assert_refs_in_workspace`
+    can distinguish a cross-workspace `product_id` from a nonexistent one.
+    """
+    external_ids = {i["product_external_id"] for i in item_dicts if i.get("product_external_id")}
+    skus = {i["product_sku"] for i in item_dicts if i.get("product_sku")}
+    explicit_ids = {i["product_id"] for i in item_dicts if i.get("product_id") is not None}
+
+    by_external_id: dict[str, uuid.UUID] = {}
+    by_sku: dict[str, uuid.UUID] = {}
+    if external_ids or skus:
+        conditions = []
+        if external_ids:
+            conditions.append(Product.external_id.in_(external_ids))
+        if skus:
+            conditions.append(Product.sku.in_(skus))
+        rows = session.execute(scoped_select(Product, workspace_id).where(or_(*conditions))).scalars().all()
+        for p in rows:
+            if p.external_id:
+                by_external_id[p.external_id] = p.id
+            if p.sku:
+                by_sku[p.sku] = p.id
+
+    workspace_by_explicit_id: dict[uuid.UUID, uuid.UUID] = {}
+    if explicit_ids:
+        # Narrow, fixed-column, id-in(...) lookup limited to exactly the
+        # referenced ids -- intentionally workspace-unscoped so a
+        # cross-workspace product_id can be told apart from a nonexistent
+        # one (Layer 2 of the two-layer model, see consistency.md); every
+        # id is then re-checked against `workspace_id` via
+        # `assert_refs_in_workspace` before it's trusted.
+        rows = session.execute(
+            select(Product.id, Product.workspace_id).where(Product.id.in_(explicit_ids))  # noqa: workspace-scope
+        ).all()
+        workspace_by_explicit_id = {row.id: row.workspace_id for row in rows}
+
+    return by_external_id, by_sku, workspace_by_explicit_id
+
+
+@router.post("/bulk-upsert", response_model=VariantBulkUpsertResult, status_code=200)
+def bulk_upsert_variants(
+    payload: VariantsBulkUpsertRequest,
+    principal_ctx: tuple = Depends(require_scopes("variants:write")),
+) -> VariantBulkUpsertResult:
+    """Set-based standalone variant bulk upsert (`contracts/catalog-bulk-upsert.md`).
+
+    Each row names its parent product by `product_id` /
+    `product_external_id` / `product_sku`; parent resolution is one
+    scoped lookup (never per-row). A cross-workspace or unresolvable
+    parent reference is rejected (422) via the workspace-consistency
+    pre-check (FR-009) before any upsert statement runs.
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    if not payload.variants:
+        return VariantBulkUpsertResult(upserted=0, variants=[])
+
+    item_dicts = [v.model_dump() for v in payload.variants]
+    by_external_id, by_sku, workspace_by_explicit_id = _resolve_parent_product_ids(
+        session, ws, item_dicts
+    )
+
+    resolved_rows: list[dict] = []
+    unresolved: list[dict] = []
+    for item in item_dicts:
+        product_id: uuid.UUID | None = None
+        if item.get("product_id") is not None:
+            try:
+                assert_refs_in_workspace(ws, [item["product_id"]], workspace_by_explicit_id)
+                product_id = item["product_id"]
+            except (CrossWorkspaceReference, MissingReference):
+                product_id = None
+        elif item.get("product_external_id"):
+            product_id = by_external_id.get(item["product_external_id"])
+        elif item.get("product_sku"):
+            product_id = by_sku.get(item["product_sku"])
+
+        if product_id is None:
+            unresolved.append(item)
+            continue
+        item["product_id"] = product_id
+        resolved_rows.append(item)
+
+    if unresolved:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "UNRESOLVED_PARENT",
+                    "message": (
+                        "One or more variant rows reference a product_id/"
+                        "product_external_id/product_sku that does not "
+                        "resolve to a product in this workspace."
+                    ),
+                    "count": len(unresolved),
+                }
+            },
+        )
+
+    variant_rows = [
+        {
+            "workspace_id": ws,
+            "product_id": r["product_id"],
+            "external_id": r.get("external_id"),
+            "sku": r.get("sku"),
+            "barcode": r.get("barcode"),
+            "title": r["title"],
+            "option_values": r.get("option_values"),
+            "current_price": r["price"],
+            "currency": r["currency"],
+            "url": r.get("url"),
+            "status": r.get("status") or "active",
+        }
+        for r in resolved_rows
+    ]
+
+    variant_ids: list[uuid.UUID] = []
+    for stmt in plan_upsert(variant_rows, is_variant=True):
+        stmt = stmt.returning(ProductVariant.id)
+        variant_ids.extend(row.id for row in session.execute(stmt).all())
+    session.flush()
+
+    variants = (
+        session.execute(scoped_select(ProductVariant, ws).where(ProductVariant.id.in_(variant_ids)))
+        .scalars()
+        .all()
+        if variant_ids
+        else []
+    )
+    return VariantBulkUpsertResult(
+        upserted=len(variants), variants=[VariantResponse.model_validate(v) for v in variants]
+    )
