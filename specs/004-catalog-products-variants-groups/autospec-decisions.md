@@ -30,6 +30,10 @@ Master doc: `/srv/crawmatic/PROJECT_SPEC.md`
 - [plan] Migration → one revision, down_revision=55da7d6d939d (current head), RLS on all 4 tables in creating migration, single head; offline render.
 - [plan] Constitution Check → PASS (all 8; II/III/VII/VIII satisfied). Artifacts: plan.md, research.md (D1-D10), data-model.md, quickstart.md, contracts/{api-products,api-variants,api-product-groups,models-catalog,catalog-bulk-upsert,default-variant,pagination,workspace-consistency,migration-catalog}.md.
 
+## checklist
+
+Run substance INLINE (context conservation). Generated checklists/catalog.md (29 requirements-quality items). Gap found + fixed before checking: bulk-upsert identity for a product with NO external_id/sku was unspecified (would silently duplicate on re-push) → added to FR-011 + 2 edge cases (always-insert documented limitation; nested Woo/Salla product+variant resolution order). Completion: catalog.md 29/29 pass; requirements.md 16/16 pass. Implement gate CLEAR.
+
 ## clarify
 
 Run doc-first INLINE (context conservation — identical no-op doc-first pattern as SPEC-01/02/03; SPEC-04 doc coverage equally complete). No questions to user. Doc-resolved clarifications recorded in spec.md `## Clarifications` (Session 2026-07-03): workspace-owned/RLS on all 4 tables; default-variant behavior (title=plan-level); set-based bulk upsert + identity order + last-wins (partial-unique ON CONFLICT=plan-level); NUMERIC(18,4)+3-letter currency; archive-by-status deletion; cursor pagination 50/500 (encoding=plan-level); scope-gating products/variants read/write (group items reuse write scopes); FK workspace-consistency in app layer; live items deferred. Requirements checklist re-validated: 16/16 still pass.

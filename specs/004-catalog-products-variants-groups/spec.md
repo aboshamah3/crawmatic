@@ -96,6 +96,8 @@ Every catalog operation runs under one workspace context and requires the approp
 - What happens when a group item references a product/variant in a different workspace? Rejected — membership references must be workspace-local.
 - What happens when the same product/variant is added to a group twice? The duplicate membership is rejected by the uniqueness rule.
 - What happens when a bulk-upsert batch contains two records with the same external id (or SKU)? The in-batch conflict is resolved deterministically (last-wins) rather than erroring.
+- What happens when a bulk-upserted product has neither external id nor SKU? It has no identity key, so it is always inserted (never matched to an existing row) — re-pushing such a product creates another row. This is a documented limitation: callers who need identity-less products to upsert must supply a client key (external id or SKU).
+- What happens when a bulk payload nests variants under products referenced by external id/SKU (Woo/Salla style)? Each product's identity is resolved first, then its variants resolve against that product (by external id → SKU → the product + title), so nested variants attach to the correct upserted product.
 - What happens when a monetary value is non-finite or over-precise, or a currency code is malformed? It is rejected at the boundary (finite `NUMERIC(18,4)`, 3-letter currency) rather than stored.
 - What happens when a product with variants is deleted while (in a future spec) it has dependent history? It is archived by status rather than hard-deleted; the response distinguishes the two outcomes.
 - What happens when a list request exceeds the maximum page size? The page size is capped at the maximum and results are paginated by cursor.
@@ -120,7 +122,7 @@ Every catalog operation runs under one workspace context and requires the approp
 
 **Bulk upsert**
 - **FR-010**: The system MUST provide set-based bulk upsert for products and for variants that inserts-or-updates in a bounded number of statements (never one statement per record), regardless of batch size.
-- **FR-011**: Bulk-upsert identity resolution MUST follow the order: `external_id`, then `sku`, then (for variants) `(product_id, title)`; matched records update in place, unmatched records insert, and no duplicates are created on re-push.
+- **FR-011**: Bulk-upsert identity resolution MUST follow the order: `external_id`, then `sku`, then (for variants) `(product_id, title)`; matched records update in place, unmatched records insert, and no duplicates are created on re-push. A **product** supplied with neither `external_id` nor `sku` has no stable identity key and MUST be treated as always-insert (it cannot be deduplicated on re-push); this limitation MUST be documented so callers know identity-less products require a client-supplied key to be upsertable.
 - **FR-012**: Bulk upsert MUST resolve two in-batch records that map to the same identity deterministically (last-wins) without error, and MUST still guarantee each upserted product ends with at least one variant.
 
 **Grouping**
