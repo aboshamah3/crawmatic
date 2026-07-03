@@ -35,11 +35,11 @@ description: "Dependency-ordered task list for SPEC-06 Scrape Profiles & Extract
 
 **Purpose**: Enums, scopes, config, the pure money boundary, and the empty package that later files import. All DB/Redis-independent.
 
-- [ ] T001 [P] Extend `libs/shared/app_shared/enums.py` with three `StrEnum`s (research D1), string-backed via `enum_column` → `VARCHAR(32)`, tokens verbatim from §22/§20: `ScrapeProfileMode` (`HTTP`/`BROWSER`/`CUSTOM`), `AdapterKey` (`default_http`/`jsonld_first`/`selector_only`/`regex_only`/`shopify_product_json`/`woocommerce_store_api`/`playwright_rendered`/`custom_adapter` — lowercase), `VariantStrategy` (`PAGE_SINGLE_PRICE`/`URL_HAS_VARIANT_SELECTED`/`HTML_VARIANT_TABLE`/`EMBEDDED_JSON_VARIANTS`/`SELECT_VARIANT_WITH_PLAYWRIGHT`/`CUSTOM_VARIANT_ADAPTER`). (FR-001, FR-005)
-- [ ] T002 [P] Extend `libs/shared/app_shared/security/scopes.py` with `SCRAPE_PROFILES_READ = "scrape_profiles:read"` and `SCRAPE_PROFILES_WRITE = "scrape_profiles:write"` in the `Scope` vocabulary (per-entity precedent). (FR-004, FR-021)
-- [ ] T003 [P] Extend `libs/shared/app_shared/config.py` with `PROFILE_RESOLUTION_CACHE_TTL_SECONDS: int = 30` (short-TTL resolution cache, FR-019).
-- [ ] T004 [P] Extend `libs/shared/app_shared/money.py`: extract a **pure** `parse_money(value) -> Decimal` boundary (Decimal-only; reject `NaN`/`Infinity`; reject scale > 4 instead of rounding; non-negative; no float) reused by both `Money.process_bind_param` AND `profiles.validation`. §19 semantics. (FR-008, FR-022)
-- [ ] T005 [P] Create `libs/shared/app_shared/profiles/__init__.py` (empty package init for the framework-agnostic validators/confidence/resolution/repository/upsert core).
+- [X] T001 [P] Extend `libs/shared/app_shared/enums.py` with three `StrEnum`s (research D1), string-backed via `enum_column` → `VARCHAR(32)`, tokens verbatim from §22/§20: `ScrapeProfileMode` (`HTTP`/`BROWSER`/`CUSTOM`), `AdapterKey` (`default_http`/`jsonld_first`/`selector_only`/`regex_only`/`shopify_product_json`/`woocommerce_store_api`/`playwright_rendered`/`custom_adapter` — lowercase), `VariantStrategy` (`PAGE_SINGLE_PRICE`/`URL_HAS_VARIANT_SELECTED`/`HTML_VARIANT_TABLE`/`EMBEDDED_JSON_VARIANTS`/`SELECT_VARIANT_WITH_PLAYWRIGHT`/`CUSTOM_VARIANT_ADAPTER`). (FR-001, FR-005)
+- [X] T002 [P] Extend `libs/shared/app_shared/security/scopes.py` with `SCRAPE_PROFILES_READ = "scrape_profiles:read"` and `SCRAPE_PROFILES_WRITE = "scrape_profiles:write"` in the `Scope` vocabulary (per-entity precedent). (FR-004, FR-021)
+- [X] T003 [P] Extend `libs/shared/app_shared/config.py` with `PROFILE_RESOLUTION_CACHE_TTL_SECONDS: int = 30` (short-TTL resolution cache, FR-019).
+- [X] T004 [P] Extend `libs/shared/app_shared/money.py`: extract a **pure** `parse_money(value) -> Decimal` boundary (Decimal-only; reject `NaN`/`Infinity`; reject scale > 4 instead of rounding; non-negative; no float) reused by both `Money.process_bind_param` AND `profiles.validation`. §19 semantics. (FR-008, FR-022)
+- [X] T005 [P] Create `libs/shared/app_shared/profiles/__init__.py` (empty package init for the framework-agnostic validators/confidence/resolution/repository/upsert core).
 
 ---
 

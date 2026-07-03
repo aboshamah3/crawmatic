@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     # --- API-key last-used throttle (SPEC-03 FR-015) ---
     API_KEY_LAST_USED_THROTTLE_SECONDS: int = 60
 
+    # --- Scrape-profile resolution cache (SPEC-06 FR-019) ---
+    PROFILE_RESOLUTION_CACHE_TTL_SECONDS: int = 30
+
     # --- Auth DB role (optional — direct BYPASSRLS role for pre-auth
     # credential lookups only; see app_shared.database.get_auth_session).
     # Deliberately never falls back to DATABASE_URL (SPEC-03 [analyze C1]).

@@ -149,6 +149,38 @@ class HealthStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ScrapeProfileMode(StrEnum):
+    """Extraction transport mode of a ``scrape_profiles`` row (SPEC-06 §22, FR-001)."""
+
+    HTTP = "HTTP"
+    BROWSER = "BROWSER"
+    CUSTOM = "CUSTOM"
+
+
+class AdapterKey(StrEnum):
+    """Extraction adapter of a ``scrape_profiles`` row (SPEC-06 §22, FR-001)."""
+
+    DEFAULT_HTTP = "default_http"
+    JSONLD_FIRST = "jsonld_first"
+    SELECTOR_ONLY = "selector_only"
+    REGEX_ONLY = "regex_only"
+    SHOPIFY_PRODUCT_JSON = "shopify_product_json"
+    WOOCOMMERCE_STORE_API = "woocommerce_store_api"
+    PLAYWRIGHT_RENDERED = "playwright_rendered"
+    CUSTOM_ADAPTER = "custom_adapter"
+
+
+class VariantStrategy(StrEnum):
+    """Variant-resolution strategy of a ``scrape_profiles`` row (SPEC-06 §22, FR-001)."""
+
+    PAGE_SINGLE_PRICE = "PAGE_SINGLE_PRICE"
+    URL_HAS_VARIANT_SELECTED = "URL_HAS_VARIANT_SELECTED"
+    HTML_VARIANT_TABLE = "HTML_VARIANT_TABLE"
+    EMBEDDED_JSON_VARIANTS = "EMBEDDED_JSON_VARIANTS"
+    SELECT_VARIANT_WITH_PLAYWRIGHT = "SELECT_VARIANT_WITH_PLAYWRIGHT"
+    CUSTOM_VARIANT_ADAPTER = "CUSTOM_VARIANT_ADAPTER"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

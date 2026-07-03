@@ -29,6 +29,8 @@ class Scope(StrEnum):
     ALERTS_READ = "alerts:read"
     WEBHOOKS_READ = "webhooks:read"
     WEBHOOKS_WRITE = "webhooks:write"
+    SCRAPE_PROFILES_READ = "scrape_profiles:read"
+    SCRAPE_PROFILES_WRITE = "scrape_profiles:write"
 
 
 def validate_scopes(values: Iterable[str]) -> list[str]:
