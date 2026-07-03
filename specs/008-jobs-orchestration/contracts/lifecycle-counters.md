@@ -2,14 +2,14 @@
 
 ## `resolve_finalized_status(success, failure, skipped, total) -> ScrapeJobStatus` (pure, `lifecycle`)
 
-Single ordered, deterministic rule (FR-019, D6):
+Single ordered, deterministic **failure-centric** rule (FR-019, D6; skips are non-fatal — analyze A1 remediation):
 
 1. `total == 0` → **COMPLETED**.
-2. `success == total` → **COMPLETED** (all succeeded).
-3. `success > 0` and (`failure > 0` or `skipped > 0`) → **PARTIAL_FAILED**.
-4. `success == 0` → **FAILED** (none succeeded, with failures/skips present).
+2. `failure == 0` → **COMPLETED** (covers all-success, success+skipped, and skipped-only — nothing failed).
+3. `failure > 0` and `success > 0` → **PARTIAL_FAILED**.
+4. `failure > 0` and `success == 0` → **FAILED**.
 
-Skipped targets increment `skipped_count` and participate in the rule (a job of only skipped/failed targets → FAILED; some-success-some-skipped → PARTIAL_FAILED). This is the ordered decision rule whose boundary values are unit-tested for determinism (constitution testing gate).
+Skipped targets increment `skipped_count` but are non-fatal: a job with no failures finalizes COMPLETED regardless of skips (skipped-only → COMPLETED); PARTIAL_FAILED requires at least one real failure alongside at least one success; FAILED requires failures with zero successes. This is the ordered decision rule whose boundary values are unit-tested for determinism (constitution testing gate).
 
 ## `stall_window(now, timeout_seconds) -> int` (pure, `lifecycle`)
 
@@ -25,7 +25,7 @@ Skipped targets increment `skipped_count` and participate in the rule (a job of 
 
 - The single writer of a target's `status` transition (`PENDING→STARTED→COMPLETED/FAILED/SKIPPED`) + timestamps (`started_at` on STARTED, `completed_at` on a terminal status) + `error_code` on FAILED (§34).
 - Touches **only** the target row — never the parent job counters (D5). Workspace-scoped.
-- This is the FR-017 seam the spider/finalizer calls as targets progress; in this spec its behavior is exercised by tests simulating transitions (US3 Independent Test), the spider wiring lands with SPEC-09's post-persistence step.
+- This is the FR-017 seam the scrape result path calls as targets progress. In this spec it IS wired into the SPEC-07 item pipeline `_flush_batch` (T052): each persisted item terminalizes its target (COMPLETED on success, FAILED with `error_code` otherwise) in the same reactor-safe transaction, then the batch enqueues `SCRAPE_FINALIZE_JOBS` once per affected job so finalization is event-driven (no dependence on the SPEC-13 beat).
 
 ## Finalization (`finalize_jobs`, maintenance task)
 
@@ -33,6 +33,7 @@ Skipped targets increment `skipped_count` and participate in the rule (a job of 
 
 ## Tests
 
-- `test_jobs_lifecycle.py`: the four rule branches + zero-target + skipped-only + mixed boundary values.
+- `test_jobs_lifecycle.py`: the four rule branches + zero-target COMPLETED + skipped-only COMPLETED + success+skipped COMPLETED + failure+success PARTIAL_FAILED + failure-only/failure+skipped FAILED boundary values.
+- `test_pipeline_target_terminalization.py` (T053): the pipeline result-path caller marks COMPLETED/FAILED correctly, skips null-`scrape_job_id` items, shares the batch transaction, and enqueues one finalize per distinct job.
 - `test_jobs_counters.py`: `aggregate_counts` over a fake session returns correct `Counts`; finalize writes one UPDATE; `mark_target` never mutates job counters.
 - Live (`test_jobs_counters_finalize_live.py`): simulate real target transitions → counters aggregate, status finalizes COMPLETED/PARTIAL_FAILED/FAILED, `completed_at` set.

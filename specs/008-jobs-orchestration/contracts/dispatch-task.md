@@ -7,7 +7,7 @@
 1. Open a session, `set_workspace_context(session, workspace_id)` (RLS), load the job (`scoped_get`) + its `PENDING` targets (`scoped_select`).
 2. If the job is not already terminal: set `status=RUNNING`, `started_at=now` (once).
 3. `batches = plan_batches(targets, http_min, http_max)` — group by `(competitor_domain, mode)`; HTTP batch 50–200 (FR-011, SC-008). The competitor domain per target comes from the match's competitor (resolved set-based, not per-target).
-4. For each batch: `node = select_node(batch.domain, settings.SCRAPYD_HTTP_URLS)` (deterministic, FR-014); `client.schedule(project="price_monitor", spider="generic_price_spider", workspace_id, scrape_job_id, match_ids=batch.match_ids, mode=batch.mode, batch_index=batch.batch_index, node_url=node)`.
+4. For each batch: pick the mode-appropriate pool `nodes = settings.SCRAPYD_BROWSER_URLS if batch.mode == ScrapeProfileMode.BROWSER else settings.SCRAPYD_HTTP_URLS` (I1 — a BROWSER batch is never routed to HTTP nodes; the browser spider/service is SPEC-14 but routing is mode-correct here), then `node = select_node(batch.domain, nodes)` (deterministic, FR-014); `client.schedule(project="price_monitor", spider="generic_price_spider", workspace_id, scrape_job_id, match_ids=batch.match_ids, mode=batch.mode, batch_index=batch.batch_index, node_url=node)`.
 5. The client's Redis `SET NX` on `dispatched:{scrape_job_id}:{batch_index}` makes a duplicate/at-least-once delivery a no-op (no second POST) (FR-013, SC-003).
 
 ## Idempotency & determinism

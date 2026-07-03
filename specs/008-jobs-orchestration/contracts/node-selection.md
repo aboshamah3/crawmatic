@@ -4,7 +4,7 @@ Pure function — no state, no persistence.
 
 ## `select_node(domain, nodes) -> node_url`
 
-- `nodes`: the ordered `Settings.SCRAPYD_HTTP_URLS` pool (non-empty).
+- `nodes`: the ordered, non-empty pool for the batch's mode — `Settings.SCRAPYD_HTTP_URLS` for HTTP batches, `Settings.SCRAPYD_BROWSER_URLS` for BROWSER batches (caller picks the pool by `batch.mode`; I1).
 - Returns `nodes[stable_hash(domain) % len(nodes)]` where `stable_hash` is a **process-stable** digest (e.g. `int.from_bytes(hashlib.blake2b(domain.encode(), digest_size=8).digest())`) — **not** Python's builtin `hash()` (salted per process via `PYTHONHASHSEED`, so non-deterministic across workers).
 - Single-node pool → always that node.
 

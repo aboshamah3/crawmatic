@@ -7,7 +7,7 @@ Detect a batch dispatched to a node that died with the batch still queued, and r
 1. Scan **non-terminal** jobs (`status in (RUNNING,)`, with `started_at` set).
 2. For each, select its targets still in a **non-progressed** state — `status == PENDING` (never moved to STARTED) — whose stall age exceeds `SCRAPE_STALL_TIMEOUT_SECONDS` (default 900 s), measured from the job's `started_at`.
 3. Exclude targets that have progressed (`STARTED`/terminal) and, where SPEC-11 in-flight locks exist, targets with a live `locked_at` — so recovery never re-runs progressed or in-flight matches.
-4. `re_batches = plan_batches(stalled_targets, ...)`; re-dispatch each via `client.schedule(..., batch_index=f"{batch_index}:r{stall_window(now, timeout)}", node_url=select_node(domain, nodes))`.
+4. Re-resolve each stalled target's `competitor_domain` + `mode` set-based (same one-read pattern as dispatch, not per-target — U3); `re_batches = plan_batches(stalled_targets, ...)`; re-dispatch each via `client.schedule(..., batch_index=f"{batch_index}:r{stall_window(now, timeout)}", node_url=select_node(domain, nodes))` where `nodes` is the mode-appropriate pool (`SCRAPYD_BROWSER_URLS` for BROWSER else `SCRAPYD_HTTP_URLS`, I1).
 
 ## Idempotency of recovery itself
 
