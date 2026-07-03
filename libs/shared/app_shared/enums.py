@@ -96,6 +96,59 @@ class GroupStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class LegalStatus(StrEnum):
+    """Legal review status of a ``competitors`` row (SPEC-05 §22, Principle VI).
+
+    Competitors default to ``REVIEW_REQUIRED`` per Constitution Principle VI.
+    """
+
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    APPROVED = "APPROVED"
+    DISABLED = "DISABLED"
+
+
+class RobotsPolicy(StrEnum):
+    """robots.txt handling policy of a ``competitors`` row (SPEC-05 §22)."""
+
+    RESPECT = "RESPECT"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    IGNORE_AFTER_APPROVAL = "IGNORE_AFTER_APPROVAL"
+
+
+class CompetitorStatus(StrEnum):
+    """Lifecycle status of a ``competitors`` row (SPEC-05 FR-016)."""
+
+    ACTIVE = "ACTIVE"
+    ARCHIVED = "ARCHIVED"
+
+
+class MatchPriority(StrEnum):
+    """Scrape priority of a ``competitor_product_matches`` row (SPEC-05 §22)."""
+
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+class MatchStatus(StrEnum):
+    """Lifecycle status of a ``competitor_product_matches`` row (SPEC-05 FR-016)."""
+
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    FAILED = "FAILED"
+    ARCHIVED = "ARCHIVED"
+
+
+class HealthStatus(StrEnum):
+    """Scrape health status of a ``competitor_product_matches`` row (SPEC-05 FR-017)."""
+
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    FAILING = "FAILING"
+    UNKNOWN = "UNKNOWN"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

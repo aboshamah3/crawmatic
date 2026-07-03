@@ -34,8 +34,8 @@ description: "Dependency-ordered task list for SPEC-05 Competitors & Matches"
 
 **Purpose**: Enums and empty package scaffolding that later files import.
 
-- [ ] T001 [P] Extend `libs/shared/app_shared/enums.py` with six `StrEnum`s (research D1), each string-backed via `enum_column` → `VARCHAR(32)`, exact uppercase §22 tokens: `LegalStatus` (`REVIEW_REQUIRED`/`APPROVED`/`DISABLED`), `RobotsPolicy` (`RESPECT`/`REVIEW_REQUIRED`/`IGNORE_AFTER_APPROVAL`), `CompetitorStatus` (`ACTIVE`/`ARCHIVED`), `MatchPriority` (`LOW`/`NORMAL`/`HIGH`/`CRITICAL`), `MatchStatus` (`ACTIVE`/`PAUSED`/`FAILED`/`ARCHIVED`), `HealthStatus` (`HEALTHY`/`DEGRADED`/`FAILING`/`UNKNOWN`). (FR-003, FR-004, FR-017)
-- [ ] T002 [P] Create `libs/shared/app_shared/matches/__init__.py` (empty package init for the framework-agnostic match-upsert core).
+- [X] T001 [P] Extend `libs/shared/app_shared/enums.py` with six `StrEnum`s (research D1), each string-backed via `enum_column` → `VARCHAR(32)`, exact uppercase §22 tokens: `LegalStatus` (`REVIEW_REQUIRED`/`APPROVED`/`DISABLED`), `RobotsPolicy` (`RESPECT`/`REVIEW_REQUIRED`/`IGNORE_AFTER_APPROVAL`), `CompetitorStatus` (`ACTIVE`/`ARCHIVED`), `MatchPriority` (`LOW`/`NORMAL`/`HIGH`/`CRITICAL`), `MatchStatus` (`ACTIVE`/`PAUSED`/`FAILED`/`ARCHIVED`), `HealthStatus` (`HEALTHY`/`DEGRADED`/`FAILING`/`UNKNOWN`). (FR-003, FR-004, FR-017)
+- [X] T002 [P] Create `libs/shared/app_shared/matches/__init__.py` (empty package init for the framework-agnostic match-upsert core).
 
 ---
 
