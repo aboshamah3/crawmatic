@@ -1,0 +1,36 @@
+<!--
+  Fixture: regex-only price page — no JSON-LD, no CSS-selectable price
+  element (SPEC-07 T003).
+
+  Purpose: exercise scrape_core.extraction.regex — the price is embedded in
+  a plain (non-ld+json) inline script blob as a quoted JSON-like key, only
+  reachable by a DB-configured regex such as:
+    price_regex    = "\"price\"\\s*:\\s*\"?([0-9.,]+)"
+    currency_regex = "\"currency\"\\s*:\\s*\"([A-Z]{3})\""
+  There is no <script type="application/ld+json"> block and no element
+  carrying a "price"/"old-price" class or id, so JSON-LD and CSS extraction
+  must both yield nothing before the pipeline falls through to regex
+  (confidence 0.75, method=REGEX). Fully invented, generic fixture product —
+  no real-competitor content (FR-021/SC-007).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Compact Trail Lantern - Fixture Store</title>
+  <script type="text/javascript">
+    window.__fixtureAnalytics = {
+      "sku": "CTL-450",
+      "price": "56.25",
+      "currency": "USD",
+      "in_stock": true
+    };
+  </script>
+</head>
+<body>
+  <main>
+    <h1>Compact Trail Lantern</h1>
+    <p class="description">A fixture product used only for extraction unit tests. Pricing shown at checkout.</p>
+  </main>
+</body>
+</html>

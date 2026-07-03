@@ -5,6 +5,7 @@ description = "Shared scraping-side library imported by both Scrapyd app members
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "app_shared",
+    "parsel>=1.11,<2",
 ]
 
 [tool.uv.sources]

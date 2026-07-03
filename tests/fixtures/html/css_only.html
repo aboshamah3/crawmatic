@@ -1,0 +1,36 @@
+<!--
+  Fixture: CSS-selector-only price page, no JSON-LD (SPEC-07 T003).
+
+  Purpose: exercise scrape_core.extraction.css — DB-selector-style elements
+  for price / old price / stock / title, reachable only via CSS selectors
+  (no <script type="application/ld+json"> block present, so the JSON-LD
+  extractor must yield nothing and the pipeline must fall back to CSS,
+  confidence 0.85, method=CSS). Suggested profile selectors this fixture is
+  designed against:
+    price_selector    = "span.price"
+    old_price_selector = "span.old-price"
+    currency_selector  = "span.currency"
+    stock_selector     = "span.stock"
+    title_selector     = "h1.product-title"
+  Fully invented, generic fixture product — no real-competitor content
+  (FR-021/SC-007).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sturdy Bracket Set - Fixture Store</title>
+</head>
+<body>
+  <main>
+    <h1 class="product-title">Sturdy Bracket Set</h1>
+    <div class="pricing">
+      <span class="currency">USD</span>
+      <span class="price">74.50</span>
+      <span class="old-price">89.00</span>
+    </div>
+    <span class="stock">In Stock</span>
+    <p class="description">A fixture product used only for extraction unit tests.</p>
+  </main>
+</body>
+</html>

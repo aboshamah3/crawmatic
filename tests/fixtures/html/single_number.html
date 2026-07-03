@@ -1,0 +1,25 @@
+<!--
+  Fixture: exactly one bare, unlabeled number on the page (SPEC-07 T003).
+
+  Purpose: exercise the SINGLE_NUMBER extraction heuristic (confidence
+  0.40) — no JSON-LD, no CSS price element, no regex-matchable "price"/
+  "currency" key, and only one number appears anywhere in the body text
+  ("4521" below). This is the edge case in contracts/price-validation.md:
+  "a bare number is not a price" — a SINGLE_NUMBER candidate must fail the
+  default 0.75 confidence gate and be rejected (LOW_CONFIDENCE_PRICE), even
+  though a number was technically found. Fully invented, generic fixture
+  product — no real-competitor content (FR-021/SC-007).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Model Reference Page - Fixture Store</title>
+</head>
+<body>
+  <main>
+    <h1>Assembly Reference Sheet</h1>
+    <p class="description">Model number: 4521. Pricing is not published on this page.</p>
+  </main>
+</body>
+</html>

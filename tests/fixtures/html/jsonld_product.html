@@ -1,0 +1,40 @@
+<!--
+  Fixture: valid schema.org Product/Offer JSON-LD (SPEC-07 T003).
+
+  Purpose: exercise scrape_core.extraction.jsonld — a Product with a nested
+  Offer carrying `price` + `priceCurrency` + `availability`, so the JSON-LD
+  extractor should be the first-hit candidate in the ordered pipeline
+  (confidence 0.95, method=JSON_LD). Fully invented, generic fixture
+  product — no real-competitor content (FR-021/SC-007).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Generic Widget Pro - Fixture Store</title>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org/",
+    "@type": "Product",
+    "name": "Generic Widget Pro",
+    "sku": "GWP-1000",
+    "description": "A fixture product used only for extraction unit tests.",
+    "offers": {
+      "@type": "Offer",
+      "price": "129.99",
+      "priceCurrency": "USD",
+      "availability": "https://schema.org/InStock",
+      "url": "https://fixture-store.invalid/products/generic-widget-pro"
+    }
+  }
+  </script>
+</head>
+<body>
+  <main>
+    <h1 class="product-title">Generic Widget Pro</h1>
+    <p class="price-display">$129.99</p>
+    <p class="availability">In stock</p>
+    <p class="description">A fixture product used only for extraction unit tests.</p>
+  </main>
+</body>
+</html>

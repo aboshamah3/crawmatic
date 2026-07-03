@@ -28,9 +28,9 @@ Backend monorepo (uv workspace). Scraping-side code in `libs/scrape-core/scrape_
 
 **Purpose**: Dependencies and test assets needed before any implementation.
 
-- [ ] T001 [P] Add `parsel` to `[project.dependencies]` in `libs/scrape-core/pyproject.toml` (pure HTML/JSON-LD/CSS parsing so extraction is unit-testable without booting Scrapy/Twisted), then `uv sync`.
-- [ ] T002 [P] Pin `requests` explicitly in `libs/shared/app_shared/pyproject.toml` (used by the framework-agnostic Scrapyd dispatch client), then `uv sync`.
-- [ ] T003 [P] Create the local fixture HTML corpus under `tests/fixtures/html/` — `jsonld_product.html`, `css_only.html`, `regex_only.html`, `single_number.html`, `discount_save_x.html` (old/"save X"/installment/shipping-only), and an SSRF redirect target descriptor — used by unit + live tests; no real-competitor content (FR-021/SC-007).
+- [X] T001 [P] Add `parsel` to `[project.dependencies]` in `libs/scrape-core/pyproject.toml` (pure HTML/JSON-LD/CSS parsing so extraction is unit-testable without booting Scrapy/Twisted), then `uv sync`.
+- [X] T002 [P] Pin `requests` explicitly in `libs/shared/app_shared/pyproject.toml` (used by the framework-agnostic Scrapyd dispatch client), then `uv sync`.
+- [X] T003 [P] Create the local fixture HTML corpus under `tests/fixtures/html/` — `jsonld_product.html`, `css_only.html`, `regex_only.html`, `single_number.html`, `discount_save_x.html` (old/"save X"/installment/shipping-only), and an SSRF redirect target descriptor — used by unit + live tests; no real-competitor content (FR-021/SC-007).
 
 ---
 

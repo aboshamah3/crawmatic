@@ -98,6 +98,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyjwt" },
     { name = "redis" },
+    { name = "requests" },
     { name = "sqlalchemy" },
     { name = "uuid6" },
 ]
@@ -109,6 +110,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.6,<3" },
     { name = "pyjwt", specifier = ">=2.9,<3" },
     { name = "redis", specifier = ">=5.0,<6" },
+    { name = "requests", specifier = ">=2.34,<3" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "uuid6", specifier = ">=2025.0.1,<2026" },
 ]
@@ -1020,10 +1022,14 @@ version = "0.1.0"
 source = { editable = "libs/scrape-core" }
 dependencies = [
     { name = "app-shared" },
+    { name = "parsel" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "app-shared", editable = "libs/shared" }]
+requires-dist = [
+    { name = "app-shared", editable = "libs/shared" },
+    { name = "parsel", specifier = ">=1.11,<2" },
+]
 
 [[package]]
 name = "scrapers"

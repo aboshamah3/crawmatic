@@ -1,0 +1,43 @@
+<!--
+  Fixture descriptor: SSRF redirect target (SPEC-07 T003).
+
+  Purpose: for tests/integration/test_spider_ssrf_live.py (US2 / SC-002,
+  contracts/fetch-url-safety.md scenario "public URL redirecting to an
+  internal IP"). The live fixture harness serves this page at a
+  public-looking URL, then serves a 302 whose Location points at a
+  private/loopback/link-local address (or the reverse — a directly
+  private-IP target). SsrfGuardMiddleware/SafeResolver must refuse the
+  redirect hop before this body is ever downloaded, so a passing test
+  asserts:
+    - no HTTP request body from this file appears in any observation
+      (no price_observation with success=true referencing "REDIRECT-MARKER")
+    - the request_attempt for the match is recorded with
+      error_code=BLOCKED and no body download occurred
+    - none of the numbers below are ever extracted or persisted
+
+  This file's own content is intentionally price-shaped (with a unique
+  marker string) so that if the SSRF guard ever regressed and let the
+  redirect through, the live test would immediately see the marker and
+  fail loudly rather than silently passing.
+
+  Fully invented, generic fixture content — no real-competitor content
+  (FR-021/SC-007). This page must NEVER be reachable from a passing spider
+  run; its existence is the negative-control target for the redirect hop.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>REDIRECT-MARKER - internal-only fixture target (should never be fetched)</title>
+</head>
+<body>
+  <main>
+    <h1 class="product-title">REDIRECT-MARKER Unreachable Product</h1>
+    <span class="price">999.99</span>
+    <p class="description">
+      If a test observes this page's content, the fetch-time SSRF guard
+      failed to block a redirect hop to an internal/private address.
+    </p>
+  </main>
+</body>
+</html>

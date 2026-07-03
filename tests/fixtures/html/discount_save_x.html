@@ -1,0 +1,35 @@
+<!--
+  Fixture: only discount/"save X"/old-price/installment/shipping numbers on
+  the page — no genuine current-price candidate (SPEC-07 T003).
+
+  Purpose: exercise validation_rules.reject_if_text_contains (old /
+  installment / discount / "save X" / shipping) per
+  contracts/price-validation.md step 5. No JSON-LD, and no element carries
+  a "price" class/id — a price_selector such as "span.price" finds nothing
+  (PRICE_NOT_FOUND); a broader regex/single-number scan over the page would
+  only ever surface these discount-adjacent numbers, each of whose
+  surrounding matched_text contains a reject term:
+    - "Save $10 today"        -> contains "save"
+    - old price "$79.99"      -> contains "old"
+    - installment "$12.50"    -> contains "installment"
+    - shipping "$6.99"        -> contains "shipping"
+  Fully invented, generic fixture product — no real-competitor content
+  (FR-021/SC-007).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Insulated Travel Mug - Fixture Store</title>
+</head>
+<body>
+  <main>
+    <h1 class="product-title">Insulated Travel Mug</h1>
+    <div class="promo">Save $10 today on this item!</div>
+    <div class="old-price">Old price: $79.99</div>
+    <div class="installment">Or 4 interest-free installments of $12.50</div>
+    <div class="shipping">Shipping: $6.99</div>
+    <p class="description">A fixture product used only for extraction/validation unit tests.</p>
+  </main>
+</body>
+</html>
