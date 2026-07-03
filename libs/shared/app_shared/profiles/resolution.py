@@ -178,3 +178,39 @@ def resolution_cache_key(
     """
     digest = hashlib.sha1(url_pattern.encode("utf-8")).hexdigest()
     return f"profres:{workspace_id}:{competitor_id}:{digest}"
+
+
+# --- Redis resolution-cache VALUE codec (SPEC-07 tasks.md T055) --------------
+#
+# Shared by `apps/api/app/services/profile_resolution.py` (the orchestrator
+# that populates the cache) and
+# `apps/scrapers/price_monitor/spiders/generic_price_spider.py` (which reads
+# the same warm cache, `apps -> libs` only per plan.md) -- both previously
+# carried byte-identical copies of this codec. Hoisted here so the two call
+# sites can never silently drift apart; the wire format is unchanged, so
+# existing cache entries still decode.
+
+#: The cached-value marker for a group that resolved to NONE_RESOLVED --
+#: distinct from any real profile id string.
+CACHE_NONE_MARKER = "none"
+CACHE_FIELD_SEP = "|"
+
+
+def encode_group_result(result: ResolutionResult) -> str:
+    """Encode a (possibly cached) group-level resolution result for Redis."""
+    if result is NONE_RESOLVED:
+        return CACHE_NONE_MARKER
+    assert isinstance(result, ResolvedProfile)
+    return f"{result.profile_id}{CACHE_FIELD_SEP}{result.level}"
+
+
+def decode_group_result(cached: str) -> ResolutionResult:
+    """Inverse of :func:`encode_group_result`.
+
+    Raises ``ValueError``/``AttributeError`` on a corrupt/unexpected
+    payload -- callers treat that as a cache miss (fail-open).
+    """
+    if cached == CACHE_NONE_MARKER:
+        return NONE_RESOLVED
+    profile_id_str, _, level = cached.partition(CACHE_FIELD_SEP)
+    return ResolvedProfile(profile_id=uuid.UUID(profile_id_str), level=level)  # type: ignore[arg-type]

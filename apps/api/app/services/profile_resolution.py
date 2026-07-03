@@ -49,20 +49,15 @@ from app_shared.profiles.repository import (
     profile_visibility_map,
 )
 from app_shared.profiles.resolution import (
-    NONE_RESOLVED,
     ResolutionResult,
-    ResolvedProfile,
     apply_match_override,
+    decode_group_result,
+    encode_group_result,
     group_matches,
     resolution_cache_key,
     resolve_group,
 )
 from app_shared.repository import scoped_select
-
-# The cached-value marker for a group that resolved to NONE_RESOLVED —
-# distinct from any real profile id string.
-_CACHE_NONE_MARKER = "none"
-_CACHE_FIELD_SEP = "|"
 
 
 # --- bounded input loaders ---------------------------------------------------
@@ -119,20 +114,11 @@ def _build_visible_ids(
 
 
 # --- Redis cache get/set (fail-open on read, best-effort on write) ---------
-
-
-def _encode_group_result(result: ResolutionResult) -> str:
-    if result is NONE_RESOLVED:
-        return _CACHE_NONE_MARKER
-    assert isinstance(result, ResolvedProfile)
-    return f"{result.profile_id}{_CACHE_FIELD_SEP}{result.level}"
-
-
-def _decode_group_result(cached: str) -> ResolutionResult:
-    if cached == _CACHE_NONE_MARKER:
-        return NONE_RESOLVED
-    profile_id_str, _, level = cached.partition(_CACHE_FIELD_SEP)
-    return ResolvedProfile(profile_id=uuid.UUID(profile_id_str), level=level)  # type: ignore[arg-type]
+#
+# The value codec itself (`encode_group_result`/`decode_group_result`) lives
+# in `app_shared.profiles.resolution` (SPEC-07 tasks.md T055) — shared with
+# `apps/scrapers/price_monitor/spiders/generic_price_spider.py`, which reads
+# this same cache.
 
 
 def _cache_get_group_result(redis: object, cache_key: str) -> ResolutionResult | None:
@@ -148,7 +134,7 @@ def _cache_get_group_result(redis: object, cache_key: str) -> ResolutionResult |
     if isinstance(cached, bytes):
         cached = cached.decode("utf-8")
     try:
-        return _decode_group_result(cached)
+        return decode_group_result(cached)
     except (ValueError, AttributeError):
         # Corrupt/unexpected cached payload — treat as a miss.
         return None
@@ -157,7 +143,7 @@ def _cache_get_group_result(redis: object, cache_key: str) -> ResolutionResult |
 def _cache_set_group_result(redis: object, cache_key: str, result: ResolutionResult) -> None:
     try:
         ttl_seconds = get_settings().PROFILE_RESOLUTION_CACHE_TTL_SECONDS
-        redis.set(cache_key, _encode_group_result(result), ex=ttl_seconds)  # type: ignore[attr-defined]
+        redis.set(cache_key, encode_group_result(result), ex=ttl_seconds)  # type: ignore[attr-defined]
     except Exception:
         # Best-effort repopulate — the freshly-resolved value is still
         # returned to the caller for this call even if the write fails.

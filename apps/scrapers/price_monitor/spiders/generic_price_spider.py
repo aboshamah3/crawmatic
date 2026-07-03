@@ -32,22 +32,24 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
 import scrapy
 from scrapy.http import Response
 from sqlalchemy import select
 
-from app_shared.enums import AccessMethod
+from app_shared.enums import AccessMethod, RobotsPolicy
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import Workspace
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.profiles.repository import GLOBAL_DEFAULT_PROFILE_NAME, profile_visibility_map
 from app_shared.profiles.resolution import (
-    NONE_RESOLVED,
     ResolutionResult,
     ResolvedProfile,
     apply_match_override,
+    decode_group_result,
+    encode_group_result,
     group_matches,
     resolution_cache_key,
     resolve_group,
@@ -64,8 +66,6 @@ from scrape_core.validation import Accepted, Rejected, validate_candidate
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODE = "HTTP"
-_CACHE_NONE_MARKER = "none"
-_CACHE_FIELD_SEP = "|"
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,7 @@ class SpiderTarget:
     competitor_id: uuid.UUID
     url: str
     profile: ScrapeProfile | None
+    robots_policy: RobotsPolicy
 
 
 # --- match_ids arg parsing (contracts/spider-args.md) -----------------------
@@ -100,21 +101,14 @@ def _parse_match_ids(raw: Any) -> list[uuid.UUID]:
     return [uuid.UUID(str(v)) for v in values]
 
 
-# --- Redis resolution-cache encode/decode (matches SPEC-06's format) --------
-
-
-def _encode_group_result(result: ResolutionResult) -> str:
-    if result is NONE_RESOLVED:
-        return _CACHE_NONE_MARKER
-    assert isinstance(result, ResolvedProfile)
-    return f"{result.profile_id}{_CACHE_FIELD_SEP}{result.level}"
-
-
-def _decode_group_result(cached: str) -> ResolutionResult:
-    if cached == _CACHE_NONE_MARKER:
-        return NONE_RESOLVED
-    profile_id_str, _, level = cached.partition(_CACHE_FIELD_SEP)
-    return ResolvedProfile(profile_id=uuid.UUID(profile_id_str), level=level)  # type: ignore[arg-type]
+# --- Redis resolution-cache get/set (value codec shared via app_shared) -----
+#
+# The encode/decode codec itself (`encode_group_result`/`decode_group_result`)
+# lives in `app_shared.profiles.resolution` (SPEC-07 tasks.md T055) — shared
+# with `apps/api/app/services/profile_resolution.py`, the SPEC-06
+# orchestrator that populates this same cache, so the two can never
+# silently drift apart. This module only duplicates the **bounded-load**
+# shape (see module docstring) — never this codec.
 
 
 def _cache_get_group_result(redis: Any, cache_key: str) -> ResolutionResult | None:
@@ -128,7 +122,7 @@ def _cache_get_group_result(redis: Any, cache_key: str) -> ResolutionResult | No
     if isinstance(cached, bytes):
         cached = cached.decode("utf-8")
     try:
-        return _decode_group_result(cached)
+        return decode_group_result(cached)
     except (ValueError, AttributeError):
         return None
 
@@ -138,7 +132,7 @@ def _cache_set_group_result(redis: Any, cache_key: str, result: ResolutionResult
         from app_shared.config import get_settings
 
         ttl_seconds = get_settings().PROFILE_RESOLUTION_CACHE_TTL_SECONDS
-        redis.set(cache_key, _encode_group_result(result), ex=ttl_seconds)
+        redis.set(cache_key, encode_group_result(result), ex=ttl_seconds)
     except Exception:  # noqa: BLE001 - best-effort repopulate only
         pass
 
@@ -191,6 +185,7 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> list[Sp
             .all()
         )
         competitor_default_by_id = {row.id: row.default_scrape_profile_id for row in competitor_rows}
+        competitor_robots_policy_by_id = {row.id: row.robots_policy for row in competitor_rows}
 
         global_default_id = session.execute(
             select(ScrapeProfile.id).where(
@@ -256,6 +251,9 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> list[Sp
                     competitor_id=match.competitor_id,
                     url=match.competitor_url,
                     profile=profile,
+                    robots_policy=competitor_robots_policy_by_id.get(
+                        match.competitor_id, RobotsPolicy.RESPECT
+                    ),
                 )
             )
         return targets
@@ -295,13 +293,28 @@ class GenericPriceSpider(scrapy.Spider):
         targets = await run_in_thread(load_targets, self.workspace_id, self.match_ids)
         for target in targets:
             self._targets_by_match_id[target.match_id] = target
-            yield scrapy.Request(
-                url=target.url,
-                callback=self.parse,
-                errback=self.errback,
-                dont_filter=True,
-                meta={"match_id": target.match_id, "download_slot": str(target.match_id)},
-            )
+            yield self._request_for(target)
+
+    def _request_for(self, target: SpiderTarget) -> scrapy.Request:
+        """Build the one ``DIRECT_HTTP`` request for `target`.
+
+        Carries the resolved per-competitor ``robots_policy`` on
+        ``request.meta`` (SPEC-07 tasks.md T054, FR-006) so
+        ``RobotsPolicyMiddleware.process_request`` honors it instead of
+        silently falling through to its conservative ``RESPECT`` default
+        for every request.
+        """
+        return scrapy.Request(
+            url=target.url,
+            callback=self.parse,
+            errback=self.errback,
+            dont_filter=True,
+            meta={
+                "match_id": target.match_id,
+                "download_slot": str(target.match_id),
+                "robots_policy": target.robots_policy,
+            },
+        )
 
     def parse(self, response: Response, **kwargs: Any) -> Any:
         target = self._targets_by_match_id[response.meta["match_id"]]
@@ -370,7 +383,8 @@ class GenericPriceSpider(scrapy.Spider):
             logger.error("generic_price_spider: fetch failure with no known target: %s", failure)
             return None
         now = datetime.now(UTC)
-        error_code = classify_exception(failure.value)
+        hostname = urlsplit(failure.request.url).hostname
+        error_code = classify_exception(failure.value, hostname=hostname)
         yield self._build_result(
             target,
             failure.request.url,

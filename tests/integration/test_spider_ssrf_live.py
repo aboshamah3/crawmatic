@@ -16,19 +16,22 @@ Two distinct enforcement layers, each proven by its own match:
    installed via ``DNS_RESOLVER``) — match 1's URL names a host
    (``private-target.invalid``) that the test-only resolver maps to a
    private IP (``10.0.0.5``); ``SafeResolver`` refuses to hand back an
-   unsafe resolved address, so the connection is never attempted. Twisted
-   wraps that refusal in a ``scrapy.exceptions.CannotResolveHostError``
-   before it reaches the spider's ``errback``, which
-   ``scrape_core.errors.classify_exception`` — not recognizing that
-   exception's class name — currently classifies as ``UNKNOWN_ERROR``
-   rather than the ``BLOCKED`` the informal acceptance language suggests
-   (verified empirically against this exact resolver/middleware stack
-   while authoring this test: `probe_ssrf2.py` in the scratchpad
-   reproduces `CannotResolveHostError` -> `classify_exception` ->
-   `UNKNOWN_ERROR`). This test asserts the actual, current classification
-   rather than the aspirational one, while still proving the
-   non-negotiable guarantee: the connection to the private IP never
-   happens and no observation is ever `success=true` for that target.
+   unsafe resolved address, so the connection is never attempted. Twisted's
+   ``HostnameEndpoint``/``SimpleResolverComplexifier`` machinery
+   unconditionally discards that refusal (class, ``error_code``, and any
+   cause chain alike) before it reaches the spider's ``errback``,
+   replacing it with a generic ``scrapy.exceptions.CannotResolveHostError``
+   indistinguishable — by type or message — from a genuine DNS miss
+   (verified empirically while authoring the SPEC-07 tasks.md T053 fix).
+   ``scrape_core.errors.classify_exception`` now recognizes this specific
+   rejection via ``scrape_core.safety.rejection_registry`` — the
+   short-TTL, hostname-keyed side-channel ``SafeResolver`` populates right
+   before raising, consulted here using the failed request's own hostname
+   — so it classifies ``BLOCKED`` (FR-005/US2 Acceptance Scenario 1)
+   while a genuine DNS failure for an unrelated hostname still classifies
+   ``DNS_ERROR``. This test proves both the non-negotiable guarantee (the
+   connection to the private IP never happens, no observation is ever
+   `success=true` for that target) and the correct classification.
 2. **Pre-fetch middleware defense on a redirect hop**
    (``scrape_core.safety.middleware.SsrfGuardMiddleware``) — match 2's URL
    is served by the loopback fixture server at a "public-looking" host
@@ -108,26 +111,19 @@ _PUBLIC_ORIGIN_HOST = "public-origin.invalid"
 #   first hop).
 # - anything else falls through to the real (production) SafeResolver.
 _RESOLVER_SOURCE = """
-import ipaddress
-
 from twisted.internet import defer
 
-from app_shared.url_safety import _reject_ip
-from scrape_core.safety.resolver import SafeResolver, UnsafeResolvedAddressError
+from scrape_core.safety.resolver import SafeResolver
 
 
 class _TestResolver(SafeResolver):
     def getHostByName(self, name, timeout=()):
         if name == "private-target.invalid":
-            ip_str = "10.0.0.5"
-            ip = ipaddress.ip_address(ip_str)
-            if _reject_ip(ip):
-                return defer.fail(
-                    UnsafeResolvedAddressError(
-                        f"host {name!r} resolved to unsafe IP {ip_str!r}"
-                    )
-                )
-            return defer.succeed(ip_str)
+            # Route through the real `_reject_unsafe` (not a re-implemented
+            # reject check) so this exercises the exact production path --
+            # including the `rejection_registry.mark_rejected` side-channel
+            # `classify_exception` relies on (SPEC-07 tasks.md T053).
+            return defer.succeed("10.0.0.5").addCallback(self._reject_unsafe, name)
         if name == "public-origin.invalid":
             return defer.succeed("127.0.0.1")
         return super().getHostByName(name, timeout)
@@ -244,6 +240,18 @@ def test_private_ip_and_redirect_to_internal_are_both_refused_pre_body(
             # The redirect hop is refused by SsrfGuardMiddleware's IP-literal
             # deny rule, which explicitly sets error_code=BLOCKED.
             assert redirect_attempt.error_code == "BLOCKED"
+
+            private_ip_attempt = session.execute(
+                text(
+                    "SELECT error_code FROM request_attempts "
+                    "WHERE workspace_id = :ws AND match_id = :match"
+                ),
+                {"ws": str(seeded.workspace_id), "match": str(private_ip_match_id)},
+            ).fetchone()
+            # SPEC-07 tasks.md T053: the connect-time SafeResolver rejection
+            # now also classifies as BLOCKED (FR-005/US2 Acceptance Scenario
+            # 1) -- previously UNKNOWN_ERROR, see module docstring.
+            assert private_ip_attempt.error_code == "BLOCKED"
 
             # No match_current_prices row was ever created for either target
             # (a failure/rejection never upserts the current price, FR-014).
