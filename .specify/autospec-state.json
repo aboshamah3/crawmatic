@@ -171,6 +171,15 @@
         "T049 cross-workspace isolation (app scoping + RLS); no-context \u2192 0 rows"
       ],
       "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 6 integration tests authored + skip cleanly. DB/reactor/network-independent logic fully unit-tested here (910 passed; integration 3 passed/130 skipped/0 errors; scoping guard OK; single head 2db33dea5e14)"
+    },
+    "08": {
+      "title": "Jobs & Orchestration",
+      "feature_directory": "specs/008-jobs-orchestration",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done",
+        "clarify": "in-progress"
+      }
     }
   }
 }
