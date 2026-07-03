@@ -8,6 +8,22 @@
 
 **Input**: SPEC-04 from PROJECT_SPEC.md §35 — store the client's catalog (products, variants, groups) with correct variant-level structure, bulk ingestion, and workspace isolation.
 
+## Clarifications
+
+### Session 2026-07-03
+
+All items below were resolved from the master specification (`PROJECT_SPEC.md` §19/§22/§24/§32) and the SPEC-02/03 foundation; no open ambiguity required a stakeholder decision. Plan-level details are noted as such.
+
+- Q: Which tables are workspace-owned / get RLS now? → A: All four (products, product_variants, product_groups, product_group_items) — each carries `workspace_id`, gets RLS enabled+forced in its creating migration (SPEC-02 `emit_rls_policy`), and is added to `WORKSPACE_OWNED_MODELS` (source: §22/§32).
+- Q: Default-variant behavior and title? → A: A product with no explicit variants auto-gets exactly one default variant inheriting its price/currency/sku/url; a product with explicit variants gets none added; product always keeps ≥1 variant. The default variant's title when none is derivable (e.g. `"Default"` vs the product title) is a plan-level choice (source: §35 04 + Constitution III).
+- Q: Bulk-upsert mechanism and in-batch conflicts? → A: Set-based `INSERT … ON CONFLICT` (bounded statements, no row loops); identity resolution `external_id` → `sku` → `(product_id, title)`; in-batch duplicates resolve last-wins. The exact ON CONFLICT target handling for the *partial* unique indexes (where external_id/sku is null) is a plan-level detail (source: §24).
+- Q: Money & currency? → A: finite `NUMERIC(18,4)` via the SPEC-02 Money type; `currency` is a 3-letter code; no cross-currency comparison in v1 (source: §19).
+- Q: Deletion semantics now vs later? → A: hard-delete allowed now (no dependent history tables until SPEC-07+) but the model/endpoint are structured for archive-by-status, and the delete response indicates which outcome occurred (source: §22/§24).
+- Q: Pagination? → A: cursor-based, default 50, max 500, `{items, next_cursor}`; the opaque cursor encoding (e.g. of `(created_at, id)`) is a plan-level detail (source: §24).
+- Q: Scope-gating (first end-to-end use)? → A: products:read/write and variants:read/write via the SPEC-03 `require_scopes` auth seam; product-group management reuses the products/variants write scopes (no dedicated group scope exists in the §33 vocabulary) (source: §24/§33).
+- Q: FK workspace-consistency? → A: all foreign references (variant→product, group_item→product/variant/group) must resolve within the same workspace; cross-workspace/nonexistent references are rejected in the application layer (composite FK including workspace_id where practical) (source: §32).
+- Q: Live-Postgres acceptance items here? → A: DB-independent logic unit-tested here; live create/upsert, RLS row denial, cross-workspace blocking, migration run, and end-to-end request flows authored + deferred to a Postgres host (source: no-docker-daemon constraint).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The users of this feature are workspace operators and their integrations (WooCommerce/Salla-style connectors) that load and manage a client's product catalog. This feature is the first to store real business data: products, their variants, and groupings — each confined to one workspace, each priceable at the variant level, and ingestible in bulk. It is also the first feature to exercise end-to-end scope-gated API access on top of the auth foundation.

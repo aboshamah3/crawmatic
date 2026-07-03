@@ -80,7 +80,8 @@
       "feature_directory": "specs/004-catalog-products-variants-groups",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     }
   }
