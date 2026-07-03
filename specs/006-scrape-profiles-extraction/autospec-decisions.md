@@ -19,3 +19,7 @@ Auto-answered questions (doc-first) during the spec-kit pipeline. Format:
 - [specify] Q: Which acceptance items are deferred (no live PG/Redis)? → A: live CRUD, RLS row denial, cross-workspace, Redis TTL/invalidation, migration run, e2e deferred; DB/Redis-independent logic unit-tested here (source: no-docker-daemon project constraint + SPEC-03/05 precedent)
 
 Scope boundaries confirmed from doc §35: access_policies/proxy_providers/domain_access_rules → SPEC-10; spider execution/price_observations → SPEC-07; domain_strategy_profiles → SPEC-12. Not built in SPEC-06.
+
+## clarify
+
+- [clarify] Ambiguity scan across the full taxonomy found no critical spec-level ambiguities: all high-impact questions were already resolved doc-first in the `## Clarifications` section, and every residual gap (cache-TTL value, FK promotion vs soft ref, delete policy block-vs-null, ReDoS-detection depth, cookie deny heuristic, global-profile seeding mechanism) is explicitly plan-level and traceable to PROJECT_SPEC §9/§16-20/§22. No stakeholder question required; no spec edits made. Requirements checklist remains 16/16. (source: doc §9/§16-20/§22 + prior-spec precedent)

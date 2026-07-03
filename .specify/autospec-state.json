@@ -128,7 +128,8 @@
       "feature_directory": "specs/006-scrape-profiles-extraction",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     }
   }
