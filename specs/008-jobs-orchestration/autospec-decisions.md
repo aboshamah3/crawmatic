@@ -13,3 +13,10 @@ Log of auto-answered questions and informed defaults. Format:
 - [specify] Q: What HTTP batch size for grouping? → A: 50–200 matches per HTTP batch, grouped by workspace/competitor-domain/scrape-mode; never one Scrapyd job per URL (source: doc §27 Batching Strategy).
 - [specify] Q: How is a "batch" represented (table vs derived)? → A: left to planning; binding requirements are deterministic-node + idempotency guarantees, not a specific schema (default — spec §Assumptions).
 - [specify] Q: Live infra verification approach? → A: unit tests + integration tests that skip cleanly (no Docker/Postgres/Redis/Scrapyd in build env), consistent with SPEC-01…07 (source: project convention + prior state file deferred_verifications).
+
+## clarify
+
+- [clarify] Q: What type/source for direct API run endpoints? → A: type=MANUAL, source=API (operator on-demand); API_TRIGGERED/PLUGIN/SCHEDULED reserved for programmatic/scheduler triggers (default — doc §22 lists the enum values but not the mapping; informed guess, integrated into spec FR-010).
+- [clarify] Q: How does a zero-active-match scoped run resolve? → A: create job, total_targets=0, no dispatch, finalize COMPLETED (default — doc §25 silent on empty case; chosen for observability + idempotency, integrated into US2-AS4 + FR-020).
+- [clarify] Q: Stall-timeout value + idempotency-guard storage (Redis vs DB)? → A: deferred to planning (config/implementation); binding reqs are detect+re-dispatch past configured timeout and no-double-run (source: doc §26 states the behavior, not the constant).
+- [clarify] No questions relayed to user — all ambiguities resolved doc-first / by informed default with clear reasonable defaults; none high-impact enough to require human decision.

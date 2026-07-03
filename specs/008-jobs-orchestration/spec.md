@@ -8,6 +8,14 @@
 
 **Input**: User description: "Jobs & Orchestration (SPEC-08). API triggers scraping through the worker and Scrapyd."
 
+## Clarifications
+
+### Session 2026-07-03
+
+- Q: What `type` and `source` do the direct API run-match/run-variant endpoints record? → A: `type = MANUAL`, `source = API` — these are operator-initiated on-demand runs; `API_TRIGGERED` is reserved for programmatic/plugin triggers, `SCHEDULED` for the scheduler (later spec).
+- Q: How does a variant (or other scoped) run with zero active matches resolve? → A: Create the job, set `total_targets = 0`, dispatch nothing, and immediately finalize it as `COMPLETED` (not rejected) so the run is observable and idempotent.
+- Q: What is the stall timeout value for re-dispatch, and where does the idempotency guard live (Redis vs DB unique row)? → A: Deferred to planning — these are configuration / implementation choices; the binding requirements are "detect + re-dispatch past a configured timeout" and "duplicate dispatch never double-runs a batch."
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Run a single match and observe its job (Priority: P1)
@@ -41,7 +49,7 @@ An operator wants to refresh all competitor prices for one product variant. They
 1. **Given** a variant with N active matches, **When** I POST to run that variant, **Then** one ScrapeJob (scope VARIANT) is created with exactly N unique targets, one per active match, and total_targets = N.
 2. **Given** a variant with both active and inactive matches, **When** I run the variant, **Then** only active matches become targets.
 3. **Given** a variant whose active matches span multiple domains and scrape modes, **When** dispatch runs, **Then** targets are grouped into batches by domain and mode (HTTP batch sizing in the 50–200 range), not one Scrapyd job per match.
-4. **Given** a variant with zero active matches, **When** I run the variant, **Then** the job is created and immediately finalized as COMPLETED with total_targets = 0 (or is rejected as nothing-to-do per a stated rule), without dispatching anything.
+4. **Given** a variant with zero active matches, **When** I run the variant, **Then** the job is created and immediately finalized as COMPLETED with total_targets = 0, without dispatching anything.
 
 ---
 
@@ -92,7 +100,7 @@ An operator runs a large job (many targets across many domains). As spiders comp
 - **FR-007**: System MUST expose `POST /v1/jobs/run/variant/{variant_id}` that finds all active matches for the variant, creates one ScrapeJob (scope VARIANT) with one unique target per active match, enqueues dispatch, and returns the job id. Inactive matches MUST be excluded.
 - **FR-008**: System MUST expose `GET /v1/jobs/{job_id}` returning the job's status, type, scope, counts (total/success/failure/skipped), and lifecycle timestamps, scoped to the caller's workspace.
 - **FR-009**: System MUST expose `GET /v1/jobs/{job_id}/results` returning the job's targets, each with match reference, status, and error_code, scoped to the caller's workspace.
-- **FR-010**: All run endpoints MUST record who/what triggered the job (`requested_by` where an authenticated principal exists; `source` = API for direct API calls).
+- **FR-010**: All run endpoints MUST record who/what triggered the job: `requested_by` = the authenticated principal, `type` = MANUAL, and `source` = API for direct operator API calls. (`API_TRIGGERED`/`PLUGIN`/`SCHEDULED`/`INTERNAL` are used by later programmatic/scheduler triggers.)
 
 **Dispatch & worker orchestration**
 
@@ -108,7 +116,7 @@ An operator runs a large job (many targets across many domains). As spiders comp
 - **FR-017**: Targets MUST support status updates (pending → started → completed/failed/skipped) with the appropriate timestamps (started_at, completed_at) and error_code on failure. These updates are made by the dispatch/finalization path and by the spider/worker as targets progress.
 - **FR-018**: Job counters (success_count, failure_count, skipped_count) MUST be derived by aggregating over scrape_job_targets — computed periodically and at finalization — and MUST NOT be incremented once per target on the job row (to avoid serializing thousands of writes on one hot row).
 - **FR-019**: Job status MUST resolve deterministically at finalization: COMPLETED when all targets succeeded, PARTIAL_FAILED when some succeeded and some failed/skipped, FAILED when none succeeded; started_at is set when work begins and completed_at when the job reaches a terminal state.
-- **FR-020**: total_targets MUST equal the number of targets created for the job; a job with zero targets MUST resolve to a defined terminal state without dispatching.
+- **FR-020**: total_targets MUST equal the number of targets created for the job; a job with zero targets MUST be finalized immediately as COMPLETED (total_targets = 0) without dispatching.
 
 ### Key Entities *(include if feature involves data)*
 
