@@ -13,18 +13,25 @@ contracts/api-auth.md, US1) and the `/v1/api-keys` router
 seam) — those endpoints do use the shared lazy DB/Redis singletons
 (never a per-request engine), consistent with the same FR-020
 discipline.
+
+SPEC-04 US1 adds the `/v1/products` and `/v1/variants` routers
+(contracts/api-products.md, contracts/api-variants.md) — product/variant
+CRUD with the default-variant guarantee, on the same auth seam and
+FR-020 discipline.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.routers import api_keys, auth
+from app.routers import api_keys, auth, products, variants
 
 app = FastAPI(title="crawmatic-api")
 
 app.include_router(auth.router)
 app.include_router(api_keys.router)
+app.include_router(products.router)
+app.include_router(variants.router)
 
 
 @app.get("/health")
