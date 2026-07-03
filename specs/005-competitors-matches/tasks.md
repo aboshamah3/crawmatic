@@ -133,8 +133,8 @@ description: "Dependency-ordered task list for SPEC-05 Competitors & Matches"
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T031 [P] Extend `tests/unit/test_import_boundaries.py` to assert `app_shared.models.competitors_matches`, `app_shared.url_safety`, `app_shared.url_pattern`, and `app_shared.matches.*` import cleanly with **no** fastapi / scrapy / twisted / playwright imports.
-- [ ] T032 Run the DB-independent validation from `specs/005-competitors-matches/quickstart.md`: full `tests/unit` suite green + `scripts/check_workspace_scoping.py` exit 0 (both new models) + `scripts/check_single_head.sh` single head + import-boundary green.
+- [X] T031 [P] Extend `tests/unit/test_import_boundaries.py` to assert `app_shared.models.competitors_matches`, `app_shared.url_safety`, `app_shared.url_pattern`, and `app_shared.matches.*` import cleanly with **no** fastapi / scrapy / twisted / playwright imports.
+- [X] T032 Run the DB-independent validation from `specs/005-competitors-matches/quickstart.md`: full `tests/unit` suite green + `scripts/check_workspace_scoping.py` exit 0 (both new models) + `scripts/check_single_head.sh` single head + import-boundary green.
 - [ ] T033 [P] ⏸ DEFERRED (needs live Postgres) Run the online migration on a Postgres host: `alembic upgrade head` creates both tables + both unique keys + composite FKs + RLS; `alembic downgrade` reverses cleanly (matches → competitors). (FR-001)
 - [ ] T034 [P] ⏸ DEFERRED (needs live Postgres) Execute the live-DB section of `specs/005-competitors-matches/quickstart.md` (end-to-end request flows: scope refusal `403` / write `200`, create with safe URL → normalized+pattern, unsafe URL rejected, bulk idempotency + reject-report, cross-workspace + RLS denial). (SC-002, SC-004, SC-006, SC-007, SC-008)
 
