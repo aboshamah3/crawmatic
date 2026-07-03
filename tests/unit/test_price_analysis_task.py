@@ -1,4 +1,5 @@
-"""`recompute_variant` task unit tests (SPEC-09 T021, US1, contracts/price-analysis-task.md).
+"""`recompute_variant` task unit tests (SPEC-09 T021/T027, US1+US2,
+contracts/price-analysis-task.md).
 
 Fake session (`FakeAlertsSession`) + fake `MatchCurrentPrice` rows — no
 DB. Per the contract: `set_workspace_context` runs before any query; a
@@ -8,7 +9,11 @@ type/severity/status/lifecycle; a currency-mismatched competitor is
 excluded from benchmarks and its `match_current_prices` row flipped
 `comparable=false`/`CURRENCY_MISMATCH`; re-running with unchanged inputs
 writes identical state (only `calculated_at`/`updated_at` advance).
-Event-write cases (`price_alert_events`) are added in US2 (T023/T027).
+Event-write cases (`price_alert_events`, US2 T023/T027): driving
+NORMAL -> HIGH_PRICE -> NORMAL -> HIGH_PRICE yields exactly one CREATED,
+one RESOLVED, one REOPENED; a same-type severity change yields UPDATED;
+an unchanged re-run writes zero events while advancing `last_seen_at`;
+`latest_alert_state_id` links the alert-state row.
 
 Loaded in a fresh subprocess (mirrors `test_jobs_dispatch_task.py`/
 `test_jobs_counters.py`'s `_REFRESH_COUNTERS_CHECK`), for the same two
@@ -46,10 +51,10 @@ sys.path.insert(0, "apps/workers")
 sys.path.insert(0, "tests/unit")
 
 from _alerts_fake_session import FakeAlertsSession
-from app_shared.enums import AlertSeverity, AlertStatus, AlertType, ScrapeErrorCode
+from app_shared.enums import AlertEventType, AlertSeverity, AlertStatus, AlertType, ScrapeErrorCode
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.observations import MatchCurrentPrice
-from app_shared.models.alerts import VariantAlertState, VariantPriceState
+from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 
 import app.workers.tasks_analysis as tasks_analysis
 
@@ -271,6 +276,159 @@ if ps.comparable_competitor_count != 0:
     sys.exit(1)
 if ps.cheapest_competitor_price is not None or ps.average_competitor_price is not None or ps.highest_competitor_price is not None:
     print("BENCHMARKS_NOT_NULL")
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+    result = _run(script)
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+# --- US2 (T027): event-write path ---------------------------------------
+
+
+def test_event_transition_sequence_created_resolved_reopened_unchanged() -> None:
+    """Drive HIGH_PRICE(created) -> NORMAL(resolved) -> HIGH_PRICE(reopened)
+    -> HIGH_PRICE again (unchanged, zero new events) via one fixed comparable
+    set (cheapest=100, average=101, highest=104) and only the variant's
+    client price changing between calls (contracts/price-analysis-task.md
+    step 9; the "NORMAL -> HIGH_PRICE -> NORMAL -> HIGH_PRICE" business-state
+    sequence from tasks.md Phase 4, where the leading NORMAL is the implicit
+    no-row starting point: the first persisted row is itself CREATED)."""
+    script = """
+fake_session.seed(make_match("100"), make_match("100"), make_match("100"), make_match("104"))
+
+# Step 1: price=102 -> HIGH_PRICE (cheapest=100 < 102 <= highest=104). No
+# prior row -> CREATED.
+variant.current_price = Decimal("102")
+tasks_analysis.recompute_variant(workspace_id=str(workspace_id), product_variant_id=str(variant_id))
+
+events = fake_session._rows.get(PriceAlertEvent, [])
+if len(events) != 1:
+    print("EXPECTED_ONE_EVENT_AFTER_STEP1:" + str(len(events)))
+    sys.exit(1)
+ev1 = events[0]
+if ev1.event_type != AlertEventType.CREATED:
+    print("STEP1_WRONG_EVENT_TYPE:" + str(ev1.event_type))
+    sys.exit(1)
+if ev1.previous_type is not None or ev1.new_type != AlertType.HIGH_PRICE:
+    print("STEP1_WRONG_TYPES:" + str((ev1.previous_type, ev1.new_type)))
+    sys.exit(1)
+
+alert_states = fake_session._rows.get(VariantAlertState, [])
+if len(alert_states) != 1:
+    print("EXPECTED_ONE_ALERT_STATE_ROW:" + str(len(alert_states)))
+    sys.exit(1)
+alert_state = alert_states[0]
+
+price_states = fake_session._rows.get(VariantPriceState, [])
+ps = price_states[0]
+if ps.latest_alert_state_id != alert_state.id:
+    print("LATEST_ALERT_STATE_ID_NOT_LINKED_STEP1")
+    sys.exit(1)
+
+# Step 2: price=97 -> NORMAL (<=cheapest=100; discount vs avg=101 is
+# (101-97)/101*100 = 3.96%, in [1,5]). prior=HIGH_PRICE -> RESOLVED.
+variant.current_price = Decimal("97")
+tasks_analysis.recompute_variant(workspace_id=str(workspace_id), product_variant_id=str(variant_id))
+
+events = fake_session._rows.get(PriceAlertEvent, [])
+if len(events) != 2:
+    print("EXPECTED_TWO_EVENTS_AFTER_STEP2:" + str(len(events)))
+    sys.exit(1)
+ev2 = events[1]
+if ev2.event_type != AlertEventType.RESOLVED:
+    print("STEP2_WRONG_EVENT_TYPE:" + str(ev2.event_type))
+    sys.exit(1)
+if ev2.previous_type != AlertType.HIGH_PRICE or ev2.new_type != AlertType.NORMAL:
+    print("STEP2_WRONG_TYPES:" + str((ev2.previous_type, ev2.new_type)))
+    sys.exit(1)
+
+alert_states = fake_session._rows.get(VariantAlertState, [])
+if len(alert_states) != 1:
+    print("RESOLVE_SHOULD_UPDATE_SAME_ROW:" + str(len(alert_states)))
+    sys.exit(1)
+if alert_states[0].status != AlertStatus.RESOLVED or alert_states[0].resolved_at is None:
+    print("STEP2_NOT_MARKED_RESOLVED")
+    sys.exit(1)
+
+# Step 3: back to price=102 -> HIGH_PRICE. prior=NORMAL, had_history=True
+# -> REOPENED (resolved_at cleared).
+variant.current_price = Decimal("102")
+tasks_analysis.recompute_variant(workspace_id=str(workspace_id), product_variant_id=str(variant_id))
+
+events = fake_session._rows.get(PriceAlertEvent, [])
+if len(events) != 3:
+    print("EXPECTED_THREE_EVENTS_AFTER_STEP3:" + str(len(events)))
+    sys.exit(1)
+ev3 = events[2]
+if ev3.event_type != AlertEventType.REOPENED:
+    print("STEP3_WRONG_EVENT_TYPE:" + str(ev3.event_type))
+    sys.exit(1)
+if ev3.previous_type != AlertType.NORMAL or ev3.new_type != AlertType.HIGH_PRICE:
+    print("STEP3_WRONG_TYPES:" + str((ev3.previous_type, ev3.new_type)))
+    sys.exit(1)
+
+alert_states = fake_session._rows.get(VariantAlertState, [])
+if alert_states[0].status != AlertStatus.ACTIVE or alert_states[0].resolved_at is not None:
+    print("STEP3_NOT_REOPENED_PROPERLY")
+    sys.exit(1)
+
+# Step 4: unchanged re-run (same price=102) -> zero new events, only
+# last_seen_at advances.
+last_seen_before = alert_states[0].last_seen_at
+import time
+time.sleep(0.01)
+tasks_analysis.recompute_variant(workspace_id=str(workspace_id), product_variant_id=str(variant_id))
+
+events = fake_session._rows.get(PriceAlertEvent, [])
+if len(events) != 3:
+    print("UNCHANGED_RERUN_WROTE_EVENTS:" + str(len(events)))
+    sys.exit(1)
+alert_states = fake_session._rows.get(VariantAlertState, [])
+if alert_states[0].last_seen_at <= last_seen_before:
+    print("LAST_SEEN_AT_DID_NOT_ADVANCE_ON_UNCHANGED_RERUN")
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+    result = _run(script)
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+def test_type_change_between_non_normal_alerts_is_updated() -> None:
+    """A type change between two non-NORMAL alerts (HIGH_PRICE -> RISK) is
+    UPDATED (contracts/alert-engine.md: "same-type severity change -> UPDATED"
+    is the defensive branch of this same rule, exercised only via a
+    hand-constructed input at the pure-engine level — T016 I1 — since
+    severity is a pure function of type and can never differ for the same
+    type through the real engine/task)."""
+    script = """
+fake_session.seed(make_match("100"), make_match("100"), make_match("100"), make_match("104"))
+
+variant.current_price = Decimal("102")  # HIGH_PRICE (created)
+tasks_analysis.recompute_variant(workspace_id=str(workspace_id), product_variant_id=str(variant_id))
+
+variant.current_price = Decimal("110")  # > highest(104) -> RISK
+tasks_analysis.recompute_variant(workspace_id=str(workspace_id), product_variant_id=str(variant_id))
+
+events = fake_session._rows.get(PriceAlertEvent, [])
+if len(events) != 2:
+    print("EXPECTED_TWO_EVENTS:" + str(len(events)))
+    sys.exit(1)
+ev = events[1]
+if ev.event_type != AlertEventType.UPDATED:
+    print("WRONG_EVENT_TYPE:" + str(ev.event_type))
+    sys.exit(1)
+if ev.previous_type != AlertType.HIGH_PRICE or ev.new_type != AlertType.RISK:
+    print("WRONG_TYPES:" + str((ev.previous_type, ev.new_type)))
+    sys.exit(1)
+if ev.previous_severity != AlertSeverity.HIGH or ev.new_severity != AlertSeverity.CRITICAL:
+    print("WRONG_SEVERITIES:" + str((ev.previous_severity, ev.new_severity)))
     sys.exit(1)
 
 print("OK")

@@ -52,6 +52,13 @@ per-target outcomes), on the same auth seam and FR-020 discipline,
 gated by the new `jobs:read`/`jobs:write` scopes. Job creation
 delegates to `app_shared.jobs.service`; dispatch is enqueued through
 `app_shared.messaging` — this router never imports `apps/workers`.
+
+SPEC-09 US2 adds the `/v1/alerts/current` (+`/{variant_id}`) and
+`/v1/alert-events` routers (contracts/api-alerts.md) — cursor-paginated,
+filterable reads over `variant_alert_states`/`price_alert_events`, on
+the same auth seam and FR-020 discipline, gated by the existing
+`alerts:read` scope (no new scope; `/v1/variants/{id}/price-comparison`,
+US1, already uses it). Never imports `apps/workers`.
 """
 
 from __future__ import annotations
@@ -59,6 +66,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.routers import (
+    alerts,
     api_keys,
     auth,
     competitors,
@@ -81,6 +89,7 @@ app.include_router(competitors.router)
 app.include_router(matches.router)
 app.include_router(scrape_profiles.router)
 app.include_router(jobs.router)
+app.include_router(alerts.router)
 
 
 @app.get("/health")

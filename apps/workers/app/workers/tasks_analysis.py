@@ -1,12 +1,13 @@
 """`price_analysis` queue task: `recompute_variant` (SPEC-09 US1 T017,
-contracts/price-analysis-task.md).
+US2 T023, contracts/price-analysis-task.md).
 
 Thin orchestrator over the pure `app_shared.alerts.engine` — reads one
 variant's client price/currency + its comparable `match_current_prices`,
 runs the engine, and idempotently upserts `variant_price_states` +
-`variant_alert_states` (writing an event **only** on a type/severity
-change — the `price_alert_events` insert + `latest_alert_state_id`
-linkage are added in US2, T023). Relies on the existing
+`variant_alert_states`, writing a `price_alert_events` row **only** on a
+type/severity change (step 9) and linking
+`variant_price_states.latest_alert_state_id` to the upserted alert-state
+row in the same transaction. Relies on the existing
 `worker_process_init` -> `dispose_engine` fork-safety hook
 (`celery_app.py`, SPEC-01/08) — never starts Scrapy in-process
 (Principle V). Runs on its own `price_analysis` queue, separate from
@@ -34,8 +35,14 @@ from app.workers.celery_app import app
 from app_shared.alerts import engine
 from app_shared.alerts.engine import AlertOutcome, CompetitorPrice
 from app_shared.database import get_session, set_workspace_context
-from app_shared.enums import AlertEventType, AlertStatus, AlertType, ScrapeErrorCode
-from app_shared.models.alerts import VariantAlertState, VariantPriceState
+from app_shared.enums import (
+    AlertEventType,
+    AlertSeverity,
+    AlertStatus,
+    AlertType,
+    ScrapeErrorCode,
+)
+from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.observations import MatchCurrentPrice
 from app_shared.repository import scoped_get, scoped_select
@@ -98,13 +105,15 @@ def _upsert_price_state(
     client_price,
     currency: str,
     outcome: AlertOutcome,
+    latest_alert_state_id: uuid.UUID,
     now: datetime,
 ) -> None:
     """Upsert `variant_price_states` on `unique(workspace_id, product_variant_id)`.
 
     Deterministic body for identical inputs (SC-001) — only `calculated_at`/
-    `updated_at` advance between runs. `latest_alert_state_id` linkage is
-    added in US2 (T023); left `NULL` on first insert, untouched on update.
+    `updated_at` advance between runs. `latest_alert_state_id` (US2 T023)
+    always points at the just-upserted `variant_alert_states` row for this
+    variant, on every run (not only on a change).
     """
     values = {
         "workspace_id": workspace_id,
@@ -118,6 +127,7 @@ def _upsert_price_state(
         "comparable_competitor_count": outcome.comparable_count,
         "latest_alert_type": outcome.type,
         "latest_alert_severity": outcome.severity,
+        "latest_alert_state_id": latest_alert_state_id,
         "calculated_at": now,
     }
     stmt = pg_insert(VariantPriceState).values(**values)
@@ -133,11 +143,51 @@ def _upsert_price_state(
             "comparable_competitor_count": stmt.excluded.comparable_competitor_count,
             "latest_alert_type": stmt.excluded.latest_alert_type,
             "latest_alert_severity": stmt.excluded.latest_alert_severity,
+            "latest_alert_state_id": stmt.excluded.latest_alert_state_id,
             "calculated_at": stmt.excluded.calculated_at,
             "updated_at": func.now(),
         },
     )
     session.execute(stmt)
+
+
+def _write_alert_event(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    product_id: uuid.UUID,
+    variant_id: uuid.UUID,
+    alert_state_id: uuid.UUID,
+    event_type: AlertEventType,
+    previous_type: AlertType | None,
+    new_type: AlertType,
+    previous_severity: AlertSeverity | None,
+    new_severity: AlertSeverity,
+    message: str,
+    details: dict | None,
+    now: datetime,
+) -> None:
+    """Append one `price_alert_events` row (step 9, contracts/price-analysis-task.md).
+
+    Called only when `engine.transition(...)` returned non-`None` — an
+    UNCHANGED/no-event run never reaches here (US2 T023, FR-013/FR-014).
+    """
+    session.add(
+        PriceAlertEvent(
+            workspace_id=workspace_id,
+            product_id=product_id,
+            product_variant_id=variant_id,
+            alert_state_id=alert_state_id,
+            event_type=event_type,
+            previous_type=previous_type,
+            new_type=new_type,
+            previous_severity=previous_severity,
+            new_severity=new_severity,
+            message=message,
+            details=details,
+            created_at=now,
+        )
+    )
 
 
 def _load_prior_alert_state(
@@ -267,17 +317,6 @@ def recompute_variant(
 
         now = datetime.now(timezone.utc)
 
-        _upsert_price_state(
-            session,
-            workspace_id=ws,
-            product_id=resolved_product_id,
-            variant_id=variant_id,
-            client_price=variant.current_price,
-            currency=variant.currency,
-            outcome=outcome,
-            now=now,
-        )
-
         prior = _load_prior_alert_state(session, ws, variant_id)
         prev_type = prior.type if prior is not None else None
         prev_severity = prior.severity if prior is not None else None
@@ -299,8 +338,43 @@ def recompute_variant(
             now=now,
         )
 
-        # The `price_alert_events` insert (step 9) + `latest_alert_state_id`
-        # linkage land in US2 (T023) — this US1 slice stops at the
-        # deterministic state upsert above.
+        # Re-read the just-upserted row to recover its `id` (needed for
+        # `variant_price_states.latest_alert_state_id` + the event's
+        # `alert_state_id` FK-shaped reference) — the upsert above is a
+        # Core statement, not an ORM-tracked insert, so its generated/
+        # existing id isn't otherwise available without a RETURNING
+        # round-trip. `unique(workspace_id, product_variant_id)`
+        # guarantees exactly one row (US2 T023).
+        alert_state = _load_prior_alert_state(session, ws, variant_id)
+        assert alert_state is not None  # just upserted, above.
+
+        _upsert_price_state(
+            session,
+            workspace_id=ws,
+            product_id=resolved_product_id,
+            variant_id=variant_id,
+            client_price=variant.current_price,
+            currency=variant.currency,
+            outcome=outcome,
+            latest_alert_state_id=alert_state.id,
+            now=now,
+        )
+
+        if event_type is not None:
+            _write_alert_event(
+                session,
+                workspace_id=ws,
+                product_id=resolved_product_id,
+                variant_id=variant_id,
+                alert_state_id=alert_state.id,
+                event_type=event_type,
+                previous_type=prev_type,
+                new_type=outcome.type,
+                previous_severity=prev_severity,
+                new_severity=outcome.severity,
+                message=outcome.message,
+                details=outcome.details,
+                now=now,
+            )
 
         session.commit()
