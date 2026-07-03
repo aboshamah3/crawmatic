@@ -1,4 +1,4 @@
-"""`scrape_dispatch` dispatch task (`contracts/dispatch-task.md`) — SPEC-08 US1.
+"""`scrape_dispatch` + `maintenance` queue tasks (SPEC-08 US1/US3).
 
 `dispatch_job` — the `scrape_dispatch`-queue Celery task that expands a
 job into Scrapyd runs. Thin orchestrator over the pure
@@ -7,9 +7,17 @@ job into Scrapyd runs. Thin orchestrator over the pure
 `dispose_engine` fork-safety hook (`celery_app.py`, FR-016) — never
 starts Scrapy in-process (Principle V).
 
-`finalize_jobs`/`refresh_job_counters`/`recover_stalled_batches`
-(`maintenance` queue, US3) are added to this same module in a later
-phase.
+`finalize_jobs`/`refresh_job_counters` (`contracts/lifecycle-counters.md`,
+D5/D6, US3) aggregate `scrape_job_targets` counts onto the job row in one
+UPDATE per job (never a per-target increment) and finalize a job's status
+deterministically once all its targets are terminal.
+
+`recover_stalled_batches` (`contracts/stall-recovery.md`, D4, US3) detects
+a batch dispatched to a node that died — its targets never left PENDING —
+past `SCRAPE_STALL_TIMEOUT_SECONDS`, and re-dispatches only those
+still-unprogressed, un-locked targets under a stall-window-bucketed
+`batch_index` so the reused Redis `SET NX` guard still neutralizes a
+duplicate recovery delivery within one window.
 """
 
 from __future__ import annotations
@@ -25,13 +33,15 @@ from app_shared.config import get_settings
 from app_shared.database import get_session, set_workspace_context
 from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetStatus
 from app_shared.jobs.batching import ResolvedTarget, plan_batches
+from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.nodes import select_node
+from app_shared.jobs.targets import Counts, aggregate_counts
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.scrapyd import ScrapydDispatchClient
-from app_shared.task_names import SCRAPE_DISPATCH_JOB
+from app_shared.task_names import SCRAPE_DISPATCH_JOB, SCRAPE_FINALIZE_JOBS, SCRAPE_RECOVER_STALLED
 
 # The Scrapy project + spider deployed to the Scrapyd nodes (apps/scrapers) —
 # unchanged from the SPEC-07 thin `dispatch.generic_price_spider` task.
@@ -47,6 +57,27 @@ _TERMINAL_JOB_STATUSES = frozenset(
         ScrapeJobStatus.PARTIAL_FAILED,
         ScrapeJobStatus.FAILED,
         ScrapeJobStatus.CANCELLED,
+    }
+)
+
+# `finalize_jobs`/`refresh_job_counters` scan every job not yet finalized —
+# `PENDING` (dispatch hasn't started work yet) or `RUNNING` (in flight).
+_NON_TERMINAL_JOB_STATUSES = frozenset(ScrapeJobStatus) - _TERMINAL_JOB_STATUSES
+
+# `recover_stalled_batches` only ever acts on a job actually in flight —
+# a `PENDING` job has no `started_at` yet, so there is nothing to stall.
+_RUNNING_JOB_STATUSES = frozenset({ScrapeJobStatus.RUNNING})
+
+# A target in one of these statuses has progressed past "never picked
+# up" — `finalize_jobs` requires ALL of a job's targets to be terminal
+# before finalizing; `recover_stalled_batches` requires a target to be
+# in NONE of these (still bare `PENDING`) before it is eligible for
+# re-dispatch.
+_TERMINAL_TARGET_STATUSES = frozenset(
+    {
+        ScrapeTargetStatus.COMPLETED,
+        ScrapeTargetStatus.FAILED,
+        ScrapeTargetStatus.SKIPPED,
     }
 )
 
@@ -134,6 +165,25 @@ def _resolve_domains_and_modes(
     return resolved
 
 
+def _scan_job_refs(
+    session: Session, statuses: frozenset[ScrapeJobStatus]
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """Resolve `(job_id, workspace_id)` pairs for every job in `statuses`.
+
+    A periodic maintenance sweep necessarily spans every workspace before
+    it can scope each job's own subsequent read/write — mirrors the
+    router precedent of resolving `(id, workspace_id)` pairs unscoped
+    (e.g. `apps/api/app/routers/matches.py`), then re-scoping via
+    `set_workspace_context` per row before touching anything else. This
+    is the one place in the module a workspace-owned model is queried
+    without a `workspace_id` predicate already in hand.
+    """
+    stmt = select(ScrapeJob.id, ScrapeJob.workspace_id).where(  # noqa: workspace-scope
+        ScrapeJob.status.in_(statuses)
+    )
+    return list(session.execute(stmt).all())
+
+
 @app.task(name=SCRAPE_DISPATCH_JOB)
 def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
     """Expand `scrape_job_id`'s PENDING targets into domain/mode-grouped Scrapyd runs.
@@ -195,5 +245,143 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 batch_index=batch.batch_index,
                 node_url=node_url,
             )
+
+        session.commit()
+
+
+def refresh_job_counters(
+    session: Session, job: ScrapeJob, workspace_id: uuid.UUID | str
+) -> Counts:
+    """Overwrite `job`'s counters from `aggregate_counts` in a single UPDATE.
+
+    Never a per-target increment (FR-018, SC-004) — `finalize_jobs` calls
+    this for every non-terminal job it scans, whether or not that job's
+    targets are all terminal yet, so in-flight progress counts stay
+    accurate even before a job fully finalizes.
+    """
+    counts = aggregate_counts(session, job.id, workspace_id)
+    job.success_count = counts.success
+    job.failure_count = counts.failure
+    job.skipped_count = counts.skipped
+    return counts
+
+
+@app.task(name=SCRAPE_FINALIZE_JOBS)
+def finalize_jobs() -> None:
+    """Aggregate counters and deterministically finalize non-terminal jobs.
+
+    For every job not yet in a terminal status: `set_workspace_context`,
+    refresh its counters (one UPDATE, never per-target), and — only once
+    ALL of its targets have reached a terminal status — resolve
+    `status = resolve_finalized_status(...)` and stamp `completed_at`.
+
+    Idempotent: a job already terminal is skipped outright, so re-running
+    this task against an already-finalized job is a no-op (FR-019).
+    """
+    with get_session() as session:
+        for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
+            set_workspace_context(session, workspace_id)
+
+            job = scoped_get(session, ScrapeJob, job_id, workspace_id)
+            if job is None or job.status in _TERMINAL_JOB_STATUSES:
+                continue
+
+            targets = list(
+                session.execute(
+                    scoped_select(ScrapeJobTarget, workspace_id).where(
+                        ScrapeJobTarget.scrape_job_id == job.id
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            counts = refresh_job_counters(session, job, workspace_id)
+
+            all_terminal = all(target.status in _TERMINAL_TARGET_STATUSES for target in targets)
+            if not all_terminal:
+                continue
+
+            job.status = resolve_finalized_status(
+                counts.success, counts.failure, counts.skipped, counts.total
+            )
+            job.completed_at = datetime.now(timezone.utc)
+
+        session.commit()
+
+
+@app.task(name=SCRAPE_RECOVER_STALLED)
+def recover_stalled_batches() -> None:
+    """Re-dispatch batches whose targets never left PENDING past the stall timeout.
+
+    Scans RUNNING jobs with `started_at` set; for each, selects targets
+    still bare `PENDING` (never progressed to STARTED/terminal) and not
+    `locked_at`-live, whose age past the job's `started_at` exceeds
+    `SCRAPE_STALL_TIMEOUT_SECONDS`. Re-resolves each stalled target's
+    domain/mode set-based (the same one-read pattern as `dispatch_job`,
+    not per-target — U3), re-plans batches, and re-dispatches each to a
+    deterministically selected, mode-appropriate node under a
+    stall-window-bucketed `batch_index` (`:r{stall_window(...)}`) — the
+    reused `SET NX` guard neutralizes a duplicate recovery delivery
+    within one window; the next window mints a fresh key, permitting a
+    genuine later retry if the batch is still stalled (D4, FR-015, I1).
+    """
+    settings = get_settings()
+    timeout = settings.SCRAPE_STALL_TIMEOUT_SECONDS
+    now = datetime.now(timezone.utc)
+    window = stall_window(now, timeout)
+
+    with get_session() as session:
+        client = ScrapydDispatchClient(settings=settings)
+
+        for job_id, workspace_id in _scan_job_refs(session, _RUNNING_JOB_STATUSES):
+            set_workspace_context(session, workspace_id)
+
+            job = scoped_get(session, ScrapeJob, job_id, workspace_id)
+            if job is None or job.started_at is None:
+                continue
+
+            age_seconds = (now - job.started_at).total_seconds()
+            if age_seconds <= timeout:
+                continue
+
+            stalled_targets = list(
+                session.execute(
+                    scoped_select(ScrapeJobTarget, workspace_id).where(
+                        ScrapeJobTarget.scrape_job_id == job.id,
+                        ScrapeJobTarget.status == ScrapeTargetStatus.PENDING,
+                        ScrapeJobTarget.locked_at.is_(None),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not stalled_targets:
+                continue
+
+            resolved_targets = _resolve_domains_and_modes(session, workspace_id, stalled_targets)
+            re_batches = plan_batches(
+                resolved_targets,
+                http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
+                http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
+            )
+
+            for batch in re_batches:
+                nodes = (
+                    settings.SCRAPYD_BROWSER_URLS
+                    if batch.mode == ScrapeProfileMode.BROWSER
+                    else settings.SCRAPYD_HTTP_URLS
+                )
+                node_url = select_node(batch.domain, nodes)
+                client.schedule(
+                    _SCRAPYD_PROJECT,
+                    _GENERIC_PRICE_SPIDER,
+                    workspace_id=str(workspace_id),
+                    scrape_job_id=str(job.id),
+                    match_ids=batch.match_ids,
+                    mode=batch.mode,
+                    batch_index=f"{batch.batch_index}:r{window}",
+                    node_url=node_url,
+                )
 
         session.commit()

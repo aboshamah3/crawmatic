@@ -24,6 +24,7 @@ from typing import Any
 
 from sqlalchemy import Select
 from sqlalchemy.sql import operators as sa_operators
+from sqlalchemy.sql.elements import Null
 
 
 def _resolve_bind_value(node: Any) -> Any:
@@ -50,6 +51,10 @@ def _eval_clause(clause: Any, obj: Any) -> bool:
         return actual in _resolve_bind_value(clause.right)
     if op is sa_operators.eq:
         return actual == _resolve_bind_value(clause.right)
+    if op is sa_operators.is_:
+        if isinstance(clause.right, Null):
+            return actual is None
+        return actual is _resolve_bind_value(clause.right)
     raise NotImplementedError(f"unsupported operator {op!r}")
 
 
@@ -116,9 +121,37 @@ class FakeOrmSession:
         self.committed = True
 
     def execute(self, stmt: Select) -> _FakeExecResult:
-        entity = stmt.column_descriptions[0]["entity"]
+        descriptions = stmt.column_descriptions
+        entity = descriptions[0]["entity"]
         rows = list(self._rows.get(entity, []))
         where = stmt.whereclause
         if where is not None:
             rows = [row for row in rows if _eval_clause(where, row)]
+
+        # Minimal ``GROUP BY <col>`` + ``COUNT(*)`` support — the only
+        # aggregate shape this codebase issues
+        # (``app_shared.jobs.targets.aggregate_counts``:
+        # ``select(Model.col, func.count()).where(...).group_by(Model.col)``).
+        group_by_clauses = list(getattr(stmt, "_group_by_clauses", ()) or ())
+        if group_by_clauses:
+            group_col_name = group_by_clauses[0].name
+            counts: dict[Any, int] = {}
+            for row in rows:
+                key = getattr(row, group_col_name)
+                counts[key] = counts.get(key, 0) + 1
+            return _FakeExecResult(list(counts.items()))
+
+        # A plain multi-column projection (e.g. ``select(Model.id,
+        # Model.workspace_id)``, the ``_scan_job_refs`` maintenance-scan
+        # shape) -- as opposed to a full-entity ``select(Model)`` -- is
+        # distinguished by its column description ``expr`` no longer
+        # being the entity class itself. Project tuples of attribute
+        # values by column name instead of returning whole ORM rows.
+        is_full_entity_select = len(descriptions) == 1 and (
+            descriptions[0]["expr"] is descriptions[0]["entity"]
+        )
+        if not is_full_entity_select:
+            column_names = [description["name"] for description in descriptions]
+            rows = [tuple(getattr(row, name) for name in column_names) for row in rows]
+
         return _FakeExecResult(rows)
