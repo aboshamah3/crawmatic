@@ -129,7 +129,8 @@
       "status": "in-progress",
       "steps": {
         "specify": "done",
-        "clarify": "done"
+        "clarify": "done",
+        "plan": "done"
       }
     }
   }
