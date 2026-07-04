@@ -29,3 +29,15 @@ No user prompts required — every material ambiguity resolved doc-first / codeb
 - [checklist] Generated checklists/distributed-correctness.md (28 requirements-quality items across concurrency/atomicity, TTL/deadlock-freedom, reactor non-blocking, fail-safe, workspace isolation, requeue/overflow bounds, observability, measurability, dependencies).
 - [checklist] Completed all checklists: requirements.md 16/16 pass; distributed-correctness.md 28/28 pass.
 - [checklist] Remediation: CHK013 (fail-closed vs prior fail-open distinction) was only in plan.md; tightened FR-023 in spec.md to state the deliberate fail-closed direction and contrast with SPEC-10 budget fail-open. All items then pass.
+
+## analyze
+
+speckit-analyze found 0 CRITICAL (not blocked). Remediated all findings in-artifact myself (analyze is read-only):
+
+- [analyze] G1 (HIGH) — `mark_target` stamps error_code only on FAILED, dropping it on SKIPPED/DEFERRED and breaking FR-020/021/SC-006. → Broadened T026 to write error_code whenever provided (any status); corrected contradictory "no behavior change"/"no new persistence path" wording in contracts/overflow-dispatch.md §2 and contracts/observability.md. (source: verified libs/shared/app_shared/jobs/targets.py mark_target)
+- [analyze] I1 (MEDIUM) — plan miscounted AccessMethods ("four" but listed three); DIRECT_HTTP_RETRY unkeyed. → FR-002 now states DIRECT_HTTP_RETRY reuses the DIRECT_HTTP bucket/semaphore; fixed plan.md Constitution-Check VI wording. (source: enums.py AccessMethod has 4 members)
+- [analyze] U1 (MEDIUM) — cooldown_seconds resolved but never consumed (dead value). → Defined its consumer: FR-006 now uses `max(wait_hint, cooldown_seconds)` as the post-denial backoff floor; T009/T013 updated to consume it. (source: doc §11 DomainAccessRule.cooldown_seconds)
+- [analyze] T1 (LOW) — plan/tasks referenced nonexistent `_expand_job`; real fn is `dispatch_job`; reaper query must not include DEFERRED. → Fixed T025/T028 to name `dispatch_job` (expansion query ~:212) and explicitly exclude the reaper (~:352). (source: apps/workers/app/workers/tasks_jobs.py)
+- [analyze] C1 (LOW) — FR-016 (price_analysis takes no scrape lock) had no test. → Extended T033 grep test to assert tasks_analysis.py references no scrape-lock symbol. (source: apps/workers/app/workers/tasks_analysis.py)
+
+Re-ran analyze after remediation: 0 CRITICAL / 0 HIGH; all of G1/I1/U1/T1/C1 verified resolved and code-grounded; 100% FR→task coverage. Two new LOW notes: N1 (overflow "release slot" wording implied a slot is always held) — applied clarifying reword to contracts/overflow-dispatch.md §3; N2 (DEFERRED re-dispatch relies on Celery at-least-once) — informational, consistent with documented assumptions, no action.

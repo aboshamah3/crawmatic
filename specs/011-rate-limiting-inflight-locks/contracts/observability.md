@@ -12,9 +12,12 @@ counts, dedup skips are named required metrics).
 | Match lock already held | `SKIPPED` | `LOCKED_ALREADY_RUNNING` | FR-021, US4 AS2 |
 | Normal fetch success/failure | `COMPLETED`/`FAILED` | (unchanged) | SPEC-08/10 |
 
-Both codes flow through the **existing** `ScrapeResult → mark_target` path — no new persistence
-writer. A transient rate-limit denial that later *succeeds* on a requeue records the normal
-success outcome (only the terminal overflow carries `RATE_LIMITED`).
+Both codes flow through the single `ScrapeResult → mark_target` writer — no *new* persistence
+path is introduced. NOTE (analyze G1): `mark_target` today only stamps `error_code` on
+`status == FAILED`; it MUST be broadened (see `overflow-dispatch.md` §2 / tasks T026) to
+persist the code on `SKIPPED` and `DEFERRED` too, otherwise these codes are dropped and SC-006
+(100% attribution) cannot hold. A transient rate-limit denial that later *succeeds* on a
+requeue records the normal success outcome (only the terminal overflow carries `RATE_LIMITED`).
 
 ## Structured logs / counters (JSON — Constitution §31)
 Emitted from the spider (limiter/lock outcomes) and pipeline (release). Keys namespaced per
