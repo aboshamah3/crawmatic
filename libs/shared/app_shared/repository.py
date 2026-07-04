@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from app_shared.models.base import Base
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.access import DomainAccessRule
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
@@ -58,6 +59,11 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         VariantPriceState,
         VariantAlertState,
         PriceAlertEvent,
+        # SPEC-10: DomainAccessRule is tenant-only (WorkspaceScopedBase).
+        # ProxyProvider/AccessPolicy are deliberately EXCLUDED — they are
+        # dual-scope (nullable workspace_id); a scoped_select would hide
+        # global rows. Query them via app_shared.access.repository instead.
+        DomainAccessRule,
     }
 )
 

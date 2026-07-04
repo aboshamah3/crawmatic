@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+from app_shared.models.access import DomainAccessRule
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
@@ -32,7 +33,9 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
     # SPEC-07 (T009) widens it again with the three observation/current-
     # price models; SPEC-08 (T009) widens it once more with the two jobs/
     # orchestration models; SPEC-09 (T007) widens it once more with the
-    # three alert/price-comparison models — updated here alongside
+    # three alert/price-comparison models; SPEC-10 (T008) widens it once
+    # more with DomainAccessRule (tenant-only — ProxyProvider/AccessPolicy
+    # are dual-scope and deliberately excluded) — updated here alongside
     # app_shared.repository so the suite stays in sync with the runtime
     # set.
     assert WORKSPACE_OWNED_MODELS == frozenset(
@@ -53,6 +56,7 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             VariantPriceState,
             VariantAlertState,
             PriceAlertEvent,
+            DomainAccessRule,
         }
     )
 

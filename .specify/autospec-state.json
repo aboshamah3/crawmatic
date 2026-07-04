@@ -236,7 +236,8 @@
         "converge": "pending"
       },
       "implement_phases": {
-        "1_setup": "done"
+        "1_setup": "done",
+        "2_foundational": "done"
       }
     }
   }

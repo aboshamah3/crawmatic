@@ -132,7 +132,12 @@ def test_alembic_heads_reports_exactly_one_head() -> None:
     head_lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(head_lines) == 1, f"expected exactly one head, got: {head_lines!r}"
     assert "(head)" in head_lines[0]
-    assert "e4a75b48360c" in head_lines[0]
+    # The current head has since moved forward to the SPEC-10 access/proxy
+    # migration (851220acab90, down_revision=e4a75b48360c) — this test
+    # only asserts *this* migration isn't itself a fork (single linear
+    # history up to and including it), not that it's still the head.
+    # tests/unit/test_migration_offline_access.py owns the current-head
+    # assertion.
 
 
 def test_down_revision_is_the_spec08_head() -> None:

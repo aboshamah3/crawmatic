@@ -73,6 +73,16 @@ from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 # `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 
+# The SPEC-10 access/proxy models — re-exported so `Base.metadata` sees
+# all three tables for Alembic autogenerate/offline-render
+# (target_metadata), and so callers can `from app_shared.models import
+# ProxyProvider, AccessPolicy, DomainAccessRule`. `ProxyProvider`/
+# `AccessPolicy` are dual-scope (mirrors `ScrapeProfile`): deliberately
+# NOT added to `app_shared.repository.WORKSPACE_OWNED_MODELS` — see
+# `app_shared.access.repository` for the sanctioned dual-scope query
+# path. `DomainAccessRule` is tenant-only and IS registered there.
+from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
+
 __all__ = [
     "Base",
     "metadata",
@@ -101,4 +111,7 @@ __all__ = [
     "VariantPriceState",
     "VariantAlertState",
     "PriceAlertEvent",
+    "ProxyProvider",
+    "AccessPolicy",
+    "DomainAccessRule",
 ]
