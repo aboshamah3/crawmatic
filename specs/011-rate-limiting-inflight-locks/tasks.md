@@ -34,8 +34,8 @@ description: "Task list for SPEC-11 — Distributed Rate Limiting & In-Flight Lo
 
 **Purpose**: Sync the workspace and scaffold the new package so all later phases have a home.
 
-- [ ] T001 Sync workspace dependencies from repo root: `uv sync --all-packages` (NEVER plain `uv sync` — it wipes workspace member deps). No new third-party dependency is added; confirm `redis`, `scrapy`, `twisted`, `sqlalchemy`, `celery` resolve.
-- [ ] T002 [P] Create the new pure-logic package `libs/shared/app_shared/limiter/__init__.py` (empty package marker; re-exports added as modules land).
+- [X] T001 Sync workspace dependencies from repo root: `uv sync --all-packages` (NEVER plain `uv sync` — it wipes workspace member deps). No new third-party dependency is added; confirm `redis`, `scrapy`, `twisted`, `sqlalchemy`, `celery` resolve.
+- [X] T002 [P] Create the new pure-logic package `libs/shared/app_shared/limiter/__init__.py` (empty package marker; re-exports added as modules land).
 
 **Checkpoint**: `uv run pytest -q` collects cleanly; new package importable.
 
@@ -47,11 +47,11 @@ description: "Task list for SPEC-11 — Distributed Rate Limiting & In-Flight Lo
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T003 Add `DEFERRED = "DEFERRED"` to `ScrapeTargetStatus` in `libs/shared/app_shared/enums.py` (VARCHAR-rendered `StrEnum` — no migration). Do NOT add it to any `_TERMINAL_TARGET_STATUSES` set — DEFERRED is non-terminal (per data-model.md §2.1, overflow-dispatch.md §1). Update the class docstring to mention the DEFERRED (overflow → re-dispatch) transition.
-- [ ] T004 [P] Add the 10 env-tunable `Settings` knobs to `libs/shared/app_shared/config.py` with defaults from observability.md: `RATE_LIMIT_DEFAULT_PER_MINUTE=60`, `RATE_LIMIT_DEFAULT_CONCURRENCY=4`, `RATE_LIMIT_KEY_TTL_SLACK_SECONDS=120`, `SEMAPHORE_SLOT_TTL_SECONDS=600`, `MATCH_LOCK_HTTP_TTL_SECONDS=600`, `MATCH_LOCK_BROWSER_TTL_SECONDS=1800`, `REQUEUE_MAX_ATTEMPTS=5`, `REQUEUE_MAX_TOTAL_WAIT_SECONDS=300`, `RATE_LIMIT_JITTER_MIN_SECONDS=2`, `RATE_LIMIT_JITTER_MAX_SECONDS=20`.
-- [ ] T005 [P] Implement workspace-namespaced key builders in `libs/shared/app_shared/limiter/keys.py`: `rate_key(workspace_id, domain, access_method)`, `semaphore_key(...)`, `match_lock_key(workspace_id, match_id)` producing `rate:{ws}:{domain}:{ACCESS_METHOD}` / `semaphore:{ws}:{domain}:{ACCESS_METHOD}` / `lock:scrape:{ws}:{match_id}` (FR-002/003/009/010; `access_method` is the `AccessMethod` value string; `workspace_id` first after the family prefix).
-- [ ] T006 Create the reactor-seam module `libs/scrape-core/scrape_core/limiter.py` with the **DECISION OF RECORD** module docstring stated verbatim from reactor-seam.md (deferToThread for all Redis round-trips via `scrape_core.db.run_in_thread`; `callLater`-backed Deferred for backoff; no async-redis; no `time.sleep`; no sync Redis on the reactor). Import `run_in_thread`; leave wrapper functions as stubs filled in per story (Constitution V — this decision is owned in scrape-core).
-- [ ] T007 [P] Implement the non-blocking delay helper in `libs/scrape-core/scrape_core/reactor.py`: `deferred_delay(seconds) -> Deferred` via `d = Deferred(); reactor.callLater(seconds, d.callback, None); return d` (FR-007, SC-005 — never `time.sleep`, never blocks a thread).
+- [X] T003 Add `DEFERRED = "DEFERRED"` to `ScrapeTargetStatus` in `libs/shared/app_shared/enums.py` (VARCHAR-rendered `StrEnum` — no migration). Do NOT add it to any `_TERMINAL_TARGET_STATUSES` set — DEFERRED is non-terminal (per data-model.md §2.1, overflow-dispatch.md §1). Update the class docstring to mention the DEFERRED (overflow → re-dispatch) transition.
+- [X] T004 [P] Add the 10 env-tunable `Settings` knobs to `libs/shared/app_shared/config.py` with defaults from observability.md: `RATE_LIMIT_DEFAULT_PER_MINUTE=60`, `RATE_LIMIT_DEFAULT_CONCURRENCY=4`, `RATE_LIMIT_KEY_TTL_SLACK_SECONDS=120`, `SEMAPHORE_SLOT_TTL_SECONDS=600`, `MATCH_LOCK_HTTP_TTL_SECONDS=600`, `MATCH_LOCK_BROWSER_TTL_SECONDS=1800`, `REQUEUE_MAX_ATTEMPTS=5`, `REQUEUE_MAX_TOTAL_WAIT_SECONDS=300`, `RATE_LIMIT_JITTER_MIN_SECONDS=2`, `RATE_LIMIT_JITTER_MAX_SECONDS=20`.
+- [X] T005 [P] Implement workspace-namespaced key builders in `libs/shared/app_shared/limiter/keys.py`: `rate_key(workspace_id, domain, access_method)`, `semaphore_key(...)`, `match_lock_key(workspace_id, match_id)` producing `rate:{ws}:{domain}:{ACCESS_METHOD}` / `semaphore:{ws}:{domain}:{ACCESS_METHOD}` / `lock:scrape:{ws}:{match_id}` (FR-002/003/009/010; `access_method` is the `AccessMethod` value string; `workspace_id` first after the family prefix).
+- [X] T006 Create the reactor-seam module `libs/scrape-core/scrape_core/limiter.py` with the **DECISION OF RECORD** module docstring stated verbatim from reactor-seam.md (deferToThread for all Redis round-trips via `scrape_core.db.run_in_thread`; `callLater`-backed Deferred for backoff; no async-redis; no `time.sleep`; no sync Redis on the reactor). Import `run_in_thread`; leave wrapper functions as stubs filled in per story (Constitution V — this decision is owned in scrape-core).
+- [X] T007 [P] Implement the non-blocking delay helper in `libs/scrape-core/scrape_core/reactor.py`: `deferred_delay(seconds) -> Deferred` via `d = Deferred(); reactor.callLater(seconds, d.callback, None); return d` (FR-007, SC-005 — never `time.sleep`, never blocks a thread).
 
 **Checkpoint**: Foundation ready — user stories can begin.
 

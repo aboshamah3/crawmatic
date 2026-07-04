@@ -332,6 +332,12 @@ class ScrapeTargetStatus(StrEnum):
     (``COMPLETED``/``FAILED``/``SKIPPED``). ``mark_target``
     (``app_shared.jobs.targets``) is the single writer of these
     transitions.
+
+    ``DEFERRED`` (SPEC-11 FR-018, data-model.md §2.1) is a distinct,
+    **non-terminal** overflow outcome: an in-spider requeue-cap
+    overflow hands the target back to Celery ``scrape_dispatch`` for
+    later re-dispatch (``DEFERRED -> STARTED`` on re-pickup), so it is
+    deliberately excluded from any terminal-status set.
     """
 
     PENDING = "PENDING"
@@ -339,6 +345,7 @@ class ScrapeTargetStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    DEFERRED = "DEFERRED"
 
 
 class AlertType(StrEnum):

@@ -165,6 +165,22 @@ class Settings(BaseSettings):
     # global settings — only the resolution-cache TTL lives here.
     ACCESS_RESOLUTION_CACHE_TTL_SECONDS: int = 30
 
+    # --- Distributed rate limiting & in-flight match locks (SPEC-11,
+    # data-model.md §4, Principle IV — env-tunable, never a hardcoded
+    # literal). Per-domain/per-rule overrides still win via
+    # `DomainAccessRule`/`AccessPolicy` (app_shared.limiter.limits); these
+    # are only the built-in defaults + lock/backoff/requeue knobs. ---
+    RATE_LIMIT_DEFAULT_PER_MINUTE: int = 60
+    RATE_LIMIT_DEFAULT_CONCURRENCY: int = 4
+    RATE_LIMIT_KEY_TTL_SLACK_SECONDS: int = 120
+    SEMAPHORE_SLOT_TTL_SECONDS: int = 600
+    MATCH_LOCK_HTTP_TTL_SECONDS: int = 600
+    MATCH_LOCK_BROWSER_TTL_SECONDS: int = 1800
+    REQUEUE_MAX_ATTEMPTS: int = 5
+    REQUEUE_MAX_TOTAL_WAIT_SECONDS: int = 300
+    RATE_LIMIT_JITTER_MIN_SECONDS: int = 2
+    RATE_LIMIT_JITTER_MAX_SECONDS: int = 20
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
