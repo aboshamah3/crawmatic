@@ -163,12 +163,12 @@
         "converge": "done"
       },
       "deferred_verifications": [
-        "T044 spider JSON-LD fixture end-to-end (seed→serve→run→observation/current-price/attempt)",
-        "T045 SSRF live: private-IP + public→internal 302 refused pre-body, recorded BLOCKED",
+        "T044 spider JSON-LD fixture end-to-end (seed\u2192serve\u2192run\u2192observation/current-price/attempt)",
+        "T045 SSRF live: private-IP + public\u2192internal 302 refused pre-body, recorded BLOCKED",
         "T046 strategies live: CSS/regex method+confidence; discount-only rejected",
         "T047 authenticated schedule.json jobid; unauth rejected; retried dispatch no double-run",
         "T048 batch live: N observations persist with commit count << N; DB off reactor thread",
-        "T049 cross-workspace isolation (app scoping + RLS); no-context → 0 rows"
+        "T049 cross-workspace isolation (app scoping + RLS); no-context \u2192 0 rows"
       ],
       "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 6 integration tests authored + skip cleanly. DB/reactor/network-independent logic fully unit-tested here (910 passed; integration 3 passed/130 skipped/0 errors; scoping guard OK; single head 2db33dea5e14)"
     },
@@ -187,14 +187,14 @@
         "converge": "done"
       },
       "deferred_verifications": [
-        "T044 run-match live e2e (seed→dispatch→schedule.json carries workspace_id/scrape_job_id/match_ids→status/results)",
-        "T045 run-variant live (one unique target per active match; zero-active→COMPLETED total_targets=0 no dispatch)",
+        "T044 run-match live e2e (seed\u2192dispatch\u2192schedule.json carries workspace_id/scrape_job_id/match_ids\u2192status/results)",
+        "T045 run-variant live (one unique target per active match; zero-active\u2192COMPLETED total_targets=0 no dispatch)",
         "T046 counters/finalize live (aggregate GROUP BY; COMPLETED/PARTIAL_FAILED/FAILED; completed_at)",
-        "T047 cross-workspace isolation live (app scoping + RLS + composite-FK IntegrityError; no-context→0 rows)",
+        "T047 cross-workspace isolation live (app scoping + RLS + composite-FK IntegrityError; no-context\u21920 rows)",
         "T048 dispatch/Scrapyd live (authenticated schedule.json per batch; retried dispatch no double-run; node_url routing)"
       ],
       "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 5 integration tests authored + skip cleanly. DB/Redis/Scrapyd-independent logic fully unit-tested here (1026 unit passed; integration 3 passed/148 skipped/0 errors; scoping guard OK; single head a6b0234cd4ad). 53 tasks (added T052/T053 from analyze U1 remediation); converge found no gaps.",
-      "converge_result": "CONVERGED — no remaining work; tasks.md unchanged (no convergence phase appended)"
+      "converge_result": "CONVERGED \u2014 no remaining work; tasks.md unchanged (no convergence phase appended)"
     },
     "09": {
       "title": "Current Prices & Alert Logic",
@@ -211,15 +211,15 @@
         "converge": "done"
       },
       "deferred_verifications": [
-        "T034 scrape→recompute→comparison live e2e",
+        "T034 scrape\u2192recompute\u2192comparison live e2e",
         "T035 alert-event history transitions on real rows (CREATED/UPDATED/RESOLVED/REOPENED)",
         "T036 cross-workspace + no-context RLS denial across all 3 tables",
         "T037 currency-mismatch write-back live (comparable=false + CURRENCY_MISMATCH)",
         "T038 real-Redis per-variant-per-job dedup (single recompute)",
         "T039 alembic upgrade head partition + RLS creation live"
       ],
-      "deferred_reason": "require a live Postgres/Redis/Celery (no container engine in build env); 6 integration tests authored + skip cleanly. Pure engine + DB/Redis-independent logic exhaustively unit-tested here (1186 unit passed incl. every §23 boundary/type/transition; integration 3 passed/165 skipped/0 errors; scoping guard OK; single head e4a75b48360c). 42 tasks; converge found no gaps.",
-      "converge_result": "CONVERGED — no remaining work; tasks.md unchanged"
+      "deferred_reason": "require a live Postgres/Redis/Celery (no container engine in build env); 6 integration tests authored + skip cleanly. Pure engine + DB/Redis-independent logic exhaustively unit-tested here (1186 unit passed incl. every \u00a723 boundary/type/transition; integration 3 passed/165 skipped/0 errors; scoping guard OK; single head e4a75b48360c). 42 tasks; converge found no gaps.",
+      "converge_result": "CONVERGED \u2014 no remaining work; tasks.md unchanged"
     },
     "10": {
       "title": "Access Policies, Proxies, Request Attempts",
@@ -243,7 +243,15 @@
         "T035 attempt-logging live (N attempts -> N RequestAttempt rows incl. retries, proxy fields, error_code, correct monthly partition, off-reactor batched, workspace isolation)"
       ],
       "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); integration tests authored + skip cleanly. request_attempts reused from SPEC-07 (not rebuilt). Pure engines + DB/Redis/reactor-independent logic exhaustively unit-tested here (1331 unit passed / 201 integration skipped / 0 failed; scoping guard OK; single head 851220acab90). 39 tasks; analyze remediated 1 HIGH + 3 MEDIUM + 3 LOW (0 CRITICAL); converge found no gaps.",
-      "converge_result": "CONVERGED — no remaining work; tasks.md unchanged (no convergence phase appended)"
+      "converge_result": "CONVERGED \u2014 no remaining work; tasks.md unchanged (no convergence phase appended)"
+    },
+    "11": {
+      "title": "Distributed Rate Limiting & In-Flight Locks",
+      "feature_directory": "specs/011-rate-limiting-inflight-locks",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
