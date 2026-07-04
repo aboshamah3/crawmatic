@@ -21,3 +21,10 @@ No operator interruption required — all clarifications resolved from the maste
 - [clarify] Q: strategy→attempt-sequence mapping → A: Direct → Direct retry(backoff) → Proxy HTTP → Playwright-via-proxy → fail; learned domains start from preferred method (source: doc §11)
 - [clarify] Q: proxy credential encryption + rotation → A: Fernet symmetric, key in env var, key_version column; decrypt-old/re-encrypt/retire rotation (source: doc §33)
 - [clarify] Q: proxy_providers.status enum → A: ACTIVE/DISABLED default (source: doc silent; low-impact default, confirmable in planning)
+
+## checklist
+
+Generated 2 domain checklists (security.md 15 items, data-integrity.md 17 items) plus
+requirements.md (16 items) — all 48 items pass after one remediation.
+
+- [checklist] Q: which tables are dual-scope vs tenant-only? → A: proxy_providers + access_policies dual-scope (nullable workspace_id, global read-only default); domain_access_rules + request_attempts tenant-only (non-null workspace_id) (source: doc §22 column nullability + plan research D2). Remediation: rewrote FR-006 to state the two isolation shapes explicitly (was uniformly "dual-scope", which contradicted §22 for domain_access_rules/request_attempts).

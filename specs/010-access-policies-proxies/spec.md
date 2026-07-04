@@ -179,10 +179,15 @@ that writes are batched and occur off the scraping reactor thread.
   loopback, link-local, unique-local, cloud metadata endpoints, internal hostnames, and embedded
   userinfo — at save time, and re-validated at fetch time (re-resolve DNS, re-validate each
   redirect hop).
-- **FR-006**: System MUST scope all three configuration tables and request attempts by workspace:
-  a null workspace denotes a system-global default visible read-only to all workspaces; a
-  non-null workspace denotes tenant-owned data. Cross-workspace read/write MUST be denied and a
-  query with no workspace context MUST return zero tenant rows.
+- **FR-006**: System MUST scope all four entities by workspace, in two isolation shapes:
+  - **Dual-scope** (proxy_providers, access_policies): workspace_id is nullable — a null row is a
+    system-global default readable by every workspace but writable only by the system; a non-null
+    row is tenant-owned and private to that workspace.
+  - **Tenant-only** (domain_access_rules, request_attempts): workspace_id is non-null — every row
+    belongs to exactly one workspace (a domain rule binds a workspace-owned competitor, so a global
+    row is meaningless).
+  For all four, cross-workspace read/write MUST be denied and a query with no workspace context
+  MUST return zero tenant rows (dual-scope tables still expose global defaults read-only).
 
 #### Access behavior resolution (US2)
 
