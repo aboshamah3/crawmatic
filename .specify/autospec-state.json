@@ -220,6 +220,21 @@
       ],
       "deferred_reason": "require a live Postgres/Redis/Celery (no container engine in build env); 6 integration tests authored + skip cleanly. Pure engine + DB/Redis-independent logic exhaustively unit-tested here (1186 unit passed incl. every §23 boundary/type/transition; integration 3 passed/165 skipped/0 errors; scoping guard OK; single head e4a75b48360c). 42 tasks; converge found no gaps.",
       "converge_result": "CONVERGED — no remaining work; tasks.md unchanged"
+    },
+    "10": {
+      "title": "Access Policies, Proxies, Request Attempts",
+      "feature_directory": "specs/010-access-policies-proxies",
+      "status": "in_progress",
+      "steps": {
+        "specify": "done",
+        "clarify": "pending",
+        "plan": "pending",
+        "checklist": "pending",
+        "tasks": "pending",
+        "analyze": "pending",
+        "implement": "pending",
+        "converge": "pending"
+      }
     }
   }
 }
