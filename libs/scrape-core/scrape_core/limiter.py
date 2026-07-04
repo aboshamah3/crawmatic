@@ -29,7 +29,18 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from scrape_core.db import run_in_thread  # noqa: F401 — used by the T012/T021 wrapper bodies
+from app_shared.limiter import bucket as _bucket
+from app_shared.limiter.keys import rate_key as _rate_key
+from app_shared.limiter.keys import semaphore_key as _semaphore_key
+
+from scrape_core.db import run_in_thread
+
+#: Fixed wait hint (seconds) used when the token bucket grants but the
+#: concurrency semaphore is full — the bucket carries no information
+#: about how long the *semaphore* will stay saturated, and slots free
+#: up frequently (fetch-scoped, not persist-scoped), so a short fixed
+#: retry hint is sufficient (T012).
+_SEMAPHORE_DENIAL_WAIT_HINT_SECONDS = 1.0
 
 __all__ = [
     "LockGrant",
@@ -78,20 +89,57 @@ async def acquire_permission(
 ) -> Permission:
     """Grant/deny an outbound-fetch permission (token bucket THEN semaphore).
 
-    Stub — filled in by T012 (US1). Must run both checks via
-    ``await run_in_thread(...)`` (never a synchronous Redis call on
-    the reactor thread) and propagate fail-closed semantics as
-    ``granted=False`` rather than raising (reactor-seam.md).
+    Both checks run via ``await run_in_thread(...)`` — never a
+    synchronous Redis call on the reactor thread. The token bucket is
+    checked first; if it denies, the semaphore is **never touched** and
+    its denial's ``wait_hint_seconds`` is returned as-is. If the bucket
+    grants but the semaphore is full, the token is *not* refunded
+    (acceptable — the bucket self-refills; simpler and never
+    over-grants) and a small fixed wait hint is returned. Any Redis
+    error surfaces as ``granted=False`` (fail-closed), never a raised
+    exception (reactor-seam.md).
     """
-    raise NotImplementedError("acquire_permission is implemented in US1 (T012)")
+    ttl_seconds = 2 * 60 + settings.RATE_LIMIT_KEY_TTL_SLACK_SECONDS
+    key = _rate_key(workspace_id, domain, access_method)
+    bucket_result = await run_in_thread(
+        _bucket.acquire_token,
+        redis,
+        key=key,
+        capacity=limits.per_minute,
+        ttl_seconds=ttl_seconds,
+    )
+    if not bucket_result.granted:
+        return Permission(granted=False, wait_hint_seconds=bucket_result.wait_hint_seconds)
+
+    sem_key = _semaphore_key(workspace_id, domain, access_method)
+    key_ttl_seconds = settings.SEMAPHORE_SLOT_TTL_SECONDS + settings.RATE_LIMIT_KEY_TTL_SLACK_SECONDS
+    slot_granted = await run_in_thread(
+        _bucket.acquire_slot,
+        redis,
+        key=sem_key,
+        limit=limits.concurrency,
+        token=sem_token,
+        slot_ttl_seconds=settings.SEMAPHORE_SLOT_TTL_SECONDS,
+        key_ttl_seconds=key_ttl_seconds,
+    )
+    if not slot_granted:
+        return Permission(granted=False, wait_hint_seconds=_SEMAPHORE_DENIAL_WAIT_HINT_SECONDS)
+
+    return Permission(
+        granted=True,
+        wait_hint_seconds=0,
+        semaphore_key=sem_key,
+        semaphore_token=sem_token,
+    )
 
 
 async def release_slot(redis: object, *, key: str, token: str) -> None:
-    """Release a previously-acquired semaphore slot.
+    """Release a previously-acquired semaphore slot (``ZREM``, off-reactor).
 
-    Stub — filled in by T012 (US1).
+    Redis errors are logged and swallowed inside
+    ``app_shared.limiter.bucket.release_slot`` (D3) — this never raises.
     """
-    raise NotImplementedError("release_slot is implemented in US1 (T012)")
+    await run_in_thread(_bucket.release_slot, redis, key=key, token=token)
 
 
 async def acquire_lock(

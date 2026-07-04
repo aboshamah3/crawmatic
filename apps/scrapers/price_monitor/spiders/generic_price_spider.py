@@ -72,6 +72,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import random
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -102,6 +104,7 @@ from app_shared.access.resolution import (
     select_domain_rule,
 )
 from app_shared.enums import AccessMethod, AccessStrategy, ProxyProviderStatus, ProxyType, RobotsPolicy, ScrapeErrorCode
+from app_shared.limiter.limits import resolve_limits
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import Workspace
@@ -126,6 +129,8 @@ from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
+from scrape_core.limiter import Permission, acquire_permission, release_slot
+from scrape_core.reactor import deferred_delay
 from scrape_core.validation import Accepted, Rejected, validate_candidate
 
 logger = logging.getLogger(__name__)
@@ -156,6 +161,21 @@ class SpiderTarget:
     domain: str = ""
     access_policy: AccessPolicy | None = None
     domain_rule: DomainAccessRule | None = None
+
+
+@dataclass
+class _RequeueState:
+    """SPEC-11 US1 (`contracts/spider-integration.md`) per-target
+    in-spider rate-limit backoff bookkeeping — keyed by ``match_id`` on
+    the spider instance (mirrors ``_targets_by_match_id``), initialized
+    once per fresh target in ``start()`` and accumulated across every
+    denial this target's attempts hit (including across SPEC-10 retry
+    attempts, T013). The requeue-cap/cumulative-wait overflow check
+    itself is US3 (T027) — not implemented here.
+    """
+
+    requeue_count: int = 0
+    cumulative_wait: float = 0.0
 
 
 # --- match_ids arg parsing (contracts/spider-args.md) -----------------------
@@ -740,6 +760,10 @@ class GenericPriceSpider(scrapy.Spider):
         # (contracts/spider-args.md).
         self.mode: str = mode or _DEFAULT_MODE
         self._targets_by_match_id: dict[uuid.UUID, SpiderTarget] = {}
+        # SPEC-11 US1 (contracts/spider-integration.md): per-target
+        # rate-limit backoff bookkeeping, reset only when a fresh target
+        # is first seen in `start()` -- see `_RequeueState`.
+        self._requeue_state_by_match_id: dict[uuid.UUID, _RequeueState] = {}
         # Populated by `start()` from `load_targets`'s bounded-load result
         # (SPEC-10 US2) -- shared workspace-wide provider state consulted
         # by `_prepare_dispatch`/`_request_for`, not duplicated per target.
@@ -755,6 +779,10 @@ class GenericPriceSpider(scrapy.Spider):
 
         for target in loaded.targets:
             self._targets_by_match_id[target.match_id] = target
+            # SPEC-11 US1: fresh per-target backoff bookkeeping (reset
+            # only here, on first sight of this target -- see
+            # `_RequeueState`).
+            self._requeue_state_by_match_id[target.match_id] = _RequeueState()
             decision = await run_in_thread(
                 _prepare_dispatch, target, 1, self._visible_providers, self._provider_rows
             )
@@ -778,7 +806,59 @@ class GenericPriceSpider(scrapy.Spider):
                 # else: NONE_RESOLVED access policy -- skip silently, see
                 # `_DispatchDecision` docstring.
                 continue
-            yield self._request_for(target, 1, decision.plan, decision.proxy)
+            perm = await self._acquire_fetch_permission(target, decision.plan.access_method)
+            yield self._request_for(target, 1, decision.plan, decision.proxy, perm)
+
+    async def _acquire_fetch_permission(self, target: SpiderTarget, access_method: AccessMethod) -> Permission:
+        """Resolve this target's effective limits and acquire a domain
+        token + concurrency slot before it may fetch (SPEC-11 US1,
+        `contracts/spider-integration.md` steps 1-2).
+
+        Loops on denial: the backoff delay is
+        ``max(wait_hint_seconds, cooldown_seconds) + jitter`` (the
+        cooldown is a floor, FR-006), then waits via the non-blocking
+        :func:`~scrape_core.reactor.deferred_delay` (never
+        ``time.sleep``) before retrying from limit-resolution. This
+        target's ``requeue_count``/``cumulative_wait`` (kept on
+        ``self._requeue_state_by_match_id``, reset only when the target
+        was first seen in ``start()``) are bumped on every denial. No
+        semaphore/lock is taken on a denied permission, so there is
+        nothing to release on denial. The requeue-cap/cumulative-wait
+        **overflow** check (marking the target ``DEFERRED`` and hand
+        it back to Celery) is US3 (T027) — not implemented here; this
+        loop retries unconditionally until granted.
+        """
+        from app_shared.config import get_settings
+
+        settings = get_settings()
+        redis = get_redis_client()
+        state = self._requeue_state_by_match_id[target.match_id]
+
+        while True:
+            limits = resolve_limits(
+                domain_rule=target.domain_rule,
+                access_policy=target.access_policy,
+                settings=settings,
+            )
+            sem_token = secrets.token_hex(16)
+            perm = await acquire_permission(
+                redis,
+                workspace_id=self.workspace_id,
+                domain=target.domain,
+                access_method=access_method,
+                limits=limits,
+                settings=settings,
+                sem_token=sem_token,
+            )
+            if perm.granted:
+                return perm
+
+            delay = max(perm.wait_hint_seconds, limits.cooldown_seconds) + random.uniform(
+                settings.RATE_LIMIT_JITTER_MIN_SECONDS, settings.RATE_LIMIT_JITTER_MAX_SECONDS
+            )
+            state.requeue_count += 1
+            state.cumulative_wait += delay
+            await deferred_delay(delay)
 
     def _request_for(
         self,
@@ -786,6 +866,7 @@ class GenericPriceSpider(scrapy.Spider):
         attempt_number: int = 1,
         plan: AttemptPlan | None = None,
         proxy_assignment: ProxyAssignment | None = None,
+        permission: Permission | None = None,
     ) -> scrapy.Request:
         """Build the request for `target`'s `attempt_number`-th attempt.
 
@@ -806,6 +887,14 @@ class GenericPriceSpider(scrapy.Spider):
         here, never logged: `contracts/spider-integration.md` §2).
         `DIRECT_ONLY` (and any plan with `use_proxy=False`) never sets
         `request.meta["proxy"]` at all (SC-001).
+
+        `permission` (SPEC-11 US1, `contracts/spider-integration.md`
+        step 4) is the granted :class:`~scrape_core.limiter.Permission`
+        from :meth:`_acquire_fetch_permission`; when given, its
+        semaphore `key`/`token` are stamped onto `request.meta` so
+        `parse`/`errback` can release the slot on fetch completion
+        (T014). `None` (pre-SPEC-11 callers, unit tests) leaves those
+        meta keys absent -- no release is attempted for such a request.
         """
         if plan is None:
             plan = AttemptPlan(access_method=AccessMethod.DIRECT_HTTP, use_proxy=False)
@@ -825,6 +914,12 @@ class GenericPriceSpider(scrapy.Spider):
             # cycle here).
             "dispatch_monotonic": time.monotonic(),
         }
+        if permission is not None:
+            # SPEC-11 US1 (T014): threaded through so `parse`/`errback`
+            # can release this fetch's concurrency slot as soon as the
+            # response/failure returns.
+            meta["semaphore_key"] = permission.semaphore_key
+            meta["semaphore_token"] = permission.semaphore_token
         headers: dict[str, str] = {}
 
         if proxy_assignment is not None:
@@ -848,7 +943,18 @@ class GenericPriceSpider(scrapy.Spider):
             meta=meta,
         )
 
-    def parse(self, response: Response, **kwargs: Any) -> Any:
+    async def parse(self, response: Response, **kwargs: Any) -> Any:
+        # SPEC-11 US1 (T014): the concurrency slot represents an
+        # in-flight *fetch* -- release it as soon as the response
+        # returns, off-reactor, distinct from the (later, US2) match
+        # lock which spans fetch->persist. A request built without a
+        # `Permission` (pre-SPEC-11 callers, unit tests) carries no
+        # semaphore meta -- nothing to release.
+        sem_key = response.meta.get("semaphore_key")
+        sem_token = response.meta.get("semaphore_token")
+        if sem_key and sem_token:
+            await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+
         target = self._targets_by_match_id[response.meta["match_id"]]
         now = datetime.now(UTC)
         # SPEC-10 US3 (T034): the *actual* attempt's transport/proxy/timing,
@@ -946,6 +1052,14 @@ class GenericPriceSpider(scrapy.Spider):
             logger.error("generic_price_spider: fetch failure with no known target: %s", failure)
             return
 
+        # SPEC-11 US1 (T014): release the failed attempt's concurrency
+        # slot before any SPEC-10 retry re-enters -- the retry
+        # (below) acquires a brand-new slot via `_acquire_fetch_permission`.
+        sem_key = failure.request.meta.get("semaphore_key")
+        sem_token = failure.request.meta.get("semaphore_token")
+        if sem_key and sem_token:
+            await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname
         failed_error_code = classify_exception(failure.value, hostname=hostname)
@@ -967,7 +1081,8 @@ class GenericPriceSpider(scrapy.Spider):
             _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
         )
         if decision.plan is not None:
-            yield self._request_for(target, next_attempt_number, decision.plan, decision.proxy)
+            perm = await self._acquire_fetch_permission(target, decision.plan.access_method)
+            yield self._request_for(target, next_attempt_number, decision.plan, decision.proxy, perm)
             return
 
         if decision.skip_error_code is None:
