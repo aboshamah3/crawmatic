@@ -173,7 +173,9 @@ that writes are batched and occur off the scraping reactor thread.
 - **FR-004**: System MUST let a workspace define **domain access rules** binding a
   competitor + domain (and optional URL pattern) to an access policy, with per-domain
   max_concurrent_requests, max_requests_per_minute, cooldown_seconds, optional block-detection
-  rules, an optional URL-pattern override, and an enabled flag.
+  rules, an optional URL-pattern override, and an enabled flag. `block_detection_rules` is stored
+  configuration only in this increment; the logic that consumes it (block detection/tuning) is a
+  later increment and is out of scope here.
 - **FR-005**: System MUST validate every proxy `base_url` (and any URL the system will connect to)
   against SSRF rules: http/https only, public host only, rejecting localhost, private ranges,
   loopback, link-local, unique-local, cloud metadata endpoints, internal hostnames, and embedded
@@ -193,7 +195,13 @@ that writes are batched and occur off the scraping reactor thread.
 
 - **FR-007**: System MUST resolve the **effective access policy** for a scrape target by
   precedence: a matching enabled domain access rule (most specific: URL-pattern match over
-  domain-only) overrides the competitor/workspace default policy.
+  domain-only) overrides the **workspace default policy**, which overrides the **global default
+  policy**. The workspace default is the workspace-owned access policy carrying the reserved name
+  `default`; the global default is the system (null-workspace) access policy carrying the reserved
+  name `global_default`. Policy names are unique per workspace, so at most one of each matches; if
+  a workspace has no `default` policy, resolution falls back to `global_default`; if neither
+  resolves, the target is reported unresolved (and skipped) rather than scraped with an implicit
+  policy.
 - **FR-008**: System MUST carry out the resolved strategy when accessing a target using the
   allowed access methods (DIRECT_HTTP, DIRECT_HTTP_RETRY, PROXY_HTTP, PLAYWRIGHT_PROXY): choose
   direct vs proxy for the first attempt and for retries per the policy flags and strategy, retry
@@ -203,14 +211,19 @@ that writes are batched and occur off the scraping reactor thread.
   PLAYWRIGHT_PROXY → fail; a learned domain starts from its preferred access method.
 - **FR-009**: System MUST assign a proxy to an outgoing scrape request when the resolved policy
   calls for it, selecting the provider/country from the policy (or domain rule), honoring
-  rotation vs sticky-session behavior.
+  rotation vs sticky-session behavior. For the RESIDENTIAL_ONLY strategy the assigned provider
+  MUST be of type RESIDENTIAL; if none is visible/eligible the attempt degrades per strategy.
 - **FR-010**: System MUST enforce the proxy provider's monthly budget from cheap Redis usage
   counters (incremented per proxied request, reset monthly) and MUST NOT enforce it by counting
   request_attempts rows; on budget exhaustion it MUST fall back per the policy strategy or fail
   with LIMIT_REACHED.
-- **FR-011**: System MUST enforce the policy's per-minute/hour/day ceilings and the domain rule's
-  cooldown/concurrency limits, deferring or blocking attempts that would exceed them and reporting
-  RATE_LIMITED where appropriate.
+- **FR-011**: System MUST enforce, on the fetch path, the policy's per-minute/hour/day request
+  ceilings and the domain rule's `cooldown_seconds`, deferring or blocking attempts that would
+  exceed them and reporting RATE_LIMITED. When a matching domain rule sets
+  `max_requests_per_minute`, that value overrides the policy's per-minute ceiling for the rule's
+  domain. Per-domain `max_concurrent_requests` is captured as configuration/intent only in this
+  increment; cluster-wide concurrency and distributed rate limiting are enforced by spec 011 and
+  are out of scope here.
 
 #### Attempt logging (US3)
 

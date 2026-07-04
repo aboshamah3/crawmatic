@@ -28,3 +28,18 @@ Generated 2 domain checklists (security.md 15 items, data-integrity.md 17 items)
 requirements.md (16 items) — all 48 items pass after one remediation.
 
 - [checklist] Q: which tables are dual-scope vs tenant-only? → A: proxy_providers + access_policies dual-scope (nullable workspace_id, global read-only default); domain_access_rules + request_attempts tenant-only (non-null workspace_id) (source: doc §22 column nullability + plan research D2). Remediation: rewrote FR-006 to state the two isolation shapes explicitly (was uniformly "dual-scope", which contradicted §22 for domain_access_rules/request_attempts).
+
+## analyze
+
+0 CRITICAL. Triaged 1 HIGH + 2 MEDIUM + 3 LOW; remediated all in-artifact (no user input).
+
+- [analyze] G1 (HIGH): rate-ceiling/cooldown module (T024) built + tested but not wired into the fetch path → FR-011 unenforced at runtime. Remediation: wired check_rate_ceilings + check_domain_cooldown into the spider request seam before every dispatch (T026 + spider-integration contract §2), reporting RATE_LIMITED; added RATE_LIMITED + LIMIT_REACHED assertions to T032.
+- [analyze] I1 (MEDIUM): FR-011 said MUST enforce per-domain concurrency, but plan defers it to SPEC-11. Remediation: reworded FR-011 to enforce ceilings+cooldown here, mark max_concurrent_requests as intent-only (SPEC-11).
+- [analyze] A1 (MEDIUM): workspace-default policy selection undefined. Remediation: pinned reserved-name convention — workspace default = policy named `default`, fallback to `global_default`; neither → NONE_RESOLVED (skip). Updated FR-007, T025, policy-resolution contract (backed by existing partial-unique (workspace_id,name)).
+- [analyze] A2 (LOW): RESIDENTIAL_ONLY didn't filter by ProxyType. Remediation: assign_proxy takes `strategy`, restricts to ProxyType.RESIDENTIAL for RESIDENTIAL_ONLY; updated FR-009, T022/T028, access-engine contract.
+- [analyze] U1 (LOW): block_detection_rules stored-but-unused. Remediation: FR-004 notes it is config-only this increment (consumer deferred).
+- [analyze] U2 (LOW): budget-exhaustion had no integration assertion. Remediation: added LIMIT_REACHED case to T032.
+
+Re-ran analyze: all 6 resolved, 0 CRITICAL/0 HIGH. One new MEDIUM surfaced:
+
+- [analyze re-run] C1 (MEDIUM): domain-rule `max_requests_per_minute` stored but not enforced. Remediation (enforce, not defer): domain-rule per-minute overrides the policy per-minute ceiling for that domain; updated FR-011 + T026.

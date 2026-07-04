@@ -42,11 +42,13 @@ run the pure core once per group, cache the result (TTL = `Settings.ACCESS_RESOL
 default 30), and return one `ResolvedPolicy | NONE_RESOLVED` per match. The spider reads the
 **same** cache key (duplicated bounded-load shape, `apps -> libs` only — the SPEC-07 precedent).
 
-Workspace/global "default policy" pointer: resolved by the reserved global name
-`global_default` (like `GLOBAL_DEFAULT_PROFILE_NAME`) and/or a `workspaces.default_access_policy_id`
-column if one is later added; for this spec the workspace default is the workspace's policy
-named per convention, and the global default is the `workspace_id IS NULL` policy named
-`global_default`. (No new `workspaces` column required — resolution reads by visible policies.)
+Workspace/global "default policy" pointer (FR-007): resolved by reserved names, not a new
+`workspaces` column. The **workspace default** is the workspace-owned access policy named
+`default`; the **global default** is the `workspace_id IS NULL` access policy named
+`global_default` (like `GLOBAL_DEFAULT_PROFILE_NAME`). Policy names are unique per workspace
+so at most one of each matches; workspace `default` overrides `global_default`; if neither
+resolves, the group yields `NONE_RESOLVED` (target skipped, not scraped with an implicit policy).
+(No new `workspaces` column required — resolution reads by visible policies.)
 
 ## Acceptance
 

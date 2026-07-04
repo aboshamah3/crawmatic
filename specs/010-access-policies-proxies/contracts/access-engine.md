@@ -33,14 +33,16 @@ class ProxyAssignment:
     sticky_key: str | None              # set when sticky_session (session reuse token)
 
 def assign_proxy(
-    *, policy_provider_id, policy_country, domain_rule_country,
-    visible_providers,                  # {id: (status, country)} own+global
+    *, strategy, policy_provider_id, policy_country, domain_rule_country,
+    visible_providers,                  # {id: (status, type, country)} own+global
     attempt_number, rotate_per_request, sticky_session, session_seed,
 ) -> ProxyAssignment | None:
-    """Pick provider+country per policy/domain-rule, honoring rotation vs sticky. Returns
-    None when the referenced provider is DISABLED/absent (degrade gracefully — caller falls
-    back per strategy or fails PROXY_FAILED). rotate_per_request -> new pick each attempt;
-    sticky_session -> stable sticky_key derived from session_seed within session TTL."""
+    """Pick provider+country per policy/domain-rule, honoring rotation vs sticky. For
+    RESIDENTIAL_ONLY, restrict candidates to ProxyType.RESIDENTIAL providers. Returns
+    None when no eligible provider is visible (DISABLED/absent, or none residential for
+    RESIDENTIAL_ONLY) — degrade gracefully (caller falls back per strategy or fails
+    PROXY_FAILED). rotate_per_request -> new pick each attempt; sticky_session -> stable
+    sticky_key derived from session_seed within session TTL."""
 ```
 
 ## Behavior matrix (encoded & tested)

@@ -20,8 +20,12 @@ with the real transport. The persistence pipeline (`BatchedPersistencePipeline`)
    `username` + `decrypt_secret(password_encrypted, password_key_version)` — decrypted
    **inside `run_in_thread`**, never on the reactor thread, never logged. Stash
    `access_method`/`proxy_provider_id`/`proxy_country`/`attempt_number` in `request.meta`.
-   Before a proxied dispatch, `incr_and_check_monthly_budget`; if exhausted, recompute
-   `next_attempt(proxy_budget_exhausted=True)`.
+   Before **every** dispatch (direct or proxied), `check_rate_ceilings` (policy per-min/hour/day)
+   + `check_domain_cooldown` (domain-rule `cooldown_seconds`), off-reactor; if not allowed, defer/
+   skip the attempt and stamp `RATE_LIMITED` (no dispatch). Before a proxied dispatch,
+   additionally `incr_and_check_monthly_budget`; if exhausted, recompute
+   `next_attempt(proxy_budget_exhausted=True)`. Per-domain `max_concurrent_requests` is not
+   enforced here (deferred to SPEC-11).
 
 3. **Retry** (`errback` / a lightweight retry on failure): consult `next_attempt(...,
    attempt_number=n+1)`. If it returns an `AttemptPlan`, yield a follow-up `scrapy.Request`
