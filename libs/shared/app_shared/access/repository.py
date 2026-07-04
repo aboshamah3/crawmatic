@@ -23,6 +23,16 @@ from sqlalchemy.orm import Session
 from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
 from app_shared.models.access import AccessPolicy, ProxyProvider
 
+# Reserved `AccessPolicy.name` values resolved by name, not a new
+# `workspaces` column (`contracts/policy-resolution.md`, SPEC-10 FR-007,
+# mirrors `app_shared.profiles.repository.GLOBAL_DEFAULT_PROFILE_NAME`).
+# The workspace default is the workspace-owned policy named "default";
+# the global default is the `workspace_id IS NULL` policy named
+# "global_default". Shared by `apps/api/app/services/access_resolution.py`
+# and the spider's duplicated bounded-load shape so the two never drift.
+WORKSPACE_DEFAULT_POLICY_NAME = "default"
+GLOBAL_DEFAULT_POLICY_NAME = "global_default"
+
 # --- ProxyProvider -----------------------------------------------------
 
 

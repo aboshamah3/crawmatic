@@ -52,9 +52,21 @@ ITEM_PIPELINES = {
 # contracts/robots-middleware.md). Ordered ahead of Scrapy's built-in
 # RetryMiddleware/HttpCompressionMiddleware (default 550) so a rejection
 # short-circuits before other request-processing runs.
+#
+# SPEC-10 US2 (contracts/spider-integration.md §5): Scrapy's built-in
+# HttpProxyMiddleware reads `request.meta["proxy"]` (set by
+# `generic_price_spider._request_for` for a proxied `AttemptPlan`) and
+# routes the connection through it -- kept at Scrapy's own default
+# priority (750) for this middleware, well after the SSRF guard/robots
+# middlewares above so the *target* URL is still DNS-re-resolved
+# (SafeResolver, below) and every redirect hop re-validated before a
+# proxy is even considered; the SSRF guard's scheme/userinfo checks
+# operate on the target URL, not the proxy, so their relative ordering
+# versus HttpProxyMiddleware doesn't matter for FR-005 fetch-time safety.
 DOWNLOADER_MIDDLEWARES = {
     "scrape_core.safety.middleware.SsrfGuardMiddleware": 100,
     "scrape_core.robots.RobotsPolicyMiddleware": 110,
+    "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
 }
 
 # Small per-process pool through PgBouncer (contracts/reactor-safe-db.md) —
