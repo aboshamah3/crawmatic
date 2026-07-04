@@ -22,3 +22,10 @@ No user prompts required — every material ambiguity resolved doc-first / codeb
 - [clarify] Q: Representation of an overflowed target? → A: New `ScrapeTargetStatus.DEFERRED` member (VARCHAR-rendered enum, no DB migration); re-dispatched via Celery `scrape_dispatch` (source: doc §12 "mark the target as deferred and overflow it back to Celery scrape_dispatch"; codebase enums.py shows current members PENDING/STARTED/COMPLETED/FAILED/SKIPPED)
 - [clarify] Q: Redis-unreachable behavior? → A: Fail safe deny/backoff (default: Constitution "Disciplined Scraping Runtime"; FR-023)
 - [clarify] Q: Are RATE_LIMITED/LOCKED_ALREADY_RUNNING and unique(scrape_job_id,match_id) new? → A: No — already exist (RATE_LIMITED/LOCKED_ALREADY_RUNNING in enums.py; unique constraint on scrape_job_targets from SPEC-08). SPEC-11 reuses/verifies (source: codebase enums.py:260-261, jobs.py:126-129)
+
+## checklist
+
+- [checklist] Focus derived doc-first from spec domain: distributed-systems correctness & operational safety (no setup questions needed to user).
+- [checklist] Generated checklists/distributed-correctness.md (28 requirements-quality items across concurrency/atomicity, TTL/deadlock-freedom, reactor non-blocking, fail-safe, workspace isolation, requeue/overflow bounds, observability, measurability, dependencies).
+- [checklist] Completed all checklists: requirements.md 16/16 pass; distributed-correctness.md 28/28 pass.
+- [checklist] Remediation: CHK013 (fail-closed vs prior fail-open distinction) was only in plan.md; tightened FR-023 in spec.md to state the deliberate fail-closed direction and contrast with SPEC-10 budget fail-open. All items then pass.

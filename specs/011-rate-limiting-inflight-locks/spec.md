@@ -141,7 +141,7 @@ When work is rate-limited or skipped due to an in-flight lock, the reason is rec
 
 **Resilience**
 
-- **FR-023**: If the shared store is unreachable, the limiter MUST fail safe — treating the request as not-permitted and backing off — so that an outage never results in uncontrolled fetching against a domain.
+- **FR-023**: If the shared store is unreachable, the limiter and match lock MUST fail **closed** (fail-safe) — treating the request as not-permitted and backing off/deferring — so that an outage never results in uncontrolled fetching against a domain. This is deliberately the *opposite* direction from the per-policy access-budget counters (SPEC-10), which fail open; the difference MUST be intentional and documented so the two Redis usages are not assumed to behave alike.
 
 ### Key Entities *(include if feature involves data)*
 
