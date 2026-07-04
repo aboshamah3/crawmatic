@@ -34,7 +34,11 @@ __all__ = ["Counts", "aggregate_counts", "mark_target"]
 
 # A target in one of these statuses has reached a terminal outcome —
 # `completed_at` is stamped exactly once, on the transition into one of
-# these (D5).
+# these (D5). `DEFERRED` (SPEC-11 US3, overflow) is deliberately NOT a
+# member -- it is a non-terminal, requeue-cap-exceeded outcome handed
+# back to Celery for re-dispatch (contracts/overflow-dispatch.md §1;
+# data-model.md §2.1), so a transition into it stamps neither
+# `completed_at` nor `started_at`.
 _TERMINAL_TARGET_STATUSES = frozenset(
     {
         ScrapeTargetStatus.COMPLETED,
@@ -66,11 +70,20 @@ def mark_target(
     """Transition the target ``(workspace_id, scrape_job_id, match_id)``.
 
     Sets ``started_at`` on a transition to ``STARTED``, ``completed_at``
-    on a transition to any terminal status, and ``error_code`` on a
-    transition to ``FAILED``. Touches ONLY this target row — never the
-    parent job's counters (D5); ``aggregate_counts`` is the sole counter
-    source. A no-op if the target can't be resolved in-workspace (e.g. an
-    already-deleted/archived row).
+    on a transition to any terminal status (``COMPLETED``/``FAILED``/
+    ``SKIPPED`` — NOT ``DEFERRED``, which is non-terminal, SPEC-11 US3),
+    and persists ``error_code`` whenever one is provided — regardless of
+    ``status`` (``error_code is not None``). This covers ``FAILED``
+    (HTTP/extraction/validation failures), ``SKIPPED`` (carrying
+    ``LOCKED_ALREADY_RUNNING`` on a match-lock collision), and
+    ``DEFERRED`` (carrying ``RATE_LIMITED`` on a requeue-cap overflow) —
+    previously the gate only fired on ``status == FAILED``, silently
+    dropping the code on ``SKIPPED``/``DEFERRED`` (analyze finding G1,
+    FR-020/FR-021, SC-006, `contracts/overflow-dispatch.md` §2). Touches
+    ONLY this target row — never the parent job's counters (D5);
+    ``aggregate_counts`` is the sole counter source. A no-op if the
+    target can't be resolved in-workspace (e.g. an already-deleted/
+    archived row).
     """
     stmt = select(ScrapeJobTarget).where(
         ScrapeJobTarget.workspace_id == workspace_id,
@@ -87,7 +100,7 @@ def mark_target(
         target.started_at = now
     if status in _TERMINAL_TARGET_STATUSES:
         target.completed_at = now
-    if status == ScrapeTargetStatus.FAILED:
+    if error_code is not None:
         target.error_code = error_code
 
 

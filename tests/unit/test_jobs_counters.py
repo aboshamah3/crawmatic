@@ -336,6 +336,72 @@ def test_mark_target_never_mutates_job_counters() -> None:
     assert job.skipped_count == 0
 
 
+def test_mark_target_persists_error_code_across_failed_skipped_deferred() -> None:
+    """SPEC-11 US3 T026 (analyze finding G1, FR-020/FR-021, SC-006).
+
+    The `error_code` gate used to fire only on `status == FAILED`,
+    silently dropping the code on `SKIPPED` (US2's
+    `LOCKED_ALREADY_RUNNING`) and `DEFERRED` (US3's `RATE_LIMITED`).
+    Broadened to persist whenever `error_code is not None`, regardless
+    of status.
+    """
+    session = FakeOrmSession()
+    workspace_id = uuid.uuid4()
+    job = _make_job(workspace_id=workspace_id)
+    session.seed(job)
+
+    cases = [
+        (ScrapeTargetStatus.FAILED, ScrapeErrorCode.HTTP_404),
+        (ScrapeTargetStatus.SKIPPED, ScrapeErrorCode.LOCKED_ALREADY_RUNNING),
+        (ScrapeTargetStatus.DEFERRED, ScrapeErrorCode.RATE_LIMITED),
+    ]
+    for status, error_code in cases:
+        target = _make_target(
+            workspace_id=workspace_id, scrape_job_id=job.id, status=ScrapeTargetStatus.STARTED
+        )
+        session.seed(target)
+
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=job.id,
+            match_id=target.match_id,
+            status=status,
+            error_code=error_code,
+        )
+
+        assert target.status == status
+        assert target.error_code == error_code, f"error_code dropped for status={status}"
+
+
+def test_mark_target_deferred_is_non_terminal_no_timestamps() -> None:
+    """DEFERRED (SPEC-11 US3 overflow) stamps neither `completed_at` nor
+    `started_at` -- it is not in `_TERMINAL_TARGET_STATUSES` and is not
+    `STARTED` (data-model.md §2.1, contracts/overflow-dispatch.md §1/§2).
+    """
+    session = FakeOrmSession()
+    workspace_id = uuid.uuid4()
+    job = _make_job(workspace_id=workspace_id)
+    session.seed(job)
+    target = _make_target(
+        workspace_id=workspace_id, scrape_job_id=job.id, status=ScrapeTargetStatus.STARTED
+    )
+    session.seed(target)
+
+    mark_target(
+        session,
+        workspace_id=workspace_id,
+        scrape_job_id=job.id,
+        match_id=target.match_id,
+        status=ScrapeTargetStatus.DEFERRED,
+        error_code=ScrapeErrorCode.RATE_LIMITED,
+    )
+
+    assert target.status == ScrapeTargetStatus.DEFERRED
+    assert target.completed_at is None
+    assert target.error_code == ScrapeErrorCode.RATE_LIMITED
+
+
 def test_mark_target_unresolvable_target_is_a_no_op() -> None:
     session = FakeOrmSession()
     workspace_id = uuid.uuid4()

@@ -103,8 +103,18 @@ from app_shared.access.resolution import (
     resolve_effective_policy,
     select_domain_rule,
 )
-from app_shared.enums import AccessMethod, AccessStrategy, ProxyProviderStatus, ProxyType, RobotsPolicy, ScrapeErrorCode
+from app_shared.enums import (
+    AccessMethod,
+    AccessStrategy,
+    ProxyProviderStatus,
+    ProxyType,
+    RobotsPolicy,
+    ScrapeErrorCode,
+    ScrapeTargetStatus,
+)
+from app_shared.jobs.targets import mark_target
 from app_shared.limiter.limits import resolve_limits
+from app_shared.messaging import enqueue
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import Workspace
@@ -124,6 +134,7 @@ from app_shared.profiles.resolution import (
 from app_shared.redis_client import get_redis_client
 from app_shared.repository import scoped_select
 from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
+from app_shared.task_names import SCRAPE_DISPATCH_JOB
 
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
@@ -170,12 +181,38 @@ class _RequeueState:
     the spider instance (mirrors ``_targets_by_match_id``), initialized
     once per fresh target in ``start()`` and accumulated across every
     denial this target's attempts hit (including across SPEC-10 retry
-    attempts, T013). The requeue-cap/cumulative-wait overflow check
-    itself is US3 (T027) — not implemented here.
+    attempts, T013). SPEC-11 US3 (T027, `contracts/overflow-dispatch.md`)
+    checks this state on every denial: once ``requeue_count`` exceeds
+    ``REQUEUE_MAX_ATTEMPTS`` or ``cumulative_wait`` exceeds
+    ``REQUEUE_MAX_TOTAL_WAIT_SECONDS``, the target overflows back to
+    Celery instead of looping again.
     """
 
     requeue_count: int = 0
     cumulative_wait: float = 0.0
+
+
+def _mark_target_deferred_rate_limited(
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    match_id: uuid.UUID,
+) -> None:
+    """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3): mark one
+    overflowed target ``DEFERRED`` + ``RATE_LIMITED`` in a single
+    off-reactor ``workspace_txn`` -- **Blocking** (DB round trip). Must
+    only ever be called inside :func:`scrape_core.db.run_in_thread`,
+    never on the reactor thread. Reuses the single ``mark_target``
+    writer (T026) -- no new persistence path.
+    """
+    with workspace_txn(workspace_id) as session:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=match_id,
+            status=ScrapeTargetStatus.DEFERRED,
+            error_code=ScrapeErrorCode.RATE_LIMITED,
+        )
 
 
 # --- match_ids arg parsing (contracts/spider-args.md) -----------------------
@@ -813,9 +850,16 @@ class GenericPriceSpider(scrapy.Spider):
                 # else: NONE_RESOLVED access policy -- skip silently, see
                 # `_DispatchDecision` docstring.
                 continue
-            yield await self._dispatch(target, 1, decision.plan, decision.proxy)
+            result = await self._dispatch(target, 1, decision.plan, decision.proxy)
+            if result is not None:
+                # SPEC-11 US3 (T027): `None` means the requeue cap
+                # overflowed and the target was already marked `DEFERRED`
+                # + re-dispatched -- nothing to yield for this attempt.
+                yield result
 
-    async def _acquire_fetch_permission(self, target: SpiderTarget, access_method: AccessMethod) -> Permission:
+    async def _acquire_fetch_permission(
+        self, target: SpiderTarget, access_method: AccessMethod
+    ) -> Permission | None:
         """Resolve this target's effective limits and acquire a domain
         token + concurrency slot before it may fetch (SPEC-11 US1,
         `contracts/spider-integration.md` steps 1-2).
@@ -829,10 +873,16 @@ class GenericPriceSpider(scrapy.Spider):
         ``self._requeue_state_by_match_id``, reset only when the target
         was first seen in ``start()``) are bumped on every denial. No
         semaphore/lock is taken on a denied permission, so there is
-        nothing to release on denial. The requeue-cap/cumulative-wait
-        **overflow** check (marking the target ``DEFERRED`` and hand
-        it back to Celery) is US3 (T027) — not implemented here; this
-        loop retries unconditionally until granted.
+        nothing to release on denial.
+
+        SPEC-11 US3 (T027, `contracts/overflow-dispatch.md`): once either
+        cap is exceeded after a denial (``requeue_count >
+        REQUEUE_MAX_ATTEMPTS`` or ``cumulative_wait >
+        REQUEUE_MAX_TOTAL_WAIT_SECONDS``), this does **not** wait/retry
+        again -- :meth:`_overflow_to_dispatch` hands the target back to
+        Celery and this returns ``None`` instead of a granted
+        :class:`Permission`, signalling the caller to dispatch nothing
+        for this target (the Scrapyd slot is freed immediately, SC-003).
         """
         from app_shared.config import get_settings
 
@@ -864,7 +914,62 @@ class GenericPriceSpider(scrapy.Spider):
             )
             state.requeue_count += 1
             state.cumulative_wait += delay
+
+            if (
+                state.requeue_count > settings.REQUEUE_MAX_ATTEMPTS
+                or state.cumulative_wait > settings.REQUEUE_MAX_TOTAL_WAIT_SECONDS
+            ):
+                await self._overflow_to_dispatch(target, perm, redis=redis)
+                return None
+
             await deferred_delay(delay)
+
+    async def _overflow_to_dispatch(
+        self, target: SpiderTarget, perm: Permission, *, redis: object
+    ) -> None:
+        """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3):
+        requeue-cap exceeded for `target` -- release any held semaphore
+        slot (defensive no-op: a denied `Permission` never carries a
+        `semaphore_key`/`semaphore_token`, since the semaphore is never
+        acquired on a denied bucket check), mark the target `DEFERRED` +
+        `RATE_LIMITED` in one off-reactor `workspace_txn`
+        (:func:`_mark_target_deferred_rate_limited`), then re-dispatch
+        the whole job via the existing `scrape_dispatch` Celery producer
+        (`app_shared.messaging.enqueue` + `app_shared.task_names`, never
+        `apps/workers` -- Constitution Principle I) so a fresh
+        `dispatch_job` run picks this (now-DEFERRED) target back up
+        (T028) and it re-enters the full lock+limiter gate. No request
+        is yielded for this attempt -- the Scrapyd slot is freed
+        immediately (SC-003).
+        """
+        if perm.semaphore_key and perm.semaphore_token:
+            await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+
+        scrape_job_id = self.scrape_job_id
+        if scrape_job_id is None:
+            # No job context to mark/re-dispatch against -- nothing more
+            # can be done for this overflowed target (spider-args.md:
+            # `scrape_job_id` is expected on every real Scrapyd-dispatched
+            # run; only hand-built unit-test spiders may omit it).
+            logger.error(
+                "generic_price_spider: requeue-cap overflow with no scrape_job_id -- "
+                "cannot mark DEFERRED or re-dispatch match_id=%s",
+                target.match_id,
+            )
+            return
+
+        await run_in_thread(
+            _mark_target_deferred_rate_limited,
+            self.workspace_id,
+            scrape_job_id,
+            target.match_id,
+        )
+        await run_in_thread(
+            enqueue,
+            SCRAPE_DISPATCH_JOB,
+            queue="scrape_dispatch",
+            kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(self.workspace_id)},
+        )
 
     async def _dispatch(
         self,
@@ -872,12 +977,18 @@ class GenericPriceSpider(scrapy.Spider):
         attempt_number: int,
         plan: AttemptPlan,
         proxy_assignment: ProxyAssignment | None,
-    ) -> "scrapy.Request | ScrapeResult":
-        """SPEC-11 US1+US2 combined dispatch gate (`contracts/spider-integration.md`
+    ) -> "scrapy.Request | ScrapeResult | None":
+        """SPEC-11 US1+US2+US3 combined dispatch gate (`contracts/spider-integration.md`
         steps 1-4): acquire the domain token + concurrency slot
         (:meth:`_acquire_fetch_permission`, looping on denial until
-        granted), then the in-flight match lock **immediately before
-        fetch** (step 3, off-reactor via :func:`~scrape_core.limiter.acquire_lock`).
+        granted or the requeue cap overflows, US3 T027), then the
+        in-flight match lock **immediately before fetch** (step 3,
+        off-reactor via :func:`~scrape_core.limiter.acquire_lock`).
+
+        Returns ``None`` when :meth:`_acquire_fetch_permission` overflowed
+        (requeue cap exceeded -- the target was already marked `DEFERRED`
+        and re-dispatched, US3 T027): nothing further to do, no request/
+        result for this attempt.
 
         On a held lock (``None``): releases the semaphore slot just
         acquired in step 2 (nothing else was taken -- no requeue, FR-011/
@@ -893,6 +1004,8 @@ class GenericPriceSpider(scrapy.Spider):
         from app_shared.config import get_settings
 
         perm = await self._acquire_fetch_permission(target, plan.access_method)
+        if perm is None:
+            return None
 
         redis = get_redis_client()
         lock = await acquire_lock(
@@ -1157,7 +1270,12 @@ class GenericPriceSpider(scrapy.Spider):
             _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
         )
         if decision.plan is not None:
-            yield await self._dispatch(target, next_attempt_number, decision.plan, decision.proxy)
+            result = await self._dispatch(target, next_attempt_number, decision.plan, decision.proxy)
+            if result is not None:
+                # SPEC-11 US3 (T027): `None` means the requeue cap
+                # overflowed and the target was already marked `DEFERRED`
+                # + re-dispatched -- nothing to yield for this attempt.
+                yield result
             return
 
         if decision.skip_error_code is None:

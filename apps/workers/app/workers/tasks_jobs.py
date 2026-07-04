@@ -209,7 +209,17 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             session.execute(
                 scoped_select(ScrapeJobTarget, workspace_uuid).where(
                     ScrapeJobTarget.scrape_job_id == job.id,
-                    ScrapeJobTarget.status == ScrapeTargetStatus.PENDING,
+                    # SPEC-11 US3 (contracts/overflow-dispatch.md §4): also
+                    # pick up DEFERRED targets (requeue-cap overflow handed
+                    # back here for re-dispatch) alongside plain PENDING --
+                    # on pickup they transition DEFERRED -> STARTED, re-
+                    # entering the lock+limiter gate (FR-019). The stalled-
+                    # target reaper below (`recover_stalled_batches`) is a
+                    # separate query and is deliberately NOT changed here --
+                    # DEFERRED must never be treated as stalled.
+                    ScrapeJobTarget.status.in_(
+                        (ScrapeTargetStatus.PENDING, ScrapeTargetStatus.DEFERRED)
+                    ),
                 )
             )
             .scalars()
