@@ -48,6 +48,16 @@ Enforces FR-003 / data-model.md "Entity: Shared Library Member":
   ``scrape_core.pipelines`` (trigger (a), SPEC-09 T029) imports
   ``app_shared.messaging``/``app_shared.redis_client``, never
   fastapi/apps.workers.
+* SPEC-10 (T038): ``app_shared.models.access`` (the three new ORM models)
+  imports no scrapy/twisted/fastapi (sqlalchemy is expected). The new
+  ``app_shared.access`` package (``engine``/``resolution``/``repository``/
+  ``budget``) and ``app_shared.security.encryption`` import no
+  scrapy/twisted/fastapi and no ``apps.*``/``app.*`` — asserted both by the
+  whole-package subprocess import check (extended below) and by a
+  dedicated AST-based static check per module (mirroring the SPEC-09
+  alerts-engine purity check), since ``engine.py``/``resolution.py`` are
+  meant to be pure/stdlib-only while ``repository.py`` legitimately pulls
+  in sqlalchemy.
 
 Each check runs the import in a **fresh subprocess** (rather than just
 inspecting ``sys.modules`` in-process) so that whatever the current test
@@ -86,6 +96,7 @@ import app_shared.models.catalog
 import app_shared.models.competitors_matches
 import app_shared.models.scrape_profiles
 import app_shared.models.observations
+import app_shared.models.access
 import app_shared.pagination
 import app_shared.catalog
 import app_shared.repository
@@ -95,6 +106,12 @@ import app_shared.security.passwords
 import app_shared.security.tokens
 import app_shared.security.jwt
 import app_shared.security.rate_limit
+import app_shared.security.encryption
+import app_shared.access
+import app_shared.access.engine
+import app_shared.access.resolution
+import app_shared.access.repository
+import app_shared.access.budget
 import app_shared.url_safety
 import app_shared.url_pattern
 import app_shared.matches
@@ -374,6 +391,56 @@ def test_models_alerts_does_not_import_scrapy_twisted_fastapi() -> None:
     import app_shared.models.alerts
 
     source_file = pathlib.Path(app_shared.models.alerts.__file__)
+    roots = _imported_root_modules(source_file)
+    leaked = roots & {"scrapy", "twisted", "fastapi"}
+    assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+# --- SPEC-10 T038 ------------------------------------------------------------
+
+_ACCESS_FORBIDDEN_ROOTS = frozenset({"scrapy", "twisted", "fastapi", "apps", "app"})
+
+
+def _access_package_dir() -> pathlib.Path:
+    import app_shared.access
+
+    return pathlib.Path(app_shared.access.__file__).parent
+
+
+def test_access_package_no_forbidden_imports() -> None:
+    """SPEC-10 T038: every module in the new ``app_shared.access`` package
+    (``engine``/``resolution``/``repository``/``budget``) is free to import
+    stdlib + sqlalchemy (``repository.py`` is a SQLAlchemy query helper) but
+    must never import scrapy/twisted/fastapi or reach into ``apps.*``/
+    ``app.*`` — the pure engines (``engine``/``resolution``/``budget``) stay
+    framework-free and even the ORM-touching ``repository`` module never
+    crosses into the apps/ side of the monorepo."""
+    package_dir = _access_package_dir()
+    for source_file in sorted(package_dir.glob("*.py")):
+        roots = _imported_root_modules(source_file)
+        leaked = roots & _ACCESS_FORBIDDEN_ROOTS
+        assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+def test_encryption_module_no_forbidden_imports() -> None:
+    """SPEC-10 T038: ``app_shared.security.encryption`` (the Fernet keyring)
+    depends only on ``cryptography.fernet`` + ``app_shared.config`` — never
+    scrapy/twisted/fastapi/apps.*."""
+    import app_shared.security.encryption
+
+    source_file = pathlib.Path(app_shared.security.encryption.__file__)
+    roots = _imported_root_modules(source_file)
+    leaked = roots & _ACCESS_FORBIDDEN_ROOTS
+    assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+def test_models_access_does_not_import_scrapy_twisted_fastapi() -> None:
+    """SPEC-10 T006/T038: the access ORM model module (ProxyProvider/
+    AccessPolicy/DomainAccessRule) is free to import sqlalchemy (it's an ORM
+    module) but must never import scrapy/twisted/fastapi."""
+    import app_shared.models.access
+
+    source_file = pathlib.Path(app_shared.models.access.__file__)
     roots = _imported_root_modules(source_file)
     leaked = roots & {"scrapy", "twisted", "fastapi"}
     assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"

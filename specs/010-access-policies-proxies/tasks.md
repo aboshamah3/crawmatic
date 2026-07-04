@@ -155,10 +155,10 @@ Reuse unchanged: `app_shared.url_safety`, `scrape_core.safety`, `app_shared.redi
 
 **Purpose**: Whole-feature guards and validation across all three stories.
 
-- [ ] T036 [P] Run the full guard sweep — `uv run python scripts/check_workspace_scoping.py` (confirms `DomainAccessRule` is scoped and the two dual-scope tables use `access.repository`, not `scoped_select`) and `uv run alembic heads` (confirms exactly one head after the new revision). (SC-005, FR-006)
-- [ ] T037 [P] Add/verify the security grep-guards — a test/CI assertion that no `ProxyProviderResponse` (or any router response) can carry `password`/`password_encrypted`/`password_key_version` (SC-003), that the spider never logs a decrypted password, and that `app_shared/access/budget.py` contains no `request_attempts` reference (FR-010) — extend `tests/unit/test_encryption.py` / add a small `tests/unit/test_access_guards.py`. (SC-003, FR-010)
-- [ ] T038 [P] Confirm the import-boundary constitution rule — `app_shared` (enums, config, encryption, models, `access/*`) imports **no** Scrapy/Twisted/FastAPI and no `apps/*`; add/extend the existing import-boundary unit test to cover the new `app_shared.access` package + `app_shared.security.encryption`. (Principle I, plan Constraints)
-- [ ] T039 Run the quickstart.md validation walkthrough end-to-end (`uv sync --all-packages`; pure-engine unit suites §2/§4 must pass everywhere; the integration suites §1/§3/§5 skip cleanly without infra); confirm the Success-mapping table (SC-001..SC-006) is exercised. (all SC)
+- [X] T036 [P] Run the full guard sweep — `uv run python scripts/check_workspace_scoping.py` (confirms `DomainAccessRule` is scoped and the two dual-scope tables use `access.repository`, not `scoped_select`) and `uv run alembic heads` (confirms exactly one head after the new revision). (SC-005, FR-006)
+- [X] T037 [P] Add/verify the security grep-guards — a test/CI assertion that no `ProxyProviderResponse` (or any router response) can carry `password`/`password_encrypted`/`password_key_version` (SC-003), that the spider never logs a decrypted password, and that `app_shared/access/budget.py` contains no `request_attempts` reference (FR-010) — extend `tests/unit/test_encryption.py` / add a small `tests/unit/test_access_guards.py`. (SC-003, FR-010)
+- [X] T038 [P] Confirm the import-boundary constitution rule — `app_shared` (enums, config, encryption, models, `access/*`) imports **no** Scrapy/Twisted/FastAPI and no `apps/*`; add/extend the existing import-boundary unit test to cover the new `app_shared.access` package + `app_shared.security.encryption`. (Principle I, plan Constraints)
+- [X] T039 Run the quickstart.md validation walkthrough end-to-end (`uv sync --all-packages`; pure-engine unit suites §2/§4 must pass everywhere; the integration suites §1/§3/§5 skip cleanly without infra); confirm the Success-mapping table (SC-001..SC-006) is exercised. (all SC)
 
 ---
 
