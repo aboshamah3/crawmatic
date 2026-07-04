@@ -8,6 +8,27 @@
 
 **Input**: User description: "SPEC-10 — Access Policies, Proxies, Request Attempts (crawmatic increment 10). Controlled access behavior for scraping: decide direct vs proxy per request, store proxy provider config with encrypted credentials, apply per-domain access overrides, and log every scrape request attempt to an append-heavy partitioned table."
 
+## Clarifications
+
+### Session 2026-07-04
+
+All items below were resolved from the master project spec (`PROJECT_SPEC.md`); none required
+operator input. Recorded here to bind the spec to the canonical decisions.
+
+- Q: What are the allowed `access_method` values recorded on a request attempt / chosen by a
+  policy? → A: `DIRECT_HTTP`, `DIRECT_HTTP_RETRY`, `PROXY_HTTP`, `PLAYWRIGHT_PROXY` (doc §11); no
+  external scraping APIs.
+- Q: How does an access strategy map to an attempt sequence for an unknown domain? → A: the
+  fallback chain is Direct HTTP → Direct HTTP retry (backoff) → HTTP via internal proxy pool →
+  internal Playwright via proxy → fail (needs tuning); learned domains start from the preferred
+  learned method instead of attempt 1 (doc §11).
+- Q: What encryption mechanism protects proxy credentials, and how is rotation handled? → A:
+  Fernet symmetric encryption with the key in an environment variable and a `key_version` column;
+  rotation supports decrypting old key versions, re-encrypting records, then retiring the old key
+  (doc §33).
+- Q: What proxy-provider `status` values are used? → A: default to `ACTIVE` / `DISABLED` (doc
+  silent on the enum; low-impact, deferred detail confirmable in planning).
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Configure how competitor sites are accessed (Priority: P1)
@@ -144,9 +165,11 @@ that writes are batched and occur off the scraping reactor thread.
 - **FR-002**: System MUST let a workspace register **proxy providers** with: name, type
   (DATACENTER, RESIDENTIAL, MOBILE), base_url, optional username, optional password, optional
   country, status, and optional monthly budget limit.
-- **FR-003**: System MUST store proxy provider passwords **encrypted at rest** using
-  application-level symmetric encryption and MUST never return the plaintext password through any
-  API response.
+- **FR-003**: System MUST store proxy provider passwords **encrypted at rest** using Fernet
+  symmetric encryption (key supplied via environment variable) with a `key_version` recorded per
+  encrypted field, and MUST never return the plaintext password through any API response.
+  Rotation MUST support decrypting prior key versions, re-encrypting records, then retiring the
+  old key.
 - **FR-004**: System MUST let a workspace define **domain access rules** binding a
   competitor + domain (and optional URL pattern) to an access policy, with per-domain
   max_concurrent_requests, max_requests_per_minute, cooldown_seconds, optional block-detection
@@ -166,10 +189,13 @@ that writes are batched and occur off the scraping reactor thread.
 - **FR-007**: System MUST resolve the **effective access policy** for a scrape target by
   precedence: a matching enabled domain access rule (most specific: URL-pattern match over
   domain-only) overrides the competitor/workspace default policy.
-- **FR-008**: System MUST carry out the resolved strategy when accessing a target: choose
+- **FR-008**: System MUST carry out the resolved strategy when accessing a target using the
+  allowed access methods (DIRECT_HTTP, DIRECT_HTTP_RETRY, PROXY_HTTP, PLAYWRIGHT_PROXY): choose
   direct vs proxy for the first attempt and for retries per the policy flags and strategy, retry
-  on failure up to max_retries, and stop or fall back per the strategy (including browser
-  fallback when allow_browser_fallback and the strategy permit).
+  on failure up to max_retries, and stop or fall back per the strategy (including browser/
+  Playwright-via-proxy fallback when allow_browser_fallback and the strategy permit). For an
+  unknown domain the default sequence is DIRECT_HTTP → DIRECT_HTTP_RETRY → PROXY_HTTP →
+  PLAYWRIGHT_PROXY → fail; a learned domain starts from its preferred access method.
 - **FR-009**: System MUST assign a proxy to an outgoing scrape request when the resolved policy
   calls for it, selecting the provider/country from the policy (or domain rule), honoring
   rotation vs sticky-session behavior.
@@ -186,7 +212,8 @@ that writes are batched and occur off the scraping reactor thread.
 - **FR-012**: System MUST log a **request attempt** for every fetch attempt (direct or proxied,
   success or failure) capturing workspace, scrape_job, match, attempt_number, url, access_method,
   proxy_provider and proxy_country (when proxied), status_code, response_time_ms, success,
-  error_code, error_message, and created_at.
+  error_code, error_message, and created_at. `access_method` MUST be one of DIRECT_HTTP,
+  DIRECT_HTTP_RETRY, PROXY_HTTP, PLAYWRIGHT_PROXY.
 - **FR-013**: System MUST classify attempt failures using the structured error codes
   (PROXY_FAILED, RATE_LIMITED, HTTP_429, HTTP_403, TIMEOUT, DNS_ERROR, BLOCKED, LIMIT_REACHED,
   UNKNOWN_ERROR).

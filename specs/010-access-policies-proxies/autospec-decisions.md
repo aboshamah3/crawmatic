@@ -12,3 +12,12 @@ during the autospec pipeline, and every default chosen where the doc was silent.
 - [specify] Q: Scope of rate limiting here vs distributed limiter → A: enforce only the policy's own per-min/hour/day ceilings + domain cooldown/concurrency; cluster-wide limiter deferred to spec 011 (source: doc §35 item 11 = separate increment)
 - [specify] Q: Scope of browser fallback → A: express via policy flag/strategy only; actual browser rendering is spec 014 (source: doc §35 item 14; default for boundary)
 - [specify] Q: request_attempts partitioning → A: monthly-partitioned from birth by created_at, PK includes partition key, soft references only (source: doc §22 lines 1241, 1880-1887, principle 25)
+
+## clarify
+
+No operator interruption required — all clarifications resolved from the master doc.
+
+- [clarify] Q: allowed access_method values → A: DIRECT_HTTP, DIRECT_HTTP_RETRY, PROXY_HTTP, PLAYWRIGHT_PROXY; no external scraping APIs (source: doc §11)
+- [clarify] Q: strategy→attempt-sequence mapping → A: Direct → Direct retry(backoff) → Proxy HTTP → Playwright-via-proxy → fail; learned domains start from preferred method (source: doc §11)
+- [clarify] Q: proxy credential encryption + rotation → A: Fernet symmetric, key in env var, key_version column; decrypt-old/re-encrypt/retire rotation (source: doc §33)
+- [clarify] Q: proxy_providers.status enum → A: ACTIVE/DISABLED default (source: doc silent; low-impact default, confirmable in planning)

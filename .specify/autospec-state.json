@@ -227,7 +227,7 @@
       "status": "in_progress",
       "steps": {
         "specify": "done",
-        "clarify": "pending",
+        "clarify": "done",
         "plan": "pending",
         "checklist": "pending",
         "tasks": "pending",
