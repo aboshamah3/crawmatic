@@ -129,7 +129,7 @@ from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import Permission, acquire_permission, release_slot
+from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
 from scrape_core.reactor import deferred_delay
 from scrape_core.validation import Accepted, Rejected, validate_candidate
 
@@ -710,6 +710,11 @@ def _attempt_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     ``_request_for`` at dispatch time) -- the real ``access_method``/
     ``proxy_provider_id``/``proxy_country``/``attempt_number``/
     ``response_time_ms`` for `_build_result`, never a hardcoded default.
+
+    SPEC-11 US2 (T022): also carries ``match_lock_key``/
+    ``match_lock_token`` (absent -> ``None``) so a dispatched attempt's
+    eventual `ScrapeResult` threads its match lock through to the
+    persistence pipeline's release (T023).
     """
     return {
         "access_method": meta.get("access_method", AccessMethod.DIRECT_HTTP),
@@ -717,6 +722,8 @@ def _attempt_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "proxy_provider_id": meta.get("proxy_provider_id"),
         "proxy_country": meta.get("proxy_country"),
         "response_time_ms": _elapsed_ms(meta.get("dispatch_monotonic")),
+        "match_lock_key": meta.get("match_lock_key"),
+        "match_lock_token": meta.get("match_lock_token"),
     }
 
 
@@ -806,8 +813,7 @@ class GenericPriceSpider(scrapy.Spider):
                 # else: NONE_RESOLVED access policy -- skip silently, see
                 # `_DispatchDecision` docstring.
                 continue
-            perm = await self._acquire_fetch_permission(target, decision.plan.access_method)
-            yield self._request_for(target, 1, decision.plan, decision.proxy, perm)
+            yield await self._dispatch(target, 1, decision.plan, decision.proxy)
 
     async def _acquire_fetch_permission(self, target: SpiderTarget, access_method: AccessMethod) -> Permission:
         """Resolve this target's effective limits and acquire a domain
@@ -860,6 +866,58 @@ class GenericPriceSpider(scrapy.Spider):
             state.cumulative_wait += delay
             await deferred_delay(delay)
 
+    async def _dispatch(
+        self,
+        target: SpiderTarget,
+        attempt_number: int,
+        plan: AttemptPlan,
+        proxy_assignment: ProxyAssignment | None,
+    ) -> "scrapy.Request | ScrapeResult":
+        """SPEC-11 US1+US2 combined dispatch gate (`contracts/spider-integration.md`
+        steps 1-4): acquire the domain token + concurrency slot
+        (:meth:`_acquire_fetch_permission`, looping on denial until
+        granted), then the in-flight match lock **immediately before
+        fetch** (step 3, off-reactor via :func:`~scrape_core.limiter.acquire_lock`).
+
+        On a held lock (``None``): releases the semaphore slot just
+        acquired in step 2 (nothing else was taken -- no requeue, FR-011/
+        014, US2 AS1) and returns a terminal ``SKIPPED``/
+        ``LOCKED_ALREADY_RUNNING`` :class:`~scrape_core.items.ScrapeResult`
+        (the existing skip-emission shape SPEC-10 uses for not-dispatched
+        attempts) instead of a request -- no fetch. On a grant, returns
+        the built ``scrapy.Request`` with both the semaphore and match-lock
+        key/token stamped onto its meta (:meth:`_request_for`) so
+        `parse`/`errback` release the slot on response and the
+        persistence pipeline releases the lock after the write commits.
+        """
+        from app_shared.config import get_settings
+
+        perm = await self._acquire_fetch_permission(target, plan.access_method)
+
+        redis = get_redis_client()
+        lock = await acquire_lock(
+            redis,
+            workspace_id=self.workspace_id,
+            match_id=target.match_id,
+            mode=plan.access_method,
+            settings=get_settings(),
+        )
+        if lock is None:
+            await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+            return self._build_result(
+                target,
+                target.url,
+                datetime.now(UTC),
+                status_code=None,
+                success=False,
+                error_code=ScrapeErrorCode.LOCKED_ALREADY_RUNNING,
+                error_message="match lock already held -- another attempt is in flight",
+                access_method=plan.access_method,
+                attempt_number=attempt_number,
+            )
+
+        return self._request_for(target, attempt_number, plan, proxy_assignment, perm, lock)
+
     def _request_for(
         self,
         target: SpiderTarget,
@@ -867,6 +925,7 @@ class GenericPriceSpider(scrapy.Spider):
         plan: AttemptPlan | None = None,
         proxy_assignment: ProxyAssignment | None = None,
         permission: Permission | None = None,
+        lock: LockGrant | None = None,
     ) -> scrapy.Request:
         """Build the request for `target`'s `attempt_number`-th attempt.
 
@@ -895,6 +954,16 @@ class GenericPriceSpider(scrapy.Spider):
         `parse`/`errback` can release the slot on fetch completion
         (T014). `None` (pre-SPEC-11 callers, unit tests) leaves those
         meta keys absent -- no release is attempted for such a request.
+
+        `lock` (SPEC-11 US2, `contracts/spider-integration.md` step 4) is
+        the granted :class:`~scrape_core.limiter.LockGrant` from
+        :meth:`_dispatch`'s :func:`~scrape_core.limiter.acquire_lock`
+        call; when given, its `key`/`token` are stamped onto
+        `request.meta` so `parse`/`errback` can carry them onto the
+        eventual `ScrapeResult` (`match_lock_key`/`match_lock_token`,
+        T020) for the persistence pipeline to release after the write
+        commits (T023). `None` (pre-SPEC-11 callers, unit tests) leaves
+        those meta keys absent -- no release is attempted.
         """
         if plan is None:
             plan = AttemptPlan(access_method=AccessMethod.DIRECT_HTTP, use_proxy=False)
@@ -920,6 +989,13 @@ class GenericPriceSpider(scrapy.Spider):
             # response/failure returns.
             meta["semaphore_key"] = permission.semaphore_key
             meta["semaphore_token"] = permission.semaphore_token
+        if lock is not None:
+            # SPEC-11 US2 (T022): threaded through so `parse`/`errback`
+            # can carry the match-lock key/token onto the eventual
+            # `ScrapeResult` for the persistence pipeline to release
+            # after the observation/attempt write commits (T023).
+            meta["match_lock_key"] = lock.key
+            meta["match_lock_token"] = lock.token
         headers: dict[str, str] = {}
 
         if proxy_assignment is not None:
@@ -1081,8 +1157,7 @@ class GenericPriceSpider(scrapy.Spider):
             _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
         )
         if decision.plan is not None:
-            perm = await self._acquire_fetch_permission(target, decision.plan.access_method)
-            yield self._request_for(target, next_attempt_number, decision.plan, decision.proxy, perm)
+            yield await self._dispatch(target, next_attempt_number, decision.plan, decision.proxy)
             return
 
         if decision.skip_error_code is None:
@@ -1129,6 +1204,8 @@ class GenericPriceSpider(scrapy.Spider):
         comparable: bool = True,
         price: Decimal | None = None,
         candidate_extras: Any = None,
+        match_lock_key: str | None = None,
+        match_lock_token: str | None = None,
     ) -> ScrapeResult:
         """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034).
 
@@ -1144,6 +1221,13 @@ class GenericPriceSpider(scrapy.Spider):
         `DIRECT_HTTP`. One `ScrapeResult` is emitted per attempt
         (including retries), so the unchanged `BatchedPersistencePipeline`
         writes one `RequestAttempt` row per attempt (FR-012/FR-013/FR-015).
+
+        ``match_lock_key``/``match_lock_token`` (SPEC-11 US2, T020/T022)
+        default to ``None`` -- a never-dispatched attempt (rate/proxy/
+        budget skip, or a SPEC-11 match-lock collision) never acquired a
+        lock, so there is nothing to release. A dispatched attempt passes
+        them via `_attempt_kwargs_from_meta` (read back from
+        `request.meta`/`response.meta`, stamped by `_request_for`).
         """
         kwargs: dict[str, Any] = {}
         if candidate_extras is not None:
@@ -1175,5 +1259,7 @@ class GenericPriceSpider(scrapy.Spider):
             comparable=comparable,
             error_code=error_code,
             error_message=error_message,
+            match_lock_key=match_lock_key,
+            match_lock_token=match_lock_token,
             **kwargs,
         )

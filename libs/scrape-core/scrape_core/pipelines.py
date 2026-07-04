@@ -82,9 +82,10 @@ from twisted.python.failure import Failure
 
 from app_shared.catalog.upsert import dedup_last_wins
 from app_shared.config import get_settings
-from app_shared.enums import ScrapeTargetStatus
+from app_shared.enums import ScrapeErrorCode, ScrapeTargetStatus
 from app_shared.ids import new_uuid7
 from app_shared.jobs.targets import mark_target
+from app_shared.limiter.locks import release_match_lock
 from app_shared.messaging import enqueue
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.redis_client import get_redis_client
@@ -133,12 +134,23 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
 
     SPEC-08 T052: for every item that carries a non-null
     ``scrape_job_id``, also terminalizes its ``scrape_job_targets`` row
-    (COMPLETED on ``item.success``, else FAILED with ``item.error_code``)
-    via ``mark_target`` — in this SAME transaction, no second
+    (COMPLETED on ``item.success``, FAILED with ``item.error_code``, or
+    — SPEC-11 US2 — SKIPPED for a ``LOCKED_ALREADY_RUNNING`` lock
+    collision) via ``mark_target`` — in this SAME transaction, no second
     ``run_in_thread``/reactor hop. Once the transaction commits, enqueues
     ``SCRAPE_FINALIZE_JOBS`` (``maintenance`` queue) exactly once per
     distinct affected ``scrape_job_id`` in the batch, so counters/status
     finalize event-driven (FR-017/018/019, SC-007).
+
+    SPEC-11 US2 (T023, ``contracts/match-lock.md`` "Ownership lifecycle"
+    step 3): once that same transaction has committed, releases each
+    item's in-flight match lock (``release_match_lock``, a Lua
+    compare-and-delete keyed by its fencing token) — still inside this
+    SAME off-reactor flush, no new reactor hop. An item with no
+    ``match_lock_token`` (e.g. the SKIPPED/not-dispatched path never
+    acquired a lock) is skipped — no release attempted. Release errors
+    are logged and swallowed inside ``release_match_lock`` itself (D3) —
+    never fails the flush.
     """
     observations: list[PriceObservation] = []
     attempts: list[RequestAttempt] = []
@@ -239,15 +251,41 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
         for item in batch:
             if item.scrape_job_id is None:
                 continue
+            if item.success:
+                target_status = ScrapeTargetStatus.COMPLETED
+            elif item.error_code == ScrapeErrorCode.LOCKED_ALREADY_RUNNING:
+                # SPEC-11 US2 (contracts/match-lock.md, data-model.md §5):
+                # a lock-collision attempt is SKIPPED, distinct from every
+                # other failure outcome -- not FAILED. `mark_target`'s
+                # error_code stamp is currently gated to `status ==
+                # FAILED` only, so this writes status=SKIPPED with the
+                # error_code still dropped until that gate is broadened
+                # (US3 T026, tasks.md) -- a known, tracked gap, not a new
+                # persistence path.
+                target_status = ScrapeTargetStatus.SKIPPED
+            else:
+                target_status = ScrapeTargetStatus.FAILED
             mark_target(
                 session,
                 workspace_id=item.workspace_id,
                 scrape_job_id=item.scrape_job_id,
                 match_id=item.match_id,
-                status=ScrapeTargetStatus.COMPLETED if item.success else ScrapeTargetStatus.FAILED,
+                status=target_status,
                 error_code=None if item.success else item.error_code,
             )
             affected_job_ids[item.scrape_job_id] = None
+
+    # SPEC-11 US2 (T023): release each item's match lock only AFTER the
+    # transaction above has committed -- still inside this same
+    # off-reactor flush (no second run_in_thread/reactor hop). An item
+    # with no match_lock_token never acquired a lock -- skipped, no
+    # release attempted. Release errors are logged + swallowed inside
+    # `release_match_lock` itself (D3) -- never fails the flush.
+    redis = get_redis_client()
+    for item in batch:
+        if item.match_lock_token is None:
+            continue
+        release_match_lock(redis, key=item.match_lock_key, token=item.match_lock_token)
 
     # Only after the transaction above has committed cleanly -- enqueue one
     # SCRAPE_FINALIZE_JOBS per distinct affected job so finalize_jobs()

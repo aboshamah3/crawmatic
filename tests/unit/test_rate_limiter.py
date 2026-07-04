@@ -402,3 +402,48 @@ def test_resolve_limits_disabled_domain_rule_is_ignored() -> None:
 
     assert limits.per_minute == 42
     assert limits.cooldown_seconds == 0
+
+
+# --- match-lock TTL / jitter invariants (SPEC-11 US2 T016, contracts/match-lock.md
+# "TTL", data-model.md §4, FR-013, US2 AS4) -----------------------------------
+#
+# `Settings.model_fields[...].default` reads the declared field default
+# directly, without constructing a full `Settings()` instance (which
+# requires every required env var -- DATABASE_URL/REDIS_URL/etc. -- to be
+# set). These are pure default-value assertions, no env/infra needed.
+
+
+def _settings_default(name: str) -> int:
+    from app_shared.config import Settings
+
+    return Settings.model_fields[name].default
+
+
+def test_jitter_bounds_are_sane_for_default_settings() -> None:
+    jitter_min = _settings_default("RATE_LIMIT_JITTER_MIN_SECONDS")
+    jitter_max = _settings_default("RATE_LIMIT_JITTER_MAX_SECONDS")
+
+    assert jitter_min > 0
+    assert jitter_max > 0
+    assert jitter_min < jitter_max
+
+
+def test_match_lock_ttl_exceeds_worst_case_in_spider_wait_for_default_settings() -> None:
+    """FR-013/US2 AS4: the match-lock TTL (HTTP or browser, whichever is
+    smaller) must comfortably exceed the worst-case cumulative backoff a
+    single in-spider retry loop could accumulate before either succeeding
+    or hitting the requeue cap -- so a still-working lock owner never
+    loses its lock mid-retry. ``typical_wait_hint`` stands in for a
+    representative per-denial wait: the cumulative-wait ceiling spread
+    evenly across the attempt-count ceiling (both caps bound the same
+    backoff loop, `contracts/spider-integration.md` step 2)."""
+    http_ttl = _settings_default("MATCH_LOCK_HTTP_TTL_SECONDS")
+    browser_ttl = _settings_default("MATCH_LOCK_BROWSER_TTL_SECONDS")
+    max_attempts = _settings_default("REQUEUE_MAX_ATTEMPTS")
+    max_total_wait = _settings_default("REQUEUE_MAX_TOTAL_WAIT_SECONDS")
+    jitter_max = _settings_default("RATE_LIMIT_JITTER_MAX_SECONDS")
+
+    typical_wait_hint = max_total_wait / max_attempts
+    worst_case_wait = max_attempts * (typical_wait_hint + jitter_max)
+
+    assert min(http_ttl, browser_ttl) > worst_case_wait

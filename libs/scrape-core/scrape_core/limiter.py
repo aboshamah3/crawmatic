@@ -18,10 +18,10 @@ only place allowed to touch Twisted for this feature, Constitution V):
 This module wraps the pure ``app_shared.limiter`` functions (token
 bucket, semaphore, fencing lock) so the spider/pipeline only ever
 awaits a ``Deferred`` — never calls ``redis`` synchronously itself.
-Every wrapper below is a stub for now; bodies are filled in per user
-story (T012 fills ``acquire_permission``/``release_slot`` for US1,
-T021 fills ``acquire_lock``/``release_lock`` for US2) without changing
-these signatures.
+``acquire_permission``/``release_slot`` (US1, T012) and
+``acquire_lock``/``release_lock`` (US2, T021) are both filled in; every
+wrapper's signature was fixed from the start (T006) so no later story
+had to change an earlier one's call sites.
 """
 
 from __future__ import annotations
@@ -29,7 +29,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+from app_shared.enums import AccessMethod
 from app_shared.limiter import bucket as _bucket
+from app_shared.limiter import locks as _locks
+from app_shared.limiter.keys import match_lock_key as _match_lock_key
 from app_shared.limiter.keys import rate_key as _rate_key
 from app_shared.limiter.keys import semaphore_key as _semaphore_key
 
@@ -147,22 +150,44 @@ async def acquire_lock(
     *,
     workspace_id: uuid.UUID | str,
     match_id: uuid.UUID | str,
-    mode: object,
+    mode: AccessMethod,
     settings: object,
 ) -> LockGrant | None:
     """Acquire the in-flight match lock, or ``None`` when already held.
 
-    Stub — filled in by T021 (US2). Must build the mode-sized TTL,
-    generate the fencing token, and call
-    ``await run_in_thread(acquire_match_lock, ...)`` — fail-closed
-    surfaces as ``None`` (reactor-seam.md).
+    Builds the mode-sized TTL (``MATCH_LOCK_BROWSER_TTL_SECONDS`` for
+    ``AccessMethod.PLAYWRIGHT_PROXY``, ``MATCH_LOCK_HTTP_TTL_SECONDS``
+    otherwise — contracts/match-lock.md "TTL"), generates a fresh fencing
+    token (:func:`app_shared.limiter.locks.new_fencing_token`), and calls
+    ``await run_in_thread(acquire_match_lock, ...)`` — off-reactor, never
+    a synchronous Redis call on the reactor thread. Fail-closed surfaces
+    as ``None`` (an acquire Redis error is indistinguishable from "already
+    held" to the caller -- both mean "do not fetch", reactor-seam.md).
     """
-    raise NotImplementedError("acquire_lock is implemented in US2 (T021)")
+    ttl_seconds = (
+        settings.MATCH_LOCK_BROWSER_TTL_SECONDS
+        if mode == AccessMethod.PLAYWRIGHT_PROXY
+        else settings.MATCH_LOCK_HTTP_TTL_SECONDS
+    )
+    key = _match_lock_key(workspace_id, match_id)
+    token = _locks.new_fencing_token()
+    acquired = await run_in_thread(
+        _locks.acquire_match_lock,
+        redis,
+        key=key,
+        token=token,
+        ttl_seconds=ttl_seconds,
+    )
+    if not acquired:
+        return None
+    return LockGrant(key=key, token=token)
 
 
 async def release_lock(redis: object, *, key: str, token: str) -> None:
     """Release a previously-acquired match lock (fencing compare-and-delete).
 
-    Stub — filled in by T021 (US2).
+    Off-reactor via ``run_in_thread``. Redis errors are logged and
+    swallowed inside ``app_shared.limiter.locks.release_match_lock``
+    (TTL reclaims regardless, D3) -- this never raises.
     """
-    raise NotImplementedError("release_lock is implemented in US2 (T021)")
+    await run_in_thread(_locks.release_match_lock, redis, key=key, token=token)

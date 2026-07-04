@@ -70,3 +70,14 @@ class ScrapeResult:
     comparable: bool = True
     error_code: ScrapeErrorCode | None = None
     error_message: str | None = None
+
+    # --- SPEC-11 US2 match-lock release-only carry-through (contracts/
+    # match-lock.md, contracts/spider-integration.md "Match-lock release")
+    # --- NOT persisted to any DB row: `scrape_core.pipelines._flush_batch`
+    # reads these only to call `release_match_lock` after the
+    # observation/attempt write commits, in the same off-reactor flush.
+    # Populated from `response.meta` for a dispatched-and-fetched attempt;
+    # `None` for an attempt that never acquired a lock (e.g. the SKIPPED/
+    # not-dispatched path) -- a missing token means no release is attempted.
+    match_lock_key: str | None = None
+    match_lock_token: str | None = None
