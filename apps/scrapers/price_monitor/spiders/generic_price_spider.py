@@ -1,5 +1,6 @@
 """``generic_price_spider`` — the SPEC-07 US1 MVP HTTP spider, extended by
-SPEC-10 US2 to drive direct-vs-proxy behavior.
+SPEC-10 US2 to drive direct-vs-proxy behavior and SPEC-10 US3 to log
+every attempt (including retries) with its real transport.
 
 Per ``contracts/spider-args.md``: parses ``workspace_id``/
 ``scrape_job_id``/``match_ids``/``mode`` from Scrapyd ``schedule.json``
@@ -52,6 +53,18 @@ request-side seam, duplicating the analogous bounded-load shape for
   — Scrapy 2.x + the project's ``AsyncioSelectorReactor`` support
   coroutine callbacks/errbacks natively (no ``twisted.inlineCallbacks``
   needed).
+
+SPEC-10 US3 (`contracts/spider-integration.md` §4, T033-T035) finishes
+this same seam's **result** side: every ``ScrapeResult`` `_build_result`
+emits now carries the *real* attempt it describes (``access_method``/
+``proxy_provider_id``/``proxy_country``/``attempt_number``/
+``status_code``/``response_time_ms``/``error_code``) instead of the
+SPEC-10-US2-era hardcoded ``DIRECT_HTTP``/attempt 1. ``errback`` emits
+one such result for the attempt that just failed *before* deciding
+whether to retry, so a policy that retries direct-then-proxy persists
+one ``RequestAttempt`` row per attempt (both the failed direct one and
+the eventual proxied one) — never collapsing a whole retry chain into a
+single terminal row (FR-012/013/015, SC-002).
 """
 
 from __future__ import annotations
@@ -59,6 +72,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -519,13 +533,23 @@ class _DispatchDecision:
     ``LIMIT_REACHED``) or because the target's access policy never
     resolved at all (``skip_error_code is None`` -- `NONE_RESOLVED`,
     per `contracts/policy-resolution.md`: "target skipped, not scraped
-    with an implicit policy"; this phase does not yet log that as a
-    `ScrapeResult`, deferred to Phase 5/T034's result-side wiring).
+    with an implicit policy" -- silently skipped, no `ScrapeResult`).
+
+    ``attempted_method``/``attempted_proxy`` (SPEC-10 US3, T034) record
+    the transport that was *decided but never dispatched* when
+    ``skip_error_code`` is set -- there is no real `scrapy.Request`/
+    response for these attempts, so `request.meta` can't supply the
+    audit fields the way it does for a dispatched attempt (`parse`/
+    `errback` read those from the response/failure instead). Unused
+    (left at their defaults) whenever ``skip_error_code is None``, since
+    that path never calls `_build_result`.
     """
 
     plan: AttemptPlan | None
     proxy: ProxyAssignment | None
     skip_error_code: ScrapeErrorCode | None = None
+    attempted_method: AccessMethod = AccessMethod.DIRECT_HTTP
+    attempted_proxy: ProxyAssignment | None = None
 
 
 def _prepare_dispatch(
@@ -568,6 +592,9 @@ def _prepare_dispatch(
         per_day=policy.max_requests_per_day,
     )
     if not rate_decision.allowed:
+        # Gated before any transport decision is even made -- there is no
+        # real "attempted method" to report, so this leaves
+        # `_DispatchDecision`'s DIRECT_HTTP/None defaults in place.
         return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.RATE_LIMITED)
 
     cooldown_seconds = target.domain_rule.cooldown_seconds if target.domain_rule is not None else 0
@@ -608,10 +635,19 @@ def _prepare_dispatch(
             # No eligible provider (disabled/absent) -- degrade per
             # strategy by reusing the budget-exhausted fallback shape
             # (same "wanted a proxy, can't use one" outcome); STOP here
-            # means PROXY_FAILED, not a budget/rate issue.
+            # means PROXY_FAILED, not a budget/rate issue. `plan` (still
+            # the pre-degrade decision here) was a proxied plan -- record
+            # that as the attempted method (no provider was ever
+            # assigned, so `attempted_proxy` stays None).
+            intended_method = plan.access_method
             plan = _decide(proxy_budget_exhausted=True)
             if plan is STOP:
-                return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.PROXY_FAILED)
+                return _DispatchDecision(
+                    plan=None,
+                    proxy=None,
+                    skip_error_code=ScrapeErrorCode.PROXY_FAILED,
+                    attempted_method=intended_method,
+                )
         else:
             provider = provider_rows.get(proxy_assignment.provider_id)
             limit = provider.monthly_budget_limit if provider is not None else None
@@ -619,12 +655,49 @@ def _prepare_dispatch(
                 redis, provider_id=proxy_assignment.provider_id, limit=limit, now=datetime.now(UTC)
             )
             if not budget_result.allowed:
+                # `proxy_assignment` (the provider that hit its budget)
+                # is worth recording even though the attempt never
+                # dispatched -- it's exactly what US3's audit/tuning
+                # goal needs ("which provider is exhausted").
+                intended_method = plan.access_method
+                intended_proxy = proxy_assignment
                 plan = _decide(proxy_budget_exhausted=True)
                 if plan is STOP:
-                    return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.LIMIT_REACHED)
+                    return _DispatchDecision(
+                        plan=None,
+                        proxy=None,
+                        skip_error_code=ScrapeErrorCode.LIMIT_REACHED,
+                        attempted_method=intended_method,
+                        attempted_proxy=intended_proxy,
+                    )
                 proxy_assignment = None  # the fallback plan is guaranteed non-proxy
 
     return _DispatchDecision(plan=plan, proxy=proxy_assignment)
+
+
+def _elapsed_ms(dispatch_monotonic: float | None) -> int | None:
+    """``response_time_ms`` (SPEC-10 US3, T034) -- elapsed wall time since
+    ``_request_for`` stashed ``time.monotonic()`` on dispatch, or ``None``
+    when the attempt was never dispatched (no request exists to time)."""
+    if dispatch_monotonic is None:
+        return None
+    return round((time.monotonic() - dispatch_monotonic) * 1000)
+
+
+def _attempt_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """The SPEC-10 US3 (T034) per-attempt audit fields for a *dispatched*
+    attempt, read back from ``request.meta``/``response.meta`` (stamped by
+    ``_request_for`` at dispatch time) -- the real ``access_method``/
+    ``proxy_provider_id``/``proxy_country``/``attempt_number``/
+    ``response_time_ms`` for `_build_result`, never a hardcoded default.
+    """
+    return {
+        "access_method": meta.get("access_method", AccessMethod.DIRECT_HTTP),
+        "attempt_number": meta.get("attempt_number", 1),
+        "proxy_provider_id": meta.get("proxy_provider_id"),
+        "proxy_country": meta.get("proxy_country"),
+        "response_time_ms": _elapsed_ms(meta.get("dispatch_monotonic")),
+    }
 
 
 def _parse_host_port(base_url: str) -> tuple[str, int]:
@@ -695,6 +768,12 @@ class GenericPriceSpider(scrapy.Spider):
                         success=False,
                         error_code=decision.skip_error_code,
                         error_message=f"attempt 1 not dispatched: {decision.skip_error_code}",
+                        access_method=decision.attempted_method,
+                        attempt_number=1,
+                        proxy_provider_id=(
+                            decision.attempted_proxy.provider_id if decision.attempted_proxy else None
+                        ),
+                        proxy_country=(decision.attempted_proxy.country if decision.attempted_proxy else None),
                     )
                 # else: NONE_RESOLVED access policy -- skip silently, see
                 # `_DispatchDecision` docstring.
@@ -739,6 +818,12 @@ class GenericPriceSpider(scrapy.Spider):
             "attempt_number": attempt_number,
             "proxy_provider_id": None,
             "proxy_country": None,
+            # SPEC-10 US3 (T034): stamped so `parse`/`errback` can compute
+            # `response_time_ms` for the eventual `ScrapeResult` -- the
+            # only per-attempt clock available (no wall-clock start time
+            # is otherwise threaded through Scrapy's request/response
+            # cycle here).
+            "dispatch_monotonic": time.monotonic(),
         }
         headers: dict[str, str] = {}
 
@@ -766,6 +851,10 @@ class GenericPriceSpider(scrapy.Spider):
     def parse(self, response: Response, **kwargs: Any) -> Any:
         target = self._targets_by_match_id[response.meta["match_id"]]
         now = datetime.now(UTC)
+        # SPEC-10 US3 (T034): the *actual* attempt's transport/proxy/timing,
+        # read from `response.meta` (stamped by `_request_for` at dispatch
+        # time) -- never the pre-SPEC-10 hardcoded `DIRECT_HTTP`.
+        attempt_kwargs = _attempt_kwargs_from_meta(response.meta)
 
         status_error_code = classify_http_status(response.status)
         if status_error_code is not None:
@@ -777,6 +866,7 @@ class GenericPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=status_error_code,
                 error_message=f"HTTP {response.status}",
+                **attempt_kwargs,
             )
             return
 
@@ -790,6 +880,7 @@ class GenericPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=PRICE_NOT_FOUND,
                 error_message="no extraction strategy matched a price",
+                **attempt_kwargs,
             )
             return
 
@@ -808,6 +899,7 @@ class GenericPriceSpider(scrapy.Spider):
                 error_code=outcome.error_code,
                 error_message=outcome.message,
                 candidate_extras=candidate,
+                **attempt_kwargs,
             )
             return
 
@@ -821,10 +913,11 @@ class GenericPriceSpider(scrapy.Spider):
             comparable=outcome.comparable,
             price=outcome.price,
             candidate_extras=candidate,
+            **attempt_kwargs,
         )
 
     async def errback(self, failure: Any) -> Any:
-        """Retry per the resolved access policy, or emit the terminal failure.
+        """Record the attempt that just failed, then retry or stop.
 
         ``async def`` (Scrapy 2.x + this project's ``AsyncioSelectorReactor``
         support coroutine errbacks natively) so the off-reactor
@@ -835,12 +928,37 @@ class GenericPriceSpider(scrapy.Spider):
         bookkeeping (`max_retries` cap, terminal browser-fallback intent,
         `STOP`) is entirely reused via `_prepare_dispatch` -- this method
         only tracks "what attempt number comes next".
+
+        SPEC-10 US3 (T034, `contracts/spider-integration.md` Acceptance
+        US3-1/SC-002): a retried attempt is its own attempt, not an
+        overwrite of a prior one -- every failure this errback observes
+        gets its **own** `ScrapeResult` (the real `access_method`/
+        `attempt_number`/proxy fields/timing straight from the failed
+        request's own `request.meta`, and the real `error_code` via
+        `classify_exception`) *before* deciding whether to retry, so a
+        `DIRECT_THEN_PROXY` policy's failed direct attempt 1 persists its
+        own `RequestAttempt` row in addition to attempt 2's (whether
+        attempt 2 dispatches, is itself gated, or the chain stops here).
         """
         match_id = failure.request.meta.get("match_id")
         target = self._targets_by_match_id.get(match_id)
         if target is None:
             logger.error("generic_price_spider: fetch failure with no known target: %s", failure)
             return
+
+        now = datetime.now(UTC)
+        hostname = urlsplit(failure.request.url).hostname
+        failed_error_code = classify_exception(failure.value, hostname=hostname)
+        yield self._build_result(
+            target,
+            failure.request.url,
+            now,
+            status_code=None,
+            success=False,
+            error_code=failed_error_code,
+            error_message=str(failure.value),
+            **_attempt_kwargs_from_meta(failure.request.meta),
+        )
 
         attempt_number = failure.request.meta.get("attempt_number", 1)
         next_attempt_number = attempt_number + 1
@@ -852,20 +970,30 @@ class GenericPriceSpider(scrapy.Spider):
             yield self._request_for(target, next_attempt_number, decision.plan, decision.proxy)
             return
 
-        now = datetime.now(UTC)
-        if decision.skip_error_code is not None:
-            error_code = decision.skip_error_code
-        else:
-            hostname = urlsplit(failure.request.url).hostname
-            error_code = classify_exception(failure.value, hostname=hostname)
+        if decision.skip_error_code is None:
+            # Genuinely out of retries (`STOP`, no rate/proxy/budget
+            # gating involved -- e.g. `max_retries` exhausted) -- the
+            # failed attempt's own row above already captures the
+            # terminal outcome; nothing further to record.
+            return
+
+        # The *next* attempt (`next_attempt_number`) was decided but
+        # never dispatched (rate/cooldown/budget-gated) -- its own
+        # separate never-dispatched row, same shape as `start()`'s skip
+        # branch (there is no request/response for it, so its fields
+        # come from the decision itself, not `request.meta`).
         yield self._build_result(
             target,
             failure.request.url,
             now,
             status_code=None,
             success=False,
-            error_code=error_code,
-            error_message=str(failure.value),
+            error_code=decision.skip_error_code,
+            error_message=f"attempt {next_attempt_number} not dispatched: {decision.skip_error_code}",
+            access_method=decision.attempted_method,
+            attempt_number=next_attempt_number,
+            proxy_provider_id=(decision.attempted_proxy.provider_id if decision.attempted_proxy else None),
+            proxy_country=(decision.attempted_proxy.country if decision.attempted_proxy else None),
         )
 
     def _build_result(
@@ -876,12 +1004,32 @@ class GenericPriceSpider(scrapy.Spider):
         *,
         status_code: int | None,
         success: bool,
+        access_method: AccessMethod = AccessMethod.DIRECT_HTTP,
+        attempt_number: int = 1,
+        proxy_provider_id: uuid.UUID | None = None,
+        proxy_country: str | None = None,
+        response_time_ms: int | None = None,
         error_code: Any = None,
         error_message: str | None = None,
         comparable: bool = True,
         price: Decimal | None = None,
         candidate_extras: Any = None,
     ) -> ScrapeResult:
+        """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034).
+
+        ``access_method``/``attempt_number``/``proxy_provider_id``/
+        ``proxy_country``/``response_time_ms`` default to a plain
+        ``DIRECT_HTTP`` first attempt (pre-SPEC-10 callers, and unit
+        tests, may call this with only the required kwargs) but every
+        SPEC-10 call site now passes the **actual** attempt's values --
+        see `_attempt_kwargs_from_meta` (dispatched attempts, `parse`/
+        `errback`) and `_DispatchDecision.attempted_method`/
+        `attempted_proxy` (never-dispatched rate/proxy/budget skips,
+        `start`/`errback`) -- never the previously hardcoded
+        `DIRECT_HTTP`. One `ScrapeResult` is emitted per attempt
+        (including retries), so the unchanged `BatchedPersistencePipeline`
+        writes one `RequestAttempt` row per attempt (FR-012/FR-013/FR-015).
+        """
         kwargs: dict[str, Any] = {}
         if candidate_extras is not None:
             kwargs.update(
@@ -900,8 +1048,12 @@ class GenericPriceSpider(scrapy.Spider):
             competitor_id=target.competitor_id,
             scrape_job_id=self.scrape_job_id,
             url=url,
-            access_method=AccessMethod.DIRECT_HTTP,
+            access_method=access_method,
+            attempt_number=attempt_number,
+            proxy_provider_id=proxy_provider_id,
+            proxy_country=proxy_country,
             status_code=status_code,
+            response_time_ms=response_time_ms,
             scraped_at=scraped_at,
             price=price,
             success=success,

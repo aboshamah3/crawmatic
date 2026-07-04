@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from app_shared.enums import ScrapeErrorCode
 
-from scrape_core.errors import classify_exception
+from scrape_core.errors import classify_exception, classify_http_status
 from scrape_core.safety import rejection_registry
 from scrape_core.safety.resolver import UnsafeResolvedAddressError
 
@@ -163,3 +163,64 @@ def test_classify_exception_timeout_by_name() -> None:
 
 def test_classify_exception_unrecognized_falls_back_to_unknown_error() -> None:
     assert classify_exception(_PlainFailure("boom")) == ScrapeErrorCode.UNKNOWN_ERROR
+
+
+# --- SPEC-10 US3 (T033): proxy/access failure vocabulary ---------------------
+
+
+def test_classify_exception_recognizes_tunnel_error_by_name() -> None:
+    """Stands in for Scrapy's own
+    `scrapy.core.downloader.handlers.http11.TunnelError` (a proxy CONNECT
+    failure, incl. a proxy-auth rejection) -- duck-typed by class name,
+    same convention as the existing timeout/DNS checks."""
+
+    class _TunnelErrorLike(Exception):
+        pass
+
+    assert classify_exception(_TunnelErrorLike("Could not open CONNECT tunnel")) == (
+        ScrapeErrorCode.PROXY_FAILED
+    )
+
+
+def test_classify_exception_recognizes_proxy_connect_error_by_name() -> None:
+    class _ProxyConnectionError(Exception):
+        pass
+
+    assert classify_exception(_ProxyConnectionError("proxy refused connection")) == (
+        ScrapeErrorCode.PROXY_FAILED
+    )
+
+
+def test_classify_exception_timeout_still_wins_over_proxy_when_both_named() -> None:
+    """Timeout/DNS class-name checks run before the proxy check -- a
+    hypothetical exception combining both substrings still prefers the
+    more established classification (documents the check order, doesn't
+    assert a name no real exception actually uses)."""
+
+    class _ProxyTimeoutErrorLike(Exception):
+        pass
+
+    assert classify_exception(_ProxyTimeoutErrorLike("proxy timeout")) == ScrapeErrorCode.TIMEOUT
+
+
+def test_classify_http_status_407_is_proxy_failed() -> None:
+    assert classify_http_status(407) == ScrapeErrorCode.PROXY_FAILED
+
+
+def test_classify_exception_recognizes_rate_limited_via_error_code_attribute() -> None:
+    """`RATE_LIMITED`/`LIMIT_REACHED` are decided directly by
+    `generic_price_spider._prepare_dispatch` (a Redis-gating decision,
+    not a raised exception) -- but the generic `error_code`-attribute
+    chain walk still recognizes either if some caller ever does raise an
+    exception carrying one, with no special-casing needed."""
+    exc = RuntimeError("rate limited")
+    exc.error_code = ScrapeErrorCode.RATE_LIMITED  # type: ignore[attr-defined]
+
+    assert classify_exception(exc) == ScrapeErrorCode.RATE_LIMITED
+
+
+def test_classify_exception_recognizes_limit_reached_via_error_code_attribute() -> None:
+    exc = RuntimeError("budget exhausted")
+    exc.error_code = ScrapeErrorCode.LIMIT_REACHED  # type: ignore[attr-defined]
+
+    assert classify_exception(exc) == ScrapeErrorCode.LIMIT_REACHED
