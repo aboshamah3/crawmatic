@@ -64,12 +64,21 @@ class Permission(object):
     denial. ``semaphore_key``/``semaphore_token`` are threaded through
     to the later :func:`release_slot` call and are only populated when
     a slot was actually acquired.
+
+    ``denied_by`` (SPEC-11 US4, T031) distinguishes *which* gate denied
+    on a non-grant -- ``"bucket"`` (the token bucket itself denied, the
+    semaphore was never touched) or ``"semaphore"`` (the bucket granted
+    but the concurrency slot was full) -- so the spider can emit the
+    correct one of ``rate_limit.hit``/``semaphore.denied``
+    (`contracts/observability.md`) instead of conflating the two.
+    ``None`` on a grant (meaningless there).
     """
 
     granted: bool
     wait_hint_seconds: float
     semaphore_key: str | None = None
     semaphore_token: str | None = None
+    denied_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +121,9 @@ async def acquire_permission(
         ttl_seconds=ttl_seconds,
     )
     if not bucket_result.granted:
-        return Permission(granted=False, wait_hint_seconds=bucket_result.wait_hint_seconds)
+        return Permission(
+            granted=False, wait_hint_seconds=bucket_result.wait_hint_seconds, denied_by="bucket"
+        )
 
     sem_key = _semaphore_key(workspace_id, domain, access_method)
     key_ttl_seconds = settings.SEMAPHORE_SLOT_TTL_SECONDS + settings.RATE_LIMIT_KEY_TTL_SLACK_SECONDS
@@ -126,7 +137,11 @@ async def acquire_permission(
         key_ttl_seconds=key_ttl_seconds,
     )
     if not slot_granted:
-        return Permission(granted=False, wait_hint_seconds=_SEMAPHORE_DENIAL_WAIT_HINT_SECONDS)
+        return Permission(
+            granted=False,
+            wait_hint_seconds=_SEMAPHORE_DENIAL_WAIT_HINT_SECONDS,
+            denied_by="semaphore",
+        )
 
     return Permission(
         granted=True,

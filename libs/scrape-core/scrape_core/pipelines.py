@@ -93,6 +93,7 @@ from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE, SCRAPE_FINALIZE_JOBS
 
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.items import ScrapeResult
+from scrape_core.observability import log_event
 
 __all__ = ["BatchedPersistencePipeline"]
 
@@ -151,6 +152,16 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     acquired a lock) is skipped — no release attempted. Release errors
     are logged and swallowed inside ``release_match_lock`` itself (D3) —
     never fails the flush.
+
+    SPEC-11 US4 (T032, ``contracts/observability.md``): each release
+    attempt also emits one structured ``dedup.release`` JSON log line
+    (workspace_id, match_id, released) right after ``release_match_lock``
+    returns, so lock releases are observable the same way the spider's
+    rate-limit/lock-collision events are (T031). The ``RATE_LIMITED``/
+    ``LOCKED_ALREADY_RUNNING`` codes reaching this module via
+    ``ScrapeResult.error_code`` already flow through the single
+    ``mark_target`` writer above (T026's broadened gate) — no new
+    persistence path is added here.
     """
     observations: list[PriceObservation] = []
     attempts: list[RequestAttempt] = []
@@ -285,7 +296,19 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     for item in batch:
         if item.match_lock_token is None:
             continue
-        release_match_lock(redis, key=item.match_lock_key, token=item.match_lock_token)
+        released = release_match_lock(redis, key=item.match_lock_key, token=item.match_lock_token)
+        # SPEC-11 US4 (T032, contracts/observability.md): one `dedup.release`
+        # per lock-release attempt -- `released=False` is not itself an
+        # error (a stale/foreign token is a correct no-op, US2 AS3; a
+        # swallowed Redis error inside `release_match_lock` also reports
+        # `False` here, D3), just an observable outcome.
+        log_event(
+            logger,
+            "dedup.release",
+            workspace_id=item.workspace_id,
+            match_id=item.match_id,
+            released=released,
+        )
 
     # Only after the transaction above has committed cleanly -- enqueue one
     # SCRAPE_FINALIZE_JOBS per distinct affected job so finalize_jobs()

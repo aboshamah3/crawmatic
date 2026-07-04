@@ -141,6 +141,7 @@ from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_htt
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
+from scrape_core.observability import log_event
 from scrape_core.reactor import deferred_delay
 from scrape_core.validation import Accepted, Rejected, validate_candidate
 
@@ -883,6 +884,13 @@ class GenericPriceSpider(scrapy.Spider):
         Celery and this returns ``None`` instead of a granted
         :class:`Permission`, signalling the caller to dispatch nothing
         for this target (the Scrapyd slot is freed immediately, SC-003).
+
+        SPEC-11 US4 (T031, `contracts/observability.md`): every denial
+        emits exactly one of ``rate_limit.hit`` (the token bucket itself
+        denied) or ``semaphore.denied`` (the bucket granted but the
+        concurrency slot was full) -- see `Permission.denied_by` -- and
+        every backoff this loop actually takes (i.e. every denial that
+        does *not* immediately overflow) also emits ``rate_limit.requeue``.
         """
         from app_shared.config import get_settings
 
@@ -909,6 +917,28 @@ class GenericPriceSpider(scrapy.Spider):
             if perm.granted:
                 return perm
 
+            # SPEC-11 US4 (T031, contracts/observability.md): distinguish
+            # which gate denied -- `semaphore.denied` (concurrency slot
+            # full) vs `rate_limit.hit` (token bucket denied, the
+            # semaphore was never touched, Permission.denied_by).
+            if perm.denied_by == "semaphore":
+                log_event(
+                    logger,
+                    "semaphore.denied",
+                    workspace_id=self.workspace_id,
+                    domain=target.domain,
+                    access_method=access_method,
+                )
+            else:
+                log_event(
+                    logger,
+                    "rate_limit.hit",
+                    workspace_id=self.workspace_id,
+                    domain=target.domain,
+                    access_method=access_method,
+                    wait_hint=perm.wait_hint_seconds,
+                )
+
             delay = max(perm.wait_hint_seconds, limits.cooldown_seconds) + random.uniform(
                 settings.RATE_LIMIT_JITTER_MIN_SECONDS, settings.RATE_LIMIT_JITTER_MAX_SECONDS
             )
@@ -922,6 +952,14 @@ class GenericPriceSpider(scrapy.Spider):
                 await self._overflow_to_dispatch(target, perm, redis=redis)
                 return None
 
+            log_event(
+                logger,
+                "rate_limit.requeue",
+                workspace_id=self.workspace_id,
+                match_id=target.match_id,
+                requeue_count=state.requeue_count,
+                delay=delay,
+            )
             await deferred_delay(delay)
 
     async def _overflow_to_dispatch(
@@ -970,6 +1008,17 @@ class GenericPriceSpider(scrapy.Spider):
             queue="scrape_dispatch",
             kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(self.workspace_id)},
         )
+        # SPEC-11 US4 (T031, contracts/observability.md): the requeue cap
+        # was exceeded and the target is now DEFERRED + re-dispatched --
+        # emitted after both the mark and the re-dispatch enqueue commit,
+        # mirroring the order the outcomes actually happen in.
+        log_event(
+            logger,
+            "rate_limit.overflow",
+            workspace_id=self.workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=target.match_id,
+        )
 
     async def _dispatch(
         self,
@@ -1017,6 +1066,15 @@ class GenericPriceSpider(scrapy.Spider):
         )
         if lock is None:
             await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+            # SPEC-11 US4 (T031, contracts/observability.md): the match
+            # lock was already held -- this attempt is skipped, no fetch
+            # (dedup.skip -- LOCKED_ALREADY_RUNNING).
+            log_event(
+                logger,
+                "dedup.skip",
+                workspace_id=self.workspace_id,
+                match_id=target.match_id,
+            )
             return self._build_result(
                 target,
                 target.url,
