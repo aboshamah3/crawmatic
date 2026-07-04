@@ -43,3 +43,10 @@ requirements.md (16 items) — all 48 items pass after one remediation.
 Re-ran analyze: all 6 resolved, 0 CRITICAL/0 HIGH. One new MEDIUM surfaced:
 
 - [analyze re-run] C1 (MEDIUM): domain-rule `max_requests_per_minute` stored but not enforced. Remediation (enforce, not defer): domain-rule per-minute overrides the policy per-minute ceiling for that domain; updated FR-011 + T026.
+
+## implement + converge
+
+Implemented in 6 sonnet subagents (one per phase), 39 tasks; committed per phase.
+- [implement] Q: now-required ENCRYPTION_KEYS broke pre-existing Settings-constructing tests → A: added the key to affected env fixtures + updated scope-vocabulary test, per the SPEC-08 precedent (source: repo convention)
+- [implement] Q: request_attempts new table? → A: no — reused SPEC-07's existing partitioned table; US3 = wiring finish only (source: plan D1)
+- [converge] CONVERGED — 0 findings (0 CRITICAL/HIGH/MEDIUM/LOW); tasks.md unchanged. Live-stack verifications deferred (no container engine), authored + skip-clean per SPEC-05→09 pattern.

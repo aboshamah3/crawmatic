@@ -224,7 +224,7 @@
     "10": {
       "title": "Access Policies, Proxies, Request Attempts",
       "feature_directory": "specs/010-access-policies-proxies",
-      "status": "in_progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -233,16 +233,17 @@
         "tasks": "done",
         "analyze": "done",
         "implement": "done",
-        "converge": "pending"
+        "converge": "done"
       },
-      "implement_phases": {
-        "1_setup": "done",
-        "2_foundational": "done",
-        "3_us1": "done",
-        "4_us2": "done",
-        "5_us3": "done",
-        "6_polish": "done"
-      }
+      "deferred_verifications": [
+        "T013 alembic upgrade head + downgrade round-trip (online) for 851220acab90 (3 tables + RLS)",
+        "T020/T021 dual-scope + tenant CRUD live (password redaction, global read-only/immutable, cross-workspace denial, no-context->0 rows)",
+        "T031 real-Redis budget/ceiling/cooldown (monthly rollover, TTL-to-end-of-month, SET NX EX)",
+        "T032 spider proxy-assignment live (DIRECT_THEN_PROXY proxied retry, DIRECT_ONLY never proxies, RATE_LIMITED defer, LIMIT_REACHED, password never logged)",
+        "T035 attempt-logging live (N attempts -> N RequestAttempt rows incl. retries, proxy fields, error_code, correct monthly partition, off-reactor batched, workspace isolation)"
+      ],
+      "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); integration tests authored + skip cleanly. request_attempts reused from SPEC-07 (not rebuilt). Pure engines + DB/Redis/reactor-independent logic exhaustively unit-tested here (1331 unit passed / 201 integration skipped / 0 failed; scoping guard OK; single head 851220acab90). 39 tasks; analyze remediated 1 HIGH + 3 MEDIUM + 3 LOW (0 CRITICAL); converge found no gaps.",
+      "converge_result": "CONVERGED — no remaining work; tasks.md unchanged (no convergence phase appended)"
     }
   }
 }
