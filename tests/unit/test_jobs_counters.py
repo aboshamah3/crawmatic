@@ -240,6 +240,7 @@ def test_refresh_job_counters_writes_counts_in_one_update() -> None:
             "SCRAPYD_USERNAME": "scrapyd",
             "SCRAPYD_PASSWORD": "change-me",
             "JWT_SECRET": "test-jwt-secret",
+            "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
         },
     )
     assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"

@@ -32,6 +32,12 @@ class Scope(StrEnum):
     WEBHOOKS_WRITE = "webhooks:write"
     SCRAPE_PROFILES_READ = "scrape_profiles:read"
     SCRAPE_PROFILES_WRITE = "scrape_profiles:write"
+    PROXY_PROVIDERS_READ = "proxy_providers:read"
+    PROXY_PROVIDERS_WRITE = "proxy_providers:write"
+    ACCESS_POLICIES_READ = "access_policies:read"
+    ACCESS_POLICIES_WRITE = "access_policies:write"
+    DOMAIN_RULES_READ = "domain_rules:read"
+    DOMAIN_RULES_WRITE = "domain_rules:write"
 
 
 def validate_scopes(values: Iterable[str]) -> list[str]:

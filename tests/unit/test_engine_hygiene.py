@@ -162,6 +162,7 @@ _CELERY_HOOK_ENV = {
     "SCRAPYD_USERNAME": "scrapyd",
     "SCRAPYD_PASSWORD": "change-me",
     "JWT_SECRET": "test-jwt-secret",
+    "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
 }
 
 
@@ -215,6 +216,7 @@ def test_get_engine_passes_prepare_threshold_none_connect_arg(
     monkeypatch.setenv("SCRAPYD_USERNAME", "scrapyd")
     monkeypatch.setenv("SCRAPYD_PASSWORD", "change-me")
     monkeypatch.setenv("JWT_SECRET", "test-jwt-secret")
+    monkeypatch.setenv("ENCRYPTION_KEYS", "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=")
 
     from app_shared.config import get_settings
 

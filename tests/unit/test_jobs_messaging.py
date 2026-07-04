@@ -46,6 +46,7 @@ def _reset_producer_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SCRAPYD_USERNAME", "scrapyd")
     monkeypatch.setenv("SCRAPYD_PASSWORD", "pw")
     monkeypatch.setenv("JWT_SECRET", "a" * 32)
+    monkeypatch.setenv("ENCRYPTION_KEYS", "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=")
     # Clear the cached pydantic-settings singleton so the monkeypatched env
     # vars above are actually seen by `get_settings()`.
     messaging_module.get_settings.cache_clear()

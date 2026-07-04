@@ -396,6 +396,44 @@ class AlertEventType(StrEnum):
     UNCHANGED = "UNCHANGED"
 
 
+class AccessStrategy(StrEnum):
+    """Named access strategy of an ``access_policies`` row (SPEC-10 §22, FR-001).
+
+    Consulted by the pure ``app_shared.access.engine`` to decide the next
+    ``AccessMethod`` for a fetch attempt: ``DIRECT_ONLY`` never proxies;
+    ``DIRECT_THEN_PROXY`` retries via proxy after a failed direct attempt;
+    ``PROXY_FIRST``/``RESIDENTIAL_ONLY`` proxy from the first attempt (the
+    latter restricted to ``ProxyType.RESIDENTIAL`` providers);
+    ``BROWSER_FALLBACK`` signals ``PLAYWRIGHT_PROXY`` intent only (SPEC-14
+    executes it).
+    """
+
+    DIRECT_ONLY = "DIRECT_ONLY"
+    DIRECT_THEN_PROXY = "DIRECT_THEN_PROXY"
+    PROXY_FIRST = "PROXY_FIRST"
+    RESIDENTIAL_ONLY = "RESIDENTIAL_ONLY"
+    BROWSER_FALLBACK = "BROWSER_FALLBACK"
+
+
+class ProxyType(StrEnum):
+    """Exit-node class of a ``proxy_providers`` row (SPEC-10 §22, FR-002)."""
+
+    DATACENTER = "DATACENTER"
+    RESIDENTIAL = "RESIDENTIAL"
+    MOBILE = "MOBILE"
+
+
+class ProxyProviderStatus(StrEnum):
+    """Lifecycle status of a ``proxy_providers`` row (SPEC-10 §22, FR-002).
+
+    A ``DISABLED`` provider is excluded from ``assign_proxy`` candidate
+    selection — callers degrade per strategy rather than crash.
+    """
+
+    ACTIVE = "ACTIVE"
+    DISABLED = "DISABLED"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

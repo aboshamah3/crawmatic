@@ -234,6 +234,9 @@
         "analyze": "done",
         "implement": "pending",
         "converge": "pending"
+      },
+      "implement_phases": {
+        "1_setup": "done"
       }
     }
   }

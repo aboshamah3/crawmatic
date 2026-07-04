@@ -28,6 +28,7 @@ REQUIRED_ENV = {
     "SCRAPYD_USERNAME": "scrapyd",
     "SCRAPYD_PASSWORD": "change-me",
     "JWT_SECRET": "test-jwt-secret",
+    "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
 }
 
 
@@ -58,3 +59,56 @@ def test_scrapyd_pools_parse_single_and_multi_url(monkeypatch: pytest.MonkeyPatc
         "http://scrapers-browser-a:6800",
         "http://scrapers-browser-b:6800",
     ]
+
+
+def test_missing_encryption_keys_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ENCRYPTION_KEYS has no default — a misconfigured deployment fails fast (SPEC-10 FR-003)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("ENCRYPTION_KEYS", raising=False)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_encryption_primary_version_absent_from_keyring_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ENCRYPTION_PRIMARY_KEY_VERSION must name a version present in ENCRYPTION_KEYS."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("ENCRYPTION_KEYS", "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=")
+    monkeypatch.setenv("ENCRYPTION_PRIMARY_KEY_VERSION", "2")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_encryption_keyring_parses_multiple_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multi-key ring (rotation scenario) parses and validates the primary version."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(
+        "ENCRYPTION_KEYS",
+        "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=,"
+        "2:9AqozIiy37PMTubfj6a0EmQoJfe_bnGqZ1oGqQGZBjM=",
+    )
+    monkeypatch.setenv("ENCRYPTION_PRIMARY_KEY_VERSION", "2")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ENCRYPTION_KEYS.startswith("1:")
+    assert settings.ENCRYPTION_PRIMARY_KEY_VERSION == 2
+
+
+def test_access_resolution_cache_ttl_defaults_to_30_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACCESS_RESOLUTION_CACHE_TTL_SECONDS defaults to 30 when unset (SPEC-10 FR-007)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("ACCESS_RESOLUTION_CACHE_TTL_SECONDS", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ACCESS_RESOLUTION_CACHE_TTL_SECONDS == 30

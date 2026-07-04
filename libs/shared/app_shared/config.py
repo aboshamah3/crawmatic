@@ -18,7 +18,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -28,6 +28,35 @@ def _split_pool(value: str) -> list[str]:
     Treated as a pool even when it contains a single URL (FR-018).
     """
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_encryption_keys(value: str) -> dict[int, str]:
+    """Parse ``"version:key,version:key"`` into a ``{version: key}`` keyring.
+
+    Per contracts/encryption.md (SPEC-10 FR-003, §33): ``ENCRYPTION_KEYS`` is a
+    comma-separated list of ``version:key`` pairs, ``key`` a urlsafe-base64
+    Fernet key. Raises ``ValueError`` on a malformed pair or a non-integer
+    version so a misconfigured deployment fails fast at ``Settings``
+    construction rather than at first encrypt/decrypt call.
+    """
+    keyring: dict[int, str] = {}
+    for pair in value.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        version_str, sep, key = pair.partition(":")
+        if not sep or not key:
+            raise ValueError(
+                f"malformed ENCRYPTION_KEYS pair {pair!r} (expected 'version:key')"
+            )
+        try:
+            version = int(version_str.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"malformed ENCRYPTION_KEYS version {version_str!r} (expected an integer)"
+            ) from exc
+        keyring[version] = key.strip()
+    return keyring
 
 
 class Settings(BaseSettings):
@@ -124,12 +153,34 @@ class Settings(BaseSettings):
     # name itself is a code constant in ``celery_app.py``, not config. ---
     PRICE_ANALYSIS_DEDUP_TTL_SECONDS: int = 21600
 
+    # --- Secret encryption (SPEC-10 FR-003, §33) ---
+    # Comma-separated "version:key" pairs; key is a urlsafe-base64 Fernet key,
+    # e.g. "1:kZ...=,2:9p...=". Required so a misconfigured deployment fails
+    # fast (never falls back to a default/plaintext key).
+    ENCRYPTION_KEYS: str
+    ENCRYPTION_PRIMARY_KEY_VERSION: int = 1
+
+    # --- Access-policy resolution cache (SPEC-10 FR-010/FR-011, §9/§22) ---
+    # Ceiling/cooldown values are per-policy/per-domain DB columns, not
+    # global settings — only the resolution-cache TTL lives here.
+    ACCESS_RESOLUTION_CACHE_TTL_SECONDS: int = 30
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
         if isinstance(value, str):
             return _split_pool(value)
         return value
+
+    @model_validator(mode="after")
+    def _validate_encryption_keyring(self) -> "Settings":
+        keyring = _parse_encryption_keys(self.ENCRYPTION_KEYS)
+        if self.ENCRYPTION_PRIMARY_KEY_VERSION not in keyring:
+            raise ValueError(
+                "ENCRYPTION_PRIMARY_KEY_VERSION "
+                f"{self.ENCRYPTION_PRIMARY_KEY_VERSION} not present in ENCRYPTION_KEYS"
+            )
+        return self
 
 
 @lru_cache

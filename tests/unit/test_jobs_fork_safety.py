@@ -103,6 +103,7 @@ _JOBS_FORK_SAFETY_ENV = {
     "SCRAPYD_USERNAME": "scrapyd",
     "SCRAPYD_PASSWORD": "change-me",
     "JWT_SECRET": "test-jwt-secret",
+    "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
 }
 
 

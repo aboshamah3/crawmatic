@@ -27,12 +27,34 @@ FULL_VOCABULARY = {
     "webhooks:write",
     "scrape_profiles:read",
     "scrape_profiles:write",
+    "proxy_providers:read",
+    "proxy_providers:write",
+    "access_policies:read",
+    "access_policies:write",
+    "domain_rules:read",
+    "domain_rules:write",
 }
 
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 17
+    assert len(FULL_VOCABULARY) == 23
+
+
+def test_access_policy_scopes_are_in_the_vocabulary() -> None:
+    """SPEC-10 T003 (FR-001/FR-002/FR-004): the six new access-control scopes
+    (`proxy_providers:*`/`access_policies:*`/`domain_rules:*`) mint alongside
+    the pre-existing vocabulary for the SPEC-10 CRUD routers."""
+    assert Scope("proxy_providers:read") == Scope.PROXY_PROVIDERS_READ
+    assert Scope("proxy_providers:write") == Scope.PROXY_PROVIDERS_WRITE
+    assert Scope("access_policies:read") == Scope.ACCESS_POLICIES_READ
+    assert Scope("access_policies:write") == Scope.ACCESS_POLICIES_WRITE
+    assert Scope("domain_rules:read") == Scope.DOMAIN_RULES_READ
+    assert Scope("domain_rules:write") == Scope.DOMAIN_RULES_WRITE
+    assert validate_scopes(["proxy_providers:read", "domain_rules:write"]) == [
+        "proxy_providers:read",
+        "domain_rules:write",
+    ]
 
 
 def test_jobs_write_scope_is_in_the_vocabulary() -> None:

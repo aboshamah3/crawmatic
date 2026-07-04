@@ -314,6 +314,7 @@ _STALL_RECOVERY_ENV = {
     "SCRAPYD_PASSWORD": "change-me",
     "JWT_SECRET": "test-jwt-secret",
     "SCRAPE_STALL_TIMEOUT_SECONDS": "900",
+    "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
 }
 
 
