@@ -250,7 +250,8 @@
       "feature_directory": "specs/011-rate-limiting-inflight-locks",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     }
   }

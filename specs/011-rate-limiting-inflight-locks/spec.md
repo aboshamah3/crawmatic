@@ -8,6 +8,18 @@
 
 **Input**: User description: "SPEC-11 — Distributed Rate Limiting & In-Flight Locks. Prevent domain blocking and duplicate work before large-scale real scraping."
 
+## Clarifications
+
+### Session 2026-07-04
+
+All items resolved doc-first from `PROJECT_SPEC.md` and the existing codebase (no user prompts required).
+
+- Q: Which limiter algorithm — token bucket or sliding window? → A: Atomic token bucket evaluated in a Lua script (doc §12 "e.g. a Lua token-bucket script"). Refill/window driven by the per-minute limit.
+- Q: Where do per-domain rate and concurrency limit *values* come from — new config, or existing tables? → A: Reuse existing config. `DomainAccessRule` (SPEC-10) already carries `max_requests_per_minute`, `max_concurrent_requests`, `cooldown_seconds` and overrides `AccessPolicy`'s `max_requests_per_minute/hour/day`. SPEC-11 *reads* these; it adds **no** new rate-config columns. Domain rule overrides workspace/competitor policy defaults.
+- Q: How is an overflowed (requeue-cap-exceeded) target represented? → A: A new `ScrapeTargetStatus.DEFERRED` member (enum renders as VARCHAR, so no DB enum migration). The spider marks the target `DEFERRED` and overflows it back to Celery `scrape_dispatch` for re-dispatch in a later batch. `PENDING`/`STARTED`/`SKIPPED`/`COMPLETED`/`FAILED` keep their existing meaning.
+- Q: How does the system behave if Redis (the shared coordination store) is unreachable? → A: Fail safe — treat acquisition as not-permitted and back off / defer; never fetch uncontrolled (grounded in Constitution "Disciplined Scraping Runtime" NON-NEGOTIABLE). Captured as FR-023.
+- Q: Are the structured error codes and the `unique(scrape_job_id, match_id)` constraint new? → A: No. `RATE_LIMITED` and `LOCKED_ALREADY_RUNNING` already exist in the error-code enum, and `unique(scrape_job_id, match_id)` already exists on `scrape_job_targets` (SPEC-08). SPEC-11 reuses/verifies them rather than creating them (FR-015 is a verification, not new schema).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The actors are the **platform operator** who triggers large scraping jobs, the **competitor domains** whose politeness limits must never be exceeded, and the **scraping runtime** (spiders running inside Scrapyd, orchestrated by Celery workers) that must coordinate across many concurrent processes through shared state.
@@ -102,7 +114,7 @@ When work is rate-limited or skipped due to an in-flight lock, the reason is rec
 - **FR-005**: All limiter and semaphore keys MUST carry a TTL so that a crashed process never causes a permanent deadlock or a stuck slot.
 - **FR-006**: When permission is denied, the limiter MUST return a wait hint, and the caller MUST reschedule the request after `wait_hint + bounded random jitter` (e.g. 2–20s) rather than retrying immediately.
 - **FR-007**: Limiter acquisition MUST be non-blocking on the reactor: it MUST NOT call `time.sleep` or perform a synchronous blocking store call on the reactor thread (use async or `deferToThread`).
-- **FR-008**: Limits (rate, window, concurrency) MUST be configuration-driven with sane defaults, consistent with the project's DB-driven / access-policy configuration.
+- **FR-008**: Limits (rate, window, concurrency, cooldown) MUST be read from existing DB configuration — `DomainAccessRule.max_requests_per_minute` / `max_concurrent_requests` / `cooldown_seconds` as the domain-level override, falling back to the resolved `AccessPolicy.max_requests_per_minute/hour/day`. SPEC-11 adds no new rate-config columns. When no rule/policy value is present, a safe built-in default applies.
 - **FR-009**: Rate limiting MUST be enforced independently per workspace (no cross-workspace interference), honoring workspace isolation.
 
 **In-flight match locking (US2)**
@@ -112,13 +124,13 @@ When work is rate-limited or skipped due to an in-flight lock, the reason is rec
 - **FR-012**: The lock value MUST be a unique fencing token; release MUST be a compare-and-delete (atomic) that deletes the key only if the stored token matches the releaser's token.
 - **FR-013**: The match lock MUST carry a TTL sized to comfortably exceed the worst-case in-spider wait (rate-limit backoff + requeue cap), with a longer TTL for browser scrapes than HTTP scrapes (e.g. HTTP ~10 min, browser ~30 min as guidance).
 - **FR-014**: When the lock is already held, the target MUST be skipped and marked `SKIPPED` with reason `LOCKED_ALREADY_RUNNING` (or requeued for a later attempt); no duplicate fetch may occur.
-- **FR-015**: The `scrape_job_targets` table MUST enforce `unique(scrape_job_id, match_id)` so duplicate targets within a single high-level job are prevented at insert time.
+- **FR-015**: The `scrape_job_targets` table MUST enforce `unique(scrape_job_id, match_id)` so duplicate targets within a single high-level job are prevented at insert time. (This constraint already exists from SPEC-08; SPEC-11 verifies and relies on it rather than adding it.)
 - **FR-016**: Downstream price-analysis MUST NOT depend on the scrape lock (it runs after release and is idempotent per variant).
 
 **Requeue cap & overflow (US3)**
 
 - **FR-017**: In-spider rescheduling MUST be bounded by both a maximum requeue count and a maximum cumulative in-spider wait per request.
-- **FR-018**: When either cap is exceeded, the request MUST NOT continue to be parked in the spider; its target MUST be marked deferred and handed back to Celery `scrape_dispatch` for re-dispatch in a later batch.
+- **FR-018**: When either cap is exceeded, the request MUST NOT continue to be parked in the spider; its target MUST be marked `DEFERRED` (a new `ScrapeTargetStatus` member) and handed back to Celery `scrape_dispatch` for re-dispatch in a later batch.
 - **FR-019**: A re-dispatched (overflowed) target MUST re-enter the normal path and again be subject to lock + limiter checks, ensuring no double-run.
 
 **Observability & error codes (US4)**
