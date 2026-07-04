@@ -237,7 +237,8 @@
       },
       "implement_phases": {
         "1_setup": "done",
-        "2_foundational": "done"
+        "2_foundational": "done",
+        "3_us1": "done"
       }
     }
   }

@@ -59,6 +59,15 @@ filterable reads over `variant_alert_states`/`price_alert_events`, on
 the same auth seam and FR-020 discipline, gated by the existing
 `alerts:read` scope (no new scope; `/v1/variants/{id}/price-comparison`,
 US1, already uses it). Never imports `apps/workers`.
+
+SPEC-10 US1 adds the `/v1/proxy-providers` and `/v1/access-policies`
+routers (both dual-scope: own + global read, own-only write, mirroring
+`/v1/scrape-profiles`) and the `/v1/domain-access-rules` router
+(tenant-only, mirroring `/v1/competitors`) — `contracts/api-access.md` —
+on the same auth seam and FR-020 discipline, gated by the new
+`proxy_providers:read/write`, `access_policies:read/write`, and
+`domain_rules:read/write` scopes. Proxy passwords are encrypted at rest
+and never returned in plaintext (`has_password` only, SC-003).
 """
 
 from __future__ import annotations
@@ -66,14 +75,17 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.routers import (
+    access_policies,
     alerts,
     api_keys,
     auth,
     competitors,
+    domain_access_rules,
     jobs,
     matches,
     product_groups,
     products,
+    proxy_providers,
     scrape_profiles,
     variants,
 )
@@ -90,6 +102,9 @@ app.include_router(matches.router)
 app.include_router(scrape_profiles.router)
 app.include_router(jobs.router)
 app.include_router(alerts.router)
+app.include_router(proxy_providers.router)
+app.include_router(access_policies.router)
+app.include_router(domain_access_rules.router)
 
 
 @app.get("/health")
