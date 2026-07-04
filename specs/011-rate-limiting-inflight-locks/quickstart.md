@@ -76,3 +76,36 @@ uv run pytest -q            # full suite (integration cases SKIP without infra)
 | 6 | SC-001 + FR-023 (never fetch uncontrolled) |
 | 7 | SC-005 (reactor never blocked) + FR-015 |
 | 4, 5 | SC-006 (100% events carry a structured code) |
+
+## Validation (T037, executed 2026-07-04, no live infra in this build env)
+
+Ran `uv sync --all-packages`, `uv run pytest -q` (full suite) and
+`uvx ruff check libs/shared/app_shared/limiter libs/scrape-core/scrape_core
+apps/scrapers apps/workers` (project `ruff` isn't installed as a synced
+dependency in this environment; `uvx ruff` runs the same tool ephemerally).
+Result: **1369 passed, 208 skipped, 0 failed**; ruff clean. Every scenario
+below is confirmed against an actually-passing unit test or a
+skip-clean integration test — nothing was faked.
+
+| Scenario | SC | Status | Evidence |
+|---|---|---|---|
+| 1 — per-domain rate limit holds across N acquirers | SC-001 | **PASS (unit)** | `tests/unit/test_rate_limiter.py::test_bucket_bounds_grants`, `::test_wait_hint_positive_on_denial`, `::test_workspace_namespacing` |
+| 2 — concurrency semaphore + crash reclaim | SC-004 | **PASS (unit)** | `tests/unit/test_rate_limiter.py::test_semaphore_cap`, `::test_semaphore_ttl_reclaim` |
+| 3 — match lock: exactly one owner, fencing release | SC-002 | **PASS (unit)** | `tests/unit/test_match_lock.py::test_single_owner`, `::test_fencing_compare_and_delete`, `::test_reacquire_after_release` |
+| 4 — denied request backs off, then overflows | SC-003 | **DEFERRED (live infra)** — skip-clean confirmed | `tests/integration/test_spider_overflow.py` (1 test) SKIPs cleanly without Redis/Scrapyd; the pure-logic half is covered by `tests/unit/test_overflow_expansion.py` (unit, passing) |
+| 5 — lock collision → SKIPPED / LOCKED_ALREADY_RUNNING | SC-002 | **DEFERRED (live infra)** — skip-clean confirmed | `tests/integration/test_spider_lock_collision.py` (1 test) SKIPs cleanly without Redis/Scrapyd |
+| 6 — Redis unreachable ⇒ fail-closed | SC-001 + FR-023 | **PASS (unit)** | `tests/unit/test_rate_limiter.py::test_fail_closed_on_redis_error`, `tests/unit/test_match_lock.py::test_fail_closed_on_redis_error` |
+| 7a — reactor never blocked (grep) | SC-005 | **PASS (unit, static)** | `tests/unit/test_reactor_safety_grep.py` (new, T033) — 5/5 pass; zero `time.sleep`/sync-redis calls outside the `run_in_thread`/`deferToThread` boundary in the spider + `scrape_core.{limiter,pipelines,reactor}`, and `apps/workers/app/workers/tasks_analysis.py` carries no scrape-lock symbol (FR-016) |
+| 7b — `uq_scrape_job_targets_scrape_job_id_match_id` exists | FR-015 | **DEFERRED (live infra)** — skip-clean confirmed | `tests/integration/test_target_unique_constraint.py` (2 tests) SKIP cleanly without Postgres |
+| 4, 5 — structured codes (RATE_LIMITED / LOCKED_ALREADY_RUNNING) | SC-006 | **PASS (unit) + DEFERRED (live infra)** | Log/counter shape: `tests/unit/test_observability_logs.py` (passing, no infra). End-to-end persisted-code assertion: `tests/integration/test_observability_codes.py` (3 tests) SKIP cleanly without Redis/Postgres |
+
+**Deferred live-verification list** (matches the SPEC-07..10 convention —
+no Docker daemon in this build env, so these SKIP rather than fake success;
+re-run once a live Redis + Postgres + Scrapyd stack is available):
+
+- `tests/integration/test_spider_lock_collision.py`
+- `tests/integration/test_target_unique_constraint.py`
+- `tests/integration/test_spider_overflow.py`
+- `tests/integration/test_observability_codes.py`
+
+All 7 skip cleanly today (`7 skipped in 0.21s`, 0 failed) when run in isolation.

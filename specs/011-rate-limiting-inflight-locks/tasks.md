@@ -150,11 +150,11 @@ description: "Task list for SPEC-11 — Distributed Rate Limiting & In-Flight Lo
 
 **Purpose**: Reactor-safety proof, lint, and full validation.
 
-- [ ] T033 [P] Reactor-safety grep test `tests/unit/test_reactor_safety_grep.py`: assert ZERO `time.sleep` and ZERO synchronous `redis`/`EVAL` calls outside a `run_in_thread`/`deferToThread` boundary anywhere in `apps/scrapers/price_monitor/spiders/generic_price_spider.py` and `libs/scrape-core/scrape_core/{limiter,pipelines,reactor}.py` (SC-005, FR-007) — runs without infra. Also assert (FR-016 negative check, analyze C1) that `apps/workers/app/workers/tasks_analysis.py` references NO scrape-lock symbol (`lock:scrape`, `acquire_match_lock`, `release_match_lock`) — price_analysis runs after lock release and must not depend on the scrape lock.
-- [ ] T034 [P] Add re-exports to `libs/shared/app_shared/limiter/__init__.py` (keys, limits, bucket, locks public API) and confirm `app_shared` imports NO Scrapy/Twisted/FastAPI/`apps.*` (Constitution I).
-- [ ] T035 Run `uv run ruff check libs/shared/app_shared/limiter libs/scrape-core/scrape_core apps/scrapers apps/workers` and fix findings.
-- [ ] T036 Run the full suite `uv run pytest -q` from repo root: confirm all unit tests PASS and every infra-dependent integration test SKIPS cleanly (no failures, no fakes) — record the skip list in the feature state per SPEC-07..10 convention.
-- [ ] T037 Execute the quickstart.md validation walkthrough (Scenarios 1–7) and confirm the mapping to SC-001..SC-006 holds.
+- [X] T033 [P] Reactor-safety grep test `tests/unit/test_reactor_safety_grep.py`: assert ZERO `time.sleep` and ZERO synchronous `redis`/`EVAL` calls outside a `run_in_thread`/`deferToThread` boundary anywhere in `apps/scrapers/price_monitor/spiders/generic_price_spider.py` and `libs/scrape-core/scrape_core/{limiter,pipelines,reactor}.py` (SC-005, FR-007) — runs without infra. Also assert (FR-016 negative check, analyze C1) that `apps/workers/app/workers/tasks_analysis.py` references NO scrape-lock symbol (`lock:scrape`, `acquire_match_lock`, `release_match_lock`) — price_analysis runs after lock release and must not depend on the scrape lock.
+- [X] T034 [P] Add re-exports to `libs/shared/app_shared/limiter/__init__.py` (keys, limits, bucket, locks public API) and confirm `app_shared` imports NO Scrapy/Twisted/FastAPI/`apps.*` (Constitution I).
+- [X] T035 Run `uv run ruff check libs/shared/app_shared/limiter libs/scrape-core/scrape_core apps/scrapers apps/workers` and fix findings.
+- [X] T036 Run the full suite `uv run pytest -q` from repo root: confirm all unit tests PASS and every infra-dependent integration test SKIPS cleanly (no failures, no fakes) — record the skip list in the feature state per SPEC-07..10 convention.
+- [X] T037 Execute the quickstart.md validation walkthrough (Scenarios 1–7) and confirm the mapping to SC-001..SC-006 holds.
 
 ---
 
