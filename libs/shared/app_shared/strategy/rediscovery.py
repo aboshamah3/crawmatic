@@ -29,12 +29,12 @@ the hot path from `request_attempts`/`price_observations`, never a widened
 `stats_buffer.py` recorder (which stays success/failure/rt/confidence/URL
 only, FR-022).
 
-## §18 bounds re-check without a `scrape_core` import
+## §18 bounds re-check without a scrape-core import
 
 Condition 7 ("price values become unrealistic", FR-020b) reuses the same
-`app_shared.money.parse_money` boundary primitive
-`scrape_core.validation.validate_candidate`'s bounds step (step 4) is
-built on, but does **not** import `scrape_core` itself:
+`app_shared.money.parse_money` boundary primitive that the scrape-core
+validation layer's bounds step (step 4) is built on, but does **not**
+import the scrape-core package itself:
 `libs/scrape-core/pyproject.toml` declares "app_shared must never depend
 on this package" (scrape-core depends on app_shared, not the reverse) —
 importing it here would be a circular/layering violation. `_price_fails_bounds`
@@ -326,9 +326,9 @@ def evaluate_rediscovery(
 def _price_fails_bounds(price: Decimal, validation_rules: dict | None) -> bool:
     """Re-check `price` against the configured `min_price`/`max_price`
     §18 bounds (FR-020b "unrealistic" rule) — the same `parse_money`
-    boundary primitive and comparison `scrape_core.validation
-    .validate_candidate`'s bounds step (step 4) uses, duplicated locally
-    (module docstring "§18 bounds re-check without a scrape_core import").
+    boundary primitive and comparison the scrape-core validation layer's
+    bounds step (step 4) uses, duplicated locally
+    (module docstring "§18 bounds re-check without a scrape-core import").
     `False` (never "unrealistic") when no bounds are configured — without
     a configured bound, "unrealistic" can't be judged (a permissive
     default, not a false trigger)."""
@@ -368,7 +368,7 @@ def build_recent_signals(
     every per-attempt-outcome condition to), most-recent first. Each
     attempt is paired (`request_attempts.created_at ==
     price_observations.scraped_at`, same `match_id`/`workspace_id` — the
-    exact correlation `scrape_core.pipelines._flush_batch` writes both
+    exact correlation the scrape-core pipeline's `_flush_batch` writes both
     rows under, one `moment` per item) with its `price_observations` row
     for price/currency/confidence, and with the match's
     `scrape_profiles.validation_rules` (via `competitor_product_matches
