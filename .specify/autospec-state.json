@@ -271,7 +271,7 @@
     "12": {
       "title": "Domain Strategy Optimizer",
       "feature_directory": "specs/012-domain-strategy-optimizer",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -279,8 +279,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T018 promotion apply live (guarded ACTIVE transition, no double-promote)",
+        "T023 consumption seam live (learned start seeds attempt 1; unseen key auto-enqueues discovery)",
+        "T025 discovery run live (probe ladder -> winner -> seed; 422 sample bounds)",
+        "T033 flush+promote live (single count=count+delta UPSERT per key; inline promotion)",
+        "T043 RLS isolation live (no-context 0 rows incl. transitive stats policy; cross-workspace denied)"
+      ],
+      "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 5 integration test files authored + skip cleanly. DB/Redis/reactor-independent logic exhaustively unit-tested (full suite 1490 passed / 221 skipped / 0 failed; ruff clean; reactor-safety + import-boundary + single-head + scoping guards green). Reuses SPEC-05 url_pattern derivation/version, existing AccessMethod/ExtractionMethod enums, SPEC-07 spider attempt path/off-reactor _flush_batch, SPEC-10 Redis atomic-counter pattern. Single head f30c60cfa2f7. analyze remediated 1 HIGH (F1 two-source rediscovery signal model, no hot-path schema widening) + 2 MEDIUM (F2 PLAYWRIGHT_PROXY skipped in discovery, F3 unrealistic/template-change detection defined) + 3 LOW; re-run 0 CRITICAL/HIGH/MEDIUM. 45 tasks.",
+      "converge_result": "CONVERGED \u2014 no remaining work; tasks.md unchanged (no convergence phase appended)"
     }
   }
 }

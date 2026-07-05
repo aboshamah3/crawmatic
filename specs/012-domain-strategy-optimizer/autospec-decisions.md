@@ -92,3 +92,11 @@ f30c60cfa2f7; scoping guard OK; ruff clean; reactor-safety + import-boundary tes
   by skip-clean integration tests; unit-level SC-001..SC-007 logic (promotion, resolution, rediscovery
   8-condition, buffered-stats no-hot-row, RLS DDL) is exhaustively unit-tested and green.
 - No `after_*` hooks fired at any implement step (none registered/enabled).
+
+## converge
+
+CONVERGED — opus subagent assessed FR-001..FR-028 (+FR-020a/020b), SC-001..SC-007, US1–US5
+acceptance scenarios, and edge cases against the built code: 0 missing / 0 partial / 0
+contradicts / 0 unrequested; 0 CRITICAL/HIGH/MEDIUM/LOW. All 45 tasks genuinely built (not just
+marked). tasks.md left byte-for-byte unchanged (append-only contract; no gaps to append). No
+before/after_converge hooks registered. Ready for review/PR.
