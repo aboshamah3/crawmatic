@@ -273,7 +273,8 @@
       "feature_directory": "specs/012-domain-strategy-optimizer",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     }
   }

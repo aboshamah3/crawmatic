@@ -8,6 +8,32 @@
 
 **Input**: User description: SPEC-12 — Domain Strategy Optimizer (roadmap §35.12; detail §14, §15; data models §22)
 
+## Clarifications
+
+### Session 2026-07-05
+
+All three items below were resolved doc-first (autospec) from the master spec; none required
+a user decision.
+
+- Q: Where does the per-attempt learning signal come from — a separate discovery double-fetch,
+  or the existing scrape pipeline? → A: The existing SPEC-07 spider per-attempt path
+  (`request_attempts`) reports each attempt's `(method_type, method_name, outcome, price,
+  currency, confidence, response_time)` into the buffered stats; no separate production
+  double-fetch. Discovery mode is the only path that actively probes multiple methods, and
+  only on a 3–10 URL sample. (source: doc §14 Atomic stats + SPEC-07 reuse)
+- Q: Over what window is the rediscovery "success rate < 80%" and "3 consecutive failures"
+  evaluated? → A: "3 consecutive failures" is tracked via the profile's `recent_failure_count`
+  (incremented on failure of the preferred method, reset to 0 on a qualifying success);
+  "success rate < 80%" is read from the per-method cumulative `strategy_attempt_stats.success_rate`
+  combined with pending buffered deltas. (source: doc §22 fields `recent_failure_count`,
+  `success_rate` + §14 flushed-DB-plus-pending-deltas rule)
+- Q: How is discovery triggered — automatically, by an operator, or both? → A: Both. A new
+  `(workspace, competitor, domain, url_pattern)` with no profile is created in
+  `DISCOVERY_REQUIRED` and enqueues discovery on the `strategy_discovery` queue; an operator
+  may also trigger a discovery run explicitly. Both converge on one discovery-run + profile-seed
+  code path. (source: doc §14 "when a new competitor/domain pattern is added" + §26
+  `strategy_discovery` queue)
+
 ## User Scenarios & Testing *(mandatory)*
 
 The "actors" here are the scraping runtime (which records attempt outcomes and asks for a
@@ -232,7 +258,8 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
 - **FR-009**: System MUST record per-method attempt statistics keyed uniquely by
   `(domain_strategy_profile_id, method_type, method_name)`, tracking attempt/success/failure
   counts, success rate, and optional average response time, average confidence, and last
-  success/failure timestamps.
+  success/failure timestamps. The raw per-attempt signal is sourced from the existing SPEC-07
+  spider attempt path (no separate production double-fetch).
 - **FR-010**: System MUST promote a method to the profile's preferred method only after 3
   successful extractions across at least 3 different URLs of the same domain+pattern, each
   with confidence ≥ the configured threshold (default 0.85), a valid numeric price, and a
@@ -256,7 +283,10 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
 
 - **FR-016**: System MUST support a discovery run over 3–10 sample matched URLs for a
   `(workspace, competitor, domain, url_pattern)` that tests candidate access methods then
-  extraction methods and identifies the winning combination.
+  extraction methods and identifies the winning combination. Discovery MUST be triggerable
+  both automatically (a new key with no profile is created `DISCOVERY_REQUIRED` and enqueues a
+  discovery run) and by explicit operator request; both paths use one discovery-run +
+  profile-seed code path.
 - **FR-017**: System MUST persist each discovery run (`strategy_discovery_runs`) with
   `sample_size`, `status`, and, on completion, `winning_access_method` /
   `winning_extraction_method` and `completed_at`.
@@ -268,9 +298,12 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
 #### Rediscovery
 
 - **FR-020**: System MUST trigger rediscovery (and mark the profile `DEGRADED`) when any of:
-  3 consecutive failures for the preferred method; success rate below 80%; selector returns
-  empty repeatedly; price confidence below 0.75 repeatedly; repeated 403/429; currency
-  disappears; price values become unrealistic; template appears changed.
+  3 consecutive failures for the preferred method (tracked via `recent_failure_count`,
+  incremented on preferred-method failure and reset to 0 on a qualifying success); per-method
+  cumulative success rate below 80% (read from `strategy_attempt_stats.success_rate` plus
+  pending buffered deltas); selector returns empty repeatedly; price confidence below 0.75
+  repeatedly; repeated 403/429; currency disappears; price values become unrealistic; template
+  appears changed.
 - **FR-021**: System MUST support a periodic light re-check that evaluates active profiles for
   degradation and enqueues rediscovery without requiring a full failed batch.
 
