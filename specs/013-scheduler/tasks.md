@@ -375,3 +375,26 @@ the T006 model file), then US3 hardening once US2's pass lands.
   (T019), per-rule error isolation (T024), RLS from the first migration (T008), scraping-free path
   (T001/T027).
 - Commit after each task or logical group; stop at any checkpoint to validate a story independently.
+
+---
+
+## Phase 7: Convergence
+
+**Purpose**: Close the gap found by `/speckit-converge` between the spec/plan/contracts and the
+current code. Append-only; complete via `/speckit-implement`.
+
+- [X] T031 **CRITICAL** Register the two refresh-rule API-key scopes in the capability vocabulary
+  `libs/shared/app_shared/security/scopes.py`: add `REFRESH_RULES_READ = "refresh_rules:read"` and
+  `REFRESH_RULES_WRITE = "refresh_rules:write"` to the `Scope` StrEnum. The `/v1/refresh-rules`
+  router (`apps/api/app/routers/refresh_rules.py`) already gates every endpoint on these exact
+  strings via `require_scopes("refresh_rules:read"/"refresh_rules:write")`, but they are absent
+  from the `Scope` enum, so `validate_scopes()` (called by `apps/api/app/routers/api_keys.py:73`
+  on API-key creation) rejects them with `422` — meaning no operator can ever be granted them and
+  the entire refresh-rules CRUD surface is unreachable in production (the live test
+  `tests/integration/test_refresh_rules_crud_live.py` masks this by inserting an `ApiKey` ORM row
+  directly, bypassing `validate_scopes`). Then update the pinned vocabulary unit test
+  `tests/unit/test_scopes.py`: add both strings to `FULL_VOCABULARY`, bump the `len(...) == 23`
+  assertion to `25`, and (mirroring `test_jobs_write_scope_is_in_the_vocabulary`) add a small
+  assertion that `Scope("refresh_rules:read")`/`Scope("refresh_rules:write")` resolve and
+  `validate_scopes([...])` round-trips them. Keep `uv run pytest tests/unit -q` green and the
+  workspace-scoping guard OK. per FR-004 / US1 / contract refresh-rules-api §Scopes (missing)

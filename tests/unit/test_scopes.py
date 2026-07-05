@@ -33,12 +33,14 @@ FULL_VOCABULARY = {
     "access_policies:write",
     "domain_rules:read",
     "domain_rules:write",
+    "refresh_rules:read",
+    "refresh_rules:write",
 }
 
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 23
+    assert len(FULL_VOCABULARY) == 25
 
 
 def test_access_policy_scopes_are_in_the_vocabulary() -> None:
@@ -54,6 +56,19 @@ def test_access_policy_scopes_are_in_the_vocabulary() -> None:
     assert validate_scopes(["proxy_providers:read", "domain_rules:write"]) == [
         "proxy_providers:read",
         "domain_rules:write",
+    ]
+
+
+def test_refresh_rules_scopes_are_in_the_vocabulary() -> None:
+    """SPEC-13 T031 (FR-004/US1): the two `refresh_rules:*` scopes are minted
+    alongside the pre-existing vocabulary for the `/v1/refresh-rules` CRUD
+    router, which already gates every endpoint on these exact strings via
+    `require_scopes(...)`."""
+    assert Scope("refresh_rules:read") == Scope.REFRESH_RULES_READ
+    assert Scope("refresh_rules:write") == Scope.REFRESH_RULES_WRITE
+    assert validate_scopes(["refresh_rules:read", "refresh_rules:write"]) == [
+        "refresh_rules:read",
+        "refresh_rules:write",
     ]
 
 

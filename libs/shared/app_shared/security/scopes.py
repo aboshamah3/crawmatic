@@ -38,6 +38,8 @@ class Scope(StrEnum):
     ACCESS_POLICIES_WRITE = "access_policies:write"
     DOMAIN_RULES_READ = "domain_rules:read"
     DOMAIN_RULES_WRITE = "domain_rules:write"
+    REFRESH_RULES_READ = "refresh_rules:read"
+    REFRESH_RULES_WRITE = "refresh_rules:write"
 
 
 def validate_scopes(values: Iterable[str]) -> list[str]:
