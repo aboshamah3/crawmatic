@@ -5,7 +5,8 @@
       "feature_directory": "specs/013-scheduler",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     },
     "00": {

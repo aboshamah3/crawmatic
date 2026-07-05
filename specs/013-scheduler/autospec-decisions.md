@@ -25,3 +25,15 @@ Auto-answered questions during the pipeline (doc-first per the autospec skill). 
 - [specify] Q: Global pass lock allowed? → A: no global `lock:scheduler:refresh-rules`/advisory
   pass lock (negates SKIP LOCKED); per-rule `pg_advisory_xact_lock` permissible belt-and-braces
   (source: doc §28 explicit). Captured as FR-009.
+
+## clarify
+
+- [clarify] Outcome: no critical ambiguities worth a formal (blocking) clarification. Spec is
+  derived directly from the authoritative master doc (§22/§25/§28/§32), which resolves every
+  material decision. No user questions asked.
+- [clarify] Q: Scheduler poll/tick interval? → A: deferred to plan (source: doc silent;
+  low-impact operational knob with an obvious default, does not change architecture or acceptance
+  tests). Plan will pick a default (reuse a Settings cadence knob rather than hardcode).
+- [clarify] Q: Uniqueness of a refresh rule per (scope, target)? → A: not constrained; multiple
+  rules for the same scope/target allowed (source: default — doc §22 lists no unique constraint;
+  operators may legitimately want two cadences on one scope). No spec change needed.
