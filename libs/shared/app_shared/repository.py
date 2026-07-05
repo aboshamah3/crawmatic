@@ -31,6 +31,7 @@ from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, Variant
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
@@ -78,6 +79,8 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         # precedent, applied to a no-workspace-column table).
         DomainStrategyProfile,
         StrategyDiscoveryRun,
+        # SPEC-13: RefreshRule is workspace-owned (tenant-only, WorkspaceScopedBase).
+        RefreshRule,
     }
 )
 

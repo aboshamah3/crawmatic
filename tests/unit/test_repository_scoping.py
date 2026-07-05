@@ -19,6 +19,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
@@ -39,7 +40,8 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
     # are dual-scope and deliberately excluded); SPEC-12 (T008) widens it
     # once more with DomainStrategyProfile/StrategyDiscoveryRun
     # (StrategyAttemptStats has no workspace_id and is deliberately excluded
-    # — read only via its scoped parent profile) — updated here alongside
+    # — read only via its scoped parent profile); SPEC-13 (T007) widens it
+    # once more with RefreshRule (tenant-only) — updated here alongside
     # app_shared.repository so the suite stays in sync with the runtime
     # set.
     assert WORKSPACE_OWNED_MODELS == frozenset(
@@ -63,6 +65,7 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             DomainAccessRule,
             DomainStrategyProfile,
             StrategyDiscoveryRun,
+            RefreshRule,
         }
     )
 

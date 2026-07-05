@@ -105,6 +105,12 @@ from app_shared.models.strategy import (
     StrategyDiscoveryRun,
 )
 
+# The SPEC-13 RefreshRule model — re-exported so `Base.metadata` sees the
+# table for Alembic autogenerate/offline-render (target_metadata), and so
+# callers can `from app_shared.models import RefreshRule`. Workspace-owned:
+# registered in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.refresh_rules import RefreshRule
+
 __all__ = [
     "Base",
     "metadata",
@@ -140,4 +146,5 @@ __all__ = [
     "DomainStrategyProfile",
     "StrategyAttemptStats",
     "StrategyDiscoveryRun",
+    "RefreshRule",
 ]

@@ -84,7 +84,7 @@ in workspace A are invisible/unaddressable to workspace B. Negatives: neither/bo
 
 ### Implementation for User Story 1
 
-- [ ] T006 [P] [US1] Create the `RefreshRule` model in
+- [X] T006 [P] [US1] Create the `RefreshRule` model in
   `libs/shared/app_shared/models/refresh_rules.py`:
   `class RefreshRule(Base, WorkspaceScopedBase, TimestampMixin)` — UUIDv7 pk, `workspace_id`,
   `name`, `scope` (`enum_column(ScrapeScope)`→`String(32)`), nullable `product_id`/
@@ -96,11 +96,11 @@ in workspace A are invisible/unaddressable to workspace B. Negatives: neither/bo
   CHECK `ck_refresh_rules_interval_minutes_positive`; CHECK `ck_refresh_rules_scope_target`
   (per-scope target-id matrix); partial index `ix_refresh_rules_due` on `(next_run_at) WHERE enabled`.
   Follow the `ScrapeJob`/`Competitor` pattern + `NAMING_CONVENTION`. (data-model.md; FR-001/002/003/018/020; research R6/R7)
-- [ ] T007 [P] [US1] Register the model: add `from app_shared.models.refresh_rules import RefreshRule`
+- [X] T007 [P] [US1] Register the model: add `from app_shared.models.refresh_rules import RefreshRule`
   and `"RefreshRule"` to `__all__` in `libs/shared/app_shared/models/__init__.py`, and add
   `RefreshRule` to the `WORKSPACE_OWNED_MODELS` frozenset in `libs/shared/app_shared/repository.py`
   so the unscoped-query CI guard (`scripts/check_workspace_scoping.py`) covers it. (FR-005; data-model Registration checklist)
-- [ ] T008 [P] [US1] Author the Alembic migration
+- [X] T008 [P] [US1] Author the Alembic migration
   `alembic/versions/<rev>_refresh_rules.py` with **`down_revision = 'f30c60cfa2f7'`** (verified single
   current head): hand-authored `create_table` (Uuid, `String(32)` enum, `DateTime(timezone=True)`),
   explicit PK / workspace FK / five CASCADE composite scope-target FKs / three CHECK constraints,
@@ -108,13 +108,13 @@ in workspace A are invisible/unaddressable to workspace B. Negatives: neither/bo
   `for statement in emit_rls_policy("refresh_rules"): op.execute(statement)` loop (ENABLE + FORCE RLS
   + workspace-isolation policy) so RLS is present from the first migration. `downgrade()` drops the
   index then the table. Mirror the SPEC-08 jobs migration. (FR-005/020; data-model Migration)
-- [ ] T009 [P] [US1] Create Pydantic v2 schemas (`extra="forbid"`) in
+- [X] T009 [P] [US1] Create Pydantic v2 schemas (`extra="forbid"`) in
   `apps/api/app/schemas/refresh_rules.py`: `RefreshRuleCreate`, `RefreshRuleUpdate`
   (all-optional, empty body → `EMPTY_UPDATE`), `RefreshRuleResponse` (`from_attributes=True`, all
   columns), `RefreshRuleListResponse` (`{items, next_cursor}`). Cross-field validators: exactly-one
   cadence → `INVALID_CADENCE`; `interval_minutes` `ge=1`; cron parseable via `validate_cron` →
   `INVALID_CRON`; scope↔target-id matrix → `SCOPE_TARGET_MISMATCH`. (FR-002/003; contract refresh-rules-api; research R9)
-- [ ] T010 [US1] Implement the CRUD router `apps/api/app/routers/refresh_rules.py`
+- [X] T010 [US1] Implement the CRUD router `apps/api/app/routers/refresh_rules.py`
   (`APIRouter(prefix="/v1/refresh-rules", tags=["refresh-rules"])`, `refresh_rules:read/write`
   scopes) over the **ordinary RLS-enforced request session** (NOT the bypass session): `POST`
   (validate, verify target id in-workspace via `scoped_get` else `SCOPE_TARGET_MISMATCH`, compute
@@ -127,21 +127,21 @@ in workspace A are invisible/unaddressable to workspace B. Negatives: neither/bo
   enable/disable path); `DELETE /{id}`
   (`scoped_get`→404, hard delete). Mirror `apps/api/app/routers/competitors.py`; structured
   `{"error":{"code","message"}}` envelope. (FR-004/005/006; contract refresh-rules-api)
-- [ ] T011 [US1] Register the router: `include_router(refresh_rules.router)` in
+- [X] T011 [US1] Register the router: `include_router(refresh_rules.router)` in
   `apps/api/app/main.py`. (contract refresh-rules-api)
 
 ### Tests for User Story 1
 
-- [ ] T012 [P] [US1] Unit test schema validation in `tests/unit/test_refresh_rules_validation.py`:
+- [X] T012 [P] [US1] Unit test schema validation in `tests/unit/test_refresh_rules_validation.py`:
   neither/both cadence → `INVALID_CADENCE`; bad cron → `INVALID_CRON`; each scope's target-id matrix
   (WORKSPACE forbids ids; others require exactly theirs) → `SCOPE_TARGET_MISMATCH`; empty PATCH →
   `EMPTY_UPDATE`. No DB. (FR-002/003; US1 AS-5/6)
-- [ ] T013 [P] [US1] Live integration test `tests/integration/test_refresh_rules_crud_live.py`:
+- [X] T013 [P] [US1] Live integration test `tests/integration/test_refresh_rules_crud_live.py`:
   CRUD round-trip + first-`next_run_at` correctness + cross-workspace RLS denial (workspace B cannot
   read/write A's rule even with an omitted app filter). Guard with the
   `pytest.mark.skipif(not _live_refresh_rules_reachable(), ...)` probe (copy the
   `test_competitors_crud_live.py` idiom, probing `refresh_rules`). (FR-004/005; US1 AS-1..4; SC-001/004)
-- [ ] T014 [P] [US1] Live integration test `tests/integration/test_refresh_rules_migration_live.py`:
+- [X] T014 [P] [US1] Live integration test `tests/integration/test_refresh_rules_migration_live.py`:
   `alembic upgrade head` then `downgrade` round-trip for the `refresh_rules` migration (table +
   CHECKs + partial index + RLS present after upgrade, gone after downgrade). Same `skipif` probe. (FR-005)
 
