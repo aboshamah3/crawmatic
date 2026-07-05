@@ -321,7 +321,8 @@
       "feature_directory": "specs/014-browser-scraping-service",
       "status": "in-progress",
       "steps": {
-        "specify": "done"
+        "specify": "done",
+        "clarify": "done"
       }
     }
   }

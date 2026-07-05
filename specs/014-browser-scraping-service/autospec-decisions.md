@@ -33,3 +33,12 @@ codebase, rather than asked of the user. Format:
   (`price_monitor`/`generic_price_spider`) for all batches; SPEC-14 must schedule the browser project
   (`price_monitor_browser`) + `generic_browser_price_spider` for BROWSER batches. Captured as FR-015/016.
   (source: code `tasks_jobs.py` lines 53–57, 247–260, 445–458)
+
+## clarify
+
+- [clarify] Q: Any critical ambiguities requiring resolution before planning? → A: None.
+  Coverage scan: all taxonomy categories Clear. The three open items
+  (`variant_selector_config` JSON shape, browser-failure error-code names, browser retry
+  semantics) are plan-level design decisions the master doc is silent on — deferred to
+  `/speckit-plan`, not asked of the user. (source: doc §8/§34 silent on these; spec Assumptions
+  already flag them as plan-defined)
