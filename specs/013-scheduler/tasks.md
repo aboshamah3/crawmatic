@@ -274,16 +274,16 @@ Force one rule's job creation to raise → only that rule rolls back; others alr
 
 **Purpose**: Guardrails and end-to-end validation across all stories.
 
-- [ ] T027 [P] Add `tests/unit/test_scheduler_import_boundary.py` asserting `apps/scheduler` (and the
+- [X] T027 [P] Add `tests/unit/test_scheduler_import_boundary.py` asserting `apps/scheduler` (and the
   new `app_shared.scheduling`/`app_shared.jobs.scopes`) import no Scrapy/Twisted/Playwright, and
   confirm the existing `tests/unit/test_import_boundaries.py` still passes (croniter adds no forbidden
   import to `app_shared`). (FR-019; quickstart Scenario 8)
-- [ ] T028 Verify the single-Alembic-head guard stays green: `uv run alembic heads` reports exactly
+- [X] T028 Verify the single-Alembic-head guard stays green: `uv run alembic heads` reports exactly
   one head (the new `refresh_rules` revision chained off `f30c60cfa2f7`); linear history preserved.
-- [ ] T029 [P] Run the suites: `uv run pytest tests/unit -q` all green (no DB) and
+- [X] T029 [P] Run the suites: `uv run pytest tests/unit -q` all green (no DB) and
   `uv run pytest tests/integration -q` with the `*_live.py` tests SKIPPING cleanly in this DB-less
   build env. (quickstart Run the tests)
-- [ ] T030 Walk the quickstart.md validation scenarios (1–8) end-to-end as the acceptance checklist
+- [X] T030 Walk the quickstart.md validation scenarios (1–8) end-to-end as the acceptance checklist
   for `specs/013-scheduler/quickstart.md`.
 
 ---
