@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import requests
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,6 +52,7 @@ from app_shared.enums import (
     AccessMethod,
     DiscoveryRunStatus,
     ExtractionMethod,
+    MethodType,
     ProxyProviderStatus,
     StrategyStatus,
 )
@@ -60,9 +62,16 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
 from app_shared.strategy.promotion import PromotionThresholds
-from app_shared.strategy.repository import resolve_profile
+from app_shared.strategy.rediscovery import (
+    CombinedStats,
+    RediscoveryThresholds,
+    apply_rediscovery,
+    build_recent_signals,
+    evaluate_rediscovery,
+)
+from app_shared.strategy.repository import resolve_profile, stats_for_profile
 from app_shared.strategy.seed import DiscoverySeedConfidences, seed_from_discovery, validate_sample_size
-from app_shared.task_names import STRATEGY_DISCOVERY_RUN
+from app_shared.task_names import STRATEGY_DISCOVERY_RUN, STRATEGY_LIGHT_RECHECK
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
@@ -74,6 +83,12 @@ logger = logging.getLogger(__name__)
 #: `STRATEGY_DISCOVERY_RUN` runs on its own queue (data-model.md §8,
 #: contracts/discovery.md), distinct from `maintenance`.
 _DISCOVERY_QUEUE = "strategy_discovery"
+
+#: `STRATEGY_LIGHT_RECHECK` batch size per invocation (contracts/rediscovery.md
+#: "Periodic light re-check", FR-021) -- a local implementation constant
+#: (data-model §7's 10 SPEC-12 `Settings` knobs are exhaustive, T004), the
+#: same precedent as this module's own `_PROBE_TIMEOUT_SECONDS`.
+_LIGHT_RECHECK_BATCH_SIZE = 200
 
 #: Deterministic cost order (cheapest first, contracts/discovery.md
 #: "Select winner") -- `PLAYWRIGHT_PROXY` is reserved vocabulary and is
@@ -506,3 +521,110 @@ def run_discovery(
             run.sample_size,
             triggered_by,
         )
+
+
+# --- periodic light re-check (US4, contracts/rediscovery.md, FR-021) ------
+
+
+def _rediscovery_thresholds(settings: Settings) -> RediscoveryThresholds:
+    return RediscoveryThresholds(
+        consecutive_failures=settings.STRATEGY_REDISCOVERY_CONSECUTIVE_FAILURES,
+        success_rate_floor=Decimal(str(settings.STRATEGY_REDISCOVERY_SUCCESS_RATE_FLOOR)),
+        low_confidence=Decimal(str(settings.STRATEGY_REDISCOVERY_LOW_CONFIDENCE)),
+    )
+
+
+def _combined_stats_for_profile(session: Session, profile: DomainStrategyProfile) -> CombinedStats:
+    """Assemble `CombinedStats` (conditions 1-2, FR-020a(a)) from the
+    profile's own `recent_failure_count` plus persisted `strategy_attempt_stats`
+    for whichever of its preferred access/extraction methods are set --
+    the worse (lower) of the two `success_rate`s is used so degradation on
+    *either* learned channel is caught (no pending-buffer deltas yet: US5's
+    `stats_buffer.read_pending` lands in a later phase; this periodic path
+    reads persisted counts only until then, contracts/rediscovery.md "Call
+    sites").
+    """
+    rows = stats_for_profile(session, profile.workspace_id, profile.id)
+    by_key = {(row.method_type, row.method_name): row for row in rows}
+
+    success_rate: Decimal | None = None
+    avg_confidence: Decimal | None = None
+    for method_type, method_name in (
+        (MethodType.ACCESS, profile.preferred_access_method),
+        (MethodType.EXTRACTION, profile.preferred_extraction_method),
+    ):
+        if method_name is None:
+            continue
+        row = by_key.get((method_type, method_name))
+        if row is None:
+            continue
+        if success_rate is None or row.success_rate < success_rate:
+            success_rate = row.success_rate
+        if method_type is MethodType.EXTRACTION:
+            avg_confidence = row.avg_confidence
+
+    return CombinedStats(
+        recent_failure_count=profile.recent_failure_count,
+        success_rate=success_rate,
+        avg_confidence=avg_confidence,
+    )
+
+
+def _scan_active_profile_refs(
+    session: Session, *, limit: int
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """Resolve `(id, workspace_id)` pairs for `ACTIVE` profiles, unscoped --
+    the `_scan_job_refs` precedent (`tasks_jobs.py`): this maintenance task
+    legitimately patrols every workspace, and every row is only read/
+    mutated after `set_workspace_context` scopes it to its own workspace
+    below (never cross-workspace data exposure)."""
+    stmt = (
+        select(DomainStrategyProfile.id, DomainStrategyProfile.workspace_id)  # noqa: workspace-scope
+        .where(DomainStrategyProfile.status == StrategyStatus.ACTIVE)
+        .order_by(DomainStrategyProfile.id)
+        .limit(limit)
+    )
+    return list(session.execute(stmt).all())
+
+
+@app.task(name=STRATEGY_LIGHT_RECHECK)
+def light_recheck() -> None:
+    """`STRATEGY_LIGHT_RECHECK` (`maintenance` queue, contracts/rediscovery.md
+    "Periodic light re-check", FR-021, US4 AS4).
+
+    Scans `ACTIVE` profiles workspace-scoped in batches (up to
+    `_LIGHT_RECHECK_BATCH_SIZE` per invocation), builds `recent_signals`
+    (`build_recent_signals`) + combined counts (`_combined_stats_for_profile`)
+    for each, evaluates `evaluate_rediscovery`, and applies
+    (`apply_rediscovery`) -- catching degradation on patrol, without
+    requiring a full failed batch to have just flushed (the inline call
+    site is the stats-flush task, US5 T035).
+    """
+    settings = get_settings()
+    thresholds = _rediscovery_thresholds(settings)
+
+    with get_session() as session:
+        for profile_id, workspace_id in _scan_active_profile_refs(
+            session, limit=_LIGHT_RECHECK_BATCH_SIZE
+        ):
+            set_workspace_context(session, workspace_id)
+
+            profile = scoped_get(session, DomainStrategyProfile, profile_id, workspace_id)
+            if profile is None or profile.status != StrategyStatus.ACTIVE:
+                continue
+
+            combined = _combined_stats_for_profile(session, profile)
+            recent_signals = build_recent_signals(session, profile)
+            decision = evaluate_rediscovery(profile, combined, recent_signals, thresholds)
+
+            triggered = apply_rediscovery(session, profile, decision)
+            if triggered:
+                logger.info(
+                    "strategy_rediscovery_triggered profile_id=%s workspace_id=%s "
+                    "reason=%s source=LIGHT_RECHECK",
+                    profile.id,
+                    workspace_id,
+                    decision.reason,
+                )
+
+        session.commit()

@@ -38,6 +38,7 @@ from app_shared.task_names import (
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
     STRATEGY_DISCOVERY_RUN,
+    STRATEGY_LIGHT_RECHECK,
 )
 
 settings = get_settings()
@@ -71,6 +72,11 @@ app = Celery(
 # `STRATEGY_DISCOVERY_RUN` — the one task allowed to probe multiple access
 # methods on a small sample; kept on its own queue since it does its own
 # blocking HTTP fetches (data-model.md §8).
+#
+# `STRATEGY_LIGHT_RECHECK` (SPEC-12 US4, contracts/rediscovery.md "Periodic
+# light re-check", FR-021) is a `maintenance` task alongside
+# `SCRAPE_FINALIZE_JOBS`/`SCRAPE_RECOVER_STALLED` — it only reads/updates
+# `domain_strategy_profiles`/`strategy_attempt_stats`, no blocking fetch.
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
@@ -83,6 +89,7 @@ app.conf.task_routes = {
     SCRAPE_FINALIZE_JOBS: {"queue": "maintenance"},
     PRICE_ANALYSIS_RECOMPUTE: {"queue": "price_analysis"},
     STRATEGY_DISCOVERY_RUN: {"queue": "strategy_discovery"},
+    STRATEGY_LIGHT_RECHECK: {"queue": "maintenance"},
 }
 
 
