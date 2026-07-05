@@ -15,7 +15,11 @@ from app_shared.models.base import (
     WorkspaceScopedBase,
     metadata,
 )
-from app_shared.models.rls import emit_global_readable_rls_policy, emit_rls_policy
+from app_shared.models.rls import (
+    emit_fk_transitive_rls_policy,
+    emit_global_readable_rls_policy,
+    emit_rls_policy,
+)
 
 # Import so `SmokeFoundation` registers on `Base.metadata` — required for
 # both Alembic autogenerate/offline-render (`target_metadata`) and the
@@ -83,6 +87,24 @@ from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, Variant
 # path. `DomainAccessRule` is tenant-only and IS registered there.
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
 
+# The SPEC-12 domain strategy optimizer models — re-exported so
+# `Base.metadata` sees all three tables for Alembic autogenerate/offline-
+# render (target_metadata), and so callers can `from app_shared.models
+# import DomainStrategyProfile, StrategyAttemptStats,
+# StrategyDiscoveryRun`. `DomainStrategyProfile`/`StrategyDiscoveryRun`
+# are workspace-owned: registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`. `StrategyAttemptStats`
+# has NO `workspace_id` column at all (unlike the nullable-workspace_id
+# dual-scope tables above) — deliberately NOT added there; isolated
+# transitively via `emit_fk_transitive_rls_policy` and queried only
+# joined to its scoped parent profile via
+# `app_shared.strategy.repository`.
+from app_shared.models.strategy import (
+    DomainStrategyProfile,
+    StrategyAttemptStats,
+    StrategyDiscoveryRun,
+)
+
 __all__ = [
     "Base",
     "metadata",
@@ -114,4 +136,8 @@ __all__ = [
     "ProxyProvider",
     "AccessPolicy",
     "DomainAccessRule",
+    "emit_fk_transitive_rls_policy",
+    "DomainStrategyProfile",
+    "StrategyAttemptStats",
+    "StrategyDiscoveryRun",
 ]

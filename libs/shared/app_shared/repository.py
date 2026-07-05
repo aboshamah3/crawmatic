@@ -31,6 +31,7 @@ from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, Variant
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
 # SPEC-03 models to any Base subclass — the four catalog models
@@ -64,6 +65,19 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         # dual-scope (nullable workspace_id); a scoped_select would hide
         # global rows. Query them via app_shared.access.repository instead.
         DomainAccessRule,
+        # SPEC-12: DomainStrategyProfile/StrategyDiscoveryRun are
+        # tenant-only (WorkspaceScopedBase). StrategyAttemptStats is
+        # deliberately EXCLUDED — unlike the SPEC-10 dual-scope tables
+        # above (nullable workspace_id hiding global rows), it has NO
+        # workspace_id column at all; a scoped_select/scoped_get can't
+        # filter on a column that doesn't exist. It is isolated
+        # transitively via its domain_strategy_profile_id FK
+        # (app_shared.models.rls.emit_fk_transitive_rls_policy) and
+        # queried only joined to its scoped parent profile via
+        # app_shared.strategy.repository (the same dual-scope exclusion
+        # precedent, applied to a no-workspace-column table).
+        DomainStrategyProfile,
+        StrategyDiscoveryRun,
     }
 )
 

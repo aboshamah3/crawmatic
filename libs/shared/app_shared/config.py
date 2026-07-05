@@ -181,6 +181,22 @@ class Settings(BaseSettings):
     RATE_LIMIT_JITTER_MIN_SECONDS: int = 2
     RATE_LIMIT_JITTER_MAX_SECONDS: int = 20
 
+    # --- Domain strategy optimizer tuning (SPEC-12, data-model §7 /
+    # research D11, Principle IV — env-tunable, never a hardcoded
+    # literal). Promotion/rediscovery/discovery thresholds are global
+    # defaults; per-domain overrides go through `DomainAccessRule`, not
+    # here. ---
+    STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD: float = 0.85
+    STRATEGY_PROMOTION_MIN_SUCCESSES: int = 3
+    STRATEGY_PROMOTION_MIN_DISTINCT_URLS: int = 3
+    STRATEGY_REDISCOVERY_SUCCESS_RATE_FLOOR: float = 0.80
+    STRATEGY_REDISCOVERY_LOW_CONFIDENCE: float = 0.75
+    STRATEGY_REDISCOVERY_CONSECUTIVE_FAILURES: int = 3
+    STRATEGY_DISCOVERY_MIN_SAMPLE: int = 3
+    STRATEGY_DISCOVERY_MAX_SAMPLE: int = 10
+    STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
+    STRATEGY_STATS_KEY_TTL_SECONDS: int = 3600
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:

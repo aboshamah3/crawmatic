@@ -25,3 +25,13 @@ SCRAPE_FINALIZE_JOBS = "maintenance.finalize_jobs"
 # by ``apps/workers/app/workers/tasks_analysis.py`` on its own
 # ``price_analysis`` queue.
 PRICE_ANALYSIS_RECOMPUTE = "price_analysis.recompute_variant"
+
+# --- Domain strategy optimizer (SPEC-12, data-model §8) ---
+# Enqueued via the same ``app_shared.messaging.enqueue`` producer seam;
+# consumed by ``apps/workers/app/workers/tasks_strategy.py``.
+# STRATEGY_DISCOVERY_RUN runs on its own ``strategy_discovery`` queue (§26);
+# the other three run on the existing ``maintenance`` queue.
+STRATEGY_DISCOVERY_RUN = "strategy_discovery.run_discovery"
+STRATEGY_STATS_FLUSH = "maintenance.strategy_stats_flush"
+STRATEGY_LIGHT_RECHECK = "maintenance.strategy_light_recheck"
+STRATEGY_PATTERN_BACKFILL = "maintenance.strategy_pattern_backfill"

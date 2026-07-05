@@ -441,6 +441,82 @@ class ProxyProviderStatus(StrEnum):
     DISABLED = "DISABLED"
 
 
+class StrategyStatus(StrEnum):
+    """Lifecycle status of a ``domain_strategy_profiles`` row (SPEC-12 §22, FR-007).
+
+    ``DISCOVERY_REQUIRED`` (new key, no learned start yet) → ``LEARNING``
+    (discovery seeded a winner or a promotion attempt is in progress) →
+    ``ACTIVE`` (3-confirmation promotion rule satisfied) → ``DEGRADED``
+    (rediscovery triggered, FR-020) → back to ``LEARNING``/``ACTIVE`` via
+    a fresh discovery run. ``DISABLED`` is operator-set only: the learned
+    preference is never applied and there is no automatic transition out
+    (FR-014).
+    """
+
+    DISCOVERY_REQUIRED = "DISCOVERY_REQUIRED"
+    LEARNING = "LEARNING"
+    ACTIVE = "ACTIVE"
+    DEGRADED = "DEGRADED"
+    DISABLED = "DISABLED"
+
+
+class MethodType(StrEnum):
+    """Disambiguates the ``method_name`` vocabulary on a ``strategy_attempt_stats``
+    row / a ``domain_strategy_profiles`` preferred-method pair (SPEC-12 §22, FR-008).
+
+    ``method_name`` values are the **reused** ``AccessMethod`` members
+    when ``method_type=ACCESS`` and the **reused** ``ExtractionMethod``
+    members when ``method_type=EXTRACTION`` — this enum is not itself a
+    method vocabulary, just the discriminator (research D1).
+    """
+
+    ACCESS = "ACCESS"
+    EXTRACTION = "EXTRACTION"
+
+
+def validate_method_name(method_type: "MethodType", method_name: str) -> str:
+    """Validate ``method_name`` against the vocabulary ``method_type`` selects (D1).
+
+    ``strategy_attempt_stats.method_name`` (and the profile's
+    ``preferred_access_method``/``preferred_extraction_method``) is a
+    plain ``Text``/``String`` column, never ``enum_column`` — one
+    column can't natively carry two disjoint enum types at once. This
+    is the application-layer gate: an ``AccessMethod`` value is only
+    valid when ``method_type=ACCESS``; an ``ExtractionMethod`` value
+    only when ``method_type=EXTRACTION``. Returns the validated
+    ``.value`` string; raises ``ValueError`` on a value that's well-
+    formed for the *other* type, or not a member of either.
+    """
+    vocabulary: type[StrEnum] = AccessMethod if method_type == MethodType.ACCESS else ExtractionMethod
+    try:
+        return vocabulary(method_name).value
+    except ValueError as exc:
+        valid = ", ".join(member.value for member in vocabulary)
+        raise ValueError(
+            f"{method_name!r} is not a valid method_name for method_type="
+            f"{method_type.value} (expected one of: {valid})"
+        ) from exc
+
+
+class DiscoveryRunStatus(StrEnum):
+    """Lifecycle status of a ``strategy_discovery_runs`` row (SPEC-12 US3 AS1/AS4).
+
+    ``PENDING`` (enqueued, not yet picked up) → ``RUNNING`` (sample is
+    being probed) → ``COMPLETED`` (a winning access + extraction method
+    pair was found, ``winning_*``/``completed_at`` set) or ``NO_WINNER``
+    (no combination cleared the promotion-quality bar, ``completed_at``
+    set, ``winning_*`` stay ``NULL``) or ``FAILED`` (an out-of-bounds
+    ``sample_size`` or an unexpected error aborted the run before/
+    during probing).
+    """
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    NO_WINNER = "NO_WINNER"
+    FAILED = "FAILED"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 

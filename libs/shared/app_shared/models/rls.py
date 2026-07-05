@@ -103,3 +103,49 @@ def emit_global_readable_rls_policy(
             f"WITH CHECK ({workspace_column} = {ctx});"
         ),
     )
+
+
+def emit_fk_transitive_rls_policy(
+    table_name: str,
+    *,
+    parent_table: str,
+    fk_column: str,
+    parent_pk: str = "id",
+    workspace_column: str = "workspace_id",
+    policy_name: str | None = None,
+) -> tuple[str, ...]:
+    """Return the DDL statements enabling fail-closed RLS **transitively via a parent**.
+
+    Per ``contracts/rls-and-migration.md`` (SPEC-12 research D3, FR-026):
+    some tables (e.g. ``strategy_attempt_stats``) deliberately carry no
+    ``workspace_id`` column of their own — isolation is anchored through
+    a real FK to a workspace-owned parent instead. Returns exactly three
+    statements, mirroring :func:`emit_rls_policy`'s ENABLE/FORCE/CREATE
+    shape:
+
+    1. ``ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;``
+    2. ``ALTER TABLE {table} FORCE ROW LEVEL SECURITY;`` — applies even
+       to the table owner.
+    3. ``CREATE POLICY {policy} ON {table} USING (EXISTS (SELECT 1 FROM
+       {parent_table} p WHERE p.{parent_pk} = {table}.{fk_column} AND
+       p.{workspace_column} = NULLIF(current_setting('app.workspace_id',
+       true), '')::uuid));``
+
+    **Fail-closed** — the same ``NULLIF(current_setting('app.workspace_id',
+    true), '')::uuid`` guard as :func:`emit_rls_policy`: with no
+    workspace context set, the inner predicate is never true for any
+    parent row, so the ``EXISTS`` subquery is never true either — zero
+    rows, never an error, never all rows (SC-005).
+    """
+    policy = policy_name or f"{table_name}_workspace_isolation"
+    ctx = "NULLIF(current_setting('app.workspace_id', true), '')::uuid"
+    return (
+        f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;",
+        f"ALTER TABLE {table_name} FORCE ROW LEVEL SECURITY;",
+        (
+            f"CREATE POLICY {policy} ON {table_name} "
+            f"USING (EXISTS (SELECT 1 FROM {parent_table} p "
+            f"WHERE p.{parent_pk} = {table_name}.{fk_column} "
+            f"AND p.{workspace_column} = {ctx}));"
+        ),
+    )
