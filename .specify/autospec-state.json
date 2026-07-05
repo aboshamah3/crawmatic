@@ -267,6 +267,14 @@
       ],
       "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 4 integration test files (7 cases) authored + skip cleanly. Redis/reactor/DB-independent logic fully unit-tested here (1369 unit passed / 208 skipped / 0 failed; ruff clean; reactor-safety AST grep test enforces no time.sleep/sync-Redis on reactor). Only schema delta: ScrapeTargetStatus.DEFERRED (VARCHAR StrEnum, no migration). analyze remediated 1 HIGH (G1 mark_target error_code gate) + 2 MEDIUM (I1 DIRECT_HTTP_RETRY keying, U1 cooldown consumer) + 2 LOW + 1 new-pass LOW (N1); re-run 0 CRITICAL/0 HIGH; converge found no gaps.",
       "converge_result": "CONVERGED \u2014 no remaining work; tasks.md unchanged (no convergence phase appended)"
+    },
+    "12": {
+      "title": "Domain Strategy Optimizer",
+      "feature_directory": "specs/012-domain-strategy-optimizer",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
