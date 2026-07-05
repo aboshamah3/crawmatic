@@ -103,3 +103,18 @@ Auto-answered questions during the pipeline (doc-first per the autospec skill). 
   apps/api / apps/scheduler / apps/workers each ship a top-level package named `app`; editable .pth
   ordering makes a bare `import app...` from repo root resolve apps/api. Tests use the established
   `sys.path.insert(0, "apps/scheduler")` subprocess idiom (as test_jobs_dispatch_task.py does).
+
+## converge
+
+- [converge] Cycle 1: found 1 CRITICAL gap (F1) — refresh_rules:read/write required by the router
+  but absent from the Scope enum → validate_scopes would 422 them at API-key creation, making the
+  whole CRUD surface ungrantable in prod (masked because the live test inserts the ApiKey row
+  directly). Appended T031; implemented (enum members + vocabulary test 23→25). Unit 1542 passed.
+- [converge] Cycle 2: CONVERGED — F1 verified closed (router strings resolve to real enum members;
+  validate_scopes round-trips; vocabulary consistent at 25). No tasks appended. All 21 FRs, 6 SCs,
+  US1/US2/US3 satisfied by real code. Baselines green (1542 unit / 3 passed+240 skipped integration
+  / single head 93511d5f7885 / scoping guard OK). Two converge cycles used (max).
+- [converge][OUT-OF-SCOPE, NOT FIXED] Converge also observed that apps/api/app/routers/strategy.py
+  (SPEC-12) gates on `strategy:read`/`strategy:write`, which are ALSO missing from the Scope enum —
+  the identical F1-class production bug, but belonging to SPEC-12, outside SPEC-13's intent. Left
+  untouched per the one-spec-per-invocation rule; flagged to the user for a follow-up fix.

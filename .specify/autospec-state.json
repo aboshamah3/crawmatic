@@ -3,7 +3,7 @@
     "13": {
       "title": "Scheduler",
       "feature_directory": "specs/013-scheduler",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -11,8 +11,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T013 refresh-rules CRUD live (round-trip, first next_run_at, cross-workspace RLS denial)",
+        "T014 alembic upgrade head + downgrade round-trip (online) for 93511d5f7885",
+        "T023 scheduler pass live (due->one SCHEDULED/SCHEDULER job/target-per-active-match; zero-match advance; backlog fire-once)",
+        "T026 concurrency live (two overlapping passes SKIP-LOCKED 0-dup/0-miss; crash-before-commit re-fire once; scope-target CASCADE delete)"
+      ],
+      "deferred_reason": "require a live Postgres/Redis (no container engine in build env); 4 integration test files authored + skip cleanly. DB/Redis-independent logic exhaustively unit-tested here (full suite 1542 unit passed / 243 integration [3 passed/240 skipped] / 0 failed / 0 errors; scoping guard OK; import-boundary + single-head guards green; single head 93511d5f7885, refresh_rules off f30c60cfa2f7). New scraping-free cadence module (croniter) + jobs.scopes resolver (6 scopes) + create_scope_job enqueue-before-commit seam; reuses SPEC-08 job service/idempotent dispatch, SPEC-11 match locks, SPEC-03 workspace-scoping/RLS + auth system-session pattern (new BYPASSRLS get_system_session). 31 tasks (added T031 from converge cycle-1 CRITICAL F1: refresh_rules scopes missing from Scope enum -> fixed). Converge cycle-2 CONVERGED, no gaps.",
+      "converge_result": "CONVERGED (2 cycles) - cycle 1 appended+fixed T031 (F1 CRITICAL: refresh_rules:read/write absent from Scope enum, CRUD surface ungrantable in prod); cycle 2 clean, no tasks appended.",
+      "out_of_scope_finding": "SPEC-12 apps/api/app/routers/strategy.py gates on strategy:read/strategy:write which are ALSO missing from the Scope enum (identical F1-class bug; strategy endpoints ungrantable in prod). Left untouched (one-spec-per-invocation); needs a SPEC-12 follow-up."
     },
     "00": {
       "title": "Project Constitution",
