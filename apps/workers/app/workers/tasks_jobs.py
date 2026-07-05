@@ -36,12 +36,19 @@ from app_shared.jobs.batching import ResolvedTarget, plan_batches
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.nodes import select_node
 from app_shared.jobs.targets import Counts, aggregate_counts
+from app_shared.messaging import enqueue
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.models.strategy import DomainStrategyProfile
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.scrapyd import ScrapydDispatchClient
-from app_shared.task_names import SCRAPE_DISPATCH_JOB, SCRAPE_FINALIZE_JOBS, SCRAPE_RECOVER_STALLED
+from app_shared.task_names import (
+    SCRAPE_DISPATCH_JOB,
+    SCRAPE_FINALIZE_JOBS,
+    SCRAPE_RECOVER_STALLED,
+    STRATEGY_STATS_FLUSH,
+)
 
 # The Scrapy project + spider deployed to the Scrapyd nodes (apps/scrapers) —
 # unchanged from the SPEC-07 thin `dispatch.generic_price_spider` task.
@@ -276,6 +283,46 @@ def refresh_job_counters(
     return counts
 
 
+def _strategy_profile_ids_for_targets(
+    session: Session, workspace_id: uuid.UUID | str, targets: list[ScrapeJobTarget]
+) -> list[uuid.UUID]:
+    """Resolve the distinct `domain_strategy_profiles` ids this job's
+    targets' matches map to (SPEC-12 US5 T036, contracts/stats-buffer.md
+    §Flush, job-finalization flush trigger) -- one set-based join over the
+    job's own already-loaded targets, never per-target (mirrors
+    `_resolve_domains_and_modes`'s one-read-per-job shape). A match whose
+    `(competitor domain, url_pattern)` key never got a profile seeded
+    (e.g. discovery hasn't run yet) contributes nothing -- `flush_stats`
+    is simply a no-op for that job's (empty) `profile_ids`.
+    """
+    if not targets:
+        return []
+
+    match_ids = [target.match_id for target in targets]
+    stmt = (
+        select(DomainStrategyProfile.id)
+        .select_from(CompetitorProductMatch)
+        .join(
+            Competitor,
+            (Competitor.workspace_id == CompetitorProductMatch.workspace_id)
+            & (Competitor.id == CompetitorProductMatch.competitor_id),
+        )
+        .join(
+            DomainStrategyProfile,
+            (DomainStrategyProfile.workspace_id == CompetitorProductMatch.workspace_id)
+            & (DomainStrategyProfile.competitor_id == CompetitorProductMatch.competitor_id)
+            & (DomainStrategyProfile.domain == Competitor.domain)
+            & (DomainStrategyProfile.url_pattern == CompetitorProductMatch.url_pattern),
+        )
+        .where(
+            CompetitorProductMatch.workspace_id == workspace_id,
+            CompetitorProductMatch.id.in_(match_ids),
+        )
+        .distinct()
+    )
+    return [row[0] for row in session.execute(stmt).all()]
+
+
 @app.task(name=SCRAPE_FINALIZE_JOBS)
 def finalize_jobs() -> None:
     """Aggregate counters and deterministically finalize non-terminal jobs.
@@ -287,6 +334,15 @@ def finalize_jobs() -> None:
 
     Idempotent: a job already terminal is skipped outright, so re-running
     this task against an already-finalized job is a no-op (FR-019).
+
+    SPEC-12 US5 (T036, contracts/stats-buffer.md §Flush, FR-023): once a
+    job actually finalizes, also enqueue `STRATEGY_STATS_FLUSH` for the
+    distinct `domain_strategy_profiles` its targets' matches map to — so a
+    job's buffered stats flush promptly at job end rather than waiting up
+    to a full `STRATEGY_STATS_FLUSH_INTERVAL_SECONDS` for the periodic
+    sweep. A job whose targets resolve no strategy profile at all (e.g.
+    every match predates SPEC-12 discovery) enqueues nothing -- `flush_stats`
+    is never called with an empty `profile_ids` list.
     """
     with get_session() as session:
         for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
@@ -316,6 +372,17 @@ def finalize_jobs() -> None:
                 counts.success, counts.failure, counts.skipped, counts.total
             )
             job.completed_at = datetime.now(timezone.utc)
+
+            profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
+            if profile_ids:
+                enqueue(
+                    STRATEGY_STATS_FLUSH,
+                    queue="maintenance",
+                    kwargs={
+                        "workspace_id": str(workspace_id),
+                        "profile_ids": [str(profile_id) for profile_id in profile_ids],
+                    },
+                )
 
         session.commit()
 

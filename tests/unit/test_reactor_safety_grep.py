@@ -221,3 +221,47 @@ def test_tasks_analysis_never_references_the_scrape_lock() -> None:
     contents = path.read_text(encoding="utf-8")
     leaked = [symbol for symbol in _SCRAPE_LOCK_SYMBOLS if symbol in contents]
     assert not leaked, f"{path} references scrape-lock symbol(s): {leaked}"
+
+
+# --- SPEC-12 US5 (T038, contracts/stats-buffer.md "Called only from") ------
+#
+# The buffered attempt-stats recorder (`app_shared.strategy.stats_buffer
+# .record_attempt`) is deliberately narrow: it must be reachable from
+# exactly one call site, `_flush_batch` in `pipelines.py` (already inside
+# `run_in_thread`, off-reactor). This is a *stronger* claim than "no sync
+# Redis outside the thread boundary" above (which `record_attempt` itself
+# would already satisfy once called from `_flush_batch`) -- it also
+# forecloses a future refactor that calls it from some OTHER
+# locally-defined function in `pipelines.py` (which might not itself be
+# reachable from `run_in_thread`) or reintroduces it into the
+# reactor-adjacent spider/limiter/reactor modules directly.
+
+
+def _functions_calling(tree: ast.Module, called_name: str) -> "set[str]":
+    """Names of every locally-defined function/method in `tree` containing
+    at least one call whose attribute or bare name is `called_name`."""
+    defs = _local_function_defs(tree)
+    callers: set[str] = set()
+    for name, node in defs.items():
+        for call in _iter_calls(node):
+            if _call_func_attr_or_name(call) == called_name:
+                callers.add(name)
+                break
+    return callers
+
+
+def test_strategy_stats_recorder_is_only_reachable_from_flush_batch() -> None:
+    """`record_attempt` is called from exactly `_flush_batch` in
+    `pipelines.py` (T037) -- never from any other locally-defined function
+    in this module, and never referenced at all in the spider/limiter/
+    reactor modules (it is Redis-only telemetry, never something the
+    reactor-adjacent seams need to know about directly)."""
+    pipelines_tree = ast.parse(
+        _PIPELINES_PATH.read_text(encoding="utf-8"), filename=str(_PIPELINES_PATH)
+    )
+    callers = _functions_calling(pipelines_tree, "record_attempt")
+    assert callers == {"_flush_batch"}, callers
+
+    for path in (_SPIDER_PATH, _LIMITER_PATH, _REACTOR_PATH):
+        contents = path.read_text(encoding="utf-8")
+        assert "record_attempt" not in contents, f"{path} references record_attempt"

@@ -327,13 +327,18 @@ class _FakeWorkspaceTxn:
 
 
 class _FakePipelineSettings:
-    """Stand-in for `Settings` -- just the one field `_flush_batch` reads
-    for the SPEC-09 recompute-dedup trigger (mirrors
-    `tests/unit/test_persistence_batching.py`'s `_FakeSettings`; named
-    differently here since this file's `_FakeSettings` above already
-    covers the SPEC-11 rate-limit knobs)."""
+    """Stand-in for `Settings` -- the SPEC-09 recompute-dedup field plus
+    the two SPEC-12 US5 T037 fields `_flush_batch` now also reads
+    unconditionally (mirrors `tests/unit/test_persistence_batching.py`'s
+    `_FakeSettings`; named differently here since this file's
+    `_FakeSettings` above already covers the SPEC-11 rate-limit knobs).
+    This file's seeded `ScrapeResult` carries no `domain_strategy_profile_id`,
+    so `record_attempt` itself is never actually invoked here -- only the
+    attribute reads need satisfying."""
 
     PRICE_ANALYSIS_DEDUP_TTL_SECONDS = 21600
+    STRATEGY_STATS_KEY_TTL_SECONDS = 3600
+    STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD = 0.85
 
 
 def test_dedup_release_event_carries_documented_fields(

@@ -38,6 +38,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 import requests
 from sqlalchemy import select
@@ -59,8 +60,10 @@ from app_shared.enums import (
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 from app_shared.profiles.confidence import resolve_confidence_rules
+from app_shared.redis_client import get_redis_client
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
+from app_shared.strategy.flush import flush_profile
 from app_shared.strategy.promotion import PromotionThresholds
 from app_shared.strategy.rediscovery import (
     CombinedStats,
@@ -71,7 +74,8 @@ from app_shared.strategy.rediscovery import (
 )
 from app_shared.strategy.repository import resolve_profile, stats_for_profile
 from app_shared.strategy.seed import DiscoverySeedConfidences, seed_from_discovery, validate_sample_size
-from app_shared.task_names import STRATEGY_DISCOVERY_RUN, STRATEGY_LIGHT_RECHECK
+from app_shared.strategy.stats_buffer import dirty_key, read_pending
+from app_shared.task_names import STRATEGY_DISCOVERY_RUN, STRATEGY_LIGHT_RECHECK, STRATEGY_STATS_FLUSH
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
@@ -534,15 +538,28 @@ def _rediscovery_thresholds(settings: Settings) -> RediscoveryThresholds:
     )
 
 
-def _combined_stats_for_profile(session: Session, profile: DomainStrategyProfile) -> CombinedStats:
+#: Scale factor `stats_buffer.record_attempt` multiplies confidence by
+#: before `HINCRBY conf_sum` (mirrors `stats_buffer._CONFIDENCE_SCALE` --
+#: duplicated here, a plain int constant, rather than importing a private
+#: name across the module boundary) -- needed to unscale a pending
+#: `conf_sum` delta back into the same `Decimal` units as the persisted
+#: `avg_confidence` column.
+_CONFIDENCE_SCALE = 10_000
+
+
+def _combined_stats_for_profile(
+    session: Session, redis: Any, profile: DomainStrategyProfile
+) -> CombinedStats:
     """Assemble `CombinedStats` (conditions 1-2, FR-020a(a)) from the
-    profile's own `recent_failure_count` plus persisted `strategy_attempt_stats`
-    for whichever of its preferred access/extraction methods are set --
-    the worse (lower) of the two `success_rate`s is used so degradation on
-    *either* learned channel is caught (no pending-buffer deltas yet: US5's
-    `stats_buffer.read_pending` lands in a later phase; this periodic path
-    reads persisted counts only until then, contracts/rediscovery.md "Call
-    sites").
+    profile's own `recent_failure_count` plus persisted
+    `strategy_attempt_stats` **plus non-destructive pending buffered
+    deltas** (`stats_buffer.read_pending`, FR-024) for whichever of its
+    preferred access/extraction methods are set -- the worse (lower) of
+    the two *combined* `success_rate`s is used so degradation on *either*
+    learned channel is caught, whether or not a flush has run yet since
+    the last few attempts. This periodic path only ever reads the pending
+    buffer (`read_pending`) -- it never drains; draining is the flush
+    task's job alone (contracts/rediscovery.md "Call sites").
     """
     rows = stats_for_profile(session, profile.workspace_id, profile.id)
     by_key = {(row.method_type, row.method_name): row for row in rows}
@@ -556,12 +573,33 @@ def _combined_stats_for_profile(session: Session, profile: DomainStrategyProfile
         if method_name is None:
             continue
         row = by_key.get((method_type, method_name))
-        if row is None:
+        pending = read_pending(
+            redis, profile_id=profile.id, method_type=method_type, method_name=method_name
+        )
+
+        persisted_attempt = row.attempt_count if row is not None else 0
+        persisted_success = row.success_count if row is not None else 0
+        combined_attempt = persisted_attempt + pending.attempt
+        combined_success = persisted_success + pending.success
+        if combined_attempt == 0:
             continue
-        if success_rate is None or row.success_rate < success_rate:
-            success_rate = row.success_rate
+
+        method_success_rate = Decimal(combined_success) / Decimal(combined_attempt)
+        if success_rate is None or method_success_rate < success_rate:
+            success_rate = method_success_rate
+
         if method_type is MethodType.EXTRACTION:
-            avg_confidence = row.avg_confidence
+            persisted_conf_scaled = (
+                (row.avg_confidence or Decimal("0")) * persisted_success * _CONFIDENCE_SCALE
+                if row is not None
+                else Decimal("0")
+            )
+            combined_conf_scaled = persisted_conf_scaled + Decimal(pending.conf_sum)
+            avg_confidence = (
+                combined_conf_scaled / _CONFIDENCE_SCALE / combined_success
+                if combined_success
+                else (row.avg_confidence if row is not None else None)
+            )
 
     return CombinedStats(
         recent_failure_count=profile.recent_failure_count,
@@ -602,6 +640,7 @@ def light_recheck() -> None:
     """
     settings = get_settings()
     thresholds = _rediscovery_thresholds(settings)
+    redis = get_redis_client()
 
     with get_session() as session:
         for profile_id, workspace_id in _scan_active_profile_refs(
@@ -613,7 +652,7 @@ def light_recheck() -> None:
             if profile is None or profile.status != StrategyStatus.ACTIVE:
                 continue
 
-            combined = _combined_stats_for_profile(session, profile)
+            combined = _combined_stats_for_profile(session, redis, profile)
             recent_signals = build_recent_signals(session, profile)
             decision = evaluate_rediscovery(profile, combined, recent_signals, thresholds)
 
@@ -628,3 +667,84 @@ def light_recheck() -> None:
                 )
 
         session.commit()
+
+
+# --- STRATEGY_STATS_FLUSH (US5, contracts/stats-buffer.md §Flush, FR-023) --
+
+
+def _scan_workspace_refs_with_profiles(session: Session) -> list[uuid.UUID]:
+    """Distinct workspace ids owning at least one `domain_strategy_profiles`
+    row -- the periodic `flush_stats` sweep's only anchor when invoked
+    with no explicit target (the job-finalization call site already knows
+    its own `workspace_id` + `profile_ids` and skips this scan entirely,
+    the `_scan_job_refs`/`_scan_active_profile_refs` precedent: this
+    maintenance task legitimately patrols every workspace, and every row
+    is only read/mutated after `set_workspace_context` scopes it to its
+    own workspace below)."""
+    stmt = select(DomainStrategyProfile.workspace_id).distinct()  # noqa: workspace-scope
+    return [row[0] for row in session.execute(stmt).all()]
+
+
+@app.task(name=STRATEGY_STATS_FLUSH)
+def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None = None) -> None:
+    """`STRATEGY_STATS_FLUSH` (`maintenance` queue, contracts/stats-buffer.md
+    §Flush, FR-023, SC-003).
+
+    Two call shapes converge on the same per-profile `flush_profile`
+    (`app_shared.strategy.flush`):
+
+    - **Periodic** (no arguments -- the scheduler's cadence,
+      `apps/scheduler/app/scheduler/scheduler_app.py`): scans every
+      workspace that owns at least one `domain_strategy_profiles` row,
+      enumerates that workspace's `stratdirty:{ws}` members
+      (`SMEMBERS`), and flushes each.
+    - **Job finalization** (`workspace_id` + `profile_ids` supplied,
+      `apps/workers/app/workers/tasks_jobs.py::finalize_jobs`): flushes
+      exactly the given profiles in that one workspace -- no Redis
+      `SMEMBERS` scan needed, the caller already knows which profiles its
+      just-finalized job touched.
+
+    A `SMEMBERS`/Redis read failure for one workspace is logged and
+    skipped -- it never aborts the sweep for every other workspace (a
+    missed cycle just means that workspace's profiles flush one interval
+    later). Emits one `strategy_stats_flushed` structured log line per
+    invocation (`dirty_profiles`, `keys_flushed`) -- contracts/
+    api-and-observability.md.
+    """
+    redis = get_redis_client()
+    dirty_profiles = 0
+    keys_flushed = 0
+
+    with get_session() as session:
+        if workspace_id is not None:
+            ws_list = [uuid.UUID(str(workspace_id))]
+        else:
+            ws_list = _scan_workspace_refs_with_profiles(session)
+
+        for ws in ws_list:
+            set_workspace_context(session, ws)
+
+            if workspace_id is not None and profile_ids is not None:
+                pending_ids = [uuid.UUID(str(pid)) for pid in profile_ids]
+            else:
+                try:
+                    pending_ids = [uuid.UUID(str(pid)) for pid in redis.smembers(dirty_key(ws))]
+                except Exception:
+                    logger.warning(
+                        "strategy_stats_flush: failed to read stratdirty for workspace_id=%s",
+                        ws,
+                        exc_info=True,
+                    )
+                    continue
+
+            for profile_id in pending_ids:
+                dirty_profiles += 1
+                keys_flushed += flush_profile(session, redis, profile_id)
+
+        session.commit()
+
+    logger.info(
+        "strategy_stats_flushed dirty_profiles=%d keys_flushed=%d",
+        dirty_profiles,
+        keys_flushed,
+    )

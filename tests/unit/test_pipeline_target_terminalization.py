@@ -152,10 +152,17 @@ class _RecordingEnqueue:
 
 
 class _FakeSettings:
-    """Stand-in for `app_shared.config.Settings` -- just the one field
-    `_flush_batch` reads (SPEC-09 T029), no real env/pydantic validation."""
+    """Stand-in for `app_shared.config.Settings` -- the SPEC-09 T029 field
+    plus the two SPEC-12 US5 T037 fields `_flush_batch` now also reads
+    unconditionally (the stats-buffer recording gate), no real
+    env/pydantic validation. None of this file's seeded `ScrapeResult`s
+    carry a `domain_strategy_profile_id`, so `record_attempt` itself is
+    never actually invoked here -- only the attribute reads need
+    satisfying."""
 
     PRICE_ANALYSIS_DEDUP_TTL_SECONDS = 21600
+    STRATEGY_STATS_KEY_TTL_SECONDS = 3600
+    STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD = 0.85
 
 
 class _FakeRedis:

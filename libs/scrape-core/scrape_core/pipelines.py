@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func
@@ -82,13 +83,14 @@ from twisted.python.failure import Failure
 
 from app_shared.catalog.upsert import dedup_last_wins
 from app_shared.config import get_settings
-from app_shared.enums import ScrapeErrorCode, ScrapeTargetStatus
+from app_shared.enums import MethodType, ScrapeErrorCode, ScrapeTargetStatus
 from app_shared.ids import new_uuid7
 from app_shared.jobs.targets import mark_target
 from app_shared.limiter.locks import release_match_lock
 from app_shared.messaging import enqueue
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.redis_client import get_redis_client
+from app_shared.strategy.stats_buffer import record_attempt
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE, SCRAPE_FINALIZE_JOBS
 
 from scrape_core.db import run_in_thread, workspace_txn
@@ -309,6 +311,63 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             match_id=item.match_id,
             released=released,
         )
+
+    # SPEC-12 US5 (T037, contracts/stats-buffer.md "Called only from"): buffer
+    # each item's attempt outcome for the domain strategy optimizer -- Redis
+    # only, still inside this SAME off-reactor flush (no new reactor hop, no
+    # blocking Redis on the reactor, FR-025/SC-007). Only items whose group
+    # resolved a `domain_strategy_profile_id` (US2 T022) are recorded; an
+    # ad-hoc/pre-SPEC-12 item with none is skipped outright. Up to two calls
+    # per item -- one for its ACCESS method, one for its EXTRACTION method
+    # (when one was even attempted, i.e. the fetch succeeded far enough to
+    # extract) -- access and extraction are learned/promoted independently
+    # (US1 AS5), so each needs its own `(method_type, method_name)` stat key.
+    # `qualifying` reuses the SPEC-06/07 outcome already computed by
+    # `validate_candidate`: `item.success` (passed every validation check),
+    # `item.comparable` (`False` **only** on a `CURRENCY_MISMATCH` warning --
+    # "currency valid when required"), `item.price is not None` ("a valid
+    # numeric Decimal"), and `item.extraction_confidence` compared against
+    # the promotion confidence bar -- no re-validation performed here.
+    settings = get_settings()
+    stats_ttl_seconds = settings.STRATEGY_STATS_KEY_TTL_SECONDS
+    promotion_confidence_threshold = Decimal(str(settings.STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD))
+    for item in batch:
+        if item.domain_strategy_profile_id is None:
+            continue
+        qualifying = (
+            item.success
+            and item.comparable
+            and item.price is not None
+            and item.extraction_confidence is not None
+            and item.extraction_confidence >= promotion_confidence_threshold
+        )
+        record_attempt(
+            redis,
+            workspace_id=item.workspace_id,
+            profile_id=item.domain_strategy_profile_id,
+            method_type=MethodType.ACCESS,
+            method_name=item.access_method.value,
+            success=item.success,
+            response_time_ms=item.response_time_ms,
+            confidence=item.extraction_confidence,
+            url=item.url,
+            qualifying=qualifying,
+            ttl_seconds=stats_ttl_seconds,
+        )
+        if item.extraction_method is not None:
+            record_attempt(
+                redis,
+                workspace_id=item.workspace_id,
+                profile_id=item.domain_strategy_profile_id,
+                method_type=MethodType.EXTRACTION,
+                method_name=item.extraction_method.value,
+                success=item.success,
+                response_time_ms=item.response_time_ms,
+                confidence=item.extraction_confidence,
+                url=item.url,
+                qualifying=qualifying,
+                ttl_seconds=stats_ttl_seconds,
+            )
 
     # Only after the transaction above has committed cleanly -- enqueue one
     # SCRAPE_FINALIZE_JOBS per distinct affected job so finalize_jobs()
