@@ -37,3 +37,7 @@ Auto-answered questions during the pipeline (doc-first per the autospec skill). 
 - [clarify] Q: Uniqueness of a refresh rule per (scope, target)? → A: not constrained; multiple
   rules for the same scope/target allowed (source: default — doc §22 lists no unique constraint;
   operators may legitimately want two cadences on one scope). No spec change needed.
+- [plan] R: BYPASSRLS system session for cross-tenant refresh-rule claim (scheduler must scan all workspaces). Justified: mirrors existing auth get_system_session seam; app-level scoped_select scoping retained for every job/target read/write; RLS still enforced on refresh_rules for the CRUD (api) path. (source: doc §28 cross-tenant enqueuer + §32 isolation)
+- [plan] R: new dependency croniter (pure-Python, scraping-free) for 5-field UTC cron next_run_at; interval_minutes = run_time + minutes. (source: plan research R-cadence; no cron lib previously present)
+- [plan] R: scope target FK columns ON DELETE CASCADE so deleting a product/variant/group/competitor/match removes referencing refresh rules cleanly (FR-020).
+- [plan] R: SCHEDULER_POLL_INTERVAL_SECONDS default 30s + SCHEDULER_CLAIM_BATCH_LIMIT as new Settings knobs (interval deferred from clarify).
