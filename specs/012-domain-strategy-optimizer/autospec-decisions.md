@@ -32,3 +32,19 @@ Partial items resolved doc-first — no user questions asked.
 - [clarify] Q: Discovery trigger — auto, operator, or both? → A: Both; converge on one
   discovery-run + profile-seed path; auto path enqueues on strategy_discovery queue. (source:
   doc §14 + §26 strategy_discovery queue)
+
+## checklist
+
+Setup questions auto-answered doc-first: depth = formal pre-implementation gate; audience =
+reviewer (autospec orchestrator); focus = learning/promotion correctness, isolation/RLS,
+reactor-safety & scale, URL-pattern versioning, rediscovery coverage. Generated
+`checklists/optimizer.md` (35 items). Both checklists completed (requirements.md 16/16;
+optimizer.md 35/35). Two items surfaced real measurability gaps → spec fixed:
+
+- [checklist] CHK005 → Fixed FR-010: "3 different URLs" now defined as 3 distinct source URLs
+  (by distinct full normalized URL string sharing the derived pattern). (source: default —
+  doc silent on URL identity)
+- [checklist] CHK030 → Fixed FR-020: quantified "repeatedly" (empty-selector / sub-0.75 /
+  403-429) as a configurable consecutive-occurrence threshold, default 3, reset on qualifying
+  success. (source: default — doc §14 leaves "repeatedly" unquantified)
+- [checklist] after_checklist hook? → None registered in extensions.yml; skipped.

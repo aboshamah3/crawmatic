@@ -261,9 +261,10 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
   success/failure timestamps. The raw per-attempt signal is sourced from the existing SPEC-07
   spider attempt path (no separate production double-fetch).
 - **FR-010**: System MUST promote a method to the profile's preferred method only after 3
-  successful extractions across at least 3 different URLs of the same domain+pattern, each
-  with confidence ≥ the configured threshold (default 0.85), a valid numeric price, and a
-  valid currency when currency is required.
+  successful extractions across at least 3 **distinct source URLs** (counted by distinct
+  full normalized URL string, all sharing the profile's derived `url_pattern`) of the same
+  domain+pattern, each with confidence ≥ the configured threshold (default 0.85), a valid
+  numeric price, and a valid currency when currency is required.
 - **FR-011**: On promotion, System MUST set the profile's `preferred_access_method` /
   `preferred_extraction_method` and corresponding `access_confidence` /
   `extraction_confidence`, update `confirmed_success_count`, and move the profile to `ACTIVE`.
@@ -303,7 +304,9 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
   cumulative success rate below 80% (read from `strategy_attempt_stats.success_rate` plus
   pending buffered deltas); selector returns empty repeatedly; price confidence below 0.75
   repeatedly; repeated 403/429; currency disappears; price values become unrealistic; template
-  appears changed.
+  appears changed. "Repeatedly" for the empty-selector, sub-0.75-confidence, and 403/429
+  signals means reaching a configurable consecutive-occurrence threshold (default 3), tracked
+  per preferred method and reset on a qualifying success.
 - **FR-021**: System MUST support a periodic light re-check that evaluates active profiles for
   degradation and enqueues rediscovery without requiring a full failed batch.
 
