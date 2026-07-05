@@ -56,14 +56,14 @@ validation) and the scheduler (US2: recompute per run) depend on. Must exist bef
 
 **⚠️ CRITICAL**: No user-story work can begin until this phase is complete.
 
-- [ ] T004 Implement the cadence module `libs/shared/app_shared/scheduling/cadence.py`:
+- [X] T004 Implement the cadence module `libs/shared/app_shared/scheduling/cadence.py`:
   `compute_next_run_at(rule, run_time) -> datetime` (cron:
   `croniter(rule.cron_expression, run_time_utc).get_next(datetime)`; interval:
   `run_time + timedelta(minutes=rule.interval_minutes)`), plus `validate_cron(expr) -> None`
   (raises on unparseable cron) and an interval guard (`> 0`). All datetimes tz-aware UTC; always
   base computation on the passed `run_time`/now (never the stale `next_run_at`), giving backlog
   fire-once for free. (research R1; FR-003/006/016/018)
-- [ ] T005 [P] Unit-test the cadence module in `tests/unit/test_cadence.py`: cron next-occurrence,
+- [X] T005 [P] Unit-test the cadence module in `tests/unit/test_cadence.py`: cron next-occurrence,
   interval next-run, far-past `next_run_at` → single strictly-future result (backlog), invalid cron
   rejected, non-positive interval rejected. Runs green with no DB. (FR-003/006/016)
 
