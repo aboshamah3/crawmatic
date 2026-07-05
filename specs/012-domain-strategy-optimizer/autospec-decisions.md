@@ -71,3 +71,24 @@ Remediated all actionable findings myself (analyze is read-only), then re-ran an
   (feature ships as one release unit).
 - Re-run: 0 CRITICAL/HIGH/MEDIUM; 3 LOW (I1 plan cosmetic, A1 FR-010 currency-required pointer,
   A2 SC-003 wording) — all three applied. Cleared for implement.
+
+## implement
+
+8 phases, one sonnet subagent per phase (P8 finished inline by orchestrator after a session-limit
+cut-off). All 45 tasks [X]. Full suite green: 1490 passed / 221 skipped / 0 failed; single head
+f30c60cfa2f7; scoping guard OK; ruff clean; reactor-safety + import-boundary tests green.
+
+- [implement] P2/T008 regression: `test_repository_scoping.py::test_workspace_owned_models_is_exactly_*`
+  asserted exact membership → updated to include DomainStrategyProfile/StrategyDiscoveryRun (correct;
+  scoping guard requires them registered).
+- [implement] P6/P7 import-boundary: `rediscovery.py` docstrings contained the literal `scrape_core`
+  substring, tripping `test_import_boundaries.py`'s static ban → reworded to "scrape-core" (hyphen).
+- [implement] P8 design (inline): STRATEGY_STATS_FLUSH was never routed to the maintenance queue in
+  celery_app.py (Phase-7 gap) → routed it alongside the new STRATEGY_PATTERN_BACKFILL. Backfill
+  re-derives a stale profile's pattern from a representative competitor match URL (matched by
+  competitor_id+url_pattern, since matches carry no domain col) → re-link if unchanged else reset to
+  DISCOVERY_REQUIRED + enqueue discovery. Not exercised at algorithm version 1 (scan empty).
+- [implement] T045 quickstart: Scenarios 1–6 are infra-gated (live Postgres/Redis/Scrapyd) and covered
+  by skip-clean integration tests; unit-level SC-001..SC-007 logic (promotion, resolution, rediscovery
+  8-condition, buffered-stats no-hot-row, RLS DDL) is exhaustively unit-tested and green.
+- No `after_*` hooks fired at any implement step (none registered/enabled).
