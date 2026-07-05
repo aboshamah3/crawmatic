@@ -278,7 +278,8 @@
         "plan": "done",
         "checklist": "done",
         "tasks": "done",
-        "analyze": "done"
+        "analyze": "done",
+        "implement": "in-progress (P1 done)"
       }
     }
   }

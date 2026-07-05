@@ -35,8 +35,8 @@ description: "Task list for SPEC-12 — Domain Strategy Optimizer"
 
 **Purpose**: Sync the workspace and scaffold the new pure-logic package so all later phases have a home.
 
-- [ ] T001 Sync workspace dependencies from repo root: `uv sync --all-packages` (NEVER plain `uv sync` — it wipes workspace member deps). No new third-party dependency is added; confirm `redis`, `sqlalchemy`, `alembic`, `celery`, `scrapy`, `twisted`, `fastapi` resolve.
-- [ ] T002 [P] Create the new pure-logic package `libs/shared/app_shared/strategy/__init__.py` (empty package marker; public re-exports are added in T042 as modules land).
+- [X] T001 Sync workspace dependencies from repo root: `uv sync --all-packages` (NEVER plain `uv sync` — it wipes workspace member deps). No new third-party dependency is added; confirm `redis`, `sqlalchemy`, `alembic`, `celery`, `scrapy`, `twisted`, `fastapi` resolve.
+- [X] T002 [P] Create the new pure-logic package `libs/shared/app_shared/strategy/__init__.py` (empty package marker; public re-exports are added in T042 as modules land).
 
 **Checkpoint**: `uv run pytest -q` collects cleanly; the new package is importable.
 
