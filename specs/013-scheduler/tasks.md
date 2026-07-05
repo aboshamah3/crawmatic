@@ -242,7 +242,7 @@ Force one rule's job creation to raise → only that rule rolls back; others alr
 
 ### Implementation for User Story 3
 
-- [ ] T024 [US3] Add per-rule error isolation to `run_refresh_pass` in
+- [X] T024 [US3] Add per-rule error isolation to `run_refresh_pass` in
   `apps/scheduler/app/scheduler/refresh.py`: wrap each rule's process step in `try/except`; on failure
   `session.rollback()` (undoing ONLY that rule — lock releases, `next_run_at` unchanged so it retries
   later), `logger.exception(...)`, and stop the pass (or track already-attempted rule ids) so the
@@ -255,11 +255,11 @@ Force one rule's job creation to raise → only that rule rolls back; others alr
 
 ### Tests for User Story 3
 
-- [ ] T025 [P] [US3] Unit test `tests/unit/test_refresh_pass_isolation.py` with a fake session +
+- [X] T025 [P] [US3] Unit test `tests/unit/test_refresh_pass_isolation.py` with a fake session +
   stubbed `create_scope_job`: a rule whose processing raises triggers rollback of only its own
   transaction and does not prevent the pass from having committed earlier rules; assert the pass does
   not re-select the unchanged poison rule endlessly. (FR-021)
-- [ ] T026 [P] [US3] Live integration test `tests/integration/test_scheduler_concurrency_live.py`
+- [X] T026 [P] [US3] Live integration test `tests/integration/test_scheduler_concurrency_live.py`
   (`skipif` probe): two overlapping passes over one due set → each rule fired exactly once
   (SKIP LOCKED, 0 dup / 0 miss); crash-before-commit (rollback after claim+enqueue) leaves
   `next_run_at` unchanged and a later pass re-fires exactly once; deleting a scope-target row

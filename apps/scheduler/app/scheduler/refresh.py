@@ -108,23 +108,43 @@ def run_refresh_pass(
                 session.rollback()
                 break
 
-            run_time = now
-            target_id = _target_id_for_rule(rule)
-            create_scope_job(
-                session,
-                workspace_id=rule.workspace_id,
-                scope=rule.scope,
-                target_id=target_id,
-                requested_by=None,
-                job_type=ScrapeJobType.SCHEDULED,
-                source=ScrapeJobSource.SCHEDULER,
-            )
+            try:
+                run_time = now
+                target_id = _target_id_for_rule(rule)
+                create_scope_job(
+                    session,
+                    workspace_id=rule.workspace_id,
+                    scope=rule.scope,
+                    target_id=target_id,
+                    requested_by=None,
+                    job_type=ScrapeJobType.SCHEDULED,
+                    source=ScrapeJobSource.SCHEDULER,
+                )
 
-            rule.last_run_at = run_time
-            rule.locked_at = run_time
-            rule.next_run_at = compute_next_run_at(rule, run_time)
+                rule.last_run_at = run_time
+                rule.locked_at = run_time
+                rule.next_run_at = compute_next_run_at(rule, run_time)
 
-            session.commit()
-            fired += 1
+                session.commit()  # enqueue already happened; commit last
+                fired += 1
+            except Exception:
+                # FR-021: this is the SAME rollback/leave-fields-unchanged
+                # path used for the crash-before-commit case (FR-014) --
+                # only THIS rule's transaction is undone. Its SKIP LOCKED
+                # row lock releases and next_run_at/last_run_at/locked_at
+                # are unchanged, so it retries on a later pass. Any
+                # dispatch that already reached the broker is neutralized
+                # by the SPEC-08 idempotent dispatch guard + SPEC-11
+                # match locks (duplicate-over-miss).
+                session.rollback()
+                logger.exception("refresh rule %s failed", rule.id)
+                # Because next_run_at is unchanged, this same poison rule
+                # would be re-selected by the identical claim query within
+                # this pass and spin forever. Stop the pass here; earlier
+                # rules in this pass already committed and keep their
+                # advanced next_run_at, so they are not re-selected. The
+                # next tick's pass retries this rule and any others still
+                # due.
+                break
 
     return fired
