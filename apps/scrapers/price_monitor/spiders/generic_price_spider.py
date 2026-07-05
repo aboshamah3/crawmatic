@@ -133,7 +133,13 @@ from app_shared.profiles.resolution import (
 from app_shared.redis_client import get_redis_client
 from app_shared.repository import scoped_select
 from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
+from app_shared.strategy.resolution import (
+    StrategyStart,
+    resolve_or_create_strategy_profile,
+    resolve_strategy_start,
+)
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
+from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
@@ -172,6 +178,15 @@ class SpiderTarget:
     domain: str = ""
     access_policy: AccessPolicy | None = None
     domain_rule: DomainAccessRule | None = None
+    # SPEC-12 US2 (contracts/consumption.md, D5/D6): this target's group's
+    # `domain_strategy_profiles` row id (always present post-T021 -- the
+    # get-or-create seam never leaves a group unresolved) and the learned
+    # `(access, extraction)` start `resolve_strategy_start` decided for it,
+    # `None` when the profile isn't eligible yet (the default ladder is
+    # used unchanged). Both default so existing hand-built targets (unit
+    # tests predating SPEC-12) keep constructing without changes.
+    domain_strategy_profile_id: uuid.UUID | None = None
+    strategy_start: StrategyStart | None = None
 
 
 @dataclass
@@ -514,6 +529,40 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
                 )
                 domain_rule_by_match[match.id] = matched_rule
 
+        # --- SPEC-12 US2: per-group domain-strategy profile get-or-create +
+        # learned-start resolution (contracts/consumption.md, D5/D6). One
+        # query (or, on a brand-new key, one insert + one enqueue) per
+        # distinct (competitor_id, url_pattern) group -- never per match
+        # (Principle IV) -- reusing the exact `matched_domain_rule_by_group`
+        # this function already computed for access-policy resolution just
+        # above, so `domain_access_rules.url_pattern_override` (FR-006) is
+        # honored from the very same domain rule, no second lookup. The
+        # lookup pattern is that manual override when one matched, else a
+        # fresh `derive_url_pattern` at the *current*
+        # `URL_PATTERN_ALGORITHM_VERSION` -- never the group's own
+        # (possibly stale) stored `competitor_product_matches.url_pattern`,
+        # so a version bump can never silently mix patterns (FR-005).
+        strategy_profile_id_by_group: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
+        strategy_start_by_group: dict[tuple[uuid.UUID, str], StrategyStart | None] = {}
+        for (competitor_id, url_pattern), group in groups.items():
+            domain = competitor_domain_by_id.get(competitor_id, "")
+            matched_rule = matched_domain_rule_by_group[(competitor_id, url_pattern)]
+            override = matched_rule.url_pattern_override if matched_rule is not None else None
+            lookup_pattern = override or derive_url_pattern(group[0].competitor_url)
+
+            strategy_profile = resolve_or_create_strategy_profile(
+                session,
+                redis,
+                workspace_id=workspace_id,
+                competitor_id=competitor_id,
+                domain=domain,
+                url_pattern=lookup_pattern,
+            )
+            strategy_profile_id_by_group[(competitor_id, url_pattern)] = strategy_profile.id
+            strategy_start_by_group[(competitor_id, url_pattern)] = resolve_strategy_start(
+                strategy_profile, algorithm_version=URL_PATTERN_ALGORITHM_VERSION
+            )
+
         resolved_policy_ids = {pid for pid in resolved_policy_id_by_match.values() if pid is not None}
         access_policies_by_id: dict[uuid.UUID, AccessPolicy] = {}
         if resolved_policy_ids:
@@ -553,6 +602,7 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
             profile_id = resolved_profile_id_by_match.get(match.id)
             profile = profiles_by_id.get(profile_id) if profile_id else None
             policy_id = resolved_policy_id_by_match.get(match.id)
+            strategy_group_key = (match.competitor_id, match.url_pattern)
             targets.append(
                 SpiderTarget(
                     match_id=match.id,
@@ -567,6 +617,8 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
                     domain=competitor_domain_by_id.get(match.competitor_id, ""),
                     access_policy=access_policies_by_id.get(policy_id) if policy_id else None,
                     domain_rule=domain_rule_by_match.get(match.id),
+                    domain_strategy_profile_id=strategy_profile_id_by_group.get(strategy_group_key),
+                    strategy_start=strategy_start_by_group.get(strategy_group_key),
                 )
             )
         return _LoadedTargets(
@@ -666,6 +718,16 @@ def _prepare_dispatch(
             use_proxy_on_first_attempt=policy.use_proxy_on_first_attempt,
             use_proxy_on_retry=policy.use_proxy_on_retry,
             allow_browser_fallback=policy.allow_browser_fallback,
+            # SPEC-12 US2 (contracts/consumption.md step 3, D6): a learned
+            # start seeds attempt 1's access method only -- `next_attempt`
+            # itself only ever consults `preferred_method` when
+            # `attempt_number == 1` (see its module docstring judgment call
+            # "SPEC-12 forward-compat"), so passing this unconditionally on
+            # every call (including retries) is safe: it's simply ignored
+            # for `attempt_number > 1`.
+            preferred_method=(
+                target.strategy_start.access_method if target.strategy_start is not None else None
+            ),
             proxy_budget_exhausted=proxy_budget_exhausted,
         )
 
@@ -1222,7 +1284,16 @@ class GenericPriceSpider(scrapy.Spider):
             )
             return
 
-        candidate = extract(response.text, target.profile)
+        # SPEC-12 US2 (contracts/consumption.md step 3, D6): a learned
+        # extraction method is tried first, falling back to the full
+        # default order only if it misses -- never a narrower chain.
+        candidate = extract(
+            response.text,
+            target.profile,
+            preferred_method=(
+                target.strategy_start.extraction_method if target.strategy_start is not None else None
+            ),
+        )
         if candidate is None:
             yield self._build_result(
                 target,
@@ -1403,6 +1474,15 @@ class GenericPriceSpider(scrapy.Spider):
         lock, so there is nothing to release. A dispatched attempt passes
         them via `_attempt_kwargs_from_meta` (read back from
         `request.meta`/`response.meta`, stamped by `_request_for`).
+
+        ``domain_strategy_profile_id`` (SPEC-12 US2, T022, contracts/
+        consumption.md step 4) is read straight off `target` -- every
+        target this spider builds carries the profile id its
+        `(competitor_id, url_pattern)` group resolved in `load_targets`
+        (`None` only for a hand-built pre-SPEC-12 target, e.g. a unit
+        test) -- so every `ScrapeResult` this method emits for a real
+        dispatched target threads it through without a second query,
+        ready for US5's off-reactor stats recorder.
         """
         kwargs: dict[str, Any] = {}
         if candidate_extras is not None:
@@ -1436,5 +1516,6 @@ class GenericPriceSpider(scrapy.Spider):
             error_message=error_message,
             match_lock_key=match_lock_key,
             match_lock_token=match_lock_token,
+            domain_strategy_profile_id=target.domain_strategy_profile_id,
             **kwargs,
         )

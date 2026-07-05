@@ -81,3 +81,15 @@ class ScrapeResult:
     # not-dispatched path) -- a missing token means no release is attempted.
     match_lock_key: str | None = None
     match_lock_token: str | None = None
+
+    # --- SPEC-12 US2 (contracts/consumption.md step 4, D5/D6) ---
+    # The `domain_strategy_profiles` row (if any) this attempt's
+    # `(competitor_id, url_pattern)` group resolved to, threaded through
+    # from `generic_price_spider.load_targets`'s per-group get-or-create
+    # seam so US5's off-reactor stats recorder (`_flush_batch` ->
+    # `app_shared.strategy.stats_buffer.record_attempt`) has the profile
+    # id without a second query. `None` when the group resolved no
+    # profile at all (should not happen post-T021, which always
+    # get-or-creates one) or for a hand-built pre-SPEC-12 item (unit
+    # tests) that never threads it through.
+    domain_strategy_profile_id: uuid.UUID | None = None
