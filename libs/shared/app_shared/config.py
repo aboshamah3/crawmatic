@@ -197,6 +197,21 @@ class Settings(BaseSettings):
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
     STRATEGY_STATS_KEY_TTL_SECONDS: int = 3600
 
+    # --- Scheduler refresh-pass tuning (SPEC-13 US2, research R8,
+    # Principle IV — env-tunable, never a hardcoded literal). Poll
+    # cadence and per-pass claim ceiling for `apps/scheduler`'s due-rule
+    # loop (`app.scheduler.refresh.run_refresh_pass`). ---
+    SCHEDULER_POLL_INTERVAL_SECONDS: int = 30
+    SCHEDULER_CLAIM_BATCH_LIMIT: int = 100
+
+    # --- Scheduler system DB role (optional — BYPASSRLS role for the
+    # scheduler's inherently cross-tenant due-rule claim only; see
+    # app_shared.database.get_system_session). Falls back to
+    # AUTH_DATABASE_URL when unset (research R2) — unlike
+    # AUTH_DATABASE_URL itself, which deliberately never falls back to
+    # DATABASE_URL (SPEC-03 [analyze C1]).
+    SYSTEM_DATABASE_URL: str | None = None
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:

@@ -42,6 +42,8 @@ _engine: Engine | None = None
 _sessionmaker: sessionmaker[Session] | None = None
 _auth_engine: Engine | None = None
 _auth_sessionmaker: sessionmaker[Session] | None = None
+_system_engine: Engine | None = None
+_system_sessionmaker: sessionmaker[Session] | None = None
 
 
 def get_engine() -> Engine:
@@ -177,6 +179,81 @@ def get_auth_session() -> Iterator[Session]:
         session.close()
 
 
+def get_system_engine() -> Engine:
+    """Return the per-process scheduler-system-role engine, creating it on first use.
+
+    Bound to ``Settings.SYSTEM_DATABASE_URL``, falling back to
+    ``Settings.AUTH_DATABASE_URL`` when unset (research R2, SPEC-13). A
+    dedicated BYPASSRLS role used ONLY by the scheduler's due-rule claim
+    (:func:`get_system_session`) — the claim is inherently cross-tenant
+    (one query must see due ``refresh_rules`` rows across every
+    workspace), which ``FORCE ROW LEVEL SECURITY`` makes impossible for
+    the ordinary pooler role with no ``app.workspace_id`` set. Raises
+    :class:`RuntimeError` if neither ``SYSTEM_DATABASE_URL`` nor
+    ``AUTH_DATABASE_URL`` is configured; see :func:`get_system_session`
+    for the fail-fast rationale (mirrors :func:`get_auth_engine`).
+    """
+    global _system_engine
+    if _system_engine is None:
+        settings = get_settings()
+        database_url = settings.SYSTEM_DATABASE_URL or settings.AUTH_DATABASE_URL
+        if not database_url:
+            raise RuntimeError(
+                "SYSTEM_DATABASE_URL (or its AUTH_DATABASE_URL fallback) is "
+                "required for the scheduler's cross-tenant refresh-rule claim; "
+                "the due-rule scan returns 0 rows without a BYPASSRLS role "
+                "under forced RLS."
+            )
+        _system_engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            connect_args={
+                # Same PgBouncer transaction-pooling constraint as the
+                # main engine (see module docstring): disable server-side
+                # prepared statements.
+                "prepare_threshold": None,
+            },
+        )
+    return _system_engine
+
+
+def get_system_sessionmaker() -> sessionmaker[Session]:
+    """Return the per-process system-role ``sessionmaker``, creating it on first use."""
+    global _system_sessionmaker
+    if _system_sessionmaker is None:
+        _system_sessionmaker = sessionmaker(bind=get_system_engine(), expire_on_commit=False)
+    return _system_sessionmaker
+
+
+@contextmanager
+def get_system_session() -> Iterator[Session]:
+    """Yield a BYPASSRLS :class:`Session` for the scheduler's due-rule claim ONLY.
+
+    Bound to ``Settings.SYSTEM_DATABASE_URL`` (falling back to
+    ``Settings.AUTH_DATABASE_URL``, research R2). This is the **one**
+    documented deviation for SPEC-13 (plan.md Complexity Tracking): the
+    refresh-rule claim (``SELECT ... FOR UPDATE SKIP LOCKED``) is
+    structurally cross-tenant, so it must bypass RLS to see due rows
+    across every workspace. Workspace isolation is **not** relaxed by
+    this seam — every read/write the scheduler performs for a claimed
+    rule still goes through app-level scoping (``scoped_select(...,
+    rule.workspace_id)`` / explicit ``workspace_id=`` on inserted
+    job/target rows, exactly as the SPEC-08 job service already does).
+
+    Scope: used ONLY by the scheduler's refresh pass
+    (``apps/scheduler/app/scheduler/refresh.py``). The API CRUD path
+    (``/v1/refresh-rules``) always keeps the ordinary RLS-enforced
+    request session (:func:`get_session` + :func:`set_workspace_context`)
+    — it must never use this BYPASSRLS session.
+    """
+    session_factory = get_system_sessionmaker()
+    session = session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def check_connection() -> None:
     """Verify connectivity by executing a trivial ``SELECT 1``.
 
@@ -198,6 +275,7 @@ def dispose_engine() -> None:
     parent process.
     """
     global _engine, _sessionmaker, _auth_engine, _auth_sessionmaker
+    global _system_engine, _system_sessionmaker
     if _engine is not None:
         _engine.dispose()
     _engine = None
@@ -206,3 +284,7 @@ def dispose_engine() -> None:
         _auth_engine.dispose()
     _auth_engine = None
     _auth_sessionmaker = None
+    if _system_engine is not None:
+        _system_engine.dispose()
+    _system_engine = None
+    _system_sessionmaker = None

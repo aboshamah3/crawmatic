@@ -11,11 +11,27 @@ is unit-testable against a fake session + fake `enqueue`.
 per ACTIVE match of the variant, resolving to an immediate COMPLETED
 job with no dispatch when the variant has zero active matches.
 
+`create_scope_job` (SPEC-13 US2, `contracts/job-service-seam.md`) is the
+new scope-general entry point reused by the scheduler's refresh pass
+(and future manual scope-run endpoints): it resolves ACTIVE matches for
+any of the six `ScrapeScope` members via
+`app_shared.jobs.scopes.resolve_scope_matches`, and — unlike
+`create_match_job`/`create_variant_job` — returns `(None, None)` with no
+job/dispatch at all when zero matches resolve (FR-015), rather than an
+immediate `COMPLETED` job. `create_match_job`/`create_variant_job`
+themselves are left untouched.
+
 Every read/write is workspace-scoped; the session already carries RLS
-context set by the caller (the router's auth seam). Counters start at 0
-and are only ever set by `app_shared.jobs.targets.aggregate_counts` —
-this module never increments them. This module does not call Scrapyd —
-it only creates rows and enqueues the dispatch task.
+context set by the caller (the router's auth seam) or — for the
+scheduler's `create_scope_job` calls — is the caller's own transaction
+on the BYPASSRLS system session (`app_shared.database.get_system_session`),
+with workspace scoping enforced at the application layer instead
+(`scoped_select`/explicit `workspace_id=` on every insert). Counters
+start at 0 and are only ever set by `app_shared.jobs.targets.aggregate_counts`
+— this module never increments them. This module does not call Scrapyd —
+it only creates rows and enqueues the dispatch task, and it never
+commits — the caller owns the transaction (enqueue-before-commit,
+FR-012).
 """
 
 from __future__ import annotations
@@ -33,6 +49,7 @@ from app_shared.enums import (
     ScrapeScope,
     ScrapeTargetStatus,
 )
+from app_shared.jobs.scopes import resolve_scope_matches
 from app_shared.messaging import enqueue
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import CompetitorProductMatch
@@ -40,7 +57,7 @@ from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.repository import scoped_select
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
 
-__all__ = ["create_match_job", "create_variant_job"]
+__all__ = ["create_match_job", "create_variant_job", "create_scope_job"]
 
 
 def _enqueue_dispatch(job_id: uuid.UUID, workspace_id: uuid.UUID | str) -> None:
@@ -90,6 +107,77 @@ def create_match_job(
         created_at=now,
     )
     session.add(target)
+    session.flush()
+
+    _enqueue_dispatch(job.id, workspace_id)
+
+    return job.id, ScrapeJobStatus.PENDING
+
+
+def create_scope_job(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    scope: ScrapeScope,
+    target_id: uuid.UUID | None,
+    requested_by: uuid.UUID | None,
+    job_type: ScrapeJobType = ScrapeJobType.MANUAL,
+    source: ScrapeJobSource = ScrapeJobSource.API,
+) -> tuple[uuid.UUID | None, ScrapeJobStatus | None]:
+    """Create a job for any of the six ``ScrapeScope`` members, or none.
+
+    Resolves ``matches = resolve_scope_matches(session, workspace_id=...,
+    scope=..., target_id=...)``. If ``matches`` is empty, creates **no**
+    job and enqueues **no** dispatch — returns ``(None, None)`` (FR-015;
+    unlike ``create_variant_job``'s zero-match case, which still creates
+    an immediately-``COMPLETED`` job). Otherwise creates one
+    ``ScrapeJob(type=job_type, source=source, scope=scope,
+    status=PENDING, total_targets=len(matches))``, flushes, then one
+    ``ScrapeJobTarget(status=PENDING)`` per match, then enqueues dispatch
+    **before returning** — this function never commits; the caller
+    (the scheduler's per-rule transaction, or a future manual scope-run
+    endpoint) owns the transaction boundary (enqueue-before-commit,
+    FR-012/FR-014).
+
+    The scheduler calls this with ``job_type=ScrapeJobType.SCHEDULED,
+    source=ScrapeJobSource.SCHEDULER``. ``create_match_job``/
+    ``create_variant_job`` are unaffected by this addition.
+    """
+    matches = resolve_scope_matches(
+        session, workspace_id=workspace_id, scope=scope, target_id=target_id
+    )
+    if not matches:
+        return None, None
+
+    now = datetime.now(timezone.utc)
+
+    job = ScrapeJob(
+        workspace_id=workspace_id,
+        type=job_type,
+        scope=scope,
+        product_id=target_id if scope == ScrapeScope.PRODUCT else None,
+        product_variant_id=target_id if scope == ScrapeScope.VARIANT else None,
+        product_group_id=target_id if scope == ScrapeScope.PRODUCT_GROUP else None,
+        competitor_id=target_id if scope == ScrapeScope.COMPETITOR else None,
+        match_id=target_id if scope == ScrapeScope.MATCH else None,
+        status=ScrapeJobStatus.PENDING,
+        total_targets=len(matches),
+        requested_by=requested_by,
+        source=source,
+        created_at=now,
+    )
+    session.add(job)
+    session.flush()
+
+    for match in matches:
+        target = ScrapeJobTarget(
+            workspace_id=workspace_id,
+            scrape_job_id=job.id,
+            match_id=match.id,
+            status=ScrapeTargetStatus.PENDING,
+            created_at=now,
+        )
+        session.add(target)
     session.flush()
 
     _enqueue_dispatch(job.id, workspace_id)

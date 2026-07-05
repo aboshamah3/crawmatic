@@ -167,22 +167,22 @@ zero-match rule advances its schedule with no job/dispatch.
 
 ### Implementation for User Story 2
 
-- [ ] T015 [P] [US2] Add the new `Settings` knobs in `libs/shared/app_shared/config.py`:
+- [X] T015 [P] [US2] Add the new `Settings` knobs in `libs/shared/app_shared/config.py`:
   `SCHEDULER_POLL_INTERVAL_SECONDS: int = 30`, `SCHEDULER_CLAIM_BATCH_LIMIT: int = 100`, and
   `SYSTEM_DATABASE_URL` (env-overridable) that **falls back to `AUTH_DATABASE_URL`** when unset.
   Match the existing `STRATEGY_*_INTERVAL_SECONDS` pattern. (research R2/R8; FR-007)
-- [ ] T016 [US2] Add the BYPASSRLS `get_system_session()` (+ `get_system_sessionmaker()`) helper in
+- [X] T016 [US2] Add the BYPASSRLS `get_system_session()` (+ `get_system_sessionmaker()`) helper in
   `libs/shared/app_shared/database.py`, bound to `Settings.SYSTEM_DATABASE_URL` (→ `AUTH_DATABASE_URL`
   fallback), mirroring the existing `get_auth_session()` seam for the cross-tenant claim. Document
   that this is used ONLY by the scheduler pass; the API CRUD path keeps the RLS-enforced request
   session. Depends on T015. (research R2; FR-005)
-- [ ] T017 [P] [US2] Implement `resolve_scope_matches(session, *, workspace_id, scope, target_id)
+- [X] T017 [P] [US2] Implement `resolve_scope_matches(session, *, workspace_id, scope, target_id)
   -> list[CompetitorProductMatch]` in `libs/shared/app_shared/jobs/scopes.py` — always
   `scoped_select(CompetitorProductMatch, workspace_id).where(status == MatchStatus.ACTIVE,
   <scope predicate>)` for all six scopes (WORKSPACE base-only; COMPETITOR/PRODUCT/VARIANT/MATCH id
   equality; PRODUCT_GROUP via `EXISTS(product_group_items ...)` with the product-arm OR variant-arm
   membership). A missing/dangling target id yields `[]` (no crash). (FR-010/020; research R4; contract job-service-seam)
-- [ ] T018 [US2] Add `create_scope_job(session, *, workspace_id, scope, target_id, requested_by,
+- [X] T018 [US2] Add `create_scope_job(session, *, workspace_id, scope, target_id, requested_by,
   job_type=ScrapeJobType.MANUAL, source=ScrapeJobSource.API) -> tuple[uuid|None, ScrapeJobStatus|None]`
   in `libs/shared/app_shared/jobs/service.py`: resolve via T017; **empty → `(None, None)`** (no job,
   no dispatch — FR-015); else create one `ScrapeJob(type=job_type, source=source, scope=scope,
@@ -190,7 +190,7 @@ zero-match rule advances its schedule with no job/dispatch.
   `ScrapeJobTarget(status=PENDING)` per match, then `_enqueue_dispatch(job.id, workspace_id)`
   **before returning (never commit — caller owns the transaction)**. Leave `create_match_job`/
   `create_variant_job` untouched. Depends on T017. (FR-011/012/015; research R3/R4; contract job-service-seam)
-- [ ] T019 [US2] Implement the refresh pass
+- [X] T019 [US2] Implement the refresh pass
   `apps/scheduler/app/scheduler/refresh.py`: `run_refresh_pass(session_factory, *, now, batch_limit) -> int`
   doing **per-rule** claim→process→commit (NOT one batch transaction): loop up to `batch_limit`,
   each iteration opening a fresh transaction, claiming ONE row with
@@ -201,7 +201,7 @@ zero-match rule advances its schedule with no job/dispatch.
   NOT in ORDER BY. Backlog rules fire once (cadence bases on `now`). Bookkeeping writes MUST stay
   confined to the claimed rule row + the standard job/target inserts done by `create_scope_job`
   (no per-request hot-row writes — FR-017). (FR-007/008/009/012/013/015/016/017; research R5; contract scheduler-loop)
-- [ ] T020 [US2] Extend the loop in `apps/scheduler/app/scheduler/scheduler_app.py`: add a second
+- [X] T020 [US2] Extend the loop in `apps/scheduler/app/scheduler/scheduler_app.py`: add a second
   independent interval accumulator driven by `SCHEDULER_POLL_INTERVAL_SECONDS` that each elapsed
   interval calls `run_refresh_pass(get_system_sessionmaker(), now=utcnow, batch_limit=SCHEDULER_CLAIM_BATCH_LIMIT)`,
   logging-and-swallowing any pass exception (never crash-loop). PRESERVE the existing SIGTERM/SIGINT
@@ -210,15 +210,15 @@ zero-match rule advances its schedule with no job/dispatch.
 
 ### Tests for User Story 2
 
-- [ ] T021 [P] [US2] Unit test `tests/unit/test_scope_resolution.py`: assert the correct predicate
+- [X] T021 [P] [US2] Unit test `tests/unit/test_scope_resolution.py`: assert the correct predicate
   branch is selected per scope (WORKSPACE base-only; COMPETITOR/PRODUCT/VARIANT/MATCH id filters;
   PRODUCT_GROUP EXISTS both membership arms) and `status == ACTIVE` always applied — verified against
   the compiled query/predicate without a live DB. (FR-010)
-- [ ] T022 [P] [US2] Unit test `tests/unit/test_create_scope_job.py` with a fake/mock session:
+- [X] T022 [P] [US2] Unit test `tests/unit/test_create_scope_job.py` with a fake/mock session:
   zero matches → returns `(None, None)`, creates no `ScrapeJob` and enqueues nothing; ≥1 match →
   creates the job + one target per match and calls `_enqueue_dispatch` **before** any commit
   (assert enqueue-before-commit ordering). (FR-011/012/015)
-- [ ] T023 [P] [US2] Live integration test `tests/integration/test_scheduler_pass_live.py`
+- [X] T023 [P] [US2] Live integration test `tests/integration/test_scheduler_pass_live.py`
   (`skipif` probe): due rule fires exactly one `SCHEDULED`/`SCHEDULER` job with one target per active
   match and advances `last_run_at`/`next_run_at`; zero-match rule advances schedule with no job;
   far-past `next_run_at` fires once and lands strictly future (backlog). (US2 AS-1..6; SC-002/005/006)
