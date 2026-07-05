@@ -315,6 +315,14 @@
       ],
       "deferred_reason": "require a live Postgres/Redis/Scrapyd (no container engine in build env); 5 integration test files authored + skip cleanly. DB/Redis/reactor-independent logic exhaustively unit-tested (full suite 1490 passed / 221 skipped / 0 failed; ruff clean; reactor-safety + import-boundary + single-head + scoping guards green). Reuses SPEC-05 url_pattern derivation/version, existing AccessMethod/ExtractionMethod enums, SPEC-07 spider attempt path/off-reactor _flush_batch, SPEC-10 Redis atomic-counter pattern. Single head f30c60cfa2f7. analyze remediated 1 HIGH (F1 two-source rediscovery signal model, no hot-path schema widening) + 2 MEDIUM (F2 PLAYWRIGHT_PROXY skipped in discovery, F3 unrealistic/template-change detection defined) + 3 LOW; re-run 0 CRITICAL/HIGH/MEDIUM. 45 tasks.",
       "converge_result": "CONVERGED \u2014 no remaining work; tasks.md unchanged (no convergence phase appended)"
+    },
+    "14": {
+      "title": "Browser Scraping Service",
+      "feature_directory": "specs/014-browser-scraping-service",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
     }
   }
 }
