@@ -1,5 +1,13 @@
 {
   "specs": {
+    "13": {
+      "title": "Scheduler",
+      "feature_directory": "specs/013-scheduler",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
+    },
     "00": {
       "title": "Project Constitution",
       "feature_directory": ".specify/memory/constitution.md",
