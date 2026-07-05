@@ -264,7 +264,9 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
   successful extractions across at least 3 **distinct source URLs** (counted by distinct
   full normalized URL string, all sharing the profile's derived `url_pattern`) of the same
   domain+pattern, each with confidence ≥ the configured threshold (default 0.85), a valid
-  numeric price, and a valid currency when currency is required.
+  numeric price, and a valid currency when currency is required (whether currency is required,
+  and price/currency validity, are determined by the reused SPEC-06/07 money & currency
+  validation rules, §18/§19).
 - **FR-011**: On promotion, System MUST set the profile's `preferred_access_method` /
   `preferred_extraction_method` and corresponding `access_confidence` /
   `extraction_confidence`, update `confirmed_success_count`, and move the profile to `ACTIVE`.
@@ -307,6 +309,21 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
   appears changed. "Repeatedly" for the empty-selector, sub-0.75-confidence, and 403/429
   signals means reaching a configurable consecutive-occurrence threshold (default 3), tracked
   per preferred method and reset on a qualifying success.
+- **FR-020a**: Rediscovery evaluation MUST draw from two signal sources without widening the
+  hot-path buffered-stats schema: (a) the aggregate/counter conditions — consecutive failures
+  and cumulative success rate — from the profile counter (`recent_failure_count`) and the
+  rolled-up per-method `strategy_attempt_stats` plus pending buffered deltas; and (b) the
+  per-attempt-outcome conditions — empty selector, sub-0.75 confidence, 403/429, currency
+  absent, unrealistic price, template change — evaluated from the recent per-attempt outcome
+  signals already recorded for the preferred method in `request_attempts` (error code, HTTP
+  status, extracted price, currency presence, confidence, observed URL), read off the hot path
+  by the flush task and the periodic light re-check. The buffered stats recorder (§FR-022)
+  remains success/failure/response-time/confidence/URL only.
+- **FR-020b**: The two under-specified outcome conditions MUST have concrete detection rules:
+  "price values become unrealistic" means the extracted price fails the §18 price-validation
+  bounds; "template appears changed" means the re-derived `url_pattern` (at the current
+  `URL_PATTERN_ALGORITHM_VERSION`) of recently observed preferred-method URLs no longer equals
+  the profile's stored `url_pattern` for ≥ the configurable consecutive threshold (default 3).
 - **FR-021**: System MUST support a periodic light re-check that evaluates active profiles for
   degradation and enqueues rediscovery without requiring a full failed batch.
 
@@ -361,8 +378,8 @@ delta. Assert no blocking buffer/DB call occurs on the scraping (reactor) thread
 - **SC-002**: Two different product URLs that share a template resolve to the same derived
   pattern in 100% of cases across the documented normalization rules and locale prefixes.
 - **SC-003**: Recording attempt stats for a single hot domain of N attempts results in at most
-  a small bounded number of primary-store writes per flush interval (independent of N), and
-  zero per-attempt primary-store writes.
+  one primary-store UPSERT per distinct `(method_type, method_name)` key per flush interval
+  (independent of N), and zero per-attempt primary-store writes.
 - **SC-004**: When a preferred method meets any rediscovery condition, the profile is marked
   degraded and rediscovery is enqueued within one evaluation cycle 100% of the time.
 - **SC-005**: A query issued without workspace context returns zero rows for all three tables,

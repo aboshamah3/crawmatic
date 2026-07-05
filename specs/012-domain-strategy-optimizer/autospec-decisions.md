@@ -48,3 +48,26 @@ optimizer.md 35/35). Two items surfaced real measurability gaps → spec fixed:
   403-429) as a configurable consecutive-occurrence threshold, default 3, reset on qualifying
   success. (source: default — doc §14 leaves "repeatedly" unquantified)
 - [checklist] after_checklist hook? → None registered in extensions.yml; skipped.
+
+## analyze
+
+First pass: 0 CRITICAL. 1 HIGH (F1), 2 MEDIUM (F2, F3), 3 LOW (F4, F5, F6-informational).
+Remediated all actionable findings myself (analyze is read-only), then re-ran analyze once.
+
+- [analyze] F1 (HIGH) rediscovery conditions 3/5/6/7/8 had no recorded signal source → Added
+  FR-020a (two-source model: aggregate counters via combined_stats; per-attempt outcome via
+  `recent_signals` built off-hot-path from existing `request_attempts` — hot-path buffer NOT
+  widened) + FR-020b (concrete detection: unrealistic=§18 bound failure; template-change=
+  re-derived url_pattern≠profile). Updated contracts/rediscovery.md (evaluator signature +
+  RecentSignals), tasks T029/T030/T031/T034/T035. (source: doc §14 + SPEC-07 request_attempts)
+- [analyze] F2 (MEDIUM) discovery probed PLAYWRIGHT_PROXY it can't execute → discovery
+  skips/short-circuits PLAYWRIGHT_PROXY until SPEC-14. Updated contracts/discovery.md, T027,
+  plan.md. (source: plan out-of-scope note + SPEC-14 boundary)
+- [analyze] F3 (MEDIUM) "unrealistic price"/"template changed" undefined → defined in FR-020b +
+  rediscovery contract. (source: doc §18 validation + §15 pattern re-derive)
+- [analyze] F4 (LOW) bare PLAYWRIGHT token drift → removed from plan.md. F5 (LOW) tie-break
+  cost order undefined → defined access cost order (ladder order) + §16 extraction order in
+  contracts/discovery.md + T027. F6 (LOW) US5-last sequencing → informational, no action
+  (feature ships as one release unit).
+- Re-run: 0 CRITICAL/HIGH/MEDIUM; 3 LOW (I1 plan cosmetic, A1 FR-010 currency-required pointer,
+  A2 SC-003 wording) — all three applied. Cleared for implement.

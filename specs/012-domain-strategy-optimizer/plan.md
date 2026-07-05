@@ -101,7 +101,8 @@ redis-client / SQLAlchemy, no Scrapy/Twisted); new enums + `Settings` knobs + ta
 `load_targets` + pipeline `_flush_batch` extensions (profile get-or-create, learned start, stats record);
 new worker tasks (discovery, stats-flush, light-recheck, pattern-backfill); a thin `apps/api` operator
 router; scheduler entries for the periodic tasks. **Out of scope (deferred):** actual Playwright browser
-execution (SPEC-14 — `PLAYWRIGHT_PROXY`/`PLAYWRIGHT` are reserved vocabulary only); per-workspace threshold
+execution (SPEC-14 — `PLAYWRIGHT_PROXY` is reserved vocabulary only, skipped during discovery until
+SPEC-14 can run it); per-workspace threshold
 overrides (global `Settings` defaults suffice); partitioning the three tables (rolled-up layer, not
 append-heavy).
 
@@ -115,7 +116,7 @@ append-heavy).
 | **II. Workspace Isolation (NON-NEGOTIABLE)** | PASS | All three tables RLS-protected in the creating migration: `domain_strategy_profiles`/`strategy_discovery_runs` via standard `emit_rls_policy` (own `workspace_id` + real FK + composite workspace-local FK to `competitors`); `strategy_attempt_stats` (no `workspace_id` per §22) via the new **`emit_fk_transitive_rls_policy`** EXISTS-subquery on its parent profile — fail-closed (no context → 0 rows, SC-005). Redis keys namespaced (`stratdirty:{workspace_id}`; profile-id keys belong to one workspace). Profiles/runs added to `WORKSPACE_OWNED_MODELS` (scoped queries + CI guard); stats excluded (no `workspace_id`) and queried only joined to its scoped parent (SPEC-10 dual-scope exclusion precedent). Cross-workspace read/write tests required (FR-026). |
 | **III. Variant-Level Pricing & Explicit Matching** | PASS (n/a) | No new pricing/matching logic. Discovery samples existing `competitor_product_matches` URLs; learning keys on the match-derived `url_pattern`. Prices are validated (Decimal/currency) only to gate a *qualifying* learning success, never to alter matching. |
 | **IV. Database-Driven Configuration** | PASS | Behavior is config-driven: promotion/rediscovery/discovery thresholds are env-tunable `Settings` with the documented defaults (0.85 / 3 / 3 / 0.80 / 0.75 / 3 / 3–10) — not hardcoded. Profile + learned-start resolution reuses the existing **per-`(competitor_id, url_pattern)`-group**, Redis-cached resolution seam — never a per-match DB walk. Learned strategy itself is the DB-driven `domain_strategy_profiles` the spec exists to populate. |
-| **V. Disciplined Scraping Runtime (NON-NEGOTIABLE)** | PASS | **Central to this spec.** Spiders still only persist: stats recording is added **inside the existing off-reactor `_flush_batch`** (`run_in_thread`), so no new reactor hop and no blocking Redis/DB on the reactor (FR-025). Promotion, rediscovery, discovery, and stats-flush all run in **Celery** (off-reactor). The static `test_reactor_safety_grep.py` proof stays green (the recorder is in the already-"safe" transitive set). Discovery reuses idempotent dispatch + in-flight match locks (SPEC-08/11). Browser stays a reserved fallback (`PLAYWRIGHT_*` vocabulary only; SPEC-14 executes). |
+| **V. Disciplined Scraping Runtime (NON-NEGOTIABLE)** | PASS | **Central to this spec.** Spiders still only persist: stats recording is added **inside the existing off-reactor `_flush_batch`** (`run_in_thread`), so no new reactor hop and no blocking Redis/DB on the reactor (FR-025). Promotion, rediscovery, discovery, and stats-flush all run in **Celery** (off-reactor). The static `test_reactor_safety_grep.py` proof stays green (the recorder is in the already-"safe" transitive set). Discovery reuses idempotent dispatch + in-flight match locks (SPEC-08/11). Browser stays a reserved fallback (`PLAYWRIGHT_PROXY` vocabulary only, skipped during discovery; SPEC-14 executes). |
 | **VI. Internal-Only & Legally Compliant Access (NON-NEGOTIABLE)** | PASS | Discovery probes only the internal ladder (`DIRECT_HTTP`/`DIRECT_HTTP_RETRY`/`PROXY_HTTP`/`PLAYWRIGHT_PROXY`); no external unlocker API, no CAPTCHA/login/paywall. Sample URLs are `validate_competitor_url`'d (SSRF guard). No raw HTML/screenshots stored — only learned strategy + rolled-up stats (§30/§38). |
 | **VII. Monetary & Extraction Correctness** | PASS | A learning success counts **only** with a valid numeric `Decimal` price and valid currency-when-required, at confidence ≥ 0.85 — reusing SPEC-06/07 money/currency validation (`app_shared.money`, `Numeric(18,4)`; confidences are `Numeric(5,4)`, never `Money`/float). Currency-mismatch/absent successes don't count and are a rediscovery signal. Promotion/rediscovery evaluators are deterministic (boundary-tested). |
 | **VIII. Scale-Safe Data & Concurrency** | PASS | **Delivers the §14 atomic-stats guarantee.** No hot-row write: per-method counters buffer in Redis (atomic `HINCRBY`), flushed with ≤1 `count = count + delta` UPDATE per key per interval (SC-003) — never N per-attempt writes. The three tables are the rolled-up layer, **not partitioned** (correctly — they aren't append-heavy). Concurrent promotion protected by the unique `(profile_id, method_type, method_name)` + a guarded single-statement `UPDATE`. UUIDv7 ids. Learned start reuses hot current-state resolution, no historical scan. |
@@ -185,10 +186,10 @@ apps/scrapers/price_monitor/
 
 apps/workers/app/workers/
 ├── tasks_strategy.py                # NEW — STRATEGY_DISCOVERY_RUN (discovery.md) + STRATEGY_STATS_FLUSH
-│                                    #   (stats-buffer.md flush + inline promotion/rediscovery)
-└── tasks_maintenance? / tasks_jobs.py
-                                     # EXTEND — STRATEGY_LIGHT_RECHECK + STRATEGY_PATTERN_BACKFILL;
-                                     #   job finalization also triggers a stats flush for the job's profiles
+│                                    #   (stats-buffer.md flush + inline promotion/rediscovery) +
+│                                    #   STRATEGY_LIGHT_RECHECK + STRATEGY_PATTERN_BACKFILL
+└── tasks_jobs.py                    # EXTEND — job finalization also triggers a stats flush for the
+                                     #   job's profiles
 
 apps/scheduler/app/scheduler/scheduler_app.py
                                      # EXTEND — enqueue periodic STRATEGY_STATS_FLUSH + STRATEGY_LIGHT_RECHECK

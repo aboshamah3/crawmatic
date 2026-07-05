@@ -20,12 +20,18 @@ queue (§26). Worker module `apps/workers/app/workers/tasks_strategy.py`. Both t
    `RUNNING` (FR-017, US3 AS1).
 3. **Probe** — the one path allowed to try multiple methods (small sample, §14): drive the sample URLs
    through the **existing** fetch/extract pipeline (reuse SPEC-07/10 dispatch + spider + SPEC-11
-   limiter/lock), testing candidate **access methods** (the internal ladder only — `DIRECT_HTTP` →
-   `DIRECT_HTTP_RETRY` → `PROXY_HTTP` → `PLAYWRIGHT_PROXY`, Constitution VI) then **extraction methods**
-   (§16 order). No external unlocker APIs; only public pages.
+   limiter/lock), testing candidate **access methods** (the internal ladder — `DIRECT_HTTP` →
+   `DIRECT_HTTP_RETRY` → `PROXY_HTTP`, Constitution VI) then **extraction methods** (§16 order). No
+   external unlocker APIs; only public pages. **`PLAYWRIGHT_PROXY` is reserved vocabulary only and is
+   short-circuited (skipped) during discovery until SPEC-14 (Browser Scraping Service) can actually
+   execute it** — discovery never probes an access method this feature cannot run.
 4. **Select winner**: the `(access_method, extraction_method)` combination that yields a valid numeric
    price + valid currency-when-required + confidence ≥ `STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD` on the
-   most sample URLs (ties broken by cheapest access method then earliest extraction-order method).
+   most sample URLs. Ties broken by **cheapest access method** then **earliest extraction-order method**,
+   where the access cost order (cheapest → most expensive) is the ladder order itself:
+   `DIRECT_HTTP < DIRECT_HTTP_RETRY < PROXY_HTTP < PLAYWRIGHT_PROXY`, and the extraction order is the §16
+   escalation order (`PLATFORM_PATTERN`, `JSON_LD`, `EMBEDDED_JSON`, `CSS_SELECTOR`, `XPATH`, `REGEX`,
+   `PLAYWRIGHT_RENDERED_SELECTOR`). Both orderings are deterministic and unit-testable.
 5. **Complete**:
    - winner found → `status = COMPLETED`, set `winning_access_method` / `winning_extraction_method` /
      `completed_at` (US3 AS1).
