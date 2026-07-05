@@ -182,23 +182,28 @@ LIMIT :batch_limit;   -- SCHEDULER_CLAIM_BATCH_LIMIT
 
 Expressed in SQLAlchemy as `select(RefreshRule).where(RefreshRule.enabled, RefreshRule.next_run_at
 <= now).order_by(RefreshRule.next_run_at).with_for_update(skip_locked=True).limit(batch_limit)`.
-The whole pass (claim + per-rule job creation + rule updates + all enqueues) runs in **one
-transaction** committed once. **No** global/advisory pass-lock (FR-009). A transaction-scoped
-per-rule `pg_advisory_xact_lock` is permitted as belt-and-suspenders but is **not** planned —
-`SKIP LOCKED` already guarantees exclusive per-row claiming across instances.
+Each due rule is claimed, processed, and committed in **its own transaction** (claim one row with
+`LIMIT 1 FOR UPDATE SKIP LOCKED` → create job/enqueue → advance `next_run_at`/`last_run_at`/
+`locked_at` → commit), looping up to `batch_limit` rules per pass. **No** global/advisory
+pass-lock (FR-009). A transaction-scoped per-rule `pg_advisory_xact_lock` is permitted as
+belt-and-suspenders but is **not** planned — `SKIP LOCKED` already guarantees exclusive per-row
+claiming across instances.
 
-**Rationale**: `FOR UPDATE SKIP LOCKED` is exactly §28's prescription; disjoint batches let N
-instances run concurrently with 0 duplicate / 0 missed runs (SC-003). A `LIMIT` bounds how long a
-pass holds row locks while it enqueues (a network hop per rule), keeping lock windows short so
-sibling instances make progress. A partial index `(next_run_at) WHERE enabled` makes the ordered
-due-scan cheap at scale (Principle VIII).
+**Rationale**: `FOR UPDATE SKIP LOCKED` is exactly §28's prescription; disjoint claims let N
+instances run concurrently with 0 duplicate / 0 missed runs (SC-003). Per-rule transactions are
+what let enqueue-before-commit (FR-012) and per-rule error isolation (FR-021) coexist: a failure
+on one rule rolls back only that rule and is retried later, without blocking the rules already
+fired. `batch_limit` bounds work per pass; each per-rule lock window is short (one job creation +
+one enqueue hop). A partial index `(next_run_at) WHERE enabled` makes the ordered due-scan cheap
+at scale (Principle VIII).
 
 **Alternatives considered**:
 - *Global advisory pass lock (`lock:scheduler:refresh-rules`)* — rejected: FR-009 / §28 forbid it;
   it would serialize instances and negate SKIP LOCKED.
-- *One transaction per rule* — acceptable but chattier; a single bounded batch transaction is
-  simpler and still crash-safe (whole batch rolls back → all locks release, no `next_run_at`
-  advanced). Batch size is the tunable that trades throughput vs. lock-hold time.
+- *Single batch transaction with all rules committed once* — rejected: one poison rule would roll
+  back the whole batch (violating FR-021), and per-rule SAVEPOINT rollback cannot un-send an
+  already-enqueued Celery dispatch (orphaning it against a rolled-back `scrape_job_id`). Per-rule
+  transactions are chattier but correct.
 
 ---
 

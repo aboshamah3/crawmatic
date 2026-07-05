@@ -41,3 +41,19 @@ Auto-answered questions during the pipeline (doc-first per the autospec skill). 
 - [plan] R: new dependency croniter (pure-Python, scraping-free) for 5-field UTC cron next_run_at; interval_minutes = run_time + minutes. (source: plan research R-cadence; no cron lib previously present)
 - [plan] R: scope target FK columns ON DELETE CASCADE so deleting a product/variant/group/competitor/match removes referencing refresh rules cleanly (FR-020).
 - [plan] R: SCHEDULER_POLL_INTERVAL_SECONDS default 30s + SCHEDULER_CLAIM_BATCH_LIMIT as new Settings knobs (interval deferred from clarify).
+
+## checklist
+
+- [checklist] Generated checklists/scheduler.md (33 requirements-quality items across concurrency,
+  cadence, isolation, scope-resolution, cross-cutting). Completed 33/33; requirements.md remains
+  16/16.
+- [checklist] Gap CHK008 → added FR-021: per-rule error isolation. One failing rule must not roll
+  back/block others in the pass; failing rule keeps next_run_at and retries later. Reconciled the
+  plan away from a single batch commit to a per-rule claim→process→commit loop (single batch txn
+  rejected: a SAVEPOINT rollback can't un-send an already-enqueued Celery dispatch → orphaned
+  dispatch). Updated scheduler-loop.md + research.md R5 + plan.md accordingly.
+- [checklist] Gap CHK015 → strengthened FR-003 to reject invalid cron / non-positive interval at
+  write time.
+- [checklist] Gap CHK021/CHK020 → strengthened FR-005: refresh_rules registered in the
+  workspace-owned model registry (unscoped-query CI guard covers it); API CRUD path uses an
+  RLS-enforced (non-bypass) session; only the scheduler claim uses BYPASSRLS.

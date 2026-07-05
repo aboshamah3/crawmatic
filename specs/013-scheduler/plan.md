@@ -119,7 +119,7 @@ libs/shared/app_shared/
 
 apps/scheduler/app/scheduler/
 ├── scheduler_app.py            # EDIT — add refresh-pass poll accumulator
-└── refresh.py                  # NEW — run_refresh_pass(session, *, now, batch_limit)
+└── refresh.py                  # NEW — run_refresh_pass(session_factory, *, now, batch_limit)
 
 apps/api/app/
 ├── routers/refresh_rules.py    # NEW — /v1/refresh-rules CRUD + PATCH enable/disable

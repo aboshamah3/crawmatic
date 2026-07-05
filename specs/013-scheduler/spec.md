@@ -152,13 +152,17 @@ double-fired on the next pass.
   VARIANT, PRODUCT_GROUP, MATCH — and MUST require the target id appropriate to the chosen scope
   (WORKSPACE requires none; the others require their corresponding id) and reject mismatches.
 - **FR-003**: The system MUST reject a rule that specifies neither cadence nor both cadences; each
-  rule has exactly one of `cron_expression` or `interval_minutes`.
+  rule has exactly one of `cron_expression` or `interval_minutes`. It MUST also reject a
+  syntactically invalid `cron_expression` and a non-positive `interval_minutes` at write time
+  (a rule that cannot yield a next occurrence is never stored).
 - **FR-004**: Operators MUST be able to create, read, list, update, and delete refresh rules, and
   to enable/disable a rule without deleting it, all scoped to their workspace.
 - **FR-005**: All refresh-rule reads and writes MUST be confined to the caller's workspace via
   both application-level scoping and database Row-Level Security, and refresh_rules MUST be
   created with RLS enabled from its first migration. A missing application filter MUST NOT expose
-  another workspace's rules.
+  another workspace's rules. refresh_rules MUST be registered among the workspace-owned models so
+  the existing CI guard against unscoped queries covers it, and the API CRUD path MUST use an
+  RLS-enforced (non-bypass) session.
 - **FR-006**: On rule creation/update the system MUST compute `next_run_at` from the rule's
   cadence; on each successful run it MUST recompute `next_run_at` to the next occurrence that is
   in the future relative to the run time.
@@ -203,6 +207,12 @@ double-fired on the next pass.
 - **FR-020**: Deleting a catalog, competitor, or match row referenced by a refresh rule MUST be
   handled cleanly (e.g. the reference is cleared or the rule is removed) so it neither blocks the
   delete nor leaves the scheduler dereferencing a missing target.
+- **FR-021**: The scheduler MUST process claimed rules with per-rule error isolation: a failure
+  while resolving one rule's scope or creating its job MUST NOT roll back, block, or prevent the
+  firing of the other rules claimed in the same pass, and MUST leave the failing rule's scheduling
+  fields unchanged so it is retried on a later pass (never lost, never permanently blocking the
+  batch). A rule whose firing is committed MUST have advanced its own `next_run_at` so it is not
+  re-selected by the same failure on the next pass.
 
 ### Key Entities *(include if feature involves data)*
 
