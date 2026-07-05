@@ -39,6 +39,8 @@ from app_shared.task_names import (
     SCRAPE_RECOVER_STALLED,
     STRATEGY_DISCOVERY_RUN,
     STRATEGY_LIGHT_RECHECK,
+    STRATEGY_PATTERN_BACKFILL,
+    STRATEGY_STATS_FLUSH,
 )
 
 settings = get_settings()
@@ -90,6 +92,8 @@ app.conf.task_routes = {
     PRICE_ANALYSIS_RECOMPUTE: {"queue": "price_analysis"},
     STRATEGY_DISCOVERY_RUN: {"queue": "strategy_discovery"},
     STRATEGY_LIGHT_RECHECK: {"queue": "maintenance"},
+    STRATEGY_STATS_FLUSH: {"queue": "maintenance"},
+    STRATEGY_PATTERN_BACKFILL: {"queue": "maintenance"},
 }
 
 

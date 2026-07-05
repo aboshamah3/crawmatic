@@ -559,9 +559,23 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
                 url_pattern=lookup_pattern,
             )
             strategy_profile_id_by_group[(competitor_id, url_pattern)] = strategy_profile.id
-            strategy_start_by_group[(competitor_id, url_pattern)] = resolve_strategy_start(
+            learned_start = resolve_strategy_start(
                 strategy_profile, algorithm_version=URL_PATTERN_ALGORITHM_VERSION
             )
+            strategy_start_by_group[(competitor_id, url_pattern)] = learned_start
+            if learned_start is not None:
+                # Structured observability event (contracts/api-and-observability.md
+                # §Observability, T040, SC-001): the consumption resolver returned a
+                # learned start, so this group skips the default escalation ladder.
+                logger.info(
+                    "generic_price_spider: strategy_learned_start_used "
+                    "profile_id=%s access_method=%s extraction_method=%s",
+                    strategy_profile.id,
+                    learned_start.access_method.value,
+                    learned_start.extraction_method.value
+                    if learned_start.extraction_method is not None
+                    else None,
+                )
 
         resolved_policy_ids = {pid for pid in resolved_policy_id_by_match.values() if pid is not None}
         access_policies_by_id: dict[uuid.UUID, AccessPolicy] = {}

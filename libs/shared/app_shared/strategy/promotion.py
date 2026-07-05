@@ -29,6 +29,7 @@ only qualifying successes (contracts/promotion.md).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -38,6 +39,8 @@ from sqlalchemy.orm import Session
 
 from app_shared.enums import MethodType, StrategyStatus, validate_method_name
 from app_shared.models.strategy import DomainStrategyProfile
+
+logger = logging.getLogger(__name__)
 
 #: Statuses from which a qualifying method may still promote a profile to
 #: ACTIVE (contracts/promotion.md "Concurrent promotion"). DISABLED is
@@ -203,4 +206,16 @@ def apply_promotion(
         .values(**values)
     )
     result = session.execute(stmt)
-    return bool(result.rowcount and result.rowcount > 0)
+    promoted = bool(result.rowcount and result.rowcount > 0)
+    if promoted:
+        # Structured observability event (contracts/api-and-observability.md
+        # §Observability, T040): a method was actually promoted this call.
+        logger.info(
+            "app_shared.strategy.promotion: strategy_method_promoted "
+            "profile_id=%s method_type=%s method_name=%s confidence=%s",
+            profile_id,
+            method_type.value,
+            validated_name,
+            decision.confidence,
+        )
+    return promoted

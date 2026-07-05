@@ -20,12 +20,13 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app_shared.enums import DiscoveryRunStatus
+from app_shared.enums import DiscoveryRunStatus, StrategyStatus
 from app_shared.messaging import enqueue
-from app_shared.models.strategy import StrategyDiscoveryRun
+from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.strategy.repository import get_profile
 from app_shared.task_names import STRATEGY_DISCOVERY_RUN
 
-__all__ = ["create_discovery_run"]
+__all__ = ["create_discovery_run", "update_profile"]
 
 #: Matches `apps/workers/app/workers/celery_app.py`'s `strategy_discovery` queue.
 _DISCOVERY_QUEUE = "strategy_discovery"
@@ -70,3 +71,29 @@ def create_discovery_run(
         },
     )
     return run
+
+
+def update_profile(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    profile_id: uuid.UUID,
+    url_pattern: str | None = None,
+    status: StrategyStatus | None = None,
+) -> DomainStrategyProfile | None:
+    """Operator override of a learned profile (FR-006 pattern override /
+    FR-014 disable-reenable). Workspace-scoped via ``get_profile`` (both id +
+    workspace_id) — returns ``None`` for a missing/cross-workspace profile so
+    the router maps it to a 404. Applies only the provided fields.
+    """
+    profile = get_profile(session, profile_id, workspace_id)
+    if profile is None:
+        return None
+
+    if url_pattern is not None:
+        profile.url_pattern = url_pattern
+    if status is not None:
+        profile.status = status
+
+    session.flush()
+    return profile

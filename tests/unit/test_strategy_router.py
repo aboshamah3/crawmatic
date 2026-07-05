@@ -27,9 +27,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.services.strategy as service_module
-from app_shared.enums import DiscoveryRunStatus
+from app_shared.enums import (
+    AccessMethod,
+    DiscoveryRunStatus,
+    StrategyStatus,
+)
 from app_shared.models.competitors_matches import Competitor
-from app_shared.models.strategy import StrategyDiscoveryRun
+from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION
 from app_shared.task_names import STRATEGY_DISCOVERY_RUN
 
 from app.deps import Principal, get_current_principal
@@ -259,3 +264,82 @@ def test_get_discovery_run_missing_is_404(
     resp = client.get(f"/v1/strategy/discovery-runs/{uuid.uuid4()}")
 
     assert resp.status_code == 404
+
+
+# --- Profile read/manage endpoints (T039) ---------------------------------
+
+
+def _make_profile(*, workspace_id: uuid.UUID = WORKSPACE_ID) -> DomainStrategyProfile:
+    profile = DomainStrategyProfile(
+        workspace_id=workspace_id,
+        competitor_id=uuid.uuid4(),
+        domain="acme.example",
+        url_pattern="acme.example/products/*",
+        url_pattern_version=URL_PATTERN_ALGORITHM_VERSION,
+        status=StrategyStatus.ACTIVE,
+        preferred_access_method=AccessMethod.PROXY_HTTP,
+        confirmed_success_count=3,
+        recent_failure_count=0,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    profile.id = uuid.uuid4()
+    return profile
+
+
+def test_get_profile_missing_is_404(
+    client: TestClient, fake_session: FakeOrmSession
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["strategy:read"]
+    )
+
+    resp = client.get(f"/v1/strategy/profiles/{uuid.uuid4()}")
+
+    assert resp.status_code == 404
+
+
+def test_patch_profile_empty_body_is_422(
+    client: TestClient, fake_session: FakeOrmSession
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["strategy:write"]
+    )
+
+    resp = client.patch(f"/v1/strategy/profiles/{uuid.uuid4()}", json={})
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["code"] == "EMPTY_UPDATE"
+
+
+def test_patch_profile_missing_is_404(
+    client: TestClient, fake_session: FakeOrmSession
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["strategy:write"]
+    )
+
+    resp = client.patch(
+        f"/v1/strategy/profiles/{uuid.uuid4()}", json={"status": "DISABLED"}
+    )
+
+    assert resp.status_code == 404
+
+
+def test_patch_profile_disable_returns_200(
+    client: TestClient, fake_session: FakeOrmSession
+) -> None:
+    profile = _make_profile()
+    fake_session.seed(profile)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["strategy:write"]
+    )
+
+    resp = client.patch(
+        f"/v1/strategy/profiles/{profile.id}", json={"status": "DISABLED"}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == str(profile.id)
+    assert body["status"] == "DISABLED"

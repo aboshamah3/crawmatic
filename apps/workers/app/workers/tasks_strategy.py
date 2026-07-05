@@ -74,9 +74,15 @@ from app_shared.strategy.rediscovery import (
 )
 from app_shared.strategy.repository import resolve_profile, stats_for_profile
 from app_shared.strategy.seed import DiscoverySeedConfidences, seed_from_discovery, validate_sample_size
+from app_shared.messaging import enqueue
 from app_shared.strategy.stats_buffer import dirty_key, read_pending
-from app_shared.task_names import STRATEGY_DISCOVERY_RUN, STRATEGY_LIGHT_RECHECK, STRATEGY_STATS_FLUSH
-from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION
+from app_shared.task_names import (
+    STRATEGY_DISCOVERY_RUN,
+    STRATEGY_LIGHT_RECHECK,
+    STRATEGY_PATTERN_BACKFILL,
+    STRATEGY_STATS_FLUSH,
+)
+from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
 from scrape_core.extraction.pipeline import extract
@@ -747,4 +753,113 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
         "strategy_stats_flushed dirty_profiles=%d keys_flushed=%d",
         dirty_profiles,
         keys_flushed,
+    )
+
+
+# --- STRATEGY_PATTERN_BACKFILL (FR-005, D10, T041) ------------------------
+
+
+#: Backfill batch size per invocation -- a local implementation constant, the
+#: same precedent as `_LIGHT_RECHECK_BATCH_SIZE`.
+_PATTERN_BACKFILL_BATCH_SIZE = 200
+
+
+def _scan_stale_pattern_profile_refs(
+    session: Session, *, limit: int
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """`(id, workspace_id)` for profiles stamped with an OLD
+    `url_pattern_version` (< current `URL_PATTERN_ALGORITHM_VERSION`), unscoped
+    -- the `_scan_active_profile_refs` precedent (every row is only
+    read/mutated after `set_workspace_context` scopes it below). At algorithm
+    version 1 (current) this returns nothing (D10 "defined mechanism, not
+    exercised at version 1")."""
+    stmt = (
+        select(DomainStrategyProfile.id, DomainStrategyProfile.workspace_id)  # noqa: workspace-scope
+        .where(DomainStrategyProfile.url_pattern_version < URL_PATTERN_ALGORITHM_VERSION)
+        .order_by(DomainStrategyProfile.id)
+        .limit(limit)
+    )
+    return list(session.execute(stmt).all())
+
+
+@app.task(name=STRATEGY_PATTERN_BACKFILL)
+def pattern_backfill() -> None:
+    """`STRATEGY_PATTERN_BACKFILL` (`maintenance` queue, FR-005, §15
+    "Pattern algorithm versioning", D10).
+
+    When `URL_PATTERN_ALGORITHM_VERSION` is bumped, stored `url_pattern`
+    values (the join key between matches and learned strategies) may no
+    longer match what the new algorithm derives. This task patrols profiles
+    stamped with an older version and, for each, re-derives the pattern from
+    a representative `competitor_product_matches` URL of the same
+    `(competitor_id, domain)`:
+
+    * pattern unchanged -> just re-stamp `url_pattern_version` (cheap re-link);
+    * pattern changed, or no representative URL exists -> re-stamp the version,
+      reset `status = DISCOVERY_REQUIRED`, and enqueue `STRATEGY_DISCOVERY_RUN`
+      so the strategy is re-learned under the new algorithm (never mixing
+      versions in a lookup, FR-005).
+
+    Bounded (`_PATTERN_BACKFILL_BATCH_SIZE` per invocation) and idempotent:
+    once every row is at the current version the scan is empty. Enqueued
+    on-demand after an algorithm bump (there is no steady-state schedule).
+    """
+    with get_session() as session:
+        rebuilt = 0
+        rediscovered = 0
+        for profile_id, workspace_id in _scan_stale_pattern_profile_refs(
+            session, limit=_PATTERN_BACKFILL_BATCH_SIZE
+        ):
+            set_workspace_context(session, workspace_id)
+            profile = scoped_get(session, DomainStrategyProfile, profile_id, workspace_id)
+            if profile is None or profile.url_pattern_version >= URL_PATTERN_ALGORITHM_VERSION:
+                continue
+
+            # A representative match currently grouped under this profile's
+            # (competitor, pattern) -- its `competitor_url` is what the new
+            # algorithm re-derives from. The competitor's single domain is
+            # implied by `competitor_id`, so no domain filter is needed.
+            sample = session.execute(
+                scoped_select(CompetitorProductMatch, workspace_id)
+                .where(
+                    CompetitorProductMatch.competitor_id == profile.competitor_id,
+                    CompetitorProductMatch.url_pattern == profile.url_pattern,
+                )
+                .limit(1)
+            ).scalars().first()
+
+            requeue = True
+            if sample is not None:
+                new_pattern = derive_url_pattern(sample.competitor_url)
+                if new_pattern == profile.url_pattern:
+                    requeue = False
+                else:
+                    profile.url_pattern = new_pattern
+
+            profile.url_pattern_version = URL_PATTERN_ALGORITHM_VERSION
+            if requeue:
+                profile.status = StrategyStatus.DISCOVERY_REQUIRED
+                enqueue(
+                    STRATEGY_DISCOVERY_RUN,
+                    queue=_DISCOVERY_QUEUE,
+                    kwargs={
+                        "workspace_id": str(workspace_id),
+                        "competitor_id": str(profile.competitor_id),
+                        "domain": profile.domain,
+                        "url_pattern": profile.url_pattern,
+                        "sample_urls": [],
+                        "triggered_by": "AUTO",
+                    },
+                )
+                rediscovered += 1
+            else:
+                rebuilt += 1
+
+        session.commit()
+
+    logger.info(
+        "strategy_pattern_backfill relinked=%d rediscovery_enqueued=%d target_version=%d",
+        rebuilt,
+        rediscovered,
+        URL_PATTERN_ALGORITHM_VERSION,
     )
