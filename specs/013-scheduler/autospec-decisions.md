@@ -77,3 +77,29 @@ Auto-answered questions during the pipeline (doc-first per the autospec skill). 
 - [analyze] I2 (LOW) remediated: spec edge cases now distinguish deleting the rule's NAMED scope
   target (CASCADE removes the rule) vs an underlying match going inactive (rule survives, resolves
   to fewer/zero matches).
+
+## implement
+
+- [implement] All 30 tasks (T001–T030) complete across 6 phases, one sonnet subagent per phase.
+  Final suite: 1541 unit passed / 0 failed; integration 3 passed / 240 skipped / 0 errors
+  (all *_live.py skip cleanly — no Postgres/Redis/Docker in build env); single alembic head
+  93511d5f7885 (refresh_rules, off f30c60cfa2f7); scripts/check_workspace_scoping.py OK; import
+  boundaries green (croniter added no forbidden import; scheduler stays scraping-free).
+- [implement] T007 also updated the frozen-set equality test test_repository_scoping.py to include
+  RefreshRule in WORKSPACE_OWNED_MODELS — the same maintenance every prior spec applies.
+- [implement] Cross-tenant RefreshRule claim in refresh.py is a sanctioned unscoped read annotated
+  `# noqa: workspace-scope` (the exact marker scripts/check_workspace_scoping.py requires; same
+  idiom as status_cache.py User lookup + strategy/flush.py). NOT a violation — the BYPASSRLS design
+  requires scanning all workspaces; app-level scoped_select is used for all job/target reads.
+- [implement] ruff "invalid-noqa" on the workspace-scope pragma is a false positive vs. the repo's
+  actual tooling (custom AST guard, not ruff; ruff is not a repo dependency). Pattern is repo-wide
+  and required; left unchanged intentionally.
+- [implement] Deferred live verifications (require live Postgres/Redis/Scrapyd; authored + skip
+  cleanly): T013 CRUD+first-next_run_at+cross-workspace RLS denial; T014 alembic upgrade/downgrade
+  round-trip; T023 due/zero-match/backlog pass e2e; T026 SKIP-LOCKED concurrency + crash-before-
+  commit re-fire + cascade-delete. quickstart scenarios 1–5,7 deferred to live; scenarios 6 (cadence
+  backlog) + 8 (import boundary) executed green here.
+- [implement] Pre-existing monorepo note (NOT introduced by SPEC-13, verified via git stash):
+  apps/api / apps/scheduler / apps/workers each ship a top-level package named `app`; editable .pth
+  ordering makes a bare `import app...` from repo root resolve apps/api. Tests use the established
+  `sys.path.insert(0, "apps/scheduler")` subprocess idiom (as test_jobs_dispatch_task.py does).
