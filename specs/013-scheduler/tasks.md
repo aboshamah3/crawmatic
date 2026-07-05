@@ -121,7 +121,10 @@ in workspace A are invisible/unaddressable to workspace B. Negatives: neither/bo
   first `next_run_at` via cadence, insert with `workspace_id=principal.workspace_id`, `201`);
   `GET` list (`scoped_select`, keyset on `(created_at, id)`, `clamp_limit`, `paginate`); `GET /{id}`
   (`scoped_get`→404); `PATCH /{id}` (`scoped_get`→404, `exclude_unset`, re-validate, recompute
-  `next_run_at` if cadence changed — this is also the enable/disable path); `DELETE /{id}`
+  `next_run_at` ONLY when the cadence fields change — an `enabled` toggle or a cadence-preserving
+  edit deliberately leaves `next_run_at` untouched, so a re-enabled rule with a stale past
+  `next_run_at` fires once on the next pass by design (FR-006/FR-016); this PATCH is also the
+  enable/disable path); `DELETE /{id}`
   (`scoped_get`→404, hard delete). Mirror `apps/api/app/routers/competitors.py`; structured
   `{"error":{"code","message"}}` envelope. (FR-004/005/006; contract refresh-rules-api)
 - [ ] T011 [US1] Register the router: `include_router(refresh_rules.router)` in
@@ -195,7 +198,9 @@ zero-match rule advances its schedule with no job/dispatch.
   (break when none), calling `create_scope_job(..., job_type=SCHEDULED, source=SCHEDULER)`, setting
   `last_run_at=run_time`, `locked_at=run_time`, `next_run_at=compute_next_run_at(rule, run_time)`,
   then `commit()` (enqueue already happened → commit last). No global/advisory pass-lock; priority
-  NOT in ORDER BY. Backlog rules fire once (cadence bases on `now`). (FR-007/008/009/012/013/015/016; research R5; contract scheduler-loop)
+  NOT in ORDER BY. Backlog rules fire once (cadence bases on `now`). Bookkeeping writes MUST stay
+  confined to the claimed rule row + the standard job/target inserts done by `create_scope_job`
+  (no per-request hot-row writes — FR-017). (FR-007/008/009/012/013/015/016/017; research R5; contract scheduler-loop)
 - [ ] T020 [US2] Extend the loop in `apps/scheduler/app/scheduler/scheduler_app.py`: add a second
   independent interval accumulator driven by `SCHEDULER_POLL_INTERVAL_SECONDS` that each elapsed
   interval calls `run_refresh_pass(get_system_sessionmaker(), now=utcnow, batch_limit=SCHEDULER_CLAIM_BATCH_LIMIT)`,
@@ -244,7 +249,9 @@ Force one rule's job creation to raise → only that rule rolls back; others alr
   unchanged-`next_run_at` poison rule cannot be re-selected within the same pass and spin the loop;
   successfully fired rules keep their advanced `next_run_at` and are not re-selected. Rely on the
   SPEC-08 idempotent dispatch guard + SPEC-11 match locks to neutralize any leaked dispatch
-  (duplicate-over-miss). Depends on T019. (FR-009/014/021; US3 AS-1..4; contract scheduler-loop)
+  (duplicate-over-miss). Use a SINGLE shared rollback/leave-fields-unchanged code path so the
+  crash-before-commit case (FR-014) and the per-rule exception case (FR-021) cannot diverge.
+  Depends on T019. (FR-009/014/021; US3 AS-1..4; contract scheduler-loop)
 
 ### Tests for User Story 3
 

@@ -125,11 +125,15 @@ double-fired on the next pass.
 - **Missed window / downtime backlog**: if the scheduler was down and `next_run_at` is far in the
   past, the rule fires once on recovery and `next_run_at` is advanced to the next *future*
   occurrence — it does not fire once per missed interval (no thundering catch-up).
-- **Scope target removed**: if a rule references a product/variant/group/competitor/match that
-  was later deleted, the scope simply resolves to zero active matches (handled like US2 AS-4);
-  the rule does not crash the pass.
+- **Scope target removed vs. underlying match removed** — two distinct cases:
+  - If the rule's *named* scope target row (the product/variant/group/competitor/match named by the
+    rule's own `*_id`) is deleted, the rule is removed with it via `ON DELETE CASCADE` (FR-020);
+    the scheduler never dereferences a missing named target.
+  - If an *underlying* match reachable from a still-present scope target is deactivated/deleted
+    (but the named target survives), the rule persists and its scope simply resolves to fewer or
+    zero active matches (handled like US2 AS-4); the rule does not crash the pass.
 - **Deleting the scope target row**: refresh rules referencing a deleted scope target must not
-  block deletion of catalog/competitor rows nor leave the scheduler dereferencing a missing row.
+  block deletion of catalog/competitor rows (achieved by the cascade above).
 - **Crash after claim, before commit**: the in-progress transaction rolls back, the row lock is
   released, `next_run_at` is unchanged, and another instance (or the next pass) re-claims it
   (US3 AS-2).
@@ -163,9 +167,12 @@ double-fired on the next pass.
   another workspace's rules. refresh_rules MUST be registered among the workspace-owned models so
   the existing CI guard against unscoped queries covers it, and the API CRUD path MUST use an
   RLS-enforced (non-bypass) session.
-- **FR-006**: On rule creation/update the system MUST compute `next_run_at` from the rule's
-  cadence; on each successful run it MUST recompute `next_run_at` to the next occurrence that is
-  in the future relative to the run time.
+- **FR-006**: On rule creation, and on update **when the cadence changes**, the system MUST
+  (re)compute `next_run_at` from the rule's cadence (base = now); on each successful run it MUST
+  recompute `next_run_at` to the next occurrence in the future relative to the run time. An update
+  that does not change the cadence (including toggling `enabled`) MUST leave `next_run_at`
+  untouched — so a rule re-enabled with a stale past `next_run_at` fires exactly once on the next
+  pass (per FR-016), which is intended, not a defect.
 - **FR-007**: The scheduler service MUST periodically select **due** rules — those with
   enabled=true and `next_run_at <= now()` — ordered by `next_run_at`, and process them.
 - **FR-008**: The scheduler MUST claim due rules using row-level locking that skips rows already

@@ -57,3 +57,23 @@ Auto-answered questions during the pipeline (doc-first per the autospec skill). 
 - [checklist] Gap CHK021/CHK020 → strengthened FR-005: refresh_rules registered in the
   workspace-owned model registry (unscoped-query CI guard covers it); API CRUD path uses an
   RLS-enforced (non-bypass) session; only the scheduler claim uses BYPASSRLS.
+
+## analyze
+
+- [analyze] Result: 0 CRITICAL, 0 HIGH, 5 LOW. 100% FR/SC coverage; external refs verified
+  (single head f30c60cfa2f7; enums ScrapeScope/ScrapeJobType.SCHEDULED/ScrapeJobSource.SCHEDULER/
+  MatchStatus.ACTIVE present; jobs/service.py seams present). One documented constitution
+  deviation (BYPASSRLS system session) — justified, not a violation. No re-run needed (nothing
+  CRITICAL/HIGH).
+- [analyze] I1 (LOW) remediated: added test_refresh_pass_isolation.py + test_scheduler_concurrency_live.py
+  to plan.md file tree (were in tasks T025/T026 but missing from tree).
+- [analyze] U1 (LOW) remediated: FR-006 + T010 now state update-time next_run_at semantics
+  explicitly (recompute only on cadence change; enable-toggle leaves next_run_at → fire-once by
+  design, not a bug).
+- [analyze] C1 (LOW) remediated: T019 now asserts bookkeeping confined to rule row + standard
+  job/target inserts (FR-017), and cites FR-017.
+- [analyze] A1 (LOW) remediated: T024 now mandates a single shared rollback path so FR-014
+  (crash) and FR-021 (per-rule exception) cannot diverge.
+- [analyze] I2 (LOW) remediated: spec edge cases now distinguish deleting the rule's NAMED scope
+  target (CASCADE removes the rule) vs an underlying match going inactive (rule survives, resolves
+  to fewer/zero matches).

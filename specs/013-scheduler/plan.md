@@ -135,11 +135,13 @@ tests/
 │   ├── test_scope_resolution.py            # NEW — per-scope predicate selection
 │   ├── test_create_scope_job.py            # NEW — zero-match + enqueue-before-commit ordering (fake session)
 │   ├── test_refresh_rules_validation.py    # NEW — cadence/scope validation, error codes
+│   ├── test_refresh_pass_isolation.py      # NEW (T025) — per-rule error isolation, fake session
 │   └── test_scheduler_import_boundary.py   # NEW (optional) — apps/scheduler purity
 └── integration/
     ├── test_refresh_rules_crud_live.py     # NEW — CRUD + cross-workspace RLS denial
     ├── test_refresh_rules_migration_live.py# NEW — alembic upgrade/downgrade
-    └── test_scheduler_pass_live.py         # NEW — SKIP-LOCKED concurrency, backlog, zero-match, cascade
+    ├── test_scheduler_pass_live.py         # NEW — SKIP-LOCKED concurrency, backlog, zero-match, cascade
+    └── test_scheduler_concurrency_live.py  # NEW (T026) — multi-instance claim + cascade delete
 ```
 
 **Structure Decision**: Backend monorepo (uv workspace). Model + cadence + job seam + session go in
