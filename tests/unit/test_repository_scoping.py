@@ -19,6 +19,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
     assert_workspace_owned_query_is_scoped,
@@ -35,7 +36,10 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
     # orchestration models; SPEC-09 (T007) widens it once more with the
     # three alert/price-comparison models; SPEC-10 (T008) widens it once
     # more with DomainAccessRule (tenant-only — ProxyProvider/AccessPolicy
-    # are dual-scope and deliberately excluded) — updated here alongside
+    # are dual-scope and deliberately excluded); SPEC-12 (T008) widens it
+    # once more with DomainStrategyProfile/StrategyDiscoveryRun
+    # (StrategyAttemptStats has no workspace_id and is deliberately excluded
+    # — read only via its scoped parent profile) — updated here alongside
     # app_shared.repository so the suite stays in sync with the runtime
     # set.
     assert WORKSPACE_OWNED_MODELS == frozenset(
@@ -57,6 +61,8 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             VariantAlertState,
             PriceAlertEvent,
             DomainAccessRule,
+            DomainStrategyProfile,
+            StrategyDiscoveryRun,
         }
     )
 
