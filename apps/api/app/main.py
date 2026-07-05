@@ -68,6 +68,14 @@ on the same auth seam and FR-020 discipline, gated by the new
 `proxy_providers:read/write`, `access_policies:read/write`, and
 `domain_rules:read/write` scopes. Proxy passwords are encrypted at rest
 and never returned in plaintext (`has_password` only, SC-003).
+
+SPEC-12 US3 adds the `/v1/strategy/discovery-runs` router
+(`contracts/discovery.md`, `contracts/api-and-observability.md`) —
+operator-triggered domain strategy discovery (`POST`, 3-10 `sample_urls`,
+422 out-of-bounds) plus cursor-list/get, on the same auth seam and
+FR-020 discipline, gated by the new `strategy:read`/`strategy:write`
+scopes. Delegates creation + enqueue to `app.services.strategy`; never
+imports `apps/workers`.
 """
 
 from __future__ import annotations
@@ -87,6 +95,7 @@ from app.routers import (
     products,
     proxy_providers,
     scrape_profiles,
+    strategy,
     variants,
 )
 
@@ -105,6 +114,7 @@ app.include_router(alerts.router)
 app.include_router(proxy_providers.router)
 app.include_router(access_policies.router)
 app.include_router(domain_access_rules.router)
+app.include_router(strategy.router)
 
 
 @app.get("/health")

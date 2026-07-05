@@ -37,6 +37,7 @@ from app_shared.task_names import (
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
+    STRATEGY_DISCOVERY_RUN,
 )
 
 settings = get_settings()
@@ -47,7 +48,11 @@ app = Celery(
     # No result backend required for the skeleton; using the same Redis
     # instance keeps configuration minimal without expanding scope.
     backend=None,
-    include=["app.workers.tasks_jobs", "app.workers.tasks_analysis"],
+    include=[
+        "app.workers.tasks_jobs",
+        "app.workers.tasks_analysis",
+        "app.workers.tasks_strategy",
+    ],
 )
 
 # --- Jobs & orchestration queues/routes (SPEC-08 FR-011, FR-015) -----------
@@ -61,16 +66,23 @@ app = Celery(
 # on its own queue, separate from `scrape_dispatch`/`maintenance` and from
 # the Scrapyd/reactor runtime (Principle V, §26), so it can be scaled and
 # deployed independently.
+#
+# `strategy_discovery` (SPEC-12 US3, §26, contracts/discovery.md) carries
+# `STRATEGY_DISCOVERY_RUN` — the one task allowed to probe multiple access
+# methods on a small sample; kept on its own queue since it does its own
+# blocking HTTP fetches (data-model.md §8).
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
     "price_analysis": {},
+    "strategy_discovery": {},
 }
 app.conf.task_routes = {
     SCRAPE_DISPATCH_JOB: {"queue": "scrape_dispatch"},
     SCRAPE_RECOVER_STALLED: {"queue": "maintenance"},
     SCRAPE_FINALIZE_JOBS: {"queue": "maintenance"},
     PRICE_ANALYSIS_RECOMPUTE: {"queue": "price_analysis"},
+    STRATEGY_DISCOVERY_RUN: {"queue": "strategy_discovery"},
 }
 
 
