@@ -36,13 +36,13 @@ Backend monorepo (uv workspace): shared lib in `libs/shared/app_shared/`, servic
 
 **Purpose**: Add the new dependency and package scaffolding shared by every later phase.
 
-- [ ] T001 Add `croniter` (pure-Python, scraping-free) as a dependency of the shared lib in
+- [X] T001 Add `croniter` (pure-Python, scraping-free) as a dependency of the shared lib in
   `libs/shared/pyproject.toml`, then refresh the lockfile with `uv lock` and
   `uv sync --all-packages` (never plain `uv sync` — it wipes workspace-member deps). Verify
   `croniter` imports no Scrapy/Twisted/Playwright/FastAPI. (research R1, FR-019)
-- [ ] T002 [P] Create the new scraping-free scheduling package marker
+- [X] T002 [P] Create the new scraping-free scheduling package marker
   `libs/shared/app_shared/scheduling/__init__.py` (empty package). (plan Project Structure)
-- [ ] T003 [P] Confirm the reused enum members exist in `libs/shared/app_shared/enums.py` —
+- [X] T003 [P] Confirm the reused enum members exist in `libs/shared/app_shared/enums.py` —
   `ScrapeScope` (WORKSPACE/COMPETITOR/PRODUCT/VARIANT/PRODUCT_GROUP/MATCH), `ScrapeJobType.SCHEDULED`,
   `ScrapeJobSource.SCHEDULER`, `MatchStatus.ACTIVE`. No new enum is minted (research R6); add a
   member only if genuinely missing. This is a verification gate, not a rewrite.
