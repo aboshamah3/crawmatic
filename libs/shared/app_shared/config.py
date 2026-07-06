@@ -222,6 +222,22 @@ class Settings(BaseSettings):
     BROWSER_CONCURRENT_REQUESTS: int = 2
     BROWSER_MAX_CONTEXTS: int = 1
 
+    # --- Retention, rollups & partition maintenance tuning (SPEC-15,
+    # data-model.md §6, Principle IV — env/DB-tunable, never a hardcoded
+    # literal). Five per-table retention windows, three maintenance-task
+    # cadence intervals, and the partition create-ahead lookahead. Reused
+    # unchanged: SYSTEM_DATABASE_URL (-> AUTH_DATABASE_URL fallback) — no
+    # new session knob added here. ---
+    RETENTION_PRICE_OBSERVATIONS_DAYS: int = 90
+    RETENTION_REQUEST_ATTEMPTS_DAYS: int = 90
+    RETENTION_PRICE_ALERT_EVENTS_DAYS: int = 365
+    RETENTION_WEBHOOK_EVENTS_DAYS: int = 90
+    RETENTION_VARIANT_PRICE_DAILY_ROLLUPS_DAYS: int = 730
+    PARTITION_CREATE_INTERVAL_SECONDS: int = 86400
+    DAILY_ROLLUP_INTERVAL_SECONDS: int = 86400
+    RETENTION_INTERVAL_SECONDS: int = 86400
+    PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 1
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:

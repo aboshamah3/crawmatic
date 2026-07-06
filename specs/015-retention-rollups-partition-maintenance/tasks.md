@@ -52,7 +52,7 @@ scans annotated `# noqa: workspace-scope`). Reuse SPEC-13's system-session infra
 **Purpose**: DB/env-tunable configuration knobs (Principle IV), task-name constants, and the new
 scraping-free package marker shared by every later phase.
 
-- [ ] T001 Add the nine env/DB-tunable `Settings` knobs in `libs/shared/app_shared/config.py`
+- [X] T001 Add the nine env/DB-tunable `Settings` knobs in `libs/shared/app_shared/config.py`
   (data-model §6, Principle IV — no hardcoded literals): five retention windows
   `RETENTION_PRICE_OBSERVATIONS_DAYS: int = 90`, `RETENTION_REQUEST_ATTEMPTS_DAYS: int = 90`,
   `RETENTION_PRICE_ALERT_EVENTS_DAYS: int = 365`, `RETENTION_WEBHOOK_EVENTS_DAYS: int = 90`,
@@ -61,11 +61,11 @@ scraping-free package marker shared by every later phase.
   `RETENTION_INTERVAL_SECONDS: int = 86400`; and `PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 1`. Match
   the existing `SCHEDULER_*`/`STRATEGY_*_INTERVAL_SECONDS` pattern; reuse the existing
   `SYSTEM_DATABASE_URL` (→ `AUTH_DATABASE_URL` fallback) — add no new session knob. (research R3/R8; FR-017)
-- [ ] T002 [P] Add the three maintenance task-name constants to `libs/shared/app_shared/task_names.py`:
+- [X] T002 [P] Add the three maintenance task-name constants to `libs/shared/app_shared/task_names.py`:
   `MAINTENANCE_PARTITION_CREATE = "maintenance.partition_create"`,
   `MAINTENANCE_DAILY_ROLLUP = "maintenance.daily_rollup"`,
   `MAINTENANCE_RETENTION_DROP = "maintenance.retention_drop"` (research R8; contracts headers).
-- [ ] T003 [P] Create the new scraping-free package marker
+- [X] T003 [P] Create the new scraping-free package marker
   `libs/shared/app_shared/maintenance/__init__.py` (empty package). (plan Project Structure)
 
 **Checkpoint**: Config knobs read at settings-build time; task names and the `maintenance` package exist.

@@ -35,3 +35,12 @@ STRATEGY_DISCOVERY_RUN = "strategy_discovery.run_discovery"
 STRATEGY_STATS_FLUSH = "maintenance.strategy_stats_flush"
 STRATEGY_LIGHT_RECHECK = "maintenance.strategy_light_recheck"
 STRATEGY_PATTERN_BACKFILL = "maintenance.strategy_pattern_backfill"
+
+# --- Retention, rollups & partition maintenance (SPEC-15, research R8) ---
+# Enqueued via the same ``app_shared.messaging.enqueue`` producer seam by the
+# scheduler's fixed-cadence accumulators; consumed by
+# ``apps/workers/app/workers/tasks_maintenance.py`` on the existing
+# ``maintenance`` queue.
+MAINTENANCE_PARTITION_CREATE = "maintenance.partition_create"
+MAINTENANCE_DAILY_ROLLUP = "maintenance.daily_rollup"
+MAINTENANCE_RETENTION_DROP = "maintenance.retention_drop"
