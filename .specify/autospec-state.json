@@ -1,5 +1,13 @@
 {
   "specs": {
+    "15": {
+      "title": "Retention, Rollups & Partition Maintenance",
+      "feature_directory": "specs/015-retention-rollups-partition-maintenance",
+      "status": "in-progress",
+      "steps": {
+        "specify": "done"
+      }
+    },
     "13": {
       "title": "Scheduler",
       "feature_directory": "specs/013-scheduler",
