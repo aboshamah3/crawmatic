@@ -119,35 +119,35 @@ and that a write dated into next month succeeds. (quickstart US1)
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] Add `month_partition_bounds(now_utc, offset) -> (suffix, start, end)` to
+- [X] T007 [US1] Add `month_partition_bounds(now_utc, offset) -> (suffix, start, end)` to
   `libs/shared/app_shared/maintenance/partitions.py` — half-open `[YYYY-MM-01, <next-month>-01)` in UTC,
   correct across Dec→Jan and Feb lengths, mirroring the migration `_month_partition_bounds` convention;
   `offset=0` yields the current month (self-heal), `offset=1` next month. tz-aware UTC (FR-025).
   (FR-004/005/007; contract partition-creation.md §Bounds)
-- [ ] T008 [US1] Implement `create_missing_partitions(session, *, now_utc, lookahead_months) -> RunReport`
+- [X] T008 [US1] Implement `create_missing_partitions(session, *, now_utc, lookahead_months) -> RunReport`
   in `libs/shared/app_shared/maintenance/partitions.py` (contract partition-creation.md): for each
   registry entry, `table_exists` gate → skip absent (record `tables_skipped_absent`); else for offsets
   `0..lookahead_months` compute bounds (T007), pre-check catalog existence and issue
   `CREATE TABLE IF NOT EXISTS {parent}_{suffix} PARTITION OF {parent} FOR VALUES FROM ('{start}') TO
   ('{end}')` (idempotent, RLS inherited from parent — no per-partition DDL), recording
   `partitions_created`. Return the structured RunReport (data-model §5). (FR-004/005/006/007/008)
-- [ ] T009 [US1] Create `apps/workers/app/workers/tasks_maintenance.py` with the
+- [X] T009 [US1] Create `apps/workers/app/workers/tasks_maintenance.py` with the
   `@app.task(name=MAINTENANCE_PARTITION_CREATE)` wrapper that opens a `get_system_session()` (BYPASSRLS,
   R9), calls `create_missing_partitions(session, now_utc=utcnow(), lookahead_months=Settings.
   PARTITION_CREATE_LOOKAHEAD_MONTHS)`, commits, and emits one structured run-report log line (FR-023).
   Mirror the `finalize_jobs`/`strategy_stats_flush` maintenance-task idiom. (research R8/R9; FR-003/023)
-- [ ] T010 [US1] Wire the task into Celery in `apps/workers/app/workers/celery_app.py`: add
+- [X] T010 [US1] Wire the task into Celery in `apps/workers/app/workers/celery_app.py`: add
   `tasks_maintenance` to `include`, and add `MAINTENANCE_PARTITION_CREATE` to the `task_routes` mapping
   → the existing `maintenance` queue (leave `task_queues`/other routes unchanged). (research R8)
-- [ ] T011 [US1] Extend the scheduler loop in `apps/scheduler/app/scheduler/scheduler_app.py`: add a new
+- [X] T011 [US1] Extend the scheduler loop in `apps/scheduler/app/scheduler/scheduler_app.py`: add a new
   independent interval accumulator driven by `PARTITION_CREATE_INTERVAL_SECONDS` that each elapsed
   interval enqueues `MAINTENANCE_PARTITION_CREATE` via `app_shared.messaging.enqueue` (fire-and-forget,
   mirroring the existing `STRATEGY_STATS_FLUSH`/refresh-pass accumulators), logging-and-swallowing any
   enqueue error. PRESERVE the existing accumulators + SIGTERM/SIGINT clean shutdown. (research R8; FR-003)
-- [ ] T012 [P] [US1] Unit test `tests/unit/test_partition_bounds.py`: `month_partition_bounds` half-open
+- [X] T012 [P] [US1] Unit test `tests/unit/test_partition_bounds.py`: `month_partition_bounds` half-open
   bounds, Dec→Jan year rollover, Feb length, `offset=0` current vs `offset=1` next, tz-aware UTC. No DB.
   (FR-007; US1 edge case "month/year boundary")
-- [ ] T013 [P] [US1] Live integration test `tests/integration/test_partition_create_live.py` (`skipif`
+- [X] T013 [P] [US1] Live integration test `tests/integration/test_partition_create_live.py` (`skipif`
   Postgres probe): current + next-month partitions created for every existing registered table; re-run
   is a no-op (FR-006); a missing current-month partition is self-healed (FR-005); `webhook_events`
   (absent) skipped without error (FR-002); a write dated into next month succeeds. (US1 AS-1..4; SC-001/002)

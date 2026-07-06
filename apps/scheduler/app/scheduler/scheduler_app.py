@@ -25,6 +25,14 @@ stopped by the orchestrator without a crash-loop, and a raised
 refresh-pass exception is logged and swallowed — it must never
 crash-loop the process (same best-effort posture as the maintenance
 enqueues).
+
+SPEC-15 US1 (contracts/partition-creation.md) adds a **third,
+independent** interval accumulator driven by
+``PARTITION_CREATE_INTERVAL_SECONDS`` that fire-and-forget enqueues
+``MAINTENANCE_PARTITION_CREATE`` on the ``maintenance`` queue — mirroring
+the SPEC-12 fixed-cadence enqueues above (not a DB-driven claim like the
+SPEC-13 refresh pass). Daily by default: weeks of lead so next-month's
+partitions always exist before the month begins (SC-001).
 """
 
 from __future__ import annotations
@@ -38,7 +46,11 @@ from types import FrameType
 from app_shared.config import get_settings
 from app_shared.database import get_system_sessionmaker
 from app_shared.messaging import enqueue
-from app_shared.task_names import STRATEGY_LIGHT_RECHECK, STRATEGY_STATS_FLUSH
+from app_shared.task_names import (
+    MAINTENANCE_PARTITION_CREATE,
+    STRATEGY_LIGHT_RECHECK,
+    STRATEGY_STATS_FLUSH,
+)
 
 from app.scheduler.refresh import run_refresh_pass
 
@@ -87,6 +99,21 @@ def _enqueue_stats_flush() -> None:
         logger.exception("scheduler: failed to enqueue %s", STRATEGY_STATS_FLUSH)
 
 
+def _enqueue_partition_create() -> None:
+    """Fire-and-forget `MAINTENANCE_PARTITION_CREATE` on the `maintenance`
+    queue (SPEC-15 US1, contracts/partition-creation.md) -- ensures
+    current + next month's partitions exist for every existing registered
+    table. Errors are logged and swallowed for the same reason
+    `_enqueue_light_recheck`/`_enqueue_stats_flush` swallow them: a
+    missed tick just means one fewer day of lead before the next poll
+    interval retries, never a crashed scheduler process.
+    """
+    try:
+        enqueue(MAINTENANCE_PARTITION_CREATE, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_PARTITION_CREATE)
+
+
 def _run_refresh_pass_tick(batch_limit: int) -> None:
     """Run one SPEC-13 refresh pass (`app.scheduler.refresh.run_refresh_pass`)
     on the BYPASSRLS system sessionmaker, claiming/firing up to
@@ -117,19 +144,23 @@ def main() -> None:
     interval = settings.STRATEGY_STATS_FLUSH_INTERVAL_SECONDS
     refresh_interval = settings.SCHEDULER_POLL_INTERVAL_SECONDS
     refresh_batch_limit = settings.SCHEDULER_CLAIM_BATCH_LIMIT
+    partition_create_interval = settings.PARTITION_CREATE_INTERVAL_SECONDS
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush every %ss; "
-        "refresh pass every %ss)",
+        "refresh pass every %ss; partition_create every %ss)",
         interval,
         refresh_interval,
+        partition_create_interval,
     )
     elapsed = 0.0
     refresh_elapsed = 0.0
+    partition_create_elapsed = 0.0
     while not _shutdown_requested:
         time.sleep(_TICK_SECONDS)
         elapsed += _TICK_SECONDS
         refresh_elapsed += _TICK_SECONDS
+        partition_create_elapsed += _TICK_SECONDS
         if elapsed >= interval:
             elapsed = 0.0
             _enqueue_light_recheck()
@@ -137,6 +168,9 @@ def main() -> None:
         if refresh_elapsed >= refresh_interval:
             refresh_elapsed = 0.0
             _run_refresh_pass_tick(refresh_batch_limit)
+        if partition_create_elapsed >= partition_create_interval:
+            partition_create_elapsed = 0.0
+            _enqueue_partition_create()
 
     logger.info("scheduler stopped")
 

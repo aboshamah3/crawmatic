@@ -33,6 +33,7 @@ from celery.signals import worker_process_init
 from app_shared.config import get_settings
 from app_shared.database import dispose_engine
 from app_shared.task_names import (
+    MAINTENANCE_PARTITION_CREATE,
     PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
@@ -55,6 +56,7 @@ app = Celery(
         "app.workers.tasks_jobs",
         "app.workers.tasks_analysis",
         "app.workers.tasks_strategy",
+        "app.workers.tasks_maintenance",
     ],
 )
 
@@ -79,6 +81,10 @@ app = Celery(
 # light re-check", FR-021) is a `maintenance` task alongside
 # `SCRAPE_FINALIZE_JOBS`/`SCRAPE_RECOVER_STALLED` — it only reads/updates
 # `domain_strategy_profiles`/`strategy_attempt_stats`, no blocking fetch.
+#
+# `MAINTENANCE_PARTITION_CREATE` (SPEC-15 US1, contracts/partition-creation.md)
+# is also a `maintenance` task — runtime `CREATE TABLE ... PARTITION OF`
+# DDL + catalog reads on the BYPASSRLS system session, no blocking fetch.
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
@@ -94,6 +100,7 @@ app.conf.task_routes = {
     STRATEGY_LIGHT_RECHECK: {"queue": "maintenance"},
     STRATEGY_STATS_FLUSH: {"queue": "maintenance"},
     STRATEGY_PATTERN_BACKFILL: {"queue": "maintenance"},
+    MAINTENANCE_PARTITION_CREATE: {"queue": "maintenance"},
 }
 
 
