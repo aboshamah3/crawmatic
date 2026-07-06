@@ -80,7 +80,7 @@ user story.
 
 **⚠️ CRITICAL**: No user-story work can begin until this phase is complete.
 
-- [ ] T004 Implement the registry module `libs/shared/app_shared/maintenance/registry.py` (data-model §2,
+- [X] T004 Implement the registry module `libs/shared/app_shared/maintenance/registry.py` (data-model §2,
   research R3): frozen `@dataclass PartitionedTable(name, partition_key, feeds_rollups,
   retention_setting)` + the module-level `PARTITIONED_TABLES` tuple with exactly the four entries —
   `price_observations`/`scraped_at`/`feeds_rollups=True`/`RETENTION_PRICE_OBSERVATIONS_DAYS`,
@@ -90,14 +90,14 @@ user story.
   `retention_days(entry, settings) -> int` helper resolving the `Settings` attr by name.
   `variant_price_daily_rollups` is deliberately **not** in this registry (not partitioned). Scraping-free.
   (FR-001; data-model §2)
-- [ ] T005 Implement the shared partition primitives in `libs/shared/app_shared/maintenance/partitions.py`
+- [X] T005 Implement the shared partition primitives in `libs/shared/app_shared/maintenance/partitions.py`
   (data-model §3, research R2/R4) — used by BOTH US1 and US3, scraping-free, system-session shaped:
   `table_exists(session, name) -> bool` via `SELECT to_regclass('public.'+name)` (NULL → False, FR-002/R4);
   `existing_partitions(session, parent) -> list[(name, start, end)]` discovering child partitions from
   `pg_catalog` (`pg_inherits` + `pg_get_expr(relpartbound)`) with parsed half-open UTC bounds (used by
   US3 drop eligibility); and the `{parent}_{YYYY}_{MM}` name/suffix helpers. No DDL here (create in US1,
   drop in US3). (FR-002/006/018; research R2/R4)
-- [ ] T006 [P] Unit test `tests/unit/test_partition_registry.py`: assert `PARTITIONED_TABLES` shape (four
+- [X] T006 [P] Unit test `tests/unit/test_partition_registry.py`: assert `PARTITIONED_TABLES` shape (four
   entries, correct partition keys, `feeds_rollups` True only for `price_observations`, retention-setting
   names resolve via `retention_days`) and that the `table_exists` gate query is built against
   `to_regclass` (compiled-SQL/predicate assertion — no live DB). (FR-001/002)
