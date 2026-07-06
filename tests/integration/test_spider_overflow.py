@@ -3,12 +3,15 @@
 SC-003, US3 AS1/AS2) — ⏸ DEFERRED.
 
 Forces `_acquire_fetch_permission`'s (T013/T027) domain-permission gate
-to deny **every** attempt (by monkeypatching `scrape_core.limiter.
-acquire_permission` inside the spider's own subprocess to always return
+to deny **every** attempt (by monkeypatching `scrape_core.targets.
+acquire_permission` -- SPEC-14 T037 moved the admission machinery out of
+the spider module into `scrape_core.targets`, shared with the browser
+spider -- inside the spider's own subprocess to always return
 `Permission(granted=False, ...)` -- real Redis token-bucket refill timing
 is not what this test is about, and the real per-denial wait is also
-monkeypatched (`deferred_delay` -> an already-fired ``Deferred``) so the
-test does not spend real wall-clock time on backoff sleeps). With
+monkeypatched (`scrape_core.targets.deferred_delay` -> an already-fired
+``Deferred``) so the test does not spend real wall-clock time on backoff
+sleeps). With
 `REQUEUE_MAX_ATTEMPTS=1` (env override), the spider must:
 
 1. Requeue exactly through the cap (2 denials: the first bumps
@@ -196,15 +199,27 @@ from twisted.internet.defer import Deferred
 
 import price_monitor.spiders.generic_price_spider as spider_mod
 
+# SPEC-14 T037/Phase-2 carry-over: the admission machinery
+# (`acquire_permission`/`deferred_delay`/`enqueue`) moved out of the
+# spider module into `scrape_core.targets` (`shared-extraction.md` --
+# both the HTTP and browser spiders now share it), so the monkeypatch
+# targets repoint there; patching `spider_mod.*` alone would silently
+# no-op (the spider's own `_acquire_fetch_permission`/
+# `_overflow_to_dispatch` are now thin wrappers over
+# `scrape_core.targets.acquire_fetch_permission`/`overflow_to_dispatch`,
+# which resolve these names against `scrape_core.targets`'s own module
+# globals, not the spider module's).
+import scrape_core.targets as targets_mod
+
 # Force EVERY permission acquire to deny -- the real Redis token-bucket
 # refill timing is not what this test is about (contracts/spider-integration.md
 # step 2); `deferred_delay` is patched to resolve instantly so the test
 # never spends real wall-clock time on backoff sleeps.
 async def _always_denied_acquire_permission(redis, *, workspace_id, domain, access_method, limits, settings, sem_token):
-    return spider_mod.Permission(granted=False, wait_hint_seconds=0.01)
+    return targets_mod.Permission(granted=False, wait_hint_seconds=0.01)
 
 
-spider_mod.acquire_permission = _always_denied_acquire_permission
+targets_mod.acquire_permission = _always_denied_acquire_permission
 
 
 def _instant_delay(seconds):
@@ -213,7 +228,7 @@ def _instant_delay(seconds):
     return d
 
 
-spider_mod.deferred_delay = _instant_delay
+targets_mod.deferred_delay = _instant_delay
 
 _enqueue_calls = []
 
@@ -224,7 +239,7 @@ def _recording_enqueue(name, *, queue, kwargs=None):
     _enqueue_calls.append({{"name": name, "queue": queue, "kwargs": kwargs}})
 
 
-spider_mod.enqueue = _recording_enqueue
+targets_mod.enqueue = _recording_enqueue
 
 from scrapy.crawler import CrawlerProcess
 from scrapy.settings import Settings

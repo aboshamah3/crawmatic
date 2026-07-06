@@ -328,7 +328,7 @@ stories complete.
 
 **Purpose**: Verification, secret-safety audit, and boundary/lint hygiene across the whole feature.
 
-- [ ] T037 [P] Confirm the import-boundary guard is still green and covers the new modules:
+- [X] T037 [P] Confirm the import-boundary guard is still green and covers the new modules:
   `scrape_core.targets`/`result_builder` import only `app_shared.*` + `scrape_core.*`;
   `scrape_core.browser.*` may import Scrapy/scrapy-playwright; `app_shared` gains no Scrapy/Twisted/
   Playwright import (shared-extraction.md). Also add a lightweight **reactor-safety unit guard** (runs
@@ -336,14 +336,14 @@ stories complete.
   `run_in_thread` — an AST/source check that `parse`/`start`/`errback` never call a sync `Session`
   commit or blocking Redis directly on the reactor thread (FR-007, Principle V; parity with the
   existing HTTP reactor-safety guard).
-- [ ] T038 [P] Secret-safety audit: grep the browser spider + `ssrf.py`/`page.py`/`variant.py` and the
+- [X] T038 [P] Secret-safety audit: grep the browser spider + `ssrf.py`/`page.py`/`variant.py` and the
   proxy path to confirm the decrypted proxy password is placed ONLY in the Playwright `proxy` dict —
   never logged, never in `request.meta["proxy"]` or any log line (FR-011, SC-006, constitution §Tech).
-- [ ] T039 Run the full unit suite that must pass in this env (`test_config.py`, `test_browser_errors.py`,
+- [X] T039 Run the full unit suite that must pass in this env (`test_config.py`, `test_browser_errors.py`,
   `test_dispatch_routing.py`, `test_variant_config.py`, the HTTP-spider regression suite) with
   `uv run pytest -q`; confirm every `*_live.py` added here skips cleanly (no Chromium/DB) rather than
   erroring.
-- [ ] T040 Walk quickstart.md scenarios 1–12 and confirm each maps to a passing unit test or a
+- [X] T040 Walk quickstart.md scenarios 1–12 and confirm each maps to a passing unit test or a
   cleanly-skipped live test; record the SC-001..008 coverage table is satisfied.
 
 ---

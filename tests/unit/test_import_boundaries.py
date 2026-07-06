@@ -343,6 +343,66 @@ def test_scrape_core_new_modules_import_cleanly_with_app_shared() -> None:
 
 # --- SPEC-09 T040 ------------------------------------------------------------
 
+# --- SPEC-14 T037: scrape_core.targets/result_builder import only
+# app_shared.*/scrape_core.* (never Scrapy/Twisted/Playwright directly);
+# scrape_core.browser.* is the one place allowed to import Scrapy/
+# scrapy-playwright (contracts/shared-extraction.md "import_boundaries
+# test stays green"). -----------------------------------------------------
+
+_SCRAPE_CORE_SHARED_FORBIDDEN_ROOTS = frozenset(
+    {"scrapy", "scrapy_playwright", "twisted", "playwright", "fastapi"}
+)
+
+
+def test_scrape_core_targets_and_result_builder_never_import_scrapy_stack() -> None:
+    """SPEC-14 T037a: `scrape_core.targets`/`result_builder` — the
+    transport-agnostic machinery shared by both the HTTP and browser
+    spiders — never import Scrapy/scrapy-playwright/Twisted/Playwright/
+    FastAPI directly. They may (and do) import sqlalchemy, stdlib, and
+    other `app_shared.*`/`scrape_core.*` modules; only the Scrapy-stack
+    roots are forbidden here."""
+    import scrape_core.result_builder
+    import scrape_core.targets
+
+    for module in (scrape_core.targets, scrape_core.result_builder):
+        source_file = pathlib.Path(module.__file__)
+        roots = _imported_root_modules(source_file)
+        leaked = roots & _SCRAPE_CORE_SHARED_FORBIDDEN_ROOTS
+        assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+_SCRAPE_CORE_BROWSER_IMPORT_CHECK = """
+import sys
+
+import scrape_core
+import scrape_core.browser
+import scrape_core.browser.ssrf
+import scrape_core.browser.variant
+import scrape_core.browser.page
+import app_shared
+
+if "scrape_core" not in sys.modules or "app_shared" not in sys.modules:
+    print("MISSING")
+    sys.exit(1)
+
+sys.exit(0)
+"""
+
+
+def test_scrape_core_browser_modules_import_cleanly_and_may_pull_in_playwright() -> None:
+    """SPEC-14 T037a: `scrape_core.browser.*` (ssrf/variant/page) is the
+    one place in `scrape_core` allowed to import Scrapy/scrapy-playwright
+    (`page.py` imports `scrapy_playwright.page.PageMethod`) — this check
+    only asserts the import succeeds and app_shared is reachable alongside
+    it, mirroring `test_scrape_core_new_modules_import_cleanly_with_app_shared`
+    for the SPEC-07 modules; it never asserts scrapy/playwright are absent."""
+    result = _run_in_subprocess(_SCRAPE_CORE_BROWSER_IMPORT_CHECK)
+    assert result.returncode == 0, (
+        "scrape_core.browser.* failed to import, or did not pull in app_shared:\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+
+
 _ALERTS_FORBIDDEN_ROOTS = frozenset({"sqlalchemy", "celery", "fastapi", "scrapy", "redis"})
 
 

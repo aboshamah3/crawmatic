@@ -9,8 +9,14 @@ This is a **static** (no infra, no reactor, no Redis) AST-based grep test —
 not a runtime check — so it runs in every environment, including this one
 with no Docker daemon.
 
-Approach for the four reactor-adjacent modules
+Approach for the five reactor-adjacent modules
 (`apps/scrapers/price_monitor/spiders/generic_price_spider.py`,
+`apps/scrapers-browser/price_monitor_browser/spiders/generic_browser_price_spider.py`
+(SPEC-14 T037b — the browser spider's `start`/`parse`/`errback` never call
+a sync Session commit or blocking Redis directly; every DB/Redis-cache
+touch it needs goes through `scrape_core.targets.load_targets`/
+`_prepare_dispatch` via `run_in_thread`, never inline on the reactor
+thread),
 `libs/scrape-core/scrape_core/{limiter,pipelines,reactor}.py`):
 
 1. Find every call to `run_in_thread(...)`/`deferToThread(...)` in the
@@ -28,16 +34,19 @@ Approach for the four reactor-adjacent modules
    calls `_cache_get_group_result`, so both are "safe").
 3. Everything **not** in that safe set is assumed to run on (or be
    reachable synchronously from) the Twisted reactor thread. Assert none
-   of those functions directly call `time.sleep(...)` or a synchronous
-   Redis method (`redis.get(...)`, `get_redis_client().set(...)`, etc.).
+   of those functions directly call `time.sleep(...)`, a synchronous
+   Redis method (`redis.get(...)`, `get_redis_client().set(...)`, etc.),
+   or a synchronous SQLAlchemy `Session.commit()`/`.rollback()`.
 
 This mirrors the actual call graph as written today: `load_targets`/
-`_prepare_dispatch`/`_mark_target_deferred_rate_limited` (spider) and
-`_flush_batch` (pipeline) are the only functions ever handed to
-`run_in_thread`, and every synchronous Redis touch in these four modules
-lives inside one of those (or something they call), never inside an
-`async def` coroutine or a Scrapy pipeline hook that runs directly on the
-reactor thread.
+`_prepare_dispatch`/`_mark_target_deferred_rate_limited` (HTTP spider),
+`load_targets`/`_prepare_dispatch` again (browser spider — imported from
+`scrape_core.targets`, so the browser spider's own `run_in_thread(...)`
+call sites name the same shared functions), and `_flush_batch` (pipeline)
+are the only functions ever handed to `run_in_thread`, and every
+synchronous Redis/Session touch in these five modules lives inside one of
+those (or something they call), never inside an `async def` coroutine or
+a Scrapy pipeline hook that runs directly on the reactor thread.
 """
 
 from __future__ import annotations
@@ -50,11 +59,20 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 _SPIDER_PATH = _REPO_ROOT / "apps/scrapers/price_monitor/spiders/generic_price_spider.py"
+_BROWSER_SPIDER_PATH = (
+    _REPO_ROOT / "apps/scrapers-browser/price_monitor_browser/spiders/generic_browser_price_spider.py"
+)
 _LIMITER_PATH = _REPO_ROOT / "libs/scrape-core/scrape_core/limiter.py"
 _PIPELINES_PATH = _REPO_ROOT / "libs/scrape-core/scrape_core/pipelines.py"
 _REACTOR_PATH = _REPO_ROOT / "libs/scrape-core/scrape_core/reactor.py"
 
-_TARGET_PATHS = (_SPIDER_PATH, _LIMITER_PATH, _PIPELINES_PATH, _REACTOR_PATH)
+_TARGET_PATHS = (
+    _SPIDER_PATH,
+    _BROWSER_SPIDER_PATH,
+    _LIMITER_PATH,
+    _PIPELINES_PATH,
+    _REACTOR_PATH,
+)
 
 _THREAD_BOUNDARY_CALLERS = {"run_in_thread", "deferToThread"}
 
@@ -143,6 +161,39 @@ def _is_time_sleep_call(call: ast.Call) -> bool:
     )
 
 
+#: SPEC-14 T037b: object names/hints that indicate a `.commit()`/
+#: `.rollback()` attribute call below is really a SQLAlchemy `Session`
+#: (as opposed to some unrelated object that happens to expose a
+#: same-named method) — mirrors `_REDIS_OBJECT_NAME_HINTS`'s convention.
+_SESSION_METHOD_NAMES = {"commit", "rollback"}
+_SESSION_OBJECT_NAME_HINTS = {"session", "sess", "db_session"}
+
+
+def _looks_like_session_object(value: ast.AST) -> bool:
+    if isinstance(value, ast.Name):
+        return value.id.lower() in _SESSION_OBJECT_NAME_HINTS
+    if isinstance(value, ast.Call):
+        callee = _call_func_attr_or_name(value)
+        return callee is not None and "session" in callee.lower()
+    return False
+
+
+def _is_sync_session_commit_call(call: ast.Call) -> bool:
+    """A direct (unawaited) `session.commit()`/`session.rollback()` call —
+    the reactor-safety contract is that every such call happens inside
+    `scrape_core.db.workspace_txn`, itself only ever entered from a
+    callable already running off-reactor via `run_in_thread`/
+    `deferToThread` (never directly in a Scrapy spider's `parse`/`start`/
+    `errback` or a downloader middleware, which run on the reactor
+    thread)."""
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in _SESSION_METHOD_NAMES
+        and _looks_like_session_object(func.value)
+    )
+
+
 def _local_function_defs(tree: ast.Module) -> "dict[str, ast.AST]":
     """Every module-level *and* class-level function/method def in this one
     module, keyed by its own (unqualified) name — a single-module call-graph
@@ -195,6 +246,12 @@ def _violations_in_file(path: pathlib.Path) -> "list[str]":
                 assert isinstance(call.func, ast.Attribute)
                 violations.append(
                     f"{path}:{call.lineno}: synchronous redis `.{call.func.attr}()` call in "
+                    f"{name}() outside a run_in_thread/deferToThread boundary"
+                )
+            elif _is_sync_session_commit_call(call):
+                assert isinstance(call.func, ast.Attribute)
+                violations.append(
+                    f"{path}:{call.lineno}: synchronous session `.{call.func.attr}()` call in "
                     f"{name}() outside a run_in_thread/deferToThread boundary"
                 )
     return violations
