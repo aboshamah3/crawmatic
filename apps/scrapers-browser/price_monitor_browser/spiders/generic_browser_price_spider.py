@@ -51,6 +51,7 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
 from scrape_core.browser.page import build_page_methods, effective_timeout
+from scrape_core.browser.variant import VariantConfigError
 from scrape_core.db import run_in_thread
 from scrape_core.errors import PRICE_NOT_FOUND, classify_http_status, classify_playwright_exception
 from scrape_core.extraction.pipeline import extract
@@ -77,17 +78,77 @@ _DEFAULT_MODE = "BROWSER"
 __all__ = ["GenericBrowserPriceSpider", "classify_browser_failure"]
 
 
-def classify_browser_failure(exc: BaseException, hostname: str | None) -> ScrapeErrorCode:
+def _variant_selectors(target: "SpiderTarget") -> set[str]:
+    """Every CSS selector `target.variant_selector_config`'s ``actions``/
+    ``settle`` step address (US3, T027) -- a best-effort signal (see
+    :func:`classify_browser_failure`) to recognize that a run-time
+    Playwright failure happened while interacting with a *variant*
+    element specifically, as opposed to the profile's own
+    ``wait_for_selector`` or a plain navigation timeout. Tolerates a
+    malformed ``variant_selector_config`` (returns whatever selectors it
+    can find) -- this is purely a classification aid, never a validator
+    (that's `scrape_core.browser.variant.parse_variant_config`'s job).
+    """
+    config = target.variant_selector_config
+    if not isinstance(config, dict):
+        return set()
+    selectors: set[str] = set()
+    actions = config.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if isinstance(action, dict):
+                selector = action.get("selector")
+                if isinstance(selector, str) and selector:
+                    selectors.add(selector)
+    settle = config.get("settle")
+    if isinstance(settle, dict):
+        settle_selector = settle.get("wait_for_selector")
+        if isinstance(settle_selector, str) and settle_selector:
+            selectors.add(settle_selector)
+    return selectors
+
+
+def classify_browser_failure(
+    exc: BaseException, hostname: str | None, target: "SpiderTarget | None" = None
+) -> ScrapeErrorCode:
     """Single-attempt browser failure classification (R3/R4, `contracts/browser-spider.md`).
 
-    US1: delegates entirely to :func:`~scrape_core.errors.classify_playwright_exception`
-    (Playwright ``TimeoutError`` -> ``TIMEOUT``, else ``PLAYWRIGHT_FAILED``).
-    ``hostname`` is accepted now (unused) so later phases can resolve
-    SSRF/robots rejections to ``BLOCKED`` first (US4 T033) and variant
-    failures to ``SELECTOR_BROKEN``/``VARIANT_NOT_FOUND`` (US3 T027)
-    without changing this function's call sites -- a clean extension
-    point, per task T018.
+    ``hostname`` is accepted now (unused) so a later phase can resolve
+    SSRF/robots rejections to ``BLOCKED`` first (US4 T033) without
+    changing this function's call sites -- a clean extension point, per
+    task T018.
+
+    US3 (T027) variant branches, checked before the generic Playwright
+    classification:
+
+    * ``exc`` is a :class:`~scrape_core.browser.variant.VariantConfigError`
+      -- always ``SELECTOR_BROKEN`` (R3). In practice this should never
+      actually reach here: the spider's ``start()`` pre-fetch guard
+      already catches every config error (both the off-reactor
+      ``resolve_variant_values`` failures recorded on
+      ``target.variant_config_error`` by ``load_targets``, T025, and any
+      structural ``parse_variant_config`` failure) *before* admission/
+      dispatch ever runs, so no request -- and therefore no ``errback``
+      call -- exists for a config error. This branch is defensive only.
+    * `target` carries a ``variant_selector_config`` and the raised
+      exception's message mentions one of that config's own selectors
+      (:func:`_variant_selectors`) -- the configured variant element was
+      missing/uninteractable at run time -- ``VARIANT_NOT_FOUND`` (R3),
+      not the generic ``TIMEOUT``/``PLAYWRIGHT_FAILED`` the same
+      Playwright exception class would otherwise classify as.
+
+    Anything else (including every US1 target, which never carries a
+    ``variant_selector_config``) delegates entirely to
+    :func:`~scrape_core.errors.classify_playwright_exception` (Playwright
+    ``TimeoutError`` -> ``TIMEOUT``, else ``PLAYWRIGHT_FAILED``) --
+    unchanged US1 behavior.
     """
+    if isinstance(exc, VariantConfigError):
+        return ScrapeErrorCode.SELECTOR_BROKEN
+    if target is not None and target.variant_selector_config is not None:
+        selectors = _variant_selectors(target)
+        if selectors and any(selector in str(exc) for selector in selectors):
+            return ScrapeErrorCode.VARIANT_NOT_FOUND
     return classify_playwright_exception(exc)
 
 
@@ -144,6 +205,48 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         for target in loaded.targets:
             self._targets_by_match_id[target.match_id] = target
             self._requeue_state_by_match_id[target.match_id] = _RequeueState()
+
+            # US3 (T027) pre-fetch variant-config guard: a malformed/
+            # unresolvable `variant_selector_config` is a config error,
+            # never a fetch failure -- surface it as a terminal
+            # `SELECTOR_BROKEN` result *before* any admission/dispatch
+            # (never fetched, `contracts/variant-selection.md`), exactly
+            # like the `_DispatchDecision.skip_error_code` "decided but
+            # never dispatched" shape just below.
+            #
+            # Two sources, both caught here so nothing downstream ever
+            # sees a raised `VariantConfigError` after a lock/slot is
+            # held: (1) `target.variant_config_error` -- an unresolvable
+            # `value_from` `load_targets` (T025) already caught
+            # off-reactor for this target; (2) a purely structural
+            # config error (bad `version`/forbidden action type/missing
+            # required key) that `resolve_variant_values` never checks --
+            # caught here by proactively building this target's page
+            # methods (pure, no I/O) via
+            # `scrape_core.browser.page.build_page_methods`, which
+            # translates `variant_selector_config` via
+            # `parse_variant_config`. `_browser_request_for` rebuilds the
+            # identical (by-then side-effect-free) list once dispatched.
+            variant_error_message = target.variant_config_error
+            if variant_error_message is None and target.variant_selector_config is not None:
+                try:
+                    build_page_methods(target)
+                except VariantConfigError as exc:
+                    variant_error_message = str(exc)
+            if variant_error_message is not None:
+                yield self._build_result(
+                    target,
+                    target.url,
+                    datetime.now(UTC),
+                    status_code=None,
+                    success=False,
+                    error_code=ScrapeErrorCode.SELECTOR_BROKEN,
+                    error_message=variant_error_message,
+                    access_method=AccessMethod.PLAYWRIGHT_PROXY,
+                    attempt_number=1,
+                )
+                continue
+
             decision = await run_in_thread(
                 _prepare_dispatch, target, 1, self._visible_providers, self._provider_rows
             )
@@ -361,7 +464,7 @@ class GenericBrowserPriceSpider(scrapy.Spider):
 
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname
-        error_code = classify_browser_failure(failure.value, hostname)
+        error_code = classify_browser_failure(failure.value, hostname, target)
         yield self._build_result(
             target,
             failure.request.url,

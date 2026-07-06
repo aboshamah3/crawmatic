@@ -333,7 +333,8 @@
         "Phase 1 Setup": "done",
         "Phase 2 Foundational": "done",
         "Phase 3 US1": "done",
-        "Phase 4 US2": "done"
+        "Phase 4 US2": "done",
+        "Phase 5 US3": "done"
       },
       "implement_notes": [
         "Phase 2: test_spider_overflow.py (skipif live) monkeypatches acquire_permission/deferred_delay/enqueue on the spider module; those moved to scrape_core.targets \u2014 repoint in Phase 7/polish so the live test patches the right module (skips cleanly now, not a current regression)."

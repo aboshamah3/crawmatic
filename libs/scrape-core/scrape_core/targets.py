@@ -109,6 +109,7 @@ from app_shared.strategy.resolution import (
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 
+from scrape_core.browser.variant import VariantConfigError, resolve_variant_values
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
 from scrape_core.observability import log_event
@@ -158,6 +159,18 @@ class SpiderTarget:
     module exists, US3) -- unpopulated (empty) until then. All four
     default so every pre-SPEC-14 constructor call site (including every
     existing unit test) keeps constructing unchanged.
+
+    SPEC-14 (T025): ``variant_config_error`` is populated by
+    ``load_targets`` (never by a hand-built unit-test target, which
+    defaults it to ``None``) when this target's
+    ``variant_selector_config`` failed off-reactor ``value_from``
+    resolution (:func:`~scrape_core.browser.variant.resolve_variant_values`
+    raised ``VariantConfigError``) -- the human-readable message, so the
+    browser spider's ``start()`` can emit a terminal ``SELECTOR_BROKEN``
+    ``ScrapeResult`` for this target *before* admission/dispatch ever
+    runs (never fetched, `contracts/variant-selection.md`), mirroring the
+    existing ``_DispatchDecision.skip_error_code`` "decided but never
+    dispatched" shape.
     """
 
     match_id: uuid.UUID
@@ -185,6 +198,11 @@ class SpiderTarget:
     browser_timeout_ms: int | None = None
     variant_selector_config: dict | None = None
     match_variant_values: dict = field(default_factory=dict)
+    # SPEC-14 (T025): the message of the `VariantConfigError`
+    # `load_targets` caught while resolving this target's
+    # `variant_selector_config` off-reactor, or `None` when resolution
+    # succeeded (or there was nothing to resolve).
+    variant_config_error: str | None = None
 
 
 @dataclass
@@ -365,8 +383,17 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
     fields (``wait_for_selector``/``browser_timeout_ms``/
     ``variant_selector_config``) onto its ``SpiderTarget`` -- straight
     off the already-loaded ``ScrapeProfile`` row, no new query.
-    ``match_variant_values`` stays at its default (empty) here; its
-    off-reactor resolution is wired in a later phase.
+
+    SPEC-14 (T025, US3): when the resolved profile carries a
+    ``variant_selector_config``, this also resolves every action's
+    ``value_from`` against the match row right here (off-reactor, DB
+    session still open) via
+    :func:`~scrape_core.browser.variant.resolve_variant_values`, storing
+    the result on ``SpiderTarget.match_variant_values``. A
+    ``VariantConfigError`` (unresolvable/unknown ``value_from``) never
+    aborts the whole bounded load -- it is recorded on that one target's
+    ``variant_config_error`` instead, for the spider to surface as a
+    terminal ``SELECTOR_BROKEN`` result before dispatch.
     """
     if not match_ids:
         return _LoadedTargets(targets=[])
@@ -622,6 +649,27 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
             profile = profiles_by_id.get(profile_id) if profile_id else None
             policy_id = resolved_policy_id_by_match.get(match.id)
             strategy_group_key = (match.competitor_id, match.url_pattern)
+            variant_selector_config = profile.variant_selector_config if profile is not None else None
+
+            # SPEC-14 (T025, US3): resolve every action's `value_from`
+            # against this match **off-reactor**, right here, while the
+            # DB session is still open -- `parse_variant_config` (which
+            # may run later, at/near request-build time) never touches
+            # the match again. A malformed config or an unresolvable
+            # `value_from` never crashes the whole bounded load (mirrors
+            # the `SecretDecryptionError` degrade-and-continue just
+            # above) -- it is recorded on this one target's
+            # `variant_config_error` instead, so the spider can emit a
+            # terminal `SELECTOR_BROKEN` result for only this target
+            # before any admission/dispatch (never fetched).
+            match_variant_values: dict[str, str] = {}
+            variant_config_error: str | None = None
+            if variant_selector_config is not None:
+                try:
+                    match_variant_values = resolve_variant_values(variant_selector_config, match)
+                except VariantConfigError as exc:
+                    variant_config_error = str(exc)
+
             targets.append(
                 SpiderTarget(
                     match_id=match.id,
@@ -640,7 +688,9 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
                     strategy_start=strategy_start_by_group.get(strategy_group_key),
                     wait_for_selector=profile.wait_for_selector if profile is not None else None,
                     browser_timeout_ms=profile.browser_timeout_ms if profile is not None else None,
-                    variant_selector_config=profile.variant_selector_config if profile is not None else None,
+                    variant_selector_config=variant_selector_config,
+                    match_variant_values=match_variant_values,
+                    variant_config_error=variant_config_error,
                 )
             )
         return _LoadedTargets(

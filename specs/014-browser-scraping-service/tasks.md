@@ -231,7 +231,7 @@ variant, with `variant_selector_config`; assert the persisted price is the post-
 the same page with no config yields the default price, and a missing target → `VARIANT_NOT_FOUND`
 (quickstart scenario 8).
 
-- [ ] T024 [US3] Create `libs/scrape-core/scrape_core/browser/variant.py` (variant-selection.md,
+- [X] T024 [US3] Create `libs/scrape-core/scrape_core/browser/variant.py` (variant-selection.md,
   data-model.md §2): `VariantConfigError(ValueError)` carrying `error_code=SELECTOR_BROKEN`;
   `resolve_variant_values(config, match) -> dict` (off-reactor value_from resolution — `options.<key>` →
   `competitor_variant_options[key]`, `identifier`, `sku`; unresolved/missing → `VariantConfigError`);
@@ -241,27 +241,27 @@ the same page with no config yields the default price, and a missing target → 
   element actions require `selector`, `select_option`/`fill` require `value`|`value_from`; every `wait_*`
   carries the effective timeout; optional trailing `settle` → appended `wait_for_selector`/
   `wait_for_load_state`).
-- [ ] T025 [US3] Wire variant resolution off-reactor into `load_targets`
+- [X] T025 [US3] Wire variant resolution off-reactor into `load_targets`
   (`libs/scrape-core/scrape_core/targets.py`): when a resolved profile carries
   `variant_selector_config`, call `resolve_variant_values(config, match)` and store the result on the
   `SpiderTarget` (its `match_variant_values` slot from T005); a `VariantConfigError` at load time marks
   the target to emit a `SELECTOR_BROKEN` failed result (never fetched). Bounded loads otherwise
   unchanged (shared-extraction.md).
-- [ ] T026 [US3] Extend `build_page_methods` in `scrape_core/browser/page.py` to append the variant
+- [X] T026 [US3] Extend `build_page_methods` in `scrape_core/browser/page.py` to append the variant
   `PageMethod`s in the contract order — profile `wait_for_selector` (if set) → variant `actions` (if
   config) → `settle` (if config) — via `parse_variant_config(target.variant_selector_config,
   target.match_variant_values)` (browser-spider.md `playwright_page_methods`).
-- [ ] T027 [US3] Complete the variant failure branches in the browser spider `errback`/parse-time guard
+- [X] T027 [US3] Complete the variant failure branches in the browser spider `errback`/parse-time guard
   (`generic_browser_price_spider.py`): a `VariantConfigError` (parse/resolve time) → `SELECTOR_BROKEN`
   failed attempt before any fetch; a Playwright missing/uninteractable-element error at run time →
   `VARIANT_NOT_FOUND` — no partially-interacted state persisted as a valid price (US3 AS3, FR-005, R3).
-- [ ] T028 [P] [US3] Unit tests for `variant.py` in `tests/unit/test_variant_config.py` (must pass in
+- [X] T028 [P] [US3] Unit tests for `variant.py` in `tests/unit/test_variant_config.py` (must pass in
   this env, quickstart scenario 2): valid `select_option value_from options.size` + `click` +
   `wait_for_selector` → ordered `PageMethod` list with resolved value from a fake match; `config is None`
   → `[]`; `{"type":"evaluate"}` / any non-allowlisted type → `VariantConfigError`; unresolved
   `value_from` (missing option key) → `VariantConfigError`; bad `version` → `VariantConfigError`;
   settle-only (`actions: []` + `settle`) valid.
-- [ ] T029 [P] [US3] Live test `tests/integration/test_browser_variant_live.py` (`skipif`): variant
+- [X] T029 [P] [US3] Live test `tests/integration/test_browser_variant_live.py` (`skipif`): variant
   fixture → persisted price is the post-selection price; same page with no config → default price; config
   whose target is missing → `VARIANT_NOT_FOUND`, no price persisted (US3 AS1/AS2/AS3, SC-003).
 

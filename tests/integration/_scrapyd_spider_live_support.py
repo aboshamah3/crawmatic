@@ -467,9 +467,18 @@ def seed_match(
     url: str,
     *,
     scrape_profile_id: uuid.UUID | None = None,
+    **match_kwargs: Any,
 ) -> uuid.UUID:
     """Seed one ``competitor_product_matches`` row linking the seeded variant
-    to ``competitor_id``/``url``; returns its id."""
+    to ``competitor_id``/``url``; returns its id.
+
+    ``**match_kwargs`` (SPEC-14 T029, US3) passes through any other
+    ``CompetitorProductMatch`` column -- in practice the per-variant
+    ``competitor_variant_options``/``competitor_variant_identifier``/
+    ``competitor_variant_sku`` a ``variant_selector_config``'s
+    ``value_from`` resolves against (`data-model.md` §2) -- mirrors
+    `seed_scrape_profile`'s ``**profile_kwargs`` convention.
+    """
     from app_shared.database import get_session
     from app_shared.models.competitors_matches import CompetitorProductMatch
 
@@ -484,6 +493,7 @@ def seed_match(
             url_pattern=url,
             url_pattern_version=1,
             scrape_profile_id=scrape_profile_id,
+            **match_kwargs,
         )
         session.add(match)
         session.commit()
