@@ -112,6 +112,7 @@ Current-state tables (e.g. a match's current price, a competitor match's current
 
 **Daily rollups (US2)**
 
+- **FR-009a**: The system MUST create the `variant_price_daily_rollups` table (deferred from SPEC-09) via a single Alembic migration that keeps the migration history at a single head, as a workspace-owned table with row-level security and `unique(workspace_id, product_variant_id, date)`. It is a plain (non-partitioned) table retained by row age (2 years); it is not a monthly-partitioned table.
 - **FR-009**: The system MUST generate daily rollups into `variant_price_daily_rollups`, one row per (workspace, product variant, day), carrying the client price, the min/avg/max comparable competitor prices, the alert type, the comparable-competitor count, the product/variant identity, currency, and the date.
 - **FR-010**: Rollup generation MUST be an upsert on the unique key (workspace, product variant, date): re-running for a day updates the existing row rather than duplicating it.
 - **FR-011**: Competitor price aggregation (min/avg/max) MUST include only comparable, same-currency prices; non-comparable or currency-mismatched prices MUST be excluded from the aggregates, and the comparable-competitor count MUST reflect only the included prices.
@@ -161,7 +162,8 @@ Current-state tables (e.g. a match's current price, a competitor match's current
 
 ## Assumptions
 
-- The append-heavy tables (`price_observations`, `request_attempts`, `price_alert_events`) and the rollup target table (`variant_price_daily_rollups`) already exist, already partitioned/defined by their introducing specs (07, 09, 10); this feature adds only the maintenance/rollup/retention jobs and does not create or alter those tables.
+- The append-heavy raw tables (`price_observations` from 07, `price_alert_events` from 09, `request_attempts` from 10) already exist, already partitioned by their introducing specs; this feature adds only the maintenance/rollup/retention jobs and does not create or alter those raw tables.
+- The rollup target table `variant_price_daily_rollups` does NOT yet exist: SPEC-09 defined its shape but explicitly deferred its creation to this spec. This feature therefore creates that table (a single Alembic migration on the current head), as a plain workspace-owned RLS table (not partitioned; retained 2 years by row age, since it is small and long-lived), then populates it. See FR-009a.
 - `webhook_events` is introduced by a later spec (SPEC-16) and does not yet exist; the registry includes it but the jobs skip it until it is present (FR-002).
 - The daily rollup source data (client price, comparable competitor prices, alert type, comparable count, currency) is available from the current-price / price-comparison surfaces produced by SPEC-09; this feature reads and aggregates that data rather than recomputing comparison logic.
 - Maintenance jobs run in the existing background/worker (or scheduler) service on a periodic schedule; scheduling cadence and orchestration reuse the platform's existing periodic-job mechanism. Exact cadence is an operational configuration detail, provided the P1 guarantee (next-month partition exists before the month starts) holds with comfortable lead time.

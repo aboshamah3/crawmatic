@@ -22,3 +22,12 @@ No questions relayed to the user — the ambiguity scan surfaced only points res
 - [clarify] Q: What does "verified complete" mean for a partition? → A: a rollup exists for every in-range UTC date that had source data; no-data dates need no rollup (source: derivation from §29 ordering guarantee).
 
 Deferred to plan (implementation-level, not user decisions): exact scheduling/orchestration mechanism (Celery beat vs scheduler service), SPEC-09 source-table wiring for rollup aggregation, concurrency/locking mechanism for maintenance passes.
+
+## plan (subagent, opus)
+
+Two codebase-grounded corrections to the spec's assumptions, both self-resolved (no user decision):
+
+- [plan] Correction: spec assumed variant_price_daily_rollups already exists (from SPEC-09). Reality: SPEC-09 defined the shape but explicitly DEFERRED creation to SPEC-15. → This feature CREATES the table via one Alembic migration (down_revision=93511d5f7885, the current head), as a plain workspace-owned RLS table (NOT partitioned; 2-year row-age retention). Spec Assumptions + new FR-009a updated to match (source: codebase specs/009 spec.md:144 / tasks.md:38 + grep confirms table absent).
+- [plan] Correction: partition CREATE/DROP is runtime DDL (CREATE/DROP TABLE ... PARTITION OF issued by the job), NOT alembic migrations — matches §29 runtime-maintenance framing and the repo's zero-runtime-partition-management starting point. Alembic used only for the one new durable table (source: doc §29 + codebase partition patterns).
+
+Plan Constitution Check: PASS with 2 documented deviations — (1) maintenance tasks use BYPASSRLS system session for inherently cross-tenant scans, app-level workspace scoping preserved on every write (identical to sanctioned SPEC-13 refresh-pass seam); (2) one bounded DELETE WHERE date<cutoff on the NON-partitioned rollup table for its 2-year age policy (it has no partition to drop; SC-003's "0% bulk DELETE" targets raw append-heavy partitions, which this table is not).
