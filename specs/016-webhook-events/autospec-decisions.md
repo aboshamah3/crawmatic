@@ -19,3 +19,8 @@ deferred to plan (grounded in existing codebase enums), none user-answerable bet
 - [clarify] Q: Exact webhook_events.status enum values? → A: Deferred to plan; reasonable default a not-delivered state (e.g. PENDING/CREATED) since v1 has no delivery (source: doc §22 lists `status` only; FR-010/FR-011 fix semantics)
 - [clarify] Q: Concrete event_type taxonomy + which transitions emit? → A: Deferred to plan; derive from existing enums — alert transitions (SPEC-09 alert_type/state), scrape job status changes (SPEC-08), strategy changes (SPEC-12) (source: doc §16 Covers, §26; grounded in codebase, not user-decidable)
 - [clarify] Q: Pagination style? → A: Keyset/cursor over (created_at, id) for stable cross-partition ordering, matching existing list endpoints (source: spec Assumptions; platform convention)
+
+## checklist
+
+- [checklist] Focus derivation → security + API/data-integrity (SSRF, RLS isolation, scopes, pagination, partitioning/retention, decoupled creation, no-delivery boundary). Source: spec domain (auth/data-integration backend, no UI).
+- Generated checklists/security-api.md (38 items). All 38 pass against spec.md + plan.md; 0 unresolved. requirements.md (specify) also fully passing. No artifact fixes required — spec already covers every requirement-quality dimension.
