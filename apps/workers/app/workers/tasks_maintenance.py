@@ -40,6 +40,7 @@ from app_shared.database import get_system_session
 from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
 from app_shared.maintenance.rollups import run_daily_rollup
+from app_shared.maintenance.soft_refs import count_tolerated_dangling_refs
 from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
@@ -116,18 +117,37 @@ def retention_drop() -> None:
     `price_observations` partition retained because its daily-rollup
     coverage is incomplete, FR-016), and `rollup_rows_deleted` (the one
     sanctioned bulk `DELETE` aging the non-partitioned
-    `variant_price_daily_rollups` table, R7). The
-    `dangling_soft_refs_tolerated` field is wired in by US4/T033.
+    `variant_price_daily_rollups` table, R7). `dangling_soft_refs_tolerated`
+    (US4/T032/T033, contracts/soft-reference-tolerance.md) is a best-effort
+    operator-visibility count of `match_current_prices` rows whose
+    `observation_id` no longer resolves — an *expected*, tolerated
+    condition, never corruption (FR-022) — logged as `None` if the probe
+    itself fails; this optional check can NEVER block or fail the core
+    create/rollup/drop guarantees above it (FR-024's non-blocking
+    principle, applied here).
     """
     with get_system_session() as session:
         report = run_retention(session, now_utc=datetime.now(timezone.utc))
+
+        dangling_soft_refs_tolerated: int | None
+        try:
+            dangling_soft_refs_tolerated = count_tolerated_dangling_refs(session)
+        except Exception:  # noqa: BLE001 - best-effort operator-visibility probe only (FR-022/024)
+            logger.warning(
+                "maintenance_retention_drop dangling_soft_refs_tolerated probe failed",
+                exc_info=True,
+            )
+            dangling_soft_refs_tolerated = None
+
         session.commit()
 
     logger.info(
         "maintenance_retention_drop tables_skipped_absent=%s partitions_dropped=%s "
-        "partitions_skipped_pending_rollups=%s rollup_rows_deleted=%s",
+        "partitions_skipped_pending_rollups=%s rollup_rows_deleted=%s "
+        "dangling_soft_refs_tolerated=%s",
         report.tables_skipped_absent,
         report.partitions_dropped,
         report.partitions_skipped_pending_rollups,
         report.rollup_rows_deleted,
+        dangling_soft_refs_tolerated,
     )

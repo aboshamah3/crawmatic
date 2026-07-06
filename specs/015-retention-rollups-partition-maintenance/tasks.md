@@ -308,26 +308,38 @@ tolerated. (quickstart US4)
 
 ### Implementation for User Story 4
 
-- [ ] T031 [US4] **AUDIT** every existing consumer of `match_current_prices` under `apps/api/app/` (and
+- [X] T031 [US4] **AUDIT** every existing consumer of `match_current_prices` under `apps/api/app/` (and
   any price-comparison surface) to confirm none inner-joins/dereferences `observation_id` into
   `price_observations` in a way that would drop or error the row when the observation's partition is
   gone — they must rely on the denormalized fields (`price`, `old_price`, `currency`, `comparable`,
   `stock_status`, `success`, `error_code`, `extraction_method`, `extraction_confidence`, `scraped_at`).
   Record the audit result; fix any hard-join reader to tolerate a `None` observation (expected
   not-found, no exception). (FR-021; contract soft-reference-tolerance.md §FR-021; SC-007)
-- [ ] T032 [US4] Implement the tolerance check in `libs/shared/app_shared/maintenance/soft_refs.py`
+  **Audit finding (no code change needed):** `apps/api/app/` has zero consumers of `MatchCurrentPrice`/
+  `PriceObservation` today (grepped every router/service/schema; the two comment hits in
+  `routers/competitors.py`/`routers/matches.py` are prose, not code). The only live reader anywhere is
+  `apps/workers/app/workers/tasks_analysis.py::_load_competitor_rows`, which `scoped_select`s
+  `MatchCurrentPrice` and reads only `match_id`/`price`/`currency`/`success`/`comparable` — it never
+  touches `observation_id` and never joins to `price_observations`. The only writer is
+  `libs/scrape-core/scrape_core/pipelines.py` (sets `observation_id` on upsert; a write path, not a
+  reader). All readers already tolerate the dangling ref by construction — confirmed via
+  `tests/integration/test_soft_ref_tolerance_live.py::test_reader_loads_denormalized_data_despite_dangling_observation_id`
+  (live-deferred, skips cleanly without Postgres).
+- [X] T032 [US4] Implement the tolerance check in `libs/shared/app_shared/maintenance/soft_refs.py`
   (contract soft-reference-tolerance.md §FR-022): `count_tolerated_dangling_refs(session) -> int`
   counting `match_current_prices WHERE observation_id IS NOT NULL AND observation_id NOT IN (SELECT id
   FROM price_observations)` — a cross-tenant (`# noqa: workspace-scope`) best-effort probe on the system
   session, classifying the result as expected/tolerated (informational, never an error/corruption
   signal). (FR-022)
-- [ ] T033 [US4] Wire the tolerance check into the retention task in
+  Pure-unit coverage (no live DB) added in `tests/unit/test_soft_ref_tolerance.py`: rendered-SQL shape
+  assertion + a fake-session count round-trip.
+- [X] T033 [US4] Wire the tolerance check into the retention task in
   `apps/workers/app/workers/tasks_maintenance.py`: after `run_retention`, best-effort call
   `count_tolerated_dangling_refs(session)` and add `dangling_soft_refs_tolerated` to the run-report log
   line, wrapped so it can NEVER block or fail the core create/rollup/drop guarantees — applying FR-024's
   non-blocking principle to this optional check (FR-024 itself builds no vacuum/analyze; out of v1 scope
   per spec). (FR-022)
-- [ ] T034 [P] [US4] Live integration test `tests/integration/test_soft_ref_tolerance_live.py` (`skipif`
+- [X] T034 [P] [US4] Live integration test `tests/integration/test_soft_ref_tolerance_live.py` (`skipif`
   probe): a `match_current_prices` row whose `observation_id` points into an already-dropped partition
   still loads and returns correct denormalized data with no error/500/row-drop (US4 AS-1); an explicit
   fetch of the missing raw row is an expected `None`; and `count_tolerated_dangling_refs` reports it as
