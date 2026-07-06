@@ -77,6 +77,7 @@ class FlushResult:
     keys_flushed: int
     transitions: tuple[StrategyTransition, ...] = field(default_factory=tuple)
 
+
 #: Scale factor `conf_sum` was multiplied by at record time
 #: (`stats_buffer._CONFIDENCE_SCALE`) -- duplicated here (a plain int
 #: constant, not worth importing a private name across the module

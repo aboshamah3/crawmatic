@@ -26,7 +26,9 @@ def test_create_rejects_unknown_fields() -> None:
 
 
 def test_create_defaults_enabled_true_and_event_types_empty() -> None:
-    payload = WebhookEndpointCreate(name="My integration", url="https://hooks.example.com/x")
+    payload = WebhookEndpointCreate(
+        name="My integration", url="https://hooks.example.com/x"
+    )
     assert payload.enabled is True
     assert payload.event_types == []
     assert payload.secret is None

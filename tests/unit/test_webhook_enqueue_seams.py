@@ -197,7 +197,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -239,7 +241,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -269,7 +273,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -388,7 +394,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -417,7 +425,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -449,7 +459,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -480,7 +492,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -638,7 +652,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -682,7 +698,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -840,7 +858,9 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"
 
 
@@ -865,5 +885,7 @@ sys.exit(0)
 """
     )
     result = _run(script)
-    assert result.returncode == 0, f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
+    )
     assert result.stdout.strip() == "OK"

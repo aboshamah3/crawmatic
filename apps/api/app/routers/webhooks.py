@@ -33,7 +33,13 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 
 from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
-from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
+from app_shared.pagination import (
+    InvalidCursor,
+    clamp_limit,
+    decode_cursor,
+    keyset_predicate,
+    paginate,
+)
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.encryption import encrypt_secret
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
@@ -69,7 +75,13 @@ def _not_found(message: str = "Webhook event not found.") -> HTTPException:
 def _unsafe_url(exc: UnsafeUrlError) -> HTTPException:
     return HTTPException(
         status_code=422,
-        detail={"error": {"code": "UNSAFE_URL", "message": str(exc), "reason": exc.reason.value}},
+        detail={
+            "error": {
+                "code": "UNSAFE_URL",
+                "message": str(exc),
+                "reason": exc.reason.value,
+            }
+        },
     )
 
 
@@ -120,7 +132,9 @@ def get_webhook_event(
 # --- webhook-endpoints CRUD (US2, T022-T025) --------------------------------
 
 
-@router.post("/v1/webhook-endpoints", response_model=WebhookEndpointResponse, status_code=201)
+@router.post(
+    "/v1/webhook-endpoints", response_model=WebhookEndpointResponse, status_code=201
+)
 def create_webhook_endpoint(
     payload: WebhookEndpointCreate,
     principal_ctx: tuple = Depends(require_scopes("webhooks:write")),
@@ -175,7 +189,9 @@ def list_webhook_endpoints(
         except InvalidCursor as exc:
             raise _invalid_cursor(exc) from exc
         stmt = stmt.where(keyset_predicate(WebhookEndpoint, after))
-    stmt = stmt.order_by(WebhookEndpoint.created_at, WebhookEndpoint.id).limit(page_limit + 1)
+    stmt = stmt.order_by(WebhookEndpoint.created_at, WebhookEndpoint.id).limit(
+        page_limit + 1
+    )
 
     rows = session.execute(stmt).scalars().all()
     envelope = paginate(rows, page_limit)

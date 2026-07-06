@@ -32,7 +32,6 @@ tolerate references into dropped/expired partitions).
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 from typing import Any
 
@@ -79,7 +78,9 @@ class WebhookEndpoint(Base, WorkspaceScopedBase, TimestampMixin):
     secret_key_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
 
     enabled: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
-    event_types: Mapped[list[str]] = mapped_column(JSONB(), nullable=False, default=list)
+    event_types: Mapped[list[str]] = mapped_column(
+        JSONB(), nullable=False, default=list
+    )
 
 
 class WebhookEvent(Base, WorkspaceScopedBase):

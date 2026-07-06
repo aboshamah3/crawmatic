@@ -61,7 +61,11 @@ def _live_webhook_events_reachable() -> bool:
     try:
         from sqlalchemy import inspect, text
 
-        from app_shared.database import check_connection, get_engine, get_system_sessionmaker
+        from app_shared.database import (
+            check_connection,
+            get_engine,
+            get_system_sessionmaker,
+        )
 
         check_connection()
         table_names = set(inspect(get_engine()).get_table_names())
@@ -134,10 +138,15 @@ def _cleanup_workspace(workspace_id: uuid.UUID) -> None:
 
     with get_session() as session:
         session.execute(
-            text("DELETE FROM webhook_events WHERE workspace_id = :ws"), {"ws": workspace_id}
+            text("DELETE FROM webhook_events WHERE workspace_id = :ws"),
+            {"ws": workspace_id},
         )
-        session.execute(text("DELETE FROM api_keys WHERE workspace_id = :ws"), {"ws": workspace_id})
-        session.execute(text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id})
+        session.execute(
+            text("DELETE FROM api_keys WHERE workspace_id = :ws"), {"ws": workspace_id}
+        )
+        session.execute(
+            text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id}
+        )
         session.commit()
 
 
@@ -318,10 +327,14 @@ def test_get_single_event_by_id(fixture: _Fixture, client) -> None:
 # --- 4. cross-workspace isolation: 404 on direct fetch, absent from list ----
 
 
-def test_cross_workspace_fetch_is_404_and_absent_from_list(fixture: _Fixture, client) -> None:
+def test_cross_workspace_fetch_is_404_and_absent_from_list(
+    fixture: _Fixture, client
+) -> None:
     headers = _auth(fixture.api_key_read)
 
-    response = client.get(f"/v1/webhook-events/{fixture.other_event_id}", headers=headers)
+    response = client.get(
+        f"/v1/webhook-events/{fixture.other_event_id}", headers=headers
+    )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
 
@@ -364,7 +377,9 @@ def test_no_workspace_context_returns_zero_rows_fail_closed(fixture: _Fixture) -
 def test_invalid_cursor_is_422_invalid_cursor(fixture: _Fixture, client) -> None:
     headers = _auth(fixture.api_key_read)
     response = client.get(
-        "/v1/webhook-events", params={"cursor": "not-a-valid-cursor!!!"}, headers=headers
+        "/v1/webhook-events",
+        params={"cursor": "not-a-valid-cursor!!!"},
+        headers=headers,
     )
     assert response.status_code == 422
     assert response.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
@@ -385,7 +400,9 @@ def test_missing_webhooks_read_scope_is_forbidden(fixture: _Fixture, client) -> 
     assert response.status_code == 403
 
 
-def test_empty_workspace_past_the_end_is_not_an_error(fixture: _Fixture, client) -> None:
+def test_empty_workspace_past_the_end_is_not_an_error(
+    fixture: _Fixture, client
+) -> None:
     """An empty page (past the end of the backlog) is `{items: [], next_cursor:
     null}`, not an error (contract edge case)."""
     headers = _auth(fixture.other_api_key_read)
@@ -412,5 +429,6 @@ def _last_cursor(client, headers: dict[str, str]) -> str:
     response = client.get("/v1/webhook-events", params={"limit": 50}, headers=headers)
     item = response.json()["items"][-1]
     return encode_cursor(
-        datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")), uuid.UUID(item["id"])
+        datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")),
+        uuid.UUID(item["id"]),
     )

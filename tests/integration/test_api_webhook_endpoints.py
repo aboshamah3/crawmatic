@@ -56,7 +56,11 @@ def _live_webhook_endpoints_reachable() -> bool:
     try:
         from sqlalchemy import inspect
 
-        from app_shared.database import check_connection, get_engine, get_system_sessionmaker
+        from app_shared.database import (
+            check_connection,
+            get_engine,
+            get_system_sessionmaker,
+        )
 
         check_connection()
         table_names = set(inspect(get_engine()).get_table_names())
@@ -130,10 +134,15 @@ def _cleanup_workspace(workspace_id: uuid.UUID) -> None:
 
     with get_session() as session:
         session.execute(
-            text("DELETE FROM webhook_endpoints WHERE workspace_id = :ws"), {"ws": workspace_id}
+            text("DELETE FROM webhook_endpoints WHERE workspace_id = :ws"),
+            {"ws": workspace_id},
         )
-        session.execute(text("DELETE FROM api_keys WHERE workspace_id = :ws"), {"ws": workspace_id})
-        session.execute(text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id})
+        session.execute(
+            text("DELETE FROM api_keys WHERE workspace_id = :ws"), {"ws": workspace_id}
+        )
+        session.execute(
+            text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id}
+        )
         session.commit()
 
 
@@ -149,7 +158,9 @@ class _Fixture:
 @pytest.fixture()
 def fixture() -> Iterator[_Fixture]:
     unique = uuid.uuid4().hex[:8]
-    workspace_id, api_key_write = _make_workspace_and_key(unique, ["webhooks:read", "webhooks:write"])
+    workspace_id, api_key_write = _make_workspace_and_key(
+        unique, ["webhooks:read", "webhooks:write"]
+    )
     _read_only_ws, api_key_read_only = _make_workspace_and_key(
         f"readonly-{unique}", ["webhooks:read"]
     )
@@ -178,7 +189,9 @@ def _auth(secret: str) -> dict[str, str]:
 # --- 1. create/list/get/patch/delete round trip (SC-002) --------------------
 
 
-def test_create_round_trips_with_has_secret_never_raw_secret(fixture: _Fixture, client) -> None:
+def test_create_round_trips_with_has_secret_never_raw_secret(
+    fixture: _Fixture, client
+) -> None:
     headers = _auth(fixture.api_key_write)
     response = client.post(
         "/v1/webhook-endpoints",
@@ -237,7 +250,9 @@ def test_full_crud_round_trip(fixture: _Fixture, client) -> None:
     delete_resp = client.delete(f"/v1/webhook-endpoints/{endpoint_id}", headers=headers)
     assert delete_resp.status_code == 204
 
-    get_after_delete = client.get(f"/v1/webhook-endpoints/{endpoint_id}", headers=headers)
+    get_after_delete = client.get(
+        f"/v1/webhook-endpoints/{endpoint_id}", headers=headers
+    )
     assert get_after_delete.status_code == 404
 
 
@@ -249,8 +264,16 @@ def test_full_crud_round_trip(fixture: _Fixture, client) -> None:
     [
         ("loopback_ip", "https://127.0.0.1/hook", "PRIVATE_OR_INTERNAL_IP"),
         ("link_local_ip", "https://169.254.169.254/hook", "PRIVATE_OR_INTERNAL_IP"),
-        ("internal_metadata_hostname", "http://metadata.google.internal/hook", "INTERNAL_HOSTNAME"),
-        ("userinfo_present", "https://user:pass@hooks.example.com/hook", "USERINFO_PRESENT"),
+        (
+            "internal_metadata_hostname",
+            "http://metadata.google.internal/hook",
+            "INTERNAL_HOSTNAME",
+        ),
+        (
+            "userinfo_present",
+            "https://user:pass@hooks.example.com/hook",
+            "USERINFO_PRESENT",
+        ),
         ("non_http_scheme", "ftp://hooks.example.com/hook", "BAD_SCHEME"),
     ],
 )
@@ -273,7 +296,9 @@ def test_create_rejects_each_ssrf_class(
     assert all(item["name"] != f"unsafe-{label}" for item in listing.json()["items"])
 
 
-def test_patch_rejects_unsafe_url_and_leaves_row_unchanged(fixture: _Fixture, client) -> None:
+def test_patch_rejects_unsafe_url_and_leaves_row_unchanged(
+    fixture: _Fixture, client
+) -> None:
     headers = _auth(fixture.api_key_write)
     create_resp = client.post(
         "/v1/webhook-endpoints",
@@ -316,7 +341,9 @@ def test_secret_is_encrypted_in_the_database_row(fixture: _Fixture, client) -> N
 
     with get_session() as session:
         row = session.execute(
-            text("SELECT secret_encrypted, secret_key_version FROM webhook_endpoints WHERE id = :id"),
+            text(
+                "SELECT secret_encrypted, secret_key_version FROM webhook_endpoints WHERE id = :id"
+            ),
             {"id": endpoint_id},
         ).one()
         assert row.secret_encrypted is not None
@@ -343,7 +370,9 @@ def test_patch_secret_tri_state(fixture: _Fixture, client) -> None:
 
     # Omitted -> unchanged.
     unchanged_resp = client.patch(
-        f"/v1/webhook-endpoints/{endpoint_id}", json={"name": "Tri State Renamed"}, headers=headers
+        f"/v1/webhook-endpoints/{endpoint_id}",
+        json={"name": "Tri State Renamed"},
+        headers=headers,
     )
     assert unchanged_resp.json()["has_secret"] is True
 
@@ -355,7 +384,9 @@ def test_patch_secret_tri_state(fixture: _Fixture, client) -> None:
 
     # Non-null value -> re-encrypt.
     reencrypted_resp = client.patch(
-        f"/v1/webhook-endpoints/{endpoint_id}", json={"secret": "new-secret"}, headers=headers
+        f"/v1/webhook-endpoints/{endpoint_id}",
+        json={"secret": "new-secret"},
+        headers=headers,
     )
     assert reencrypted_resp.json()["has_secret"] is True
 
@@ -378,18 +409,24 @@ def test_cross_workspace_get_patch_delete_is_404(fixture: _Fixture, client) -> N
     assert get_resp.status_code == 404
 
     patch_resp = client.patch(
-        f"/v1/webhook-endpoints/{endpoint_id}", json={"name": "Hijacked"}, headers=other_headers
+        f"/v1/webhook-endpoints/{endpoint_id}",
+        json={"name": "Hijacked"},
+        headers=other_headers,
     )
     assert patch_resp.status_code == 404
 
-    delete_resp = client.delete(f"/v1/webhook-endpoints/{endpoint_id}", headers=other_headers)
+    delete_resp = client.delete(
+        f"/v1/webhook-endpoints/{endpoint_id}", headers=other_headers
+    )
     assert delete_resp.status_code == 404
 
     listing = client.get("/v1/webhook-endpoints", headers=other_headers)
     assert all(item["id"] != endpoint_id for item in listing.json()["items"])
 
     # Untouched from the owner's perspective.
-    still_there = client.get(f"/v1/webhook-endpoints/{endpoint_id}", headers=owner_headers)
+    still_there = client.get(
+        f"/v1/webhook-endpoints/{endpoint_id}", headers=owner_headers
+    )
     assert still_there.status_code == 200
     assert still_there.json()["name"] == "Owner Only"
 
@@ -397,7 +434,9 @@ def test_cross_workspace_get_patch_delete_is_404(fixture: _Fixture, client) -> N
 # --- 6. no workspace context -> 0 rows, fail closed --------------------------
 
 
-def test_no_workspace_context_returns_zero_rows_fail_closed(fixture: _Fixture, client) -> None:
+def test_no_workspace_context_returns_zero_rows_fail_closed(
+    fixture: _Fixture, client
+) -> None:
     from sqlalchemy import create_engine, text
 
     from app_shared.config import get_settings
@@ -424,7 +463,9 @@ def test_no_workspace_context_returns_zero_rows_fail_closed(fixture: _Fixture, c
 # --- 7. webhooks:read-only key: reads OK, writes 403 (US2 AS6) ---------------
 
 
-def test_read_only_scope_is_refused_on_every_write_op(fixture: _Fixture, client) -> None:
+def test_read_only_scope_is_refused_on_every_write_op(
+    fixture: _Fixture, client
+) -> None:
     read_headers = _auth(fixture.api_key_read_only)
 
     create_resp = client.post(
@@ -443,15 +484,21 @@ def test_read_only_scope_is_refused_on_every_write_op(fixture: _Fixture, client)
     endpoint_id = seeded.json()["id"]
 
     patch_resp = client.patch(
-        f"/v1/webhook-endpoints/{endpoint_id}", json={"name": "Nope"}, headers=read_headers
+        f"/v1/webhook-endpoints/{endpoint_id}",
+        json={"name": "Nope"},
+        headers=read_headers,
     )
     assert patch_resp.status_code == 403
 
-    delete_resp = client.delete(f"/v1/webhook-endpoints/{endpoint_id}", headers=read_headers)
+    delete_resp = client.delete(
+        f"/v1/webhook-endpoints/{endpoint_id}", headers=read_headers
+    )
     assert delete_resp.status_code == 403
 
 
-def test_read_only_scope_is_permitted_on_every_read_op(fixture: _Fixture, client) -> None:
+def test_read_only_scope_is_permitted_on_every_read_op(
+    fixture: _Fixture, client
+) -> None:
     write_headers = _auth(fixture.api_key_write)
     seeded = client.post(
         "/v1/webhook-endpoints",

@@ -88,7 +88,9 @@ def test_offline_upgrade_head_renders_current_and_next_month_partitions() -> Non
     sql = result.stdout
 
     for suffix in _current_and_next_month_suffixes():
-        assert f"CREATE TABLE webhook_events_{suffix} PARTITION OF webhook_events" in sql
+        assert (
+            f"CREATE TABLE webhook_events_{suffix} PARTITION OF webhook_events" in sql
+        )
 
 
 def test_offline_upgrade_head_renders_six_rls_statements() -> None:

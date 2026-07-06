@@ -34,6 +34,7 @@ already registered there; this migration only creates the real table
 so the existing ``table_exists`` gate activates the already-registered
 partition-create/retention jobs.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -46,8 +47,8 @@ from sqlalchemy.dialects import postgresql
 from app_shared.models import emit_rls_policy
 
 # revision identifiers, used by Alembic.
-revision: str = '03dec3037c8f'
-down_revision: Union[str, Sequence[str], None] = '4a1dca402f78'
+revision: str = "03dec3037c8f"
+down_revision: Union[str, Sequence[str], None] = "4a1dca402f78"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -44,7 +44,11 @@ def _claim_dedup_key(dedup_key: str) -> bool:
     (dedup is best-effort, never a reason to drop a genuine event)."""
     try:
         redis = get_redis_client()
-        return bool(redis.set(f"{_DEDUP_KEY_PREFIX}:{dedup_key}", "1", nx=True, ex=_DEDUP_TTL_SECONDS))
+        return bool(
+            redis.set(
+                f"{_DEDUP_KEY_PREFIX}:{dedup_key}", "1", nx=True, ex=_DEDUP_TTL_SECONDS
+            )
+        )
     except Exception:
         logger.warning(
             "create_webhook_event: dedup check failed, proceeding dedup_key=%s",

@@ -140,13 +140,13 @@ description: "Task list for SPEC-16 Webhook Events implementation"
 
 **Purpose**: Guards, lint, and full-suite verification across all stories.
 
-- [ ] T038 Run `uv run ruff check` and `uv run ruff format --check` over the new/edited files (`libs/shared/app_shared/{enums,task_names,repository,models/webhooks,models/__init__,webhooks/payloads}.py`, `apps/api/app/{routers,schemas}/webhooks.py`, `apps/api/app/main.py`, `apps/workers/app/workers/{tasks_webhooks,celery_app,tasks_analysis,tasks_jobs,tasks_strategy}.py`, migration, tests); fix all findings.
-- [ ] T039 [P] Run the single-head guard `uv run pytest tests/unit/test_strategy_single_head.py` — must report exactly one Alembic head (linear chain, `down_revision='4a1dca402f78'`).
-- [ ] T040 [P] Run the workspace-scoping guard `uv run python scripts/check_workspace_scoping.py` (and `tests/unit/` scoping tests) — confirms both `WebhookEndpoint` and `WebhookEvent` are in `WORKSPACE_OWNED_MODELS` (the script imports that set; there is no separate mirror list to keep in sync).
-- [ ] T041 [P] Run the import-boundary guard `uv run pytest tests/unit/test_import_boundaries.py` — confirms `app_shared` (incl. new `webhooks/payloads.py`) pulls in no Scrapy/Twisted/Playwright/FastAPI and does not import `scrape_core`; seams enqueue by name only.
-- [ ] T042 [P] Run the partition-registry / retention guards `uv run pytest tests/unit/test_partition_registry.py tests/unit/test_retention_eligibility.py` — confirm still green (`len(PARTITIONED_TABLES)==4`, `webhook_events: 90`) proving nothing was re-added.
-- [ ] T043 Run the full suite `uv run pytest` (unit green; integration `webhook`/`live` cases skip cleanly via the DB probe in this build env) and confirm no regressions.
-- [ ] T044 Execute `specs/016-webhook-events/quickstart.md` validation steps (or confirm they are all covered by the tests above) and note any live-only steps deferred for lack of a Postgres/Redis/Celery stack.
+- [X] T038 Run `uv run ruff check` and `uv run ruff format --check` over the new/edited files (`libs/shared/app_shared/{enums,task_names,repository,models/webhooks,models/__init__,webhooks/payloads}.py`, `apps/api/app/{routers,schemas}/webhooks.py`, `apps/api/app/main.py`, `apps/workers/app/workers/{tasks_webhooks,celery_app,tasks_analysis,tasks_jobs,tasks_strategy}.py`, migration, tests); fix all findings.
+- [X] T039 [P] Run the single-head guard `uv run pytest tests/unit/test_strategy_single_head.py` — must report exactly one Alembic head (linear chain, `down_revision='4a1dca402f78'`).
+- [X] T040 [P] Run the workspace-scoping guard `uv run python scripts/check_workspace_scoping.py` (and `tests/unit/` scoping tests) — confirms both `WebhookEndpoint` and `WebhookEvent` are in `WORKSPACE_OWNED_MODELS` (the script imports that set; there is no separate mirror list to keep in sync).
+- [X] T041 [P] Run the import-boundary guard `uv run pytest tests/unit/test_import_boundaries.py` — confirms `app_shared` (incl. new `webhooks/payloads.py`) pulls in no Scrapy/Twisted/Playwright/FastAPI and does not import `scrape_core`; seams enqueue by name only.
+- [X] T042 [P] Run the partition-registry / retention guards `uv run pytest tests/unit/test_partition_registry.py tests/unit/test_retention_eligibility.py` — confirm still green (`len(PARTITIONED_TABLES)==4`, `webhook_events: 90`) proving nothing was re-added.
+- [X] T043 Run the full suite `uv run pytest` (unit green; integration `webhook`/`live` cases skip cleanly via the DB probe in this build env) and confirm no regressions.
+- [X] T044 Execute `specs/016-webhook-events/quickstart.md` validation steps (or confirm they are all covered by the tests above) and note any live-only steps deferred for lack of a Postgres/Redis/Celery stack.
 
 ---
 

@@ -63,7 +63,9 @@ class _StubWebhookEndpoint:
     updated_at: datetime
 
 
-def _stub(secret_encrypted: str | None, secret_key_version: int | None) -> _StubWebhookEndpoint:
+def _stub(
+    secret_encrypted: str | None, secret_key_version: int | None
+) -> _StubWebhookEndpoint:
     now = datetime.now(timezone.utc)
     return _StubWebhookEndpoint(
         id=uuid.uuid4(),
@@ -83,7 +85,9 @@ def test_to_response_json_never_contains_the_secret_ciphertext() -> None:
     """SPEC-16 T026: the serialized JSON of a `WebhookEndpointResponse` built
     from an endpoint that DOES have a secret must never contain the
     ciphertext, the key version, or any `secret*` key -- only `has_secret`."""
-    endpoint = _stub(secret_encrypted="gAAAAA-fake-fernet-ciphertext", secret_key_version=3)
+    endpoint = _stub(
+        secret_encrypted="gAAAAA-fake-fernet-ciphertext", secret_key_version=3
+    )
     response = webhook_schemas._to_response(endpoint)  # type: ignore[arg-type]
 
     dumped = response.model_dump()

@@ -62,7 +62,11 @@ def _live_webhook_creation_reachable() -> bool:
     try:
         from sqlalchemy import inspect
 
-        from app_shared.database import check_connection, get_engine, get_system_sessionmaker
+        from app_shared.database import (
+            check_connection,
+            get_engine,
+            get_system_sessionmaker,
+        )
 
         check_connection()
         table_names = set(inspect(get_engine()).get_table_names())
@@ -111,9 +115,12 @@ def seeded_workspace() -> Iterator[uuid.UUID]:
 
     with get_session() as session:
         session.execute(
-            text("DELETE FROM webhook_events WHERE workspace_id = :ws"), {"ws": workspace_id}
+            text("DELETE FROM webhook_events WHERE workspace_id = :ws"),
+            {"ws": workspace_id},
         )
-        session.execute(text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id})
+        session.execute(
+            text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id}
+        )
         session.commit()
 
 

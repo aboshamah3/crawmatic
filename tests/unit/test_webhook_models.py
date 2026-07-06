@@ -27,7 +27,9 @@ def _compiled_type(column) -> str:
 
 
 def _fk_constraints(table) -> dict[str, ForeignKeyConstraint]:
-    return {fk.name: fk for fk in table.constraints if isinstance(fk, ForeignKeyConstraint)}
+    return {
+        fk.name: fk for fk in table.constraints if isinstance(fk, ForeignKeyConstraint)
+    }
 
 
 def _all_constraint_and_index_names(table) -> list[str]:
