@@ -44,3 +44,11 @@ STRATEGY_PATTERN_BACKFILL = "maintenance.strategy_pattern_backfill"
 MAINTENANCE_PARTITION_CREATE = "maintenance.partition_create"
 MAINTENANCE_DAILY_ROLLUP = "maintenance.daily_rollup"
 MAINTENANCE_RETENTION_DROP = "maintenance.retention_drop"
+
+# --- Webhook events (SPEC-16 FR-008, FR-009) ---
+# Enqueued via the same ``app_shared.messaging.enqueue`` producer seam by
+# three existing sources (alert transitions, job finalization, strategy
+# status changes) strictly after their own commit; consumed by
+# ``apps/workers/app/workers/tasks_webhooks.py`` on the new
+# ``webhook_events`` queue.
+CREATE_WEBHOOK_EVENT = "webhook_events.create_webhook_event"

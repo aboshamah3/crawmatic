@@ -517,6 +517,41 @@ class DiscoveryRunStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class WebhookEventStatus(StrEnum):
+    """Delivery status of a ``webhook_events`` row (SPEC-16 §22, FR-011).
+
+    v1 only ever writes ``PENDING`` (recorded, not delivered;
+    ``delivered_at`` stays null). ``DELIVERED``/``FAILED`` are reserved
+    for the future delivery feature and are unused in v1.
+    """
+
+    PENDING = "PENDING"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+
+
+class WebhookEventType(StrEnum):
+    """Stable event-type taxonomy for ``webhook_events.event_type`` (SPEC-16 §22, FR-008).
+
+    Maps existing source-domain enum transitions to a stable dotted
+    string vocabulary: price alerts (SPEC-09 ``AlertEventType``), scrape
+    job terminal statuses (SPEC-08 ``ScrapeJobStatus``), and domain
+    strategy status changes (SPEC-12 ``StrategyStatus`` ACTIVE/DEGRADED).
+    Stored in a ``String(64)`` column (free string, producer-validated
+    by this enum); endpoint ``event_types`` subscriptions remain a free
+    JSONB list of strings, forward-compatible with unknown types.
+    """
+
+    PRICE_ALERT_CREATED = "price.alert.created"
+    PRICE_ALERT_UPDATED = "price.alert.updated"
+    PRICE_ALERT_RESOLVED = "price.alert.resolved"
+    PRICE_ALERT_REOPENED = "price.alert.reopened"
+    SCRAPE_JOB_COMPLETED = "scrape.job.completed"
+    SCRAPE_JOB_PARTIAL = "scrape.job.partial_failed"
+    SCRAPE_JOB_FAILED = "scrape.job.failed"
+    DOMAIN_STRATEGY_UPDATED = "domain.strategy.updated"
+
+
 class _AppValidatedEnumString(TypeDecorator[Any]):
     """Plain ``String`` column with application-side enum validation.
 
