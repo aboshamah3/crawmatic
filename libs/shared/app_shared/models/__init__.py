@@ -118,6 +118,13 @@ from app_shared.models.refresh_rules import RefreshRule
 # `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.rollups import VariantPriceDailyRollup
 
+# The SPEC-16 webhook models — re-exported so `Base.metadata` sees both
+# tables for Alembic autogenerate/offline-render (target_metadata), and
+# so callers can `from app_shared.models import WebhookEndpoint,
+# WebhookEvent`. Both workspace-owned: registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
+
 __all__ = [
     "Base",
     "metadata",
@@ -155,4 +162,6 @@ __all__ = [
     "StrategyDiscoveryRun",
     "RefreshRule",
     "VariantPriceDailyRollup",
+    "WebhookEndpoint",
+    "WebhookEvent",
 ]

@@ -34,6 +34,7 @@ from app_shared.models.observations import MatchCurrentPrice, PriceObservation, 
 from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.rollups import VariantPriceDailyRollup
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
 # SPEC-03 models to any Base subclass — the four catalog models
@@ -88,6 +89,13 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         # even though the aggregation job's cross-tenant *scan* runs on the
         # BYPASSRLS system session (research R9).
         VariantPriceDailyRollup,
+        # SPEC-16: WebhookEndpoint/WebhookEvent are both workspace-owned
+        # (tenant-only, WorkspaceScopedBase) — the CRUD endpoint table and
+        # the born-partitioned event history table both carry a real,
+        # non-null workspace_id (the RLS anchor) and are queried
+        # exclusively via scoped_select/scoped_get.
+        WebhookEndpoint,
+        WebhookEvent,
     }
 )
 

@@ -22,6 +22,7 @@ from app_shared.models.observations import MatchCurrentPrice, PriceObservation, 
 from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.rollups import VariantPriceDailyRollup
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
     assert_workspace_owned_query_is_scoped,
@@ -43,9 +44,10 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
     # (StrategyAttemptStats has no workspace_id and is deliberately excluded
     # — read only via its scoped parent profile); SPEC-13 (T007) widens it
     # once more with RefreshRule (tenant-only); SPEC-15 (T015) widens it
-    # once more with VariantPriceDailyRollup (tenant-only) — updated here
-    # alongside app_shared.repository so the suite stays in sync with the
-    # runtime set.
+    # once more with VariantPriceDailyRollup (tenant-only); SPEC-16 (T009)
+    # widens it once more with WebhookEndpoint/WebhookEvent (both
+    # tenant-only) — updated here alongside app_shared.repository so the
+    # suite stays in sync with the runtime set.
     assert WORKSPACE_OWNED_MODELS == frozenset(
         {
             User,
@@ -69,6 +71,8 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             StrategyDiscoveryRun,
             RefreshRule,
             VariantPriceDailyRollup,
+            WebhookEndpoint,
+            WebhookEvent,
         }
     )
 
