@@ -32,6 +32,7 @@ from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.models.refresh_rules import RefreshRule
+from app_shared.models.rollups import VariantPriceDailyRollup
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
@@ -81,6 +82,12 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         StrategyDiscoveryRun,
         # SPEC-13: RefreshRule is workspace-owned (tenant-only, WorkspaceScopedBase).
         RefreshRule,
+        # SPEC-15 US2: VariantPriceDailyRollup is workspace-owned (tenant-only,
+        # WorkspaceScopedBase) — every read/write in
+        # app_shared.maintenance.rollups carries an explicit workspace_id=
+        # even though the aggregation job's cross-tenant *scan* runs on the
+        # BYPASSRLS system session (research R9).
+        VariantPriceDailyRollup,
     }
 )
 

@@ -33,6 +33,13 @@ independent** interval accumulator driven by
 the SPEC-12 fixed-cadence enqueues above (not a DB-driven claim like the
 SPEC-13 refresh pass). Daily by default: weeks of lead so next-month's
 partitions always exist before the month begins (SC-001).
+
+SPEC-15 US2 (contracts/daily-rollup.md) adds a **fourth, independent**
+interval accumulator driven by ``DAILY_ROLLUP_INTERVAL_SECONDS`` that
+fire-and-forget enqueues ``MAINTENANCE_DAILY_ROLLUP`` on the
+``maintenance`` queue — same fixed-cadence shape as the partition-create
+accumulator above (no arguments; the task itself defaults to yesterday
+UTC).
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from app_shared.config import get_settings
 from app_shared.database import get_system_sessionmaker
 from app_shared.messaging import enqueue
 from app_shared.task_names import (
+    MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_STATS_FLUSH,
@@ -114,6 +122,23 @@ def _enqueue_partition_create() -> None:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_PARTITION_CREATE)
 
 
+def _enqueue_daily_rollup() -> None:
+    """Fire-and-forget `MAINTENANCE_DAILY_ROLLUP` on the `maintenance`
+    queue (SPEC-15 US2, contracts/daily-rollup.md) -- upserts one
+    `variant_price_daily_rollups` row per (workspace, variant) with
+    activity on the default target day (yesterday UTC). Errors are
+    logged and swallowed for the same reason
+    `_enqueue_light_recheck`/`_enqueue_stats_flush`/
+    `_enqueue_partition_create` swallow them: a missed tick just means
+    that day's rollup is retried on the next interval, never a crashed
+    scheduler process.
+    """
+    try:
+        enqueue(MAINTENANCE_DAILY_ROLLUP, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_DAILY_ROLLUP)
+
+
 def _run_refresh_pass_tick(batch_limit: int) -> None:
     """Run one SPEC-13 refresh pass (`app.scheduler.refresh.run_refresh_pass`)
     on the BYPASSRLS system sessionmaker, claiming/firing up to
@@ -145,22 +170,26 @@ def main() -> None:
     refresh_interval = settings.SCHEDULER_POLL_INTERVAL_SECONDS
     refresh_batch_limit = settings.SCHEDULER_CLAIM_BATCH_LIMIT
     partition_create_interval = settings.PARTITION_CREATE_INTERVAL_SECONDS
+    daily_rollup_interval = settings.DAILY_ROLLUP_INTERVAL_SECONDS
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush every %ss; "
-        "refresh pass every %ss; partition_create every %ss)",
+        "refresh pass every %ss; partition_create every %ss; daily_rollup every %ss)",
         interval,
         refresh_interval,
         partition_create_interval,
+        daily_rollup_interval,
     )
     elapsed = 0.0
     refresh_elapsed = 0.0
     partition_create_elapsed = 0.0
+    daily_rollup_elapsed = 0.0
     while not _shutdown_requested:
         time.sleep(_TICK_SECONDS)
         elapsed += _TICK_SECONDS
         refresh_elapsed += _TICK_SECONDS
         partition_create_elapsed += _TICK_SECONDS
+        daily_rollup_elapsed += _TICK_SECONDS
         if elapsed >= interval:
             elapsed = 0.0
             _enqueue_light_recheck()
@@ -171,6 +200,9 @@ def main() -> None:
         if partition_create_elapsed >= partition_create_interval:
             partition_create_elapsed = 0.0
             _enqueue_partition_create()
+        if daily_rollup_elapsed >= daily_rollup_interval:
+            daily_rollup_elapsed = 0.0
+            _enqueue_daily_rollup()
 
     logger.info("scheduler stopped")
 

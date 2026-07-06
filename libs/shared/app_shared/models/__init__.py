@@ -111,6 +111,13 @@ from app_shared.models.strategy import (
 # registered in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.refresh_rules import RefreshRule
 
+# The SPEC-15 US2 VariantPriceDailyRollup model — re-exported so
+# `Base.metadata` sees the table for Alembic autogenerate/offline-render
+# (target_metadata), and so callers can `from app_shared.models import
+# VariantPriceDailyRollup`. Workspace-owned: registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.rollups import VariantPriceDailyRollup
+
 __all__ = [
     "Base",
     "metadata",
@@ -147,4 +154,5 @@ __all__ = [
     "StrategyAttemptStats",
     "StrategyDiscoveryRun",
     "RefreshRule",
+    "VariantPriceDailyRollup",
 ]

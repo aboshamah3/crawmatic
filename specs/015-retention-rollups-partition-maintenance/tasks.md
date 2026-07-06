@@ -172,7 +172,7 @@ prices NULL); and re-running the same day upserts without duplication. (quicksta
 
 ### Implementation for User Story 2
 
-- [ ] T014 [P] [US2] Create the `VariantPriceDailyRollup` model in
+- [X] T014 [P] [US2] Create the `VariantPriceDailyRollup` model in
   `libs/shared/app_shared/models/rollups.py` — `class VariantPriceDailyRollup(Base, WorkspaceScopedBase,
   TimestampMixin)`, template `VariantPriceState` (`models/alerts.py`): UUIDv7 `id` pk, `workspace_id`
   (FK anchor), `product_id`/`product_variant_id` (soft `Uuid`, no FK), `date` (`Date`, UTC calendar
@@ -183,12 +183,12 @@ prices NULL); and re-running the same day upserts without duplication. (quicksta
   product_variant_id_date")` (upsert arbiter); `Index("ix_variant_price_daily_rollups_workspace_id",...)`
   and `Index("ix_variant_price_daily_rollups_date",...)`; follow `NAMING_CONVENTION`. (data-model §1;
   FR-009/012/013/014/025)
-- [ ] T015 [P] [US2] Register the model: add `from app_shared.models.rollups import
+- [X] T015 [P] [US2] Register the model: add `from app_shared.models.rollups import
   VariantPriceDailyRollup` and `"VariantPriceDailyRollup"` to `__all__` in
   `libs/shared/app_shared/models/__init__.py`, and add `VariantPriceDailyRollup` to the
   `WORKSPACE_OWNED_MODELS` frozenset in `libs/shared/app_shared/repository.py` so the unscoped-query CI
   guard (`scripts/check_workspace_scoping.py`) covers it. (FR-014; data-model §1 Registration)
-- [ ] T016 [P] [US2] Author the Alembic migration
+- [X] T016 [P] [US2] Author the Alembic migration
   `alembic/versions/<rev>_variant_price_daily_rollups.py` with **`down_revision = '93511d5f7885'`**
   (current single head): hand-authored `op.create_table(...)` (Uuid, `Date`, `CHAR(3)`, `Numeric(18,4)`,
   `String(32)` enum, `DateTime(timezone=True)`) with explicit PK / workspace FK / the unique constraint,
@@ -196,7 +196,7 @@ prices NULL); and re-running the same day upserts without duplication. (quicksta
   `for stmt in emit_rls_policy("variant_price_daily_rollups"): op.execute(stmt)` loop (ENABLE + FORCE
   RLS + fail-closed workspace-isolation policy) so RLS is present from the first migration. `downgrade()`
   drops indexes then table. Mirror `2db33dea5e14`/the SPEC-13 refresh_rules migration. (FR-009a; data-model §1 Migration)
-- [ ] T017 [US2] Implement `run_daily_rollup(session, *, target_date=None) -> RunReport` in
+- [X] T017 [US2] Implement `run_daily_rollup(session, *, target_date=None) -> RunReport` in
   `libs/shared/app_shared/maintenance/rollups.py` (contract daily-rollup.md, research R6): default
   `target_date` = most-recent-completed UTC day (yesterday UTC); cross-tenant scan
   (`# noqa: workspace-scope`) of distinct `(workspace_id, product_variant_id, product_id)` with ≥1
@@ -208,25 +208,25 @@ prices NULL); and re-running the same day upserts without duplication. (quicksta
   ws+pv (R6); UPSERT `variant_price_daily_rollups` `ON CONFLICT (workspace_id, product_variant_id, date)
   DO UPDATE` with explicit `workspace_id=` (FR-010/014); zero-comparable variant → row with client price,
   NULL competitor prices, count 0 (FR-013). Return RunReport (`rollups_upserted`). (FR-009/010/011/012/013/014)
-- [ ] T018 [US2] Add the `@app.task(name=MAINTENANCE_DAILY_ROLLUP)` wrapper to
+- [X] T018 [US2] Add the `@app.task(name=MAINTENANCE_DAILY_ROLLUP)` wrapper to
   `apps/workers/app/workers/tasks_maintenance.py` — opens `get_system_session()`, calls
   `run_daily_rollup(session)` (default day; accept an optional `target_date` arg for backfill), commits,
   emits the structured run-report log line (FR-023). (research R8/R9)
-- [ ] T019 [US2] Add `MAINTENANCE_DAILY_ROLLUP` to the `task_routes` mapping → `maintenance` queue in
+- [X] T019 [US2] Add `MAINTENANCE_DAILY_ROLLUP` to the `task_routes` mapping → `maintenance` queue in
   `apps/workers/app/workers/celery_app.py` (extends T010). (research R8)
-- [ ] T020 [US2] Add a `DAILY_ROLLUP_INTERVAL_SECONDS` interval accumulator to
+- [X] T020 [US2] Add a `DAILY_ROLLUP_INTERVAL_SECONDS` interval accumulator to
   `apps/scheduler/app/scheduler/scheduler_app.py` that enqueues `MAINTENANCE_DAILY_ROLLUP`
   fire-and-forget (mirrors T011). Preserve existing accumulators. (research R8)
-- [ ] T021 [P] [US2] Unit test `tests/unit/test_rollup_aggregation.py`: currency-mismatch exclusion from
+- [X] T021 [P] [US2] Unit test `tests/unit/test_rollup_aggregation.py`: currency-mismatch exclusion from
   min/avg/max **and** count (FR-011), correct min/avg/max, exact `Decimal` money with no float/NaN/Inf
   (FR-012), comparable count, and the zero-comparable → count-0 / NULL-competitor-price case (FR-013) —
   against the compiled aggregate predicate / a pure aggregation helper, no live DB. (FR-011/012/013)
-- [ ] T022 [P] [US2] Unit test `tests/unit/test_migration_offline_rollups.py`: assert the new migration
+- [X] T022 [P] [US2] Unit test `tests/unit/test_migration_offline_rollups.py`: assert the new migration
   renders offline (`alembic upgrade head --sql` produces `CREATE TABLE variant_price_daily_rollups` + the
   RLS statements), that `alembic heads` yields exactly **one** head, and that the new revision's
   `down_revision == '93511d5f7885'`. Mirror `tests/unit/test_strategy_single_head.py`. Runs green, no DB.
   (FR-009a; research cross-cutting single-head)
-- [ ] T023 [P] [US2] Live integration test `tests/integration/test_daily_rollup_live.py` (`skipif`
+- [X] T023 [P] [US2] Live integration test `tests/integration/test_daily_rollup_live.py` (`skipif`
   probe): one row per (workspace, variant, day) with correct client price + competitor min/avg/max +
   count + alert type; currency-mismatched competitor prices excluded (SC-006); zero-comparable variant
   → row with count 0 / NULL competitor prices (US2 AS-3); re-run of the same day upserts (no

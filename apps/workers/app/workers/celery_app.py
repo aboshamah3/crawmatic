@@ -33,6 +33,7 @@ from celery.signals import worker_process_init
 from app_shared.config import get_settings
 from app_shared.database import dispose_engine
 from app_shared.task_names import (
+    MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
@@ -85,6 +86,11 @@ app = Celery(
 # `MAINTENANCE_PARTITION_CREATE` (SPEC-15 US1, contracts/partition-creation.md)
 # is also a `maintenance` task — runtime `CREATE TABLE ... PARTITION OF`
 # DDL + catalog reads on the BYPASSRLS system session, no blocking fetch.
+#
+# `MAINTENANCE_DAILY_ROLLUP` (SPEC-15 US2, contracts/daily-rollup.md) is
+# also a `maintenance` task — aggregates that day's `price_observations`
+# into `variant_price_daily_rollups` on the BYPASSRLS system session, no
+# blocking fetch.
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
@@ -101,6 +107,7 @@ app.conf.task_routes = {
     STRATEGY_STATS_FLUSH: {"queue": "maintenance"},
     STRATEGY_PATTERN_BACKFILL: {"queue": "maintenance"},
     MAINTENANCE_PARTITION_CREATE: {"queue": "maintenance"},
+    MAINTENANCE_DAILY_ROLLUP: {"queue": "maintenance"},
 }
 
 
