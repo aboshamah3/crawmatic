@@ -9,12 +9,26 @@ concurrency/timeout/flush knobs read from `app_shared.config.get_settings()`
 (Principle IV) -- while keeping the scrapy-playwright download handlers +
 `AsyncioSelectorReactor` this project already had.
 
-**SSRF safety gate (NOT wired here, Constitution §VI NON-NEGOTIABLE):**
-`SsrfGuardMiddleware`, `DNS_RESOLVER = SafeResolver`, and
-`PLAYWRIGHT_ABORT_REQUEST` are added in T030/T031 (US4) -- a required
-MVP safety gate. The browser path MUST NOT be dispatched against real
-targets in production until those land, even though this module alone
-is importable/testable now.
+**SSRF safety gate (T031, US4, `contracts/browser-safety.md`, Constitution
+§VI NON-NEGOTIABLE)**: three layers, mirroring the HTTP project's
+`price_monitor/settings.py` plus one browser-specific addition --
+
+* `SsrfGuardMiddleware` (priority 100, same as HTTP) -- pre-fetch scheme/
+  userinfo guard; re-applied to every request Scrapy's downloader itself
+  handles (the *original* Scrapy request only -- see the next bullet for
+  why that isn't enough alone here).
+* `DNS_RESOLVER = SafeResolver` -- defense-in-depth for any *non-Playwright*
+  request this project still issues directly (e.g. `RobotsPolicyMiddleware`'s
+  own robots.txt fetch, `contracts/browser-safety.md` "Robots"). Does
+  **not** cover Playwright navigations themselves: `scrapy-playwright`
+  never consults Scrapy's `DNS_RESOLVER` (Chromium resolves DNS itself),
+  so `SafeResolver` alone would leave every browser navigation unchecked.
+* `PLAYWRIGHT_ABORT_REQUEST = scrape_core.browser.ssrf.abort_unsafe_request`
+  -- the browser-specific per-navigation-hop resolved-IP guard that closes
+  that exact gap: scrapy-playwright invokes it for **every** Playwright
+  request, including each redirect hop Chromium follows internally
+  (bypassing `RedirectMiddleware`/`SsrfGuardMiddleware` entirely for that
+  hop) -- see `scrape_core.browser.ssrf` module docstring.
 """
 
 from app_shared.config import get_settings
@@ -31,6 +45,13 @@ NEWSPIDER_MODULE = "price_monitor_browser.spiders"
 # both (parity with price_monitor/settings.py).
 ROBOTSTXT_OBEY = False
 
+# Connect-time SSRF defense (defense-in-depth, contracts/browser-safety.md
+# "SSRF" layer 2's sibling note) for any non-Playwright request this
+# project issues directly (e.g. robots.txt fetches) -- parity with
+# price_monitor/settings.py. Does NOT cover Playwright navigations
+# themselves (see PLAYWRIGHT_ABORT_REQUEST below and the module docstring).
+DNS_RESOLVER = "scrape_core.safety.resolver.SafeResolver"
+
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
 # scrapy-playwright requires the asyncio reactor.
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
@@ -43,15 +64,23 @@ DOWNLOAD_HANDLERS = {
 }
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
 
+# Per-navigation-hop resolved-IP SSRF guard (T030/T031, Constitution §VI
+# NON-NEGOTIABLE) -- scrapy-playwright calls this for every Playwright
+# request, including each redirect hop Chromium follows internally (see
+# `scrape_core.browser.ssrf` module docstring for why this is required in
+# addition to `SsrfGuardMiddleware`/`DNS_RESOLVER` below).
+PLAYWRIGHT_ABORT_REQUEST = "scrape_core.browser.ssrf.abort_unsafe_request"
+
 ITEM_PIPELINES = {
     "scrape_core.pipelines.BatchedPersistencePipeline": 300,
 }
 
-# Per-request (never process-global) robots_policy enforcement (parity
-# with price_monitor/settings.py's RobotsPolicyMiddleware priority).
-# The SSRF guard (`SsrfGuardMiddleware`, priority 100) is added in T031 --
-# left out here deliberately (see module docstring).
+# Pre-fetch scheme/userinfo SSRF guard (priority 100, same priority as
+# price_monitor/settings.py) ordered ahead of per-request robots handling
+# (110) so a rejection short-circuits before any other request processing
+# -- exact parity with the HTTP project's middleware ordering.
 DOWNLOADER_MIDDLEWARES = {
+    "scrape_core.safety.middleware.SsrfGuardMiddleware": 100,
     "scrape_core.robots.RobotsPolicyMiddleware": 110,
 }
 

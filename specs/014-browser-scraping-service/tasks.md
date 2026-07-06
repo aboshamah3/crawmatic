@@ -281,7 +281,7 @@ private/redirect-to-internal host is refused before the body is read and recorde
 proxy is used and the attempt records `PLAYWRIGHT_PROXY` (password unlogged); N targets persist in far
 fewer than N off-reactor commits (quickstart scenarios 9–12).
 
-- [ ] T030 [US4] Create `libs/scrape-core/scrape_core/browser/ssrf.py` with async
+- [X] T030 [US4] Create `libs/scrape-core/scrape_core/browser/ssrf.py` with async
   `abort_unsafe_request(request) -> bool` (browser-safety.md, R6): return `True` (abort) only for
   navigation/document requests (`request.is_navigation_request()` or `resource_type == "document"`)
   whose URL fails the reused `scrape_core.safety.fetch.validate_resolved_target(url, resolver=...)` —
@@ -289,12 +289,12 @@ fewer than N off-reactor commits (quickstart scenarios 9–12).
   the reused `app_shared.url_safety._reject_ip`. The blocking resolve runs **off the reactor thread**
   (`loop.getaddrinfo`/`run_in_thread`); sub-resources pass. Re-runs on every redirect hop. No
   re-implemented SSRF logic.
-- [ ] T031 [US4] Add the SSRF wiring to `apps/scrapers-browser/price_monitor_browser/settings.py`
+- [X] T031 [US4] Add the SSRF wiring to `apps/scrapers-browser/price_monitor_browser/settings.py`
   (browser-safety.md): `SsrfGuardMiddleware` in `DOWNLOADER_MIDDLEWARES` (priority 100) for the pre-fetch
   scheme/userinfo guard; `DNS_RESOLVER = scrape_core.safety.resolver.SafeResolver` (defense-in-depth for
   non-Playwright requests e.g. robots.txt); `PLAYWRIGHT_ABORT_REQUEST =
   scrape_core.browser.ssrf.abort_unsafe_request`. (Extends T014; same file, sequential after it.)
-- [ ] T032 [US4] Add the proxied-context branch to `_browser_request_for` in
+- [X] T032 [US4] Add the proxied-context branch to `_browser_request_for` in
   `generic_browser_price_spider.py` (browser-safety.md, R7): when `_prepare_dispatch` yields a proxied
   plan, set `meta["playwright_context"] = f"proxy:{provider_id}"` and `meta["playwright_context_kwargs"]
   = {"proxy": {"server": f"http://{host}:{port}", "username": provider.username, "password":
@@ -302,19 +302,19 @@ fewer than N off-reactor commits (quickstart scenarios 9–12).
   plus `proxy_provider_id`/`proxy_country` (reused SPEC-10 audit). Password never logged, never in a
   `meta["proxy"]` URL. Context-creation-with-proxy failure → `PROXY_FAILED` failed attempt (never a
   silent direct fetch).
-- [ ] T033 [US4] Complete `classify_browser_failure` in the spider `errback` (browser-spider.md): resolve
+- [X] T033 [US4] Complete `classify_browser_failure` in the spider `errback` (browser-spider.md): resolve
   SSRF/robots failures to `BLOCKED` via the reused `classify_exception` / rejection registry FIRST
   (`SsrfRejectedError`, `RobotsBlockedError`), then fall through to `classify_playwright_exception`
   (T018) and the variant codes (T027), then `PROXY_FAILED` for proxy-context failures (FR-008/009/011,
   US4 AS2/AS3).
-- [ ] T034 [P] [US4] Live test `tests/integration/test_browser_ssrf_live.py` (`skipif`): a fixture whose
+- [X] T034 [P] [US4] Live test `tests/integration/test_browser_ssrf_live.py` (`skipif`): a fixture whose
   host resolves to a private IP, and one that 302s to an internal address → navigation aborted before
   body processing (via `PLAYWRIGHT_ABORT_REQUEST`), one `BLOCKED` attempt, no observation (US4 AS2,
   SC-005).
-- [ ] T035 [P] [US4] Live test `tests/integration/test_browser_proxy_live.py` (`skipif`): access policy
+- [X] T035 [P] [US4] Live test `tests/integration/test_browser_proxy_live.py` (`skipif`): access policy
   assigns a proxy → browser routes through it, attempt records `PLAYWRIGHT_PROXY` +
   `proxy_provider_id`/`proxy_country`, and the proxy password appears in NO log line (US4 AS3, SC-006).
-- [ ] T036 [P] [US4] Live test `tests/integration/test_browser_bounds_live.py` (`skipif`): under many
+- [X] T036 [P] [US4] Live test `tests/integration/test_browser_bounds_live.py` (`skipif`): under many
   browser targets, simultaneous sessions never exceed `BROWSER_CONCURRENT_REQUESTS`/`BROWSER_MAX_CONTEXTS`;
   persisting N results does far fewer than N commits with no DB call on the reactor thread; a held match
   lock → `LOCKED_ALREADY_RUNNING` SKIPPED, no duplicate scrape (US4 AS1/AS4/AS5, SC-004/007).

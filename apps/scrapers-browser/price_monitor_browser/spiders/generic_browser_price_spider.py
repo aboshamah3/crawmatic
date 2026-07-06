@@ -23,9 +23,15 @@ R7: every browser fetch is recorded under ``AccessMethod.PLAYWRIGHT_PROXY``
 which HTTP-shaped `AccessMethod` the shared `_prepare_dispatch` decision
 returned for attempt 1 (`app_shared.access.engine.next_attempt` was
 designed for the HTTP escalation ladder); `decision.plan.use_proxy` still
-carries whether an actual upstream proxy should be used for this fetch
-(wired in US4/T032 -- accepted but unused by `_browser_request_for` in
-US1, which only ever builds a direct/default Playwright context).
+carries whether an actual upstream proxy should be used for this fetch.
+When proxied (US4, T032), `_browser_request_for` routes the fetch through
+a per-provider Playwright browser context (`playwright_context`/
+`playwright_context_kwargs`, `contracts/browser-safety.md` "Proxy") built
+from the already-decrypted password `load_targets` stashed on
+`self._provider_passwords` (never decrypted here, never logged) --
+`proxy_provider_id`/`proxy_country` are stamped for the reused SPEC-10
+audit. An unproxied target still uses the default Playwright context, no
+proxy kwargs, and still `PLAYWRIGHT_PROXY` with null proxy fields (R5).
 
 No alert/variant-state/webhook computed here (FR-006/FR-020) -- the
 spider stops at persistence, exactly like the HTTP spider.
@@ -53,7 +59,12 @@ from app_shared.redis_client import get_redis_client
 from scrape_core.browser.page import build_page_methods, effective_timeout
 from scrape_core.browser.variant import VariantConfigError
 from scrape_core.db import run_in_thread
-from scrape_core.errors import PRICE_NOT_FOUND, classify_http_status, classify_playwright_exception
+from scrape_core.errors import (
+    PRICE_NOT_FOUND,
+    classify_exception,
+    classify_http_status,
+    classify_playwright_exception,
+)
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, release_slot
@@ -62,6 +73,7 @@ from scrape_core.targets import (
     AdmissionContext,
     VisibleProviders,
     _attempt_kwargs_from_meta,
+    _parse_host_port,
     _parse_match_ids,
     _prepare_dispatch,
     _RequeueState,
@@ -108,47 +120,96 @@ def _variant_selectors(target: "SpiderTarget") -> set[str]:
     return selectors
 
 
-def classify_browser_failure(
-    exc: BaseException, hostname: str | None, target: "SpiderTarget | None" = None
-) -> ScrapeErrorCode:
-    """Single-attempt browser failure classification (R3/R4, `contracts/browser-spider.md`).
+_PROXY_FAILURE_MARKERS = ("proxy", "err_tunnel", "err_no_supported_proxies")
 
-    ``hostname`` is accepted now (unused) so a later phase can resolve
-    SSRF/robots rejections to ``BLOCKED`` first (US4 T033) without
-    changing this function's call sites -- a clean extension point, per
-    task T018.
 
-    US3 (T027) variant branches, checked before the generic Playwright
-    classification:
+def _looks_like_proxy_failure(exc: BaseException) -> bool:
+    """Duck-typed-by-message proxy-connect/context-creation signal (T033).
 
-    * ``exc`` is a :class:`~scrape_core.browser.variant.VariantConfigError`
-      -- always ``SELECTOR_BROKEN`` (R3). In practice this should never
-      actually reach here: the spider's ``start()`` pre-fetch guard
-      already catches every config error (both the off-reactor
-      ``resolve_variant_values`` failures recorded on
-      ``target.variant_config_error`` by ``load_targets``, T025, and any
-      structural ``parse_variant_config`` failure) *before* admission/
-      dispatch ever runs, so no request -- and therefore no ``errback``
-      call -- exists for a config error. This branch is defensive only.
-    * `target` carries a ``variant_selector_config`` and the raised
-      exception's message mentions one of that config's own selectors
-      (:func:`_variant_selectors`) -- the configured variant element was
-      missing/uninteractable at run time -- ``VARIANT_NOT_FOUND`` (R3),
-      not the generic ``TIMEOUT``/``PLAYWRIGHT_FAILED`` the same
-      Playwright exception class would otherwise classify as.
-
-    Anything else (including every US1 target, which never carries a
-    ``variant_selector_config``) delegates entirely to
-    :func:`~scrape_core.errors.classify_playwright_exception` (Playwright
-    ``TimeoutError`` -> ``TIMEOUT``, else ``PLAYWRIGHT_FAILED``) --
-    unchanged US1 behavior.
+    Playwright wraps every failure (a malformed `proxy` context kwarg, a
+    proxy CONNECT/tunnel refusal, an auth rejection, ...) in its own
+    generically-named ``Error``/``TimeoutError`` classes -- there is no
+    dedicated Playwright exception type to recognize by class, unlike
+    Scrapy's own ``TunnelError`` the HTTP path's ``classify_exception``
+    checks by name (SPEC-10 US3). Chromium's underlying network-stack
+    messages for a proxy failure (context-creation-time or at the first
+    navigation attempt through it -- Chromium does not distinguish the
+    two for our purposes) consistently mention "proxy" or one of the
+    ``net::ERR_*`` proxy codes, so this mirrors that same convention
+    against the exception's message instead of its class name. Ordinary
+    navigation timeouts/selector waits never match (Playwright's own
+    ``TimeoutError`` message is just ``"Timeout <n>ms exceeded."``), so
+    this never shadows the generic ``TIMEOUT``/``PLAYWRIGHT_FAILED``
+    classification for a target that wasn't proxied.
     """
+    message = str(exc).lower()
+    return any(marker in message for marker in _PROXY_FAILURE_MARKERS)
+
+
+def classify_browser_failure(
+    exc: BaseException,
+    hostname: str | None,
+    target: "SpiderTarget | None" = None,
+    *,
+    used_proxy: bool = False,
+) -> ScrapeErrorCode:
+    """Single-attempt browser failure classification (R3/R4/R6/R7,
+    `contracts/browser-spider.md`, `contracts/browser-safety.md`).
+
+    Priority order (US4, T033):
+
+    1. **SSRF/robots -> BLOCKED, first.** Reuses
+       :func:`scrape_core.errors.classify_exception` purely as a BLOCKED
+       *detector* here (its own non-BLOCKED outputs -- TIMEOUT/DNS_ERROR/
+       PROXY_FAILED/UNKNOWN_ERROR -- are discarded; this function's own
+       browser-specific classification below is authoritative for those).
+       It recognizes two rejections, neither of them re-implemented here:
+       ``scrape_core.safety.middleware.SsrfRejectedError`` (pre-fetch
+       scheme/userinfo guard) and ``scrape_core.robots.RobotsBlockedError``
+       both carry an explicit ``error_code=BLOCKED`` attribute reaching
+       ``errback`` intact (both are raised by ordinary Scrapy downloader
+       middlewares, never discarded en route). The per-navigation-hop
+       ``PLAYWRIGHT_ABORT_REQUEST`` rejection (`scrape_core.browser.ssrf`)
+       is different: aborting inside Chromium's network layer surfaces
+       only a generic Playwright network error with no `error_code` of
+       its own, so that rejection is recognized instead via
+       `classify_exception`'s `hostname`-keyed
+       `scrape_core.safety.rejection_registry` side-channel -- the exact
+       mechanism `abort_unsafe_request` marks a hostname through (see
+       that module's docstring).
+    2. **Variant codes (US3, T027)**, checked next: a
+       :class:`~scrape_core.browser.variant.VariantConfigError` ->
+       ``SELECTOR_BROKEN`` (defensive only -- the spider's pre-fetch guard
+       already catches every config error before any request exists); a
+       run-time missing/uninteractable variant element (message mentions
+       one of `target`'s own selectors, :func:`_variant_selectors`) ->
+       ``VARIANT_NOT_FOUND``.
+    3. **Proxy-context failure (US4, T032/T033)**: `used_proxy` is `True`
+       (the failed request's context was `f"proxy:{provider_id}"`) and the
+       exception looks proxy-shaped (:func:`_looks_like_proxy_failure`) ->
+       ``PROXY_FAILED`` -- covers both a context-creation-time failure
+       (bad/unreachable proxy) and a proxy CONNECT/tunnel refusal at fetch
+       time; never a silent direct fetch (`contracts/browser-safety.md`
+       "Proxy").
+    4. **Catch-all**: :func:`~scrape_core.errors.classify_playwright_exception`
+       (Playwright ``TimeoutError`` -> ``TIMEOUT``, else
+       ``PLAYWRIGHT_FAILED``) -- unchanged US1 behavior for every target
+       that isn't SSRF/robots-blocked, variant-related, or proxy-context-
+       shaped.
+    """
+    if classify_exception(exc, hostname=hostname) == ScrapeErrorCode.BLOCKED:
+        return ScrapeErrorCode.BLOCKED
+
     if isinstance(exc, VariantConfigError):
         return ScrapeErrorCode.SELECTOR_BROKEN
     if target is not None and target.variant_selector_config is not None:
         selectors = _variant_selectors(target)
         if selectors and any(selector in str(exc) for selector in selectors):
             return ScrapeErrorCode.VARIANT_NOT_FOUND
+
+    if used_proxy and _looks_like_proxy_failure(exc):
+        return ScrapeErrorCode.PROXY_FAILED
+
     return classify_playwright_exception(exc)
 
 
@@ -309,12 +370,28 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         `PLAYWRIGHT_PROXY` plan (pre-SPEC-14-admission callers, and unit
         tests, may call this with only `target`).
 
-        US1: direct/default Playwright context only -- the proxied-
-        context branch (`playwright_context`/`playwright_context_kwargs`,
-        `proxy_provider_id`/`proxy_country` audit fields) is added in
-        US4/T032; `proxy_assignment` is accepted (the shared
-        `dispatch_admission` `build_request` callback signature) but
-        unused here.
+        US4 (T032, `contracts/browser-safety.md` "Proxy"): when
+        `proxy_assignment` names a provider present in
+        `self._provider_rows` (populated by `start()` from `load_targets`'s
+        bounded load, identical to the HTTP spider), the request routes
+        through a per-provider Playwright browser context instead of the
+        default one -- `meta["playwright_context"] = f"proxy:{provider_id}"`
+        + `meta["playwright_context_kwargs"] = {"proxy": {...}}`, never
+        `meta["proxy"]` (that key is the HTTP-transport-specific one
+        `scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware` reads;
+        this project never registers that middleware). The proxy password
+        is the **already-decrypted** string `load_targets` stashed on
+        `self._provider_passwords` (never decrypted here, never logged).
+        `proxy_provider_id`/`proxy_country` are stamped for the reused
+        SPEC-10 attempt audit only when `provider` is actually found (exact
+        parity with the HTTP spider's `_request_for`) -- an unresolvable/
+        dangling provider id (edge case, mirrors the HTTP spider's
+        degrade-not-crash convention) leaves the request on the default
+        context with no proxy kwargs and null audit fields, same shape as
+        an unproxied target. A genuine context-creation failure with a
+        *found* provider surfaces at run time as a Playwright error
+        `errback`'s `classify_browser_failure` recognizes as `PROXY_FAILED`
+        (T033) -- never a silent direct fetch.
         """
         if plan is None:
             plan = AttemptPlan(access_method=AccessMethod.PLAYWRIGHT_PROXY, use_proxy=False)
@@ -349,6 +426,26 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         if lock is not None:
             meta["match_lock_key"] = lock.key
             meta["match_lock_token"] = lock.token
+
+        if proxy_assignment is not None:
+            provider = self._provider_rows.get(proxy_assignment.provider_id)
+            if provider is not None:
+                host, port = _parse_host_port(provider.base_url)
+                proxy_kwargs: dict[str, Any] = {"server": f"http://{host}:{port}"}
+                if provider.username:
+                    # Already decrypted off-reactor by `load_targets`
+                    # (never here, never logged) -- see docstring.
+                    password = self._provider_passwords.get(proxy_assignment.provider_id) or ""
+                    proxy_kwargs["username"] = provider.username
+                    proxy_kwargs["password"] = password
+                # Per-provider context name (never the shared default
+                # context) so concurrent targets on different providers
+                # never share a browser context/proxy -- scrapy-playwright
+                # keys its context pool by this exact string.
+                meta["playwright_context"] = f"proxy:{proxy_assignment.provider_id}"
+                meta["playwright_context_kwargs"] = {"proxy": proxy_kwargs}
+                meta["proxy_provider_id"] = proxy_assignment.provider_id
+                meta["proxy_country"] = proxy_assignment.country
 
         return scrapy.Request(
             url=target.url,
@@ -464,7 +561,11 @@ class GenericBrowserPriceSpider(scrapy.Spider):
 
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname
-        error_code = classify_browser_failure(failure.value, hostname, target)
+        # US4 (T033): a proxied-context request's `playwright_context` is
+        # always `f"proxy:{provider_id}"` (T032) -- an unproxied/default
+        # request never carries that meta key.
+        used_proxy = str(failure.request.meta.get("playwright_context", "")).startswith("proxy:")
+        error_code = classify_browser_failure(failure.value, hostname, target, used_proxy=used_proxy)
         yield self._build_result(
             target,
             failure.request.url,
