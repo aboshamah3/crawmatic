@@ -86,11 +86,18 @@ Payload:
 `dedup_key = f"job:{scrape_job_id}:{status}"` (job finalizes once → naturally unique).
 
 ### 3. Domain strategy change — SPEC-12
-Seam: `apps/workers/app/workers/tasks_strategy.py::flush_stats`, after `session.commit()`
-(~line 750), when `apply_promotion` returned `promoted=True`
-(`app_shared/strategy/promotion.py:148` → status `ACTIVE`); and on `apply_rediscovery`
-(`app_shared/strategy/rediscovery.py:435` → status `DEGRADED`).
-Source enum `StrategyStatus` (`app_shared/enums.py:444–460`).
+Seams (analyze N1 — the transitions do NOT surface in `flush_stats`; enqueue post-commit at the
+two REAL sites, once per genuine `apply_*`==`True` transition):
+- `apply_promotion` (`app_shared/strategy/promotion.py:148`, returns `promoted: bool` → status
+  `ACTIVE`) and `apply_rediscovery` (`app_shared/strategy/rediscovery.py:435`, returns
+  `triggered: bool` → status `DEGRADED`) both fire inside
+  `app_shared/strategy/flush.py::flush_profile` (promotion per-method ~L271, rediscovery ~L306).
+  `flush_profile` must surface its genuine transitions to its caller; enqueue post-commit in
+  `apps/workers/app/workers/tasks_strategy.py::flush_stats` (after its `session.commit()`).
+- `apply_rediscovery` ALSO fires in `tasks_strategy.py::light_recheck` (~L665); enqueue post-commit
+  there (after its `session.commit()` ~L675) for each `triggered` profile — this DEGRADED path is
+  otherwise missed.
+Source enum `StrategyStatus` (`app_shared/enums.py:444–460`). Anchors approximate — locate by function.
 
 | Trigger | new `StrategyStatus` | webhook `event_type` |
 |---|---|---|

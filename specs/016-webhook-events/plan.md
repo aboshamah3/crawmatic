@@ -55,7 +55,8 @@ creation is off the request/scrape hot path (dedicated queue). Built for 10k–2
 SSRF NON-NEGOTIABLE (reuse existing validator, no second validator); partition-drop retention only
 (no bulk DELETE); event creation must never block/fail/roll back the source operation.
 
-**Scale/Scope**: 2 tables, 1 Celery task, 1 new queue, 6 REST endpoints, 3 enqueue seams, 1 Alembic
+**Scale/Scope**: 2 tables, 1 Celery task, 1 new queue, 6 REST endpoints, enqueue seams at 4 sites
+(alert `recompute_variant`, job `finalize_jobs`, strategy `flush_stats`+`light_recheck`; see analyze N1), 1 Alembic
 migration (`down_revision = '4a1dca402f78'`, the current single head).
 
 ## Constitution Check
@@ -145,7 +146,10 @@ apps/workers/app/workers/
 │                                   #       import constant, add module to include=[...]
 ├── tasks_analysis.py               # EDIT: enqueue after commit when event_type is not None (SPEC-09)
 ├── tasks_jobs.py                   # EDIT: enqueue after commit for each finalized terminal job (SPEC-08)
-└── tasks_strategy.py               # EDIT: enqueue after commit on promotion/rediscovery (SPEC-12)
+└── tasks_strategy.py               # EDIT: enqueue after commit in flush_stats (transitions surfaced
+                                    #       by flush.py::flush_profile) AND in light_recheck (SPEC-12);
+                                    #       see analyze N1. Also EDIT libs/shared/app_shared/strategy/
+                                    #       flush.py to return flush_profile's genuine transitions.
 
 tests/
 ├── unit/test_webhook_models.py                 # NEW

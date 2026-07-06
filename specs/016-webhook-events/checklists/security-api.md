@@ -9,7 +9,7 @@ partitioning/retention, decoupled event creation, and the v1 no-delivery boundar
 ## SSRF / URL-Safety Requirements
 
 - [x] CHK001 Are the exact URL-rejection rules (scheme, private/loopback/link-local/unique-local ranges, metadata endpoints, internal hostnames, userinfo) enumerated in requirements rather than left to "validate the URL"? [Completeness, Spec §FR-002]
-- [x] CHK002 Is it specified that validation occurs against the *resolved IP*, not only the literal string, to defeat DNS-based bypass? [Clarity, Spec §FR-002, Edge Cases]
+- [x] CHK002 Is the save-time vs delivery-time SSRF split unambiguous — save-time is a string/literal + known-internal-hostname check (no DNS resolution), with DNS re-resolution explicitly a delivery-time control out of v1 scope? [Clarity, Spec §FR-002, Edge Cases]
 - [x] CHK003 Is the requirement to *reuse the existing* competitor-URL validator (rather than a new divergent one) stated explicitly? [Consistency, Spec §FR-003]
 - [x] CHK004 Are the save-time validation points (both create AND update) both covered by requirements? [Coverage, Spec §FR-002/FR-004]
 - [x] CHK005 Is delivery-time re-validation explicitly scoped OUT of v1 (deferred with the dispatcher) so its absence is intentional, not a gap? [Scope Boundary, Spec §Assumptions]

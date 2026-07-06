@@ -130,9 +130,15 @@ identical source signal does not create contradictory or malformed duplicates.
 - **Polling during retention drop**: When old monthly partitions are dropped by the maintenance job,
   polling continues to work for the remaining (in-retention) events; already-advanced pollers are not
   broken by the disappearance of expired events.
-- **Endpoint URL that resolves to a private IP via DNS**: A public-looking hostname whose DNS resolves
-  into a private/internal range is rejected at save time by IP-level validation, not just string
-  matching.
+- **Endpoint URL targeting an internal destination**: At save time the URL is rejected when its scheme
+  is not http/https, when its host is an IP *literal* in a private/loopback/link-local/reserved/
+  unique-local/metadata range, when its host is a known internal hostname or internal-suffix
+  (localhost, *.internal, *.local, cloud-metadata host, docker-compose service names), or when it
+  embeds userinfo. Save-time validation does NOT perform DNS resolution (consistent with the reused
+  validator and the master doc's two-phase model): a *public-looking hostname whose DNS resolves into a
+  private range* is caught later at delivery time by the future dispatcher's re-resolution, which is out
+  of v1 scope. This matches how competitor match URLs are handled (save-time string/literal check;
+  fetch-time DNS re-validation).
 - **event_types on an endpoint referencing an unknown type**: Recording subscription intent for a type
   string that no source currently emits is permitted (forward-compatible) but does not cause events to
   be created for it.
@@ -150,11 +156,15 @@ identical source signal does not create contradictory or malformed duplicates.
 - **FR-001**: System MUST let an authorized user register a webhook endpoint carrying a name, a URL, an
   enabled flag, an optional list of subscribed event types, and an optional stored secret placeholder.
 - **FR-002**: System MUST validate a webhook endpoint URL at save time (create and update) against
-  SSRF-safe rules: scheme MUST be http or https; the host MUST be a public DNS name or public IP; the
-  system MUST reject localhost, private ranges (10/8, 172.16/12, 192.168/16), loopback, link-local
-  (169.254/16, fe80::/10), unique-local (fc00::/7), cloud metadata endpoints, and internal service
-  hostnames; and MUST reject URLs containing userinfo (user:pass@host). Validation MUST occur against
-  the resolved IP, not only the literal string.
+  SSRF-safe rules: scheme MUST be http or https; the system MUST reject a host that is an IP *literal*
+  in a non-public range — private (10/8, 172.16/12, 192.168/16), loopback, link-local (169.254/16,
+  fe80::/10), unique-local (fc00::/7), reserved/multicast/unspecified, and cloud-metadata addresses —
+  MUST reject known internal service hostnames and internal-suffix hosts (localhost, cloud-metadata
+  host, docker-compose service names, `*.internal`/`*.local`/`*.localhost`), and MUST reject URLs
+  containing userinfo (user:pass@host). Save-time validation is a string/literal check and does NOT
+  perform DNS resolution; authoritative DNS re-resolution of a hostname against the same deny rules is
+  a delivery-time control performed by the future dispatcher (out of v1 scope), mirroring the master
+  doc's two-phase SSRF model (§11) and the existing competitor-URL save-time validator.
 - **FR-003**: System MUST reuse the existing SSRF/URL-safety validation used for competitor match URLs
   rather than introducing a second, divergent validator.
 - **FR-004**: Users MUST be able to list, retrieve, update, and delete webhook endpoints within their
@@ -235,9 +245,11 @@ identical source signal does not create contradictory or malformed duplicates.
 - **SC-001**: An external integrator can retrieve every event in a workspace exactly once by walking
   the paginated poll API from start to finish, with zero duplicates and zero omissions, across a
   dataset that spans at least two monthly partitions.
-- **SC-002**: 100% of webhook endpoint URLs that target private, loopback, link-local, unique-local,
-  cloud-metadata, internal-hostname, userinfo-bearing, or non-http(s) destinations are rejected at save
-  time; 100% of valid public http/https URLs are accepted.
+- **SC-002**: 100% of webhook endpoint URLs whose host is a non-public IP *literal* (private, loopback,
+  link-local, unique-local, reserved, cloud-metadata), a known internal hostname/suffix, or that carry
+  userinfo or a non-http(s) scheme, are rejected at save time; 100% of valid public http/https URLs are
+  accepted. (DNS-resolution-based rejection of public-looking hostnames is a delivery-time control,
+  out of v1 scope.)
 - **SC-003**: Each of the three source domain changes (alert transition, job status change, strategy
   change) results in exactly one corresponding webhook event in the correct workspace, with a payload
   that identifies the affected entity.

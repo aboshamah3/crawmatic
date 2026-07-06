@@ -24,3 +24,15 @@ deferred to plan (grounded in existing codebase enums), none user-answerable bet
 
 - [checklist] Focus derivation → security + API/data-integrity (SSRF, RLS isolation, scopes, pagination, partitioning/retention, decoupled creation, no-delivery boundary). Source: spec domain (auth/data-integration backend, no UI).
 - Generated checklists/security-api.md (38 items). All 38 pass against spec.md + plan.md; 0 unresolved. requirements.md (specify) also fully passing. No artifact fixes required — spec already covers every requirement-quality dimension.
+
+## analyze
+
+Report: 0 CRITICAL, 1 HIGH, 1 MEDIUM, 2 LOW. 100% FR→task coverage (19/19). Not blocked. Remediated all:
+- [analyze] I1 (HIGH) SSRF DNS contradiction: FR-002 + edge case + SC-002 over-specified save-time "validate against resolved IP", but the mandated reuse validator `validate_competitor_url` does NO DNS resolution (by design — master doc §11 puts DNS re-resolution at fetch/delivery time). → Fixed spec: save-time = string/literal + known-internal-hostname check; DNS re-resolution deferred to delivery-time dispatcher (out of v1). Aligns with doc §11 two-phase model + competitor-URL precedent. Updated CHK002 to match. (source: doc §11; url_safety.py:115 "No DNS resolution")
+- [analyze] I2 (MEDIUM) T009 told implementer to mirror WORKSPACE_OWNED_MODELS into check_workspace_scoping.py, but that script imports the set (no hardcoded list). → Reworded T009: edit repository.py only, run guard to verify.
+- [analyze] I3 (LOW) `has_secret` mislabeled as reused function → clarified as derived response boolean in ground rules.
+- [analyze] I4 (LOW) stale ~line anchors in T033/T034/T035 → added locate-by-function-name caveats.
+
+### analyze re-run (post-remediation)
+- I1–I4 all verified RESOLVED. New finding N1 surfaced:
+- [analyze] N1 (HIGH) strategy seam mis-anchored: T035 assumed `apply_promotion`/`apply_rediscovery` run in `flush_stats` returning `promoted`, but both actually fire inside `app_shared/strategy/flush.py::flush_profile` (which returns only `keys_flushed:int`), and `apply_rediscovery` ALSO fires in `tasks_strategy.py::light_recheck` — so the original T035 was unimplementable and would miss the light_recheck DEGRADED path (violating FR-008/SC-003). → Re-anchored to both real sites: (a) flush_profile surfaces genuine transitions (widen `-> int` return) → flush_stats enqueues post-commit; (b) light_recheck enqueues post-commit per `triggered`. Updated T035/T036/T040 + contracts/events.md §3 + plan.md (seam count 4 sites, tasks_strategy.py note). Verified against live code (flush.py:271/306, promotion.py:148, rediscovery.py:435→bool, light_recheck:665/675). Final focused re-run: 0 CRITICAL / 0 HIGH remaining.
