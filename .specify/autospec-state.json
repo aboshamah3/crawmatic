@@ -369,7 +369,7 @@
     "16": {
       "title": "Webhook Events",
       "feature_directory": "specs/016-webhook-events",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -377,8 +377,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T020 US1 poll live: keyset pagination across two monthly partitions exactly-once/gapless; event_type filter; single fetch; cross-workspace 404/absent; no-context 0 rows; invalid cursor 422; missing-scope 403; empty-page",
+        "T028 US2 endpoint CRUD live: create/list/get/patch/delete round-trip; SSRF UNSAFE_URL rejection (literal private/loopback/metadata/userinfo/bad-scheme); tri-state secret; cross-workspace isolation; secret never serialized",
+        "T037 US3 event-creation-at-seams live + soft-ref tolerance: alert/job/strategy transitions each produce exactly one webhook_events row (correct workspace/type/payload); PENDING status + null delivered_at; broker error never fails source op",
+        "migration 03dec3037c8f upgrade head + downgrade round-trip (online); RLS cross-workspace denial on both tables; current+next-month partition creation; retention drop of webhook_events via SPEC-15 job"
+      ],
+      "deferred_reason": "require a live Postgres/Redis/Celery (no container engine in build env); integration test files authored + skip cleanly via existing skipif DB probe (0 errors). DB/Redis/Celery-independent logic exhaustively unit-tested here (full suite 1770 passed / 293 skipped / 0 failed / 0 errors). Two tables: webhook_endpoints (plain, mirrors refresh_rules) + webhook_events (born monthly-partitioned by created_at, composite PK (id,created_at), RANGE partitioning, mirrors price_alert_events) via single migration 03dec3037c8f (down_revision 4a1dca402f78, single head) with RLS on both. REUSE-heavy: validate_competitor_url SSRF (save-time string/literal, no DNS \u2014 DNS re-resolution deferred to delivery-time out of v1), Fernet encrypt_secret, app_shared.pagination keyset cursors, app_shared.messaging.enqueue, SPEC-15 maintenance registry (webhook_events + RETENTION_WEBHOOK_EVENTS_DAYS=90 already present, VERIFY-only \u2014 NOT re-added). webhooks:read/webhooks:write already in Scope enum (VERIFY-only). New create_webhook_event Celery task on new webhook_events queue; 4 fire-and-forget post-commit enqueue seams. 44 tasks.",
+      "converge_result": "CONVERGED (1 cycle) - all 19 FR + 7 SC + US1-3 verified; tasks.md unchanged. Only live-env verification deferred.",
+      "analyze_remediation": "0 CRITICAL. Remediated I1 (HIGH: FR-002/edge-case/SC-002 over-specified save-time DNS resolution; reconciled to string/literal check matching reused validate_competitor_url + doc \u00a711 two-phase model, DNS re-resolution deferred to delivery-time), I2 (MED: T009 non-existent check_workspace_scoping.py mirror step), I3/I4 (LOW). Re-run found N1 (HIGH: strategy seam mis-anchored to flush_stats assuming non-existent `promoted` return + missing light_recheck rediscovery path -> unimplementable/would violate FR-008/SC-003); re-anchored T035 to real sites (flush_profile widened to FlushResult surfacing transitions + light_recheck), verified against live code. Final re-run 0 CRITICAL/0 HIGH."
     }
   }
 }
