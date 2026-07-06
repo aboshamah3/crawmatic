@@ -189,7 +189,7 @@ mode; retried dispatch never double-runs.
 `(price_monitor, generic_price_spider)` on `SCRAPYD_HTTP_URLS`, no batch mixes modes, and a re-dispatch
 targets the same node/spider once (quickstart scenarios 4, 12).
 
-- [ ] T021 [US2] Fix `apps/workers/app/workers/tasks_jobs.py` (dispatch-routing.md): add module
+- [X] T021 [US2] Fix `apps/workers/app/workers/tasks_jobs.py` (dispatch-routing.md): add module
   constants `_SCRAPYD_BROWSER_PROJECT = "price_monitor_browser"` and `_GENERIC_BROWSER_SPIDER =
   "generic_browser_price_spider"`; in **both** `dispatch_job` and `recover_stalled_batches`, inside the
   `for batch in batches:` loop select **`(project, spider)`** by `batch.mode` — `BROWSER` →
@@ -200,13 +200,13 @@ targets the same node/spider once (quickstart scenarios 4, 12).
   `select_node`, and the
   `dispatched:{scrape_job_id}:{batch_index}` idempotency guard (and its `:r{window}` recovery form)
   **unchanged** (FR-015/016, SC-008).
-- [ ] T022 [P] [US2] Unit test the dispatch project/spider selector in
+- [X] T022 [P] [US2] Unit test the dispatch project/spider selector in
   `tests/unit/test_dispatch_routing.py` (must pass in this env): a mixed set of `Batch(mode=BROWSER)` /
   `Batch(mode=HTTP)` → assert the args a fake `ScrapydDispatchClient.schedule` receives —
   `(price_monitor_browser, generic_browser_price_spider, SCRAPYD_BROWSER_URLS)` vs
   `(price_monitor, generic_price_spider, SCRAPYD_HTTP_URLS)`; an all-HTTP job sends nothing to the
   browser pool (US2 AS1/AS3, SC-002).
-- [ ] T023 [P] [US2] Live test `tests/integration/test_dispatch_browser_idempotent_live.py` (`skipif`
+- [X] T023 [P] [US2] Live test `tests/integration/test_dispatch_browser_idempotent_live.py` (`skipif`
   Redis): dispatch a browser batch twice (same `scrape_job_id`/`batch_index`) → one Scrapyd run, same
   node/spider, no double-run (US2 AS2, SC-008). Also assert the dispatch client sends **basic-auth**
   credentials on the browser-node `schedule.json` call exactly as for the HTTP node (FR-013 dispatch-auth

@@ -69,6 +69,7 @@ from typing import Any
 __all__ = [
     "live_stack_reachable",
     "live_scrapyd_reachable",
+    "live_scrapyd_browser_reachable",
     "serve_fixture_pages",
     "run_generic_price_spider_subprocess",
     "SeededWorkspace",
@@ -143,6 +144,43 @@ def live_scrapyd_reachable() -> bool:
 
         get_redis_client().ping()
         base = settings.SCRAPYD_HTTP_URLS[0].rstrip("/")
+        resp = requests.get(
+            f"{base}/daemonstatus.json",
+            auth=(settings.SCRAPYD_USERNAME, settings.SCRAPYD_PASSWORD),
+            timeout=3,
+        )
+        if resp.status_code != 200:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+
+def live_scrapyd_browser_reachable() -> bool:
+    """Best-effort probe: Redis + a live, authenticated Scrapyd *browser*
+    node (SPEC-14, ``SCRAPYD_BROWSER_URLS``) -- mirrors
+    :func:`live_scrapyd_reachable`, just against the separate browser
+    node pool (SPEC-01's deployment scaffold; the browser-specific image/
+    `scrapyd.conf` basic-auth are out of scope for this dispatch-routing
+    fix, only its reachability is)."""
+    try:
+        from app_shared.config import get_settings
+
+        settings = get_settings()
+    except Exception:
+        return False
+
+    if not settings.REDIS_URL or not settings.SCRAPYD_BROWSER_URLS:
+        return False
+
+    try:
+        import requests
+
+        from app_shared.redis_client import get_redis_client
+
+        get_redis_client().ping()
+        base = settings.SCRAPYD_BROWSER_URLS[0].rstrip("/")
         resp = requests.get(
             f"{base}/daemonstatus.json",
             auth=(settings.SCRAPYD_USERNAME, settings.SCRAPYD_PASSWORD),

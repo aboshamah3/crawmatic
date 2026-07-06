@@ -55,6 +55,13 @@ from app_shared.task_names import (
 _SCRAPYD_PROJECT = "price_monitor"
 _GENERIC_PRICE_SPIDER = "generic_price_spider"
 
+# The Scrapy project + spider deployed to the *browser* Scrapyd nodes
+# (apps/scrapers-browser, SPEC-14 US1) — a BROWSER-mode batch must be
+# scheduled here, never against the HTTP project/spider above
+# (contracts/dispatch-routing.md, US2).
+_SCRAPYD_BROWSER_PROJECT = "price_monitor_browser"
+_GENERIC_BROWSER_SPIDER = "generic_browser_price_spider"
+
 # A job in one of these statuses has already finalized — a duplicate/
 # retried dispatch delivery must never re-open it (idempotent RUNNING+
 # started_at transition, contract step 2).
@@ -246,15 +253,22 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
 
         client = ScrapydDispatchClient(settings=settings)
         for batch in batches:
-            nodes = (
-                settings.SCRAPYD_BROWSER_URLS
-                if batch.mode == ScrapeProfileMode.BROWSER
-                else settings.SCRAPYD_HTTP_URLS
-            )
+            if batch.mode == ScrapeProfileMode.BROWSER:
+                project, spider, nodes = (
+                    _SCRAPYD_BROWSER_PROJECT,
+                    _GENERIC_BROWSER_SPIDER,
+                    settings.SCRAPYD_BROWSER_URLS,
+                )
+            else:
+                project, spider, nodes = (
+                    _SCRAPYD_PROJECT,
+                    _GENERIC_PRICE_SPIDER,
+                    settings.SCRAPYD_HTTP_URLS,
+                )
             node_url = select_node(batch.domain, nodes)
             client.schedule(
-                _SCRAPYD_PROJECT,
-                _GENERIC_PRICE_SPIDER,
+                project,
+                spider,
                 workspace_id=str(workspace_uuid),
                 scrape_job_id=str(job.id),
                 match_ids=batch.match_ids,
@@ -444,15 +458,22 @@ def recover_stalled_batches() -> None:
             )
 
             for batch in re_batches:
-                nodes = (
-                    settings.SCRAPYD_BROWSER_URLS
-                    if batch.mode == ScrapeProfileMode.BROWSER
-                    else settings.SCRAPYD_HTTP_URLS
-                )
+                if batch.mode == ScrapeProfileMode.BROWSER:
+                    project, spider, nodes = (
+                        _SCRAPYD_BROWSER_PROJECT,
+                        _GENERIC_BROWSER_SPIDER,
+                        settings.SCRAPYD_BROWSER_URLS,
+                    )
+                else:
+                    project, spider, nodes = (
+                        _SCRAPYD_PROJECT,
+                        _GENERIC_PRICE_SPIDER,
+                        settings.SCRAPYD_HTTP_URLS,
+                    )
                 node_url = select_node(batch.domain, nodes)
                 client.schedule(
-                    _SCRAPYD_PROJECT,
-                    _GENERIC_PRICE_SPIDER,
+                    project,
+                    spider,
                     workspace_id=str(workspace_id),
                     scrape_job_id=str(job.id),
                     match_ids=batch.match_ids,
