@@ -85,6 +85,14 @@ id), on the same auth seam and FR-020 discipline, gated by the new
 `refresh_rules:read`/`refresh_rules:write` scopes. The scheduler pass that
 acts on these rules lives in `apps/scheduler` (US2, a later phase); this
 router never imports it.
+
+SPEC-16 US1 adds the `/v1/webhook-events` (+`/{id}`) router
+(`contracts/rest-api.md`) — cursor-paginated, `event_type`-filterable reads
+over `webhook_events`, on the same auth seam and FR-020 discipline, gated by
+the existing `webhooks:read` scope (no new scope). `/v1/webhook-endpoints*`
+CRUD (US2) lands in the same router module in a later phase. Never imports
+`apps/workers` — the `create_webhook_event` task that populates this table
+is enqueued by name elsewhere.
 """
 
 from __future__ import annotations
@@ -107,6 +115,7 @@ from app.routers import (
     scrape_profiles,
     strategy,
     variants,
+    webhooks,
 )
 
 app = FastAPI(title="crawmatic-api")
@@ -126,6 +135,7 @@ app.include_router(access_policies.router)
 app.include_router(domain_access_rules.router)
 app.include_router(strategy.router)
 app.include_router(refresh_rules.router)
+app.include_router(webhooks.router)
 
 
 @app.get("/health")
