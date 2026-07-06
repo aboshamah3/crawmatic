@@ -40,8 +40,13 @@ All via `scrape_core.pipelines._flush_batch` — no browser-specific persistence
 
 ## 2. `variant_selector_config` JSON shape (plan-defined, R2)
 
-Stored in the existing `scrape_profiles.variant_selector_config` JSONB column. Interpreted by
-`scrape_core.browser.variant.parse_variant_config(config, match) -> list[PageMethod]`.
+Stored in the existing `scrape_profiles.variant_selector_config` JSONB column. Interpreted by a
+**two-function** split (R2, variant-selection.md) so the blocking `value_from` resolution runs
+off-reactor while translation stays pure:
+`scrape_core.browser.variant.resolve_variant_values(config, match) -> dict[str, str]` (off-reactor,
+called inside `load_targets`, resolves each action's `value_from` against the match row) followed by
+`scrape_core.browser.variant.parse_variant_config(config, resolved_values) -> list[PageMethod]` (pure
+translation, no DB/match access).
 
 ```jsonc
 {

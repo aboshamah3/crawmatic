@@ -120,15 +120,21 @@ one `PRICE_ANALYSIS_RECOMPUTE` enqueued (quickstart scenarios 5–7).
   `Settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS`, R10) and `build_page_methods(target)` returning the
   ordered `scrapy_playwright.page.PageMethod` list — for US1 the profile `wait_for_selector` (if set) as
   a `wait_for_selector` PageMethod carrying the effective timeout (browser-spider.md
-  `_browser_request_for`; variant/settle steps are appended in US3).
+  `_browser_request_for`; variant/settle steps are appended in US3). **When `wait_for_selector` is
+  unset** (spec FR-003 / Edge Cases "no wait_for_selector"), express the "normal load/network settle"
+  default explicitly — append a `wait_for_load_state("networkidle")` PageMethod (bounded by the effective
+  timeout) rather than relying solely on the goto load event — so extraction always runs against a
+  settled rendered DOM.
 - [ ] T014 [US1] Complete `apps/scrapers-browser/price_monitor_browser/settings.py` for shared-runtime
   parity (R9): `ITEM_PIPELINES = {BatchedPersistencePipeline: 300}`; keep the scrapy-playwright
   `DOWNLOAD_HANDLERS` + `AsyncioSelectorReactor`; set `PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT`,
   `CONCURRENT_REQUESTS = BROWSER_CONCURRENT_REQUESTS`, `PLAYWRIGHT_MAX_CONTEXTS = BROWSER_MAX_CONTEXTS`,
   and `SCRAPE_FLUSH_MAX_ITEMS`/`SCRAPE_FLUSH_INTERVAL_SECONDS` all read from `get_settings()` (no
   hardcoded literals); `ROBOTSTXT_OBEY = False` with `RobotsPolicyMiddleware` in
-  `DOWNLOADER_MIDDLEWARES` (priority 110). (SSRF middleware + DNS_RESOLVER + PLAYWRIGHT_ABORT_REQUEST are
-  added in US4/T024.)
+  `DOWNLOADER_MIDDLEWARES` (priority 110). (SSRF middleware + DNS_RESOLVER + PLAYWRIGHT_ABORT_REQUEST
+  are added in T030/T031 — a **required MVP safety gate** per Constitution §VI, NON-NEGOTIABLE; the
+  browser path MUST NOT be dispatched in production until T030/T031 land, even though they are
+  authored in the US4 phase.)
 - [ ] T015 [US1] Create `apps/scrapers-browser/price_monitor_browser/spiders/generic_browser_price_spider.py`
   → `GenericBrowserPriceSpider(scrapy.Spider)`, `name = "generic_browser_price_spider"`. Accept the same
   args as the HTTP spider (`workspace_id`, `scrape_job_id`, `match_ids`, `mode`) via shared
@@ -186,10 +192,12 @@ targets the same node/spider once (quickstart scenarios 4, 12).
 - [ ] T021 [US2] Fix `apps/workers/app/workers/tasks_jobs.py` (dispatch-routing.md): add module
   constants `_SCRAPYD_BROWSER_PROJECT = "price_monitor_browser"` and `_GENERIC_BROWSER_SPIDER =
   "generic_browser_price_spider"`; in **both** `dispatch_job` and `recover_stalled_batches`, inside the
-  `for batch in batches:` loop select `(project, spider, nodes)` by `batch.mode` — `BROWSER` →
-  `(_SCRAPYD_BROWSER_PROJECT, _GENERIC_BROWSER_SPIDER, settings.SCRAPYD_BROWSER_URLS)`, else the existing
-  `(_SCRAPYD_PROJECT, _GENERIC_PRICE_SPIDER, settings.SCRAPYD_HTTP_URLS)` — and pass the selected
-  `project`/`spider` to `client.schedule(...)`. Leave `plan_batches`, `select_node`, and the
+  `for batch in batches:` loop select **`(project, spider)`** by `batch.mode` — `BROWSER` →
+  `(_SCRAPYD_BROWSER_PROJECT, _GENERIC_BROWSER_SPIDER)`, else `(_SCRAPYD_PROJECT, _GENERIC_PRICE_SPIDER)`
+  — and pass the selected `project`/`spider` to `client.schedule(...)`. **Node routing
+  (`SCRAPYD_BROWSER_URLS` vs `SCRAPYD_HTTP_URLS`) is ALREADY mode-branched in the code — leave it
+  unchanged.** Only the hardcoded project/spider constants are the defect. Leave `plan_batches`,
+  `select_node`, and the
   `dispatched:{scrape_job_id}:{batch_index}` idempotency guard (and its `:r{window}` recovery form)
   **unchanged** (FR-015/016, SC-008).
 - [ ] T022 [P] [US2] Unit test the dispatch project/spider selector in
@@ -200,10 +208,15 @@ targets the same node/spider once (quickstart scenarios 4, 12).
   browser pool (US2 AS1/AS3, SC-002).
 - [ ] T023 [P] [US2] Live test `tests/integration/test_dispatch_browser_idempotent_live.py` (`skipif`
   Redis): dispatch a browser batch twice (same `scrape_job_id`/`batch_index`) → one Scrapyd run, same
-  node/spider, no double-run (US2 AS2, SC-008).
+  node/spider, no double-run (US2 AS2, SC-008). Also assert the dispatch client sends **basic-auth**
+  credentials on the browser-node `schedule.json` call exactly as for the HTTP node (FR-013 dispatch-auth
+  check; the browser deployment scaffold itself — image/`scrapyd.conf` basic-auth — is SPEC-01's, R12).
 
 **Checkpoint**: Browser-mode work reaches the browser service in production; US1 is now reachable end to
-end through dispatch. Together US1+US2 are the deployable MVP.
+end through dispatch. **The deployable MVP is US1 + US2 + the SSRF safety gate (T030/T031)** — per
+Constitution §VI (NON-NEGOTIABLE), the browser path must enforce SSRF on every navigation hop before it
+may run against real targets, so T030/T031 are pulled forward into the MVP definition even though they
+live in the US4 phase. Do NOT ship browser dispatch to production with US1+US2 alone.
 
 ---
 
@@ -318,7 +331,11 @@ stories complete.
 - [ ] T037 [P] Confirm the import-boundary guard is still green and covers the new modules:
   `scrape_core.targets`/`result_builder` import only `app_shared.*` + `scrape_core.*`;
   `scrape_core.browser.*` may import Scrapy/scrapy-playwright; `app_shared` gains no Scrapy/Twisted/
-  Playwright import (shared-extraction.md).
+  Playwright import (shared-extraction.md). Also add a lightweight **reactor-safety unit guard** (runs
+  in this container-less env) asserting the browser spider's DB/Redis entry points route through
+  `run_in_thread` — an AST/source check that `parse`/`start`/`errback` never call a sync `Session`
+  commit or blocking Redis directly on the reactor thread (FR-007, Principle V; parity with the
+  existing HTTP reactor-safety guard).
 - [ ] T038 [P] Secret-safety audit: grep the browser spider + `ssrf.py`/`page.py`/`variant.py` and the
   proxy path to confirm the decrypted proxy password is placed ONLY in the Playwright `proxy` dict —
   never logged, never in `request.meta["proxy"]` or any log line (FR-011, SC-006, constitution §Tech).
@@ -394,12 +411,17 @@ Task: "Bounds/lock live test in tests/integration/test_browser_bounds_live.py"  
 
 ## Implementation Strategy
 
-### MVP First (US1 + US2)
+### MVP First (US1 + US2 + SSRF gate T030/T031)
 
 1. Phase 1 Setup → Phase 2 Foundational (shared extraction; regression green — CRITICAL gate).
 2. Phase 3 US1 → a scheduled browser-mode match renders JS and persists a price.
 3. Phase 4 US2 → production dispatch actually routes browser work to the browser service.
-4. **STOP and VALIDATE**: browser-mode matches get browser-scraped end to end through dispatch.
+4. **SSRF safety gate (T030 + T031)** — pull these US4 tasks forward: per-hop
+   `PLAYWRIGHT_ABORT_REQUEST` + pre-fetch `SsrfGuardMiddleware`/`DNS_RESOLVER` wiring. Per
+   Constitution §VI (NON-NEGOTIABLE) the browser path must enforce SSRF on every navigation hop
+   before it runs against real targets. The MVP is NOT production-deployable without this step.
+5. **STOP and VALIDATE**: browser-mode matches get browser-scraped end to end through dispatch,
+   with SSRF enforced on every hop (private/redirect-to-internal refused before body).
 
 ### Incremental Delivery
 

@@ -158,8 +158,10 @@ libs/scrape-core/scrape_core/
 │   │                          #   re-validation via reused scrape_core.safety.fetch.validate_resolved_target
 │   ├── variant.py             # NEW — parse variant_selector_config → ordered PageMethod list (allowlist,
 │   │                          #   value_from resolution); raises a typed VariantConfigError on bad shape
-│   └── page.py                # NEW — build the Playwright meta (wait_for_selector PageMethod, proxied
-│                              #   context kwargs, nav timeout) for one target
+│   └── page.py                # NEW — build the ordered Playwright PageMethod list (wait_for_selector +
+│                              #   variant + settle) + effective nav/wait timeout for one target. (The
+│                              #   proxied playwright_context kwargs are stamped in the spider's
+│                              #   _browser_request_for, not here — see tasks T032.)
 └── pipelines.py / items.py / limiter.py / robots.py / safety/* / extraction/* / validation.py
                                # UNCHANGED — reused as-is (persistence, locks, SSRF core, robots, extraction)
 

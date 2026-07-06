@@ -42,3 +42,47 @@ codebase, rather than asked of the user. Format:
   semantics) are plan-level design decisions the master doc is silent on — deferred to
   `/speckit-plan`, not asked of the user. (source: doc §8/§34 silent on these; spec Assumptions
   already flag them as plan-defined)
+
+## analyze
+
+speckit-analyze report: 0 CRITICAL, 1 HIGH, 2 MEDIUM, 2 LOW. No user pause required
+(no CRITICAL). Remediations applied to artifacts by the orchestrator (analyze is read-only):
+
+- [analyze] C1 (HIGH, Constitution §VI NON-NEGOTIABLE): tasks.md labeled US1+US2 the "deployable
+  MVP", but the browser SSRF guard (per-hop `PLAYWRIGHT_ABORT_REQUEST` T030 + pre-fetch
+  `SsrfGuardMiddleware`/`DNS_RESOLVER` wiring T031) only landed in US4. Shipping the MVP would run
+  the browser path with NO SSRF enforcement — a Principle VI violation. → FIX: redefined the
+  deployable MVP to include T030/T031 as a hard safety gate; the browser path MUST NOT be
+  dispatched in production until T030/T031 complete. Updated T014 forward-ref, Phase 4 checkpoint,
+  Phase 6 note, and the Implementation Strategy MVP section. (tasks.md)
+- [analyze] I1 (MEDIUM, signature drift): data-model.md §2 stated the interpreter as
+  `parse_variant_config(config, match) -> list[PageMethod]` (one fn taking the match), but the
+  design (research R2 + variant-selection.md + tasks T024) splits it into
+  `resolve_variant_values(config, match)` (off-reactor) + `parse_variant_config(config,
+  resolved_values)` (pure). → FIX: corrected data-model.md §2 to the two-function signature.
+- [analyze] G1 (MEDIUM, coverage): FR-013 (browser service basic-auth on every `schedule.json`)
+  had no dedicated verification task. → FIX: extended T023 to assert the dispatch client
+  authenticates to the browser node (basic auth), noting the deployment scaffold itself is
+  SPEC-01's (R12).
+- [analyze] X1 (LOW, redundant wording): T021 bundled `nodes` into the "change" tuple though node
+  routing is already mode-branched in `tasks_jobs.py`. → FIX: trimmed T021 wording to clarify only
+  the project/spider constants change; node selection already mode-branched, left unchanged.
+- [analyze] N1 (LOW/MEDIUM, test): FR-007/Principle V reactor safety asserted only in the
+  env-skipped live test T036. → FIX: added a lightweight unit guard to Polish (T037) asserting the
+  spider's DB/Redis entry points route through `run_in_thread` (runs in this container-less env).
+
+Re-run (after C1/HIGH remediation): 0 CRITICAL, 0 HIGH, 0 MEDIUM, 4 LOW. C1 confirmed mitigated
+(now informational S1 — flagged in 3 places + pulled into MVP gate). Second-pass LOW findings:
+
+- [analyze] I1b (LOW, plan wording): plan.md said `page.py` builds "proxied context kwargs", but
+  T032 stamps the proxied `playwright_context` in the spider's `_browser_request_for`, not `page.py`.
+  → FIX: corrected plan.md structure comment for `page.py`.
+- [analyze] B1 (LOW, FR-003 unset-selector default): T013 only appended a wait PageMethod "if set";
+  the "normal load/network settle" default for the `wait_for_selector`-unset path was implicit.
+  → FIX: T013 now appends an explicit `wait_for_load_state("networkidle")` (bounded) when unset.
+- [analyze] U1 (LOW, negative reqs): FR-017 (no-migration) / FR-019 (public-pages/no-stealth) have
+  no dedicated verification task. → ACCEPTED as reuse/constraint-guaranteed (no new schema is
+  structurally impossible here; FR-019 is a design constraint honored by reusing the locked access
+  methods). Not worth a task; noted.
+- [analyze] S1 (LOW, informational): SSRF authored two phases after US1 settings.py — already
+  mitigated by the C1 fix (MVP gate). No further action.
