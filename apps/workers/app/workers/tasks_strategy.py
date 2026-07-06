@@ -63,7 +63,7 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
-from app_shared.strategy.flush import flush_profile
+from app_shared.strategy.flush import StrategyTransition, flush_profile
 from app_shared.strategy.promotion import PromotionThresholds
 from app_shared.strategy.rediscovery import (
     CombinedStats,
@@ -77,6 +77,7 @@ from app_shared.strategy.seed import DiscoverySeedConfidences, seed_from_discove
 from app_shared.messaging import enqueue
 from app_shared.strategy.stats_buffer import dirty_key, read_pending
 from app_shared.task_names import (
+    CREATE_WEBHOOK_EVENT,
     STRATEGY_DISCOVERY_RUN,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_PATTERN_BACKFILL,
@@ -84,6 +85,7 @@ from app_shared.task_names import (
 )
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
+from app_shared.webhooks.payloads import build_strategy_event
 
 from scrape_core.extraction.pipeline import extract
 from scrape_core.validation import Accepted, validate_candidate
@@ -643,10 +645,18 @@ def light_recheck() -> None:
     (`apply_rediscovery`) -- catching degradation on patrol, without
     requiring a full failed batch to have just flushed (the inline call
     site is the stats-flush task, US5 T035).
+
+    SPEC-16 US3 (T035b, contracts/events.md #3): every profile whose
+    `apply_rediscovery` call here actually returns `True` (a genuine
+    ACTIVE -> DEGRADED transition) is collected and, strictly AFTER the
+    single `session.commit()` below, enqueued as one `DOMAIN_STRATEGY_UPDATED`
+    webhook event via `_enqueue_strategy_transition` -- this is the one
+    rediscovery path `flush_profile`/`flush_stats` never sees on its own.
     """
     settings = get_settings()
     thresholds = _rediscovery_thresholds(settings)
     redis = get_redis_client()
+    transitions: list[StrategyTransition] = []
 
     with get_session() as session:
         for profile_id, workspace_id in _scan_active_profile_refs(
@@ -671,8 +681,21 @@ def light_recheck() -> None:
                     workspace_id,
                     decision.reason,
                 )
+                transitions.append(
+                    StrategyTransition(
+                        profile_id=profile.id,
+                        workspace_id=workspace_id,
+                        domain=profile.domain,
+                        new_status=StrategyStatus.DEGRADED,
+                        change="REDISCOVERY_TRIGGERED",
+                        method=None,
+                    )
+                )
 
         session.commit()
+
+    for transition in transitions:
+        _enqueue_strategy_transition(transition)
 
 
 # --- STRATEGY_STATS_FLUSH (US5, contracts/stats-buffer.md §Flush, FR-023) --
@@ -689,6 +712,40 @@ def _scan_workspace_refs_with_profiles(session: Session) -> list[uuid.UUID]:
     own workspace below)."""
     stmt = select(DomainStrategyProfile.workspace_id).distinct()  # noqa: workspace-scope
     return [row[0] for row in session.execute(stmt).all()]
+
+
+def _enqueue_strategy_transition(transition: StrategyTransition) -> None:
+    """SPEC-16 US3 (T035, contracts/events.md #3): fire-and-forget,
+    post-commit webhook enqueue for one genuine strategy-status transition
+    (`flush_stats`'s surfaced `flush_profile` transitions, or
+    `light_recheck`'s own `triggered` rediscoveries). A broker error here
+    is caught and logged, never allowed to fail/roll back the
+    already-committed strategy change above (FR-009/SC-005)."""
+    event_type, payload, dedup_key = build_strategy_event(
+        strategy_profile_id=transition.profile_id,
+        domain=transition.domain,
+        new_status=transition.new_status,
+        change=transition.change,
+        method=transition.method,
+    )
+    try:
+        enqueue(
+            CREATE_WEBHOOK_EVENT,
+            queue="webhook_events",
+            kwargs={
+                "workspace_id": str(transition.workspace_id),
+                "event_type": event_type,
+                "payload": payload,
+                "dedup_key": dedup_key,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "webhook_enqueue_failed source=strategy profile_id=%s change=%s",
+            transition.profile_id,
+            transition.change,
+            exc_info=True,
+        )
 
 
 @app.task(name=STRATEGY_STATS_FLUSH)
@@ -716,10 +773,18 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
     later). Emits one `strategy_stats_flushed` structured log line per
     invocation (`dirty_profiles`, `keys_flushed`) -- contracts/
     api-and-observability.md.
+
+    SPEC-16 US3 (T035a, contracts/events.md #3): every genuine
+    promotion/rediscovery transition `flush_profile` surfaces across this
+    sweep is collected and, strictly AFTER the single `session.commit()`
+    below, enqueued as one webhook event each via `_enqueue_strategy_transition`
+    -- never pre-commit, never speculative (only transitions an `apply_*`
+    call already confirmed real).
     """
     redis = get_redis_client()
     dirty_profiles = 0
     keys_flushed = 0
+    transitions: list[StrategyTransition] = []
 
     with get_session() as session:
         if workspace_id is not None:
@@ -745,9 +810,14 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
 
             for profile_id in pending_ids:
                 dirty_profiles += 1
-                keys_flushed += flush_profile(session, redis, profile_id)
+                result = flush_profile(session, redis, profile_id)
+                keys_flushed += result.keys_flushed
+                transitions.extend(result.transitions)
 
         session.commit()
+
+    for transition in transitions:
+        _enqueue_strategy_transition(transition)
 
     logger.info(
         "strategy_stats_flushed dirty_profiles=%d keys_flushed=%d",

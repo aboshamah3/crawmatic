@@ -169,10 +169,15 @@ def test_flush_upserts_once_per_key_and_promotes(seeded_profile: uuid.UUID) -> N
 
     redis = get_redis_client()
     with get_session() as session:
-        keys_flushed = flush_profile(session, redis, seeded_profile)
+        result = flush_profile(session, redis, seeded_profile)
         session.commit()
 
-    assert keys_flushed == 1
+    assert result.keys_flushed == 1
+    assert len(result.transitions) == 1
+    transition = result.transitions[0]
+    assert transition.new_status.value == "ACTIVE"
+    assert transition.change == "PROMOTED"
+    assert transition.method == AccessMethod.DIRECT_HTTP.value
 
     with get_session() as session:
         rows = (
@@ -213,7 +218,7 @@ def test_second_flush_with_no_new_activity_writes_nothing(seeded_profile: uuid.U
     with get_session() as session:
         first = flush_profile(session, redis, seeded_profile)
         session.commit()
-    assert first == 1
+    assert first.keys_flushed == 1
 
     with get_session() as session:
         before = (
@@ -225,7 +230,8 @@ def test_second_flush_with_no_new_activity_writes_nothing(seeded_profile: uuid.U
     with get_session() as session:
         second = flush_profile(session, redis, seeded_profile)
         session.commit()
-    assert second == 0
+    assert second.keys_flushed == 0
+    assert second.transitions == ()
 
     with get_session() as session:
         after = (
@@ -244,7 +250,8 @@ def test_flush_profile_with_no_pending_activity_is_a_noop(seeded_profile: uuid.U
 
     redis = get_redis_client()
     with get_session() as session:
-        keys_flushed = flush_profile(session, redis, seeded_profile)
+        result = flush_profile(session, redis, seeded_profile)
         session.commit()
 
-    assert keys_flushed == 0
+    assert result.keys_flushed == 0
+    assert result.transitions == ()

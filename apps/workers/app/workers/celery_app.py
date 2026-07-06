@@ -33,6 +33,7 @@ from celery.signals import worker_process_init
 from app_shared.config import get_settings
 from app_shared.database import dispose_engine
 from app_shared.task_names import (
+    CREATE_WEBHOOK_EVENT,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RETENTION_DROP,
@@ -59,6 +60,7 @@ app = Celery(
         "app.workers.tasks_analysis",
         "app.workers.tasks_strategy",
         "app.workers.tasks_maintenance",
+        "app.workers.tasks_webhooks",
     ],
 )
 
@@ -99,11 +101,19 @@ app = Celery(
 # coverage for `price_observations`, plus the one sanctioned bulk DELETE
 # aging `variant_price_daily_rollups`, on the BYPASSRLS system session,
 # no blocking fetch.
+#
+# `webhook_events` (SPEC-16 FR-008/FR-009) carries `CREATE_WEBHOOK_EVENT` —
+# the fire-and-forget, post-commit event-recording task enqueued by three
+# existing producer seams (alert transitions, job finalization, strategy
+# status changes). Kept on its own queue so it never competes with/blocks
+# `maintenance`/`price_analysis` traffic; it does no blocking fetch, just
+# one insert.
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
     "price_analysis": {},
     "strategy_discovery": {},
+    "webhook_events": {},
 }
 app.conf.task_routes = {
     SCRAPE_DISPATCH_JOB: {"queue": "scrape_dispatch"},
@@ -117,6 +127,7 @@ app.conf.task_routes = {
     MAINTENANCE_PARTITION_CREATE: {"queue": "maintenance"},
     MAINTENANCE_DAILY_ROLLUP: {"queue": "maintenance"},
     MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
+    CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},
 }
 
 

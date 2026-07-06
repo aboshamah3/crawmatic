@@ -23,6 +23,7 @@ correctness guard — at-least-once Celery delivery is always safe here.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -42,11 +43,15 @@ from app_shared.enums import (
     AlertType,
     ScrapeErrorCode,
 )
+from app_shared.messaging import enqueue
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.observations import MatchCurrentPrice
 from app_shared.repository import scoped_get, scoped_select
-from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
+from app_shared.task_names import CREATE_WEBHOOK_EVENT, PRICE_ANALYSIS_RECOMPUTE
+from app_shared.webhooks.payloads import build_alert_event
+
+logger = logging.getLogger(__name__)
 
 
 def _load_competitor_rows(
@@ -290,12 +295,13 @@ def recompute_variant(
     """Recompute one variant's price comparison + alert state (idempotent).
 
     kwargs are JSON-serializable strings (Celery convention); `product_id`
-    is optional (resolved from the variant if absent), `scrape_job_id` is
-    accepted for signature parity with the emitters but unused here — the
-    per-variant-per-job dedup is entirely an emission-side concern (D4).
+    is optional (resolved from the variant if absent). `scrape_job_id` is
+    accepted for signature parity with the emitters — the per-variant-
+    per-job *analysis* dedup is entirely an emission-side concern (D4/D7)
+    and this task does nothing with it for that purpose, but it is still
+    threaded through to the SPEC-16 webhook seam below (post-commit) as
+    part of that event's own `dedup_key` (contracts/events.md #1).
     """
-    del scrape_job_id  # dedup is emission-side only (D4/D7) — nothing to do with it here.
-
     ws = uuid.UUID(str(workspace_id))
     variant_id = uuid.UUID(str(product_variant_id))
 
@@ -378,3 +384,43 @@ def recompute_variant(
             )
 
         session.commit()
+
+        # SPEC-16 US3 (T033, contracts/events.md #1): fire-and-forget,
+        # strictly post-commit webhook event -- only on a genuine alert
+        # transition (`event_type is not None`; UNCHANGED never reaches
+        # here). A broker error here must never fail/roll back the
+        # already-committed analysis above (FR-009/SC-005), so it is
+        # caught and logged, never re-raised.
+        if event_type is not None:
+            built = build_alert_event(
+                product_variant_id=variant_id,
+                product_id=resolved_product_id,
+                alert_state_id=alert_state.id,
+                transition=event_type,
+                previous_type=prev_type,
+                new_type=outcome.type,
+                previous_severity=prev_severity,
+                new_severity=outcome.severity,
+                scrape_job_id=scrape_job_id,
+            )
+            if built is not None:
+                webhook_event_type, webhook_payload, dedup_key = built
+                try:
+                    enqueue(
+                        CREATE_WEBHOOK_EVENT,
+                        queue="webhook_events",
+                        kwargs={
+                            "workspace_id": str(ws),
+                            "event_type": webhook_event_type,
+                            "payload": webhook_payload,
+                            "dedup_key": dedup_key,
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "webhook_enqueue_failed source=recompute_variant "
+                        "product_variant_id=%s event_type=%s",
+                        variant_id,
+                        webhook_event_type,
+                        exc_info=True,
+                    )

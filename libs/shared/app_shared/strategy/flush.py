@@ -17,6 +17,7 @@ context), never the spider/reactor thread.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -27,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from app_shared.config import Settings, get_settings
 from app_shared.database import set_workspace_context
-from app_shared.enums import AccessMethod, ExtractionMethod, MethodType
+from app_shared.enums import AccessMethod, ExtractionMethod, MethodType, StrategyStatus
 from app_shared.ids import new_uuid7
 from app_shared.models.strategy import DomainStrategyProfile, StrategyAttemptStats
 from app_shared.strategy import stats_buffer
@@ -46,7 +47,35 @@ from app_shared.strategy.rediscovery import (
 )
 from app_shared.strategy.repository import stats_for_profile
 
-__all__ = ["flush_profile"]
+__all__ = ["flush_profile", "FlushResult", "StrategyTransition"]
+
+
+@dataclass(frozen=True)
+class StrategyTransition:
+    """One genuine promotion/rediscovery transition surfaced by `flush_profile`
+    (SPEC-16 US3 T035, contracts/events.md #3) -- only ever constructed when
+    the corresponding `apply_promotion`/`apply_rediscovery` call returned
+    `True` (a real row change), so this is never emitted speculatively.
+    """
+
+    profile_id: uuid.UUID
+    workspace_id: uuid.UUID
+    domain: str
+    new_status: StrategyStatus
+    change: str  # "PROMOTED" | "REDISCOVERY_TRIGGERED"
+    method: str | None
+
+
+@dataclass(frozen=True)
+class FlushResult:
+    """`flush_profile`'s return: the number of keys drained this cycle plus
+    any genuine strategy-status transitions it caused (SPEC-16 US3 T035) --
+    the caller (`tasks_strategy.py::flush_stats`) enqueues one webhook event
+    per transition, strictly after its own `session.commit()`.
+    """
+
+    keys_flushed: int
+    transitions: tuple[StrategyTransition, ...] = field(default_factory=tuple)
 
 #: Scale factor `conf_sum` was multiplied by at record time
 #: (`stats_buffer._CONFIDENCE_SCALE`) -- duplicated here (a plain int
@@ -201,27 +230,32 @@ def _combined_stats(session: Session, profile: DomainStrategyProfile) -> Combine
     )
 
 
-def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> int:
+def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> FlushResult:
     """Drain + upsert every dirty `(method_type, method_name)` key of one
     profile, then evaluate promotion (US1) and rediscovery (US4) against
     the just-flushed persisted counts (contracts/stats-buffer.md §Flush).
 
-    Returns the number of `(method_type, method_name)` keys that actually
-    had a pending delta this cycle (0 if the profile had nothing
-    buffered -- e.g. a stale `stratdirty` member from an already-drained
-    cycle). `profile_id` alone resolves the profile (no `workspace_id`
-    argument) -- the *first* thing this does is load the row by bare PK
-    and `set_workspace_context` from its own `workspace_id`, the same
+    Returns a `FlushResult` whose `keys_flushed` is the number of
+    `(method_type, method_name)` keys that actually had a pending delta
+    this cycle (0 if the profile had nothing buffered -- e.g. a stale
+    `stratdirty` member from an already-drained cycle), and whose
+    `transitions` (SPEC-16 US3 T035, contracts/events.md #3) surfaces every
+    genuine promotion/rediscovery status change this call caused -- only
+    when the corresponding `apply_promotion`/`apply_rediscovery` call
+    actually returned `True` (a real row change), never speculatively.
+    `profile_id` alone resolves the profile (no `workspace_id` argument)
+    -- the *first* thing this does is load the row by bare PK and
+    `set_workspace_context` from its own `workspace_id`, the same
     "resolve first, scope second" shape `apps/workers/app/workers/
     tasks_strategy.py::light_recheck` already uses for its own per-profile
     loop (this module's one unscoped read of a workspace-owned model).
 
-    No-op (returns `0`, no statement executed) when the profile no longer
-    exists (e.g. deleted between the dirty-set read and this flush).
+    No-op (`FlushResult(0, ())`, no statement executed) when the profile no
+    longer exists (e.g. deleted between the dirty-set read and this flush).
     """
     profile = session.get(DomainStrategyProfile, profile_id)  # noqa: workspace-scope
     if profile is None:
-        return 0
+        return FlushResult(keys_flushed=0, transitions=())
 
     set_workspace_context(session, profile.workspace_id)
 
@@ -234,6 +268,7 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
     any_failure = False
     preferred_qualifying_delta = 0
     preferred_failure_delta = 0
+    transitions: list[StrategyTransition] = []
 
     for method_type, method_name in _CANDIDATE_METHODS:
         drained = stats_buffer.drain(
@@ -280,6 +315,19 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
             # only cleared once the method actually promotes
             # (contracts/stats-buffer.md "Drain").
             redis.delete(stats_buffer.url_key(profile.id, method_type, method_name))
+            # SPEC-16 US3 (T035a): a genuine promotion -- `apply_promotion`
+            # only returns True on a real row change -- surfaced to the
+            # caller for a post-commit webhook enqueue.
+            transitions.append(
+                StrategyTransition(
+                    profile_id=profile.id,
+                    workspace_id=profile.workspace_id,
+                    domain=profile.domain,
+                    new_status=StrategyStatus.ACTIVE,
+                    change="PROMOTED",
+                    method=method_name,
+                )
+            )
 
     # recent_failure_count (Clarification #2): ++ on a preferred-method
     # failure delta, reset to 0 on a preferred-method qualifying-success
@@ -303,7 +351,20 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
     rediscovery_decision = evaluate_rediscovery(
         profile, combined_stats, recent_signals, _rediscovery_thresholds(settings)
     )
-    apply_rediscovery(session, profile, rediscovery_decision)
+    rediscovered = apply_rediscovery(session, profile, rediscovery_decision)
+    if rediscovered:
+        # SPEC-16 US3 (T035a): a genuine rediscovery trigger -- surfaced to
+        # the caller for a post-commit webhook enqueue, same as promotion.
+        transitions.append(
+            StrategyTransition(
+                profile_id=profile.id,
+                workspace_id=profile.workspace_id,
+                domain=profile.domain,
+                new_status=StrategyStatus.DEGRADED,
+                change="REDISCOVERY_TRIGGERED",
+                method=None,
+            )
+        )
 
     # Every candidate key was drained this cycle -- by definition nothing
     # is left pending for this profile from here, so the dirty marker is
@@ -312,4 +373,4 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
     # re-dirties the profile via its own SADD, picked up next cycle.
     redis.srem(stats_buffer.dirty_key(profile.workspace_id), str(profile.id))
 
-    return keys_flushed
+    return FlushResult(keys_flushed=keys_flushed, transitions=tuple(transitions))

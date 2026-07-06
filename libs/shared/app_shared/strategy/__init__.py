@@ -11,7 +11,7 @@ Public surface re-exported here (T042) so callers import from
 
 from __future__ import annotations
 
-from app_shared.strategy.flush import flush_profile
+from app_shared.strategy.flush import FlushResult, StrategyTransition, flush_profile
 from app_shared.strategy.promotion import (
     MethodStats,
     PromotionDecision,
@@ -87,6 +87,8 @@ __all__ = [
     "drain",
     # flush
     "flush_profile",
+    "FlushResult",
+    "StrategyTransition",
     # repository
     "resolve_profile",
     "get_profile",

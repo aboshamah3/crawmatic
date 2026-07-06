@@ -22,6 +22,7 @@ duplicate recovery delivery within one window.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -44,11 +45,15 @@ from app_shared.models.strategy import DomainStrategyProfile
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.scrapyd import ScrapydDispatchClient
 from app_shared.task_names import (
+    CREATE_WEBHOOK_EVENT,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
     STRATEGY_STATS_FLUSH,
 )
+from app_shared.webhooks.payloads import build_job_event
+
+logger = logging.getLogger(__name__)
 
 # The Scrapy project + spider deployed to the Scrapyd nodes (apps/scrapers) —
 # unchanged from the SPEC-07 thin `dispatch.generic_price_spider` task.
@@ -357,7 +362,17 @@ def finalize_jobs() -> None:
     sweep. A job whose targets resolve no strategy profile at all (e.g.
     every match predates SPEC-12 discovery) enqueues nothing -- `flush_stats`
     is never called with an empty `profile_ids` list.
+
+    SPEC-16 US3 (T034, contracts/events.md #2): once a job actually
+    finalizes, its `(job_id, status, counts)` is collected here and, AFTER
+    the single `session.commit()` below, one `create_webhook_event` is
+    enqueued per finalized job via `build_job_event` — `CANCELLED` (never
+    produced by this path) and any non-terminal status enqueue nothing. A
+    broker error at this seam is caught and logged, never allowed to fail
+    the already-committed finalize above (FR-009/SC-005).
     """
+    finalized: list[tuple[uuid.UUID, uuid.UUID, ScrapeJobStatus, Counts]] = []
+
     with get_session() as session:
         for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
             set_workspace_context(session, workspace_id)
@@ -386,6 +401,7 @@ def finalize_jobs() -> None:
                 counts.success, counts.failure, counts.skipped, counts.total
             )
             job.completed_at = datetime.now(timezone.utc)
+            finalized.append((job.id, workspace_id, job.status, counts))
 
             profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
             if profile_ids:
@@ -399,6 +415,38 @@ def finalize_jobs() -> None:
                 )
 
         session.commit()
+
+        for job_id, workspace_id, status, counts in finalized:
+            built = build_job_event(
+                scrape_job_id=job_id,
+                status=status,
+                success_count=counts.success,
+                failure_count=counts.failure,
+                skipped_count=counts.skipped,
+                total=counts.total,
+            )
+            if built is None:
+                continue
+            webhook_event_type, webhook_payload, dedup_key = built
+            try:
+                enqueue(
+                    CREATE_WEBHOOK_EVENT,
+                    queue="webhook_events",
+                    kwargs={
+                        "workspace_id": str(workspace_id),
+                        "event_type": webhook_event_type,
+                        "payload": webhook_payload,
+                        "dedup_key": dedup_key,
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "webhook_enqueue_failed source=finalize_jobs "
+                    "scrape_job_id=%s event_type=%s",
+                    job_id,
+                    webhook_event_type,
+                    exc_info=True,
+                )
 
 
 @app.task(name=SCRAPE_RECOVER_STALLED)
