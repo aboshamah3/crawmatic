@@ -3,7 +3,7 @@
     "15": {
       "title": "Retention, Rollups & Partition Maintenance",
       "feature_directory": "specs/015-retention-rollups-partition-maintenance",
-      "status": "in-progress",
+      "status": "completed",
       "steps": {
         "specify": "done",
         "clarify": "done",
@@ -11,8 +11,18 @@
         "checklist": "done",
         "tasks": "done",
         "analyze": "done",
-        "implement": "done"
-      }
+        "implement": "done",
+        "converge": "done"
+      },
+      "deferred_verifications": [
+        "T013 partition-create live (4 cases): current+next-month partitions created for existing tables with webhook_events skipped; no-op re-run; self-heal a dropped current-month partition; write dated into next month succeeds",
+        "T023 daily-rollup live (3 cases): one correct row per (workspace,variant,day) with currency-mismatch exclusion + zero-comparable row; upsert idempotency on re-run; cross-workspace RLS denial on variant_price_daily_rollups",
+        "T030 retention-drop live (6 cases): drop when rollups cover; retain when coverage missing; in-window partition untouched; non-rollup table age-only drop; no double-drop on re-run; rollup-table 2y age DELETE",
+        "T034 soft-ref-tolerance live (2 cases): dangling match_current_prices.observation_id read returns denormalized data with no error; explicit observation fetch is None and count_tolerated_dangling_refs reports it tolerated"
+      ],
+      "deferred_reason": "require a live Postgres/Redis (no container engine in build env); 4 live integration test files (15 cases) authored + skip cleanly via skipif probe (0 errors). DB/Redis-independent logic exhaustively unit-tested here (full suite 1673 unit passed / 0 failed; integration 3 passed / 267 skipped / 0 failed). New scraping-free libs/shared/app_shared/maintenance package (registry/partitions/rollups/retention/soft_refs) + 3 Celery maintenance tasks (partition_create/daily_rollup/retention_drop on BYPASSRLS system session) + 3 scheduler cadence accumulators. Runtime partition create/drop is runtime DDL (CREATE/DROP TABLE ... PARTITION OF), NOT alembic. One new durable table variant_price_daily_rollups (created here — SPEC-09 deferred it) via single migration 4a1dca402f78 (down_revision 93511d5f7885, single head) with RLS + unique(uq_vpdr_workspace_id_product_variant_id_date). Reuses SPEC-13 system-session/scheduler-loop, SPEC-09 variant_price_states + comparable flag, emit_rls_policy, Money/Numeric(18,4), TimestampMixin. 39 tasks. analyze remediated 1 MEDIUM (C1 FR-024 vacuum/analyze reframed as non-blocking constraint, active housekeeping out of v1 scope) + 2 LOW (I1 min/avg/max<->cheapest/average/highest mapping note, D1 FR-001 canonical retention windows); 0 CRITICAL/HIGH.",
+      "converge_result": "CONVERGED (1 cycle) - all 26 FR + 7 SC + US1-4 acceptance scenarios verified against built code; both sanctioned deviations (BYPASSRLS system session with app-level scoping preserved; single bulk DELETE confined to non-partitioned rollup table, provably not applied to raw partitions) correctly implemented; tasks.md unchanged (no convergence phase appended). Only live-env verification deferred.",
+      "corrections": "Spec's Assumptions originally claimed variant_price_daily_rollups already existed (from SPEC-09). Plan (codebase-grounded) found SPEC-09 DEFERRED its creation to SPEC-15 -> spec Assumptions + new FR-009a updated; table created here. Partition create/drop confirmed as runtime DDL, not migrations."
     },
     "13": {
       "title": "Scheduler",

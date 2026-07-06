@@ -42,3 +42,16 @@ Report: 0 CRITICAL, 0 HIGH, 1 MEDIUM, 3 LOW. No constitution MUST violations; 26
 - [analyze] U1 (LOW): T036 docker-compose scheduler→redis depends_on has no backing FR. → Accepted as-is (legitimate plan-derived operability fix; no action).
 
 Re-run not required: only MEDIUM/LOW remediated (no CRITICAL/HIGH); edits are scope/citation/terminology clarifications that introduce no new coverage gaps.
+
+## implement (7 phases, sonnet subagents)
+
+All 39 tasks (T001–T039) implemented + marked [X], one commit per phase. Final full suite: 1673 unit passed / 0 failed; integration 3 passed / 267 skipped / 0 failed; single alembic head 4a1dca402f78; workspace-scoping guard OK; import-boundary (scraping-free) green.
+
+Implementer design decisions worth recording (all self-resolved, reasonable, documented in code):
+- [implement] variant_price_daily_rollups unique constraint name: naming-convention-expanded name (67 chars) exceeds Postgres 63-byte identifier cap -> uses repo shorthand precedent uq_vpdr_workspace_id_product_variant_id_date.
+- [implement] Daily-rollup average competitor price is quantized to the column's NUMERIC(18,4) scale (ROUND_HALF_UP) before storage (an arithmetic mean isn't exact at 4dp and Money rejects over-scale values). Documented as a stored-snapshot decision distinct from the alerts engine's stricter never-round policy.
+- [implement] T031 audit finding: NO reader hard-joins match_current_prices.observation_id; the only live reader (apps/workers tasks_analysis _load_competitor_rows) reads denormalized fields only -> readers already tolerate dangling refs, no code fix needed (FR-021 satisfied by construction).
+
+## converge (subagent, opus)
+
+CONVERGED in 1 cycle, tasks.md unchanged (no convergence phase appended). Verified all 26 FR + 7 SC + US1–US4 acceptance scenarios against real code; confirmed the single bulk DELETE targets only variant_price_daily_rollups (grep-verified, never a raw partition -> SC-003 preserved) and all 3 tasks use the BYPASSRLS system session with explicit workspace_id= scoping preserved. 0 findings (CRITICAL/HIGH/MEDIUM/LOW all 0).
