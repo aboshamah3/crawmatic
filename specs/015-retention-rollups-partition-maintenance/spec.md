@@ -8,6 +8,17 @@
 
 **Input**: User description: "SPEC-15 — Retention, Rollups & Partition Maintenance. Deliver the scheduled jobs that keep the already-partitioned append-heavy tables (price_observations, request_attempts, price_alert_events, and later webhook_events) healthy over time: create next month's partitions in advance, generate daily rollups, drop expired partitions by DROP (never bulk DELETE) only after their rollups are verified, and guarantee readers tolerate soft references that dangle into dropped partitions."
 
+## Clarifications
+
+### Session 2026-07-06
+
+All items below were resolved doc-first (PROJECT_SPEC §29/§22) or by direct derivation from the data model — no open human decision remained. They are recorded here because they materially sharpen data modeling, the verify-before-drop ordering guarantee, and scheduling for downstream task design.
+
+- Q: By which calendar date is a raw price observation assigned to a daily rollup? → A: The UTC calendar date of its partition key (`price_observations.scraped_at`). This makes a partition's date range map 1:1 onto the set of rollup dates that must exist to consider it "covered," which is the basis for the verify-before-drop check (FR-016).
+- Q: How far ahead must partitions be pre-created? → A: At least the next month (maintain current + next month at all times), run with enough schedule lead time that next month's partition always exists before that month begins (FR-004/FR-005).
+- Q: Which day does each scheduled rollup run process, and how does it handle re-runs? → A: The most recent completed UTC day by default, idempotently — re-running or backfilling any past day upserts on `unique(workspace_id, product_variant_id, date)` without duplication (FR-010).
+- Q: "Verified complete" rollups for a partition means what, concretely? → A: For every UTC date within the partition's range that had source pricing data, a rollup row exists; a date with no source data needs no rollup to count as covered (FR-016, Assumptions).
+
 ## User Scenarios & Testing *(mandatory)*
 
 The consumers of this feature are the **platform operators** who run the price-monitoring backend and the **downstream readers** (analytics, comparison, alerting) that depend on the append-heavy data staying queryable, bounded, and correct. There is no end-user UI in v1; the "actors" are scheduled maintenance jobs and the code paths that read partitioned data.
