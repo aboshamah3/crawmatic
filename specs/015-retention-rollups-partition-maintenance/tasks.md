@@ -355,23 +355,23 @@ surfaces tolerated soft refs.
 **Purpose**: Import-boundary + workspace-scoping + single-head guardrails, deploy-topology fix, and
 end-to-end validation across all stories.
 
-- [ ] T035 [P] Extend `tests/unit/test_import_boundaries.py` to assert the new
+- [X] T035 [P] Extend `tests/unit/test_import_boundaries.py` to assert the new
   `app_shared.maintenance.*` package and `apps/workers/app/workers/tasks_maintenance.py` import no
   Scrapy/Twisted/Playwright (FR-003, Principle I/V), and run `uv run python
   scripts/check_workspace_scoping.py` to confirm the guard passes (the sanctioned cross-tenant scans in
   `rollups.py`/`retention.py`/`soft_refs.py` are annotated `# noqa: workspace-scope`; every rollup
   read/write carries explicit `workspace_id=`). (FR-003/014; quickstart Setup/build checks)
-- [ ] T036 Fix the deploy topology in `docker-compose.yml`: add the broker/`redis` service to the
+- [X] T036 Fix the deploy topology in `docker-compose.yml`: add the broker/`redis` service to the
   `scheduler` service's `depends_on` (it now enqueues three more maintenance tasks; the existing gap is
   latent — research R8 operational note). Do not change job logic.
-- [ ] T037 Verify the single-Alembic-head guard stays green: `uv run alembic heads` reports exactly one
+- [X] T037 Verify the single-Alembic-head guard stays green: `uv run alembic heads` reports exactly one
   head (the new `variant_price_daily_rollups` revision chained off `93511d5f7885`); linear history
   preserved. (research cross-cutting; FR-009a)
-- [ ] T038 [P] Run the suites: `uv run pytest tests/unit -q` all green (no DB — includes
+- [X] T038 [P] Run the suites: `uv run pytest tests/unit -q` all green (no DB — includes
   `test_partition_registry`, `test_partition_bounds`, `test_rollup_aggregation`, `test_retention_eligibility`,
   `test_migration_offline_rollups`, `test_import_boundaries`) and `uv run pytest tests/integration -q`
   with the four `*_live.py` tests SKIPPING cleanly in this DB-less build env. (quickstart)
-- [ ] T039 Walk the quickstart.md validation scenarios (Setup + US1–US4 + the SC-001..007 coverage table)
+- [X] T039 Walk the quickstart.md validation scenarios (Setup + US1–US4 + the SC-001..007 coverage table)
   end-to-end as the acceptance checklist for
   `specs/015-retention-rollups-partition-maintenance/quickstart.md`.
 

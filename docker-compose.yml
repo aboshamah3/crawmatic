@@ -106,6 +106,8 @@ services:
     depends_on:
       pgbouncer:
         condition: service_started
+      redis:
+        condition: service_started
 
   worker:
     build:

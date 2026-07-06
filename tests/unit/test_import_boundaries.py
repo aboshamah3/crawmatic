@@ -506,6 +506,51 @@ def test_models_access_does_not_import_scrapy_twisted_fastapi() -> None:
     assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
 
 
+# --- SPEC-15 T035 ------------------------------------------------------------
+
+_MAINTENANCE_PACKAGE_FORBIDDEN_ROOTS = frozenset(
+    {"scrapy", "twisted", "playwright", "fastapi", "apps", "app"}
+)
+
+
+def _maintenance_package_dir() -> pathlib.Path:
+    import app_shared.maintenance
+
+    return pathlib.Path(app_shared.maintenance.__file__).parent
+
+
+def test_maintenance_package_no_forbidden_imports() -> None:
+    """SPEC-15 T035: every module in the new ``app_shared.maintenance``
+    package (``registry``/``partitions``/``rollups``/``retention``/
+    ``soft_refs``) is free to import stdlib + sqlalchemy (it is a
+    DB-facing maintenance core) but must never import Scrapy/Twisted/
+    Playwright (Constitution I/V, FR-003) — those belong only to the
+    Scrapyd-side scraping stack — and, like every other ``app_shared``
+    module, must never reach into ``apps.*``/``app.*`` (the reverse
+    dependency edge is forbidden)."""
+    package_dir = _maintenance_package_dir()
+    for source_file in sorted(package_dir.glob("*.py")):
+        roots = _imported_root_modules(source_file)
+        leaked = roots & _MAINTENANCE_PACKAGE_FORBIDDEN_ROOTS
+        assert not leaked, f"{source_file} imports forbidden module(s): {sorted(leaked)}"
+
+
+def test_tasks_maintenance_no_scrapy_twisted_playwright() -> None:
+    """SPEC-15 T035: the three maintenance Celery tasks
+    (``partition_create``/``daily_rollup``/``retention_drop`` in
+    ``apps/workers/app/workers/tasks_maintenance.py``) never import
+    Scrapy/Twisted/Playwright directly — they are pure DB-maintenance
+    tasks (DDL + rollup/retention aggregation on the BYPASSRLS system
+    session), never a scraping runtime."""
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    tasks_maintenance_path = (
+        repo_root / "apps" / "workers" / "app" / "workers" / "tasks_maintenance.py"
+    )
+    roots = _imported_root_modules(tasks_maintenance_path)
+    leaked = roots & {"scrapy", "twisted", "playwright"}
+    assert not leaked, f"{tasks_maintenance_path} imports forbidden module(s): {sorted(leaked)}"
+
+
 _ALERTS_ROUTERS_IMPORT_CHECK = """
 import sys
 
