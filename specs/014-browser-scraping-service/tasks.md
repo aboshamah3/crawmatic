@@ -39,14 +39,14 @@ import); `scrape_core` may depend on `app_shared`, never the reverse.
 
 **Purpose**: DB/env-tunable configuration knobs (Principle IV) and workspace dependency sanity.
 
-- [ ] T001 [P] Add three env/DB-tunable knobs to `libs/shared/app_shared/config.py` on the `Settings`
+- [X] T001 [P] Add three env/DB-tunable knobs to `libs/shared/app_shared/config.py` on the `Settings`
   model: `SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS: int = 30000`, `BROWSER_CONCURRENT_REQUESTS: int = 2`,
   `BROWSER_MAX_CONTEXTS: int = 1` (data-model.md §4). Keep `app_shared` import-clean (no Scrapy/Twisted/
   Playwright). Do NOT touch existing knobs (`MATCH_LOCK_BROWSER_TTL_SECONDS`, `SCRAPE_FLUSH_*`,
   `SCRAPYD_BROWSER_URLS` already exist and are reused).
-- [ ] T002 [P] Add unit coverage for the three new knobs' defaults + env override in
+- [X] T002 [P] Add unit coverage for the three new knobs' defaults + env override in
   `tests/unit/test_config.py` (must pass in this env).
-- [ ] T003 Verify workspace deps resolve for the browser project: `uv sync --all-packages` (NEVER plain
+- [X] T003 Verify workspace deps resolve for the browser project: `uv sync --all-packages` (NEVER plain
   `uv sync`), and confirm `apps/scrapers-browser` already declares `scrapy-playwright`/`playwright`
   (SPEC-01 scaffold; add to its `pyproject.toml` only if genuinely absent).
 

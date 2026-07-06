@@ -212,6 +212,16 @@ class Settings(BaseSettings):
     # DATABASE_URL (SPEC-03 [analyze C1]).
     SYSTEM_DATABASE_URL: str | None = None
 
+    # --- Browser scraping service tuning (SPEC-14, data-model.md §4,
+    # Principle IV — env/DB-tunable, never a hardcoded literal). Default
+    # wait/nav bound when a profile's `browser_timeout_ms` is unset (R10),
+    # plus the browser Scrapyd project's deliberately low
+    # CONCURRENT_REQUESTS / PLAYWRIGHT_MAX_CONTEXTS (R9). Reused unchanged:
+    # MATCH_LOCK_BROWSER_TTL_SECONDS, SCRAPE_FLUSH_*, SCRAPYD_BROWSER_URLS. ---
+    SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS: int = 30000
+    BROWSER_CONCURRENT_REQUESTS: int = 2
+    BROWSER_MAX_CONTEXTS: int = 1
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:

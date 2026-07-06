@@ -112,3 +112,33 @@ def test_access_resolution_cache_ttl_defaults_to_30_seconds(
     settings = Settings(_env_file=None)
 
     assert settings.ACCESS_RESOLUTION_CACHE_TTL_SECONDS == 30
+
+
+def test_browser_scraping_knobs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Browser-service knobs default per data-model.md §4 (SPEC-14 R9/R10) when unset."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("BROWSER_CONCURRENT_REQUESTS", raising=False)
+    monkeypatch.delenv("BROWSER_MAX_CONTEXTS", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS == 30000
+    assert settings.BROWSER_CONCURRENT_REQUESTS == 2
+    assert settings.BROWSER_MAX_CONTEXTS == 1
+
+
+def test_browser_scraping_knobs_honor_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Browser-service knobs are env/DB-tunable, never hardcoded (SPEC-14 Principle IV)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS", "45000")
+    monkeypatch.setenv("BROWSER_CONCURRENT_REQUESTS", "4")
+    monkeypatch.setenv("BROWSER_MAX_CONTEXTS", "2")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS == 45000
+    assert settings.BROWSER_CONCURRENT_REQUESTS == 4
+    assert settings.BROWSER_MAX_CONTEXTS == 2
