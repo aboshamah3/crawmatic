@@ -115,7 +115,7 @@ Current-state tables (e.g. a match's current price, a competitor match's current
 - **FR-009a**: The system MUST create the `variant_price_daily_rollups` table (deferred from SPEC-09) via a single Alembic migration that keeps the migration history at a single head, as a workspace-owned table with row-level security and `unique(workspace_id, product_variant_id, date)`. It is a plain (non-partitioned) table retained by row age (2 years); it is not a monthly-partitioned table.
 - **FR-009**: The system MUST generate daily rollups into `variant_price_daily_rollups`, one row per (workspace, product variant, day), carrying the client price, the min/avg/max comparable competitor prices, the alert type, the comparable-competitor count, the product/variant identity, currency, and the date.
 - **FR-010**: Rollup generation MUST be an upsert on the unique key (workspace, product variant, date): re-running for a day updates the existing row rather than duplicating it.
-- **FR-011**: Competitor price aggregation (min/avg/max) MUST include only comparable, same-currency prices; non-comparable or currency-mismatched prices MUST be excluded from the aggregates, and the comparable-competitor count MUST reflect only the included prices.
+- **FR-011**: Competitor price aggregation (min/avg/max — realized in the data model as the `cheapest_/average_/highest_competitor_price` columns) MUST include only comparable, same-currency prices; non-comparable or currency-mismatched prices MUST be excluded from the aggregates, and the comparable-competitor count MUST reflect only the included prices.
 - **FR-012**: Monetary aggregation MUST use exact decimal arithmetic on finite values only; no floating-point money and no NaN/Infinity may enter a rollup.
 - **FR-013**: A rollup row MUST be produced for a variant that had a client price that day even when it had zero comparable competitor prices (competitor min/avg/max empty, comparable count zero).
 - **FR-014**: Rollup rows MUST be workspace-owned and subject to workspace isolation (scoped writes + row-level security), consistent with every other workspace-owned table; the maintenance job writes across workspaces using a system/elevated execution context rather than a single tenant's context.
@@ -124,7 +124,7 @@ Current-state tables (e.g. a match's current price, a competitor match's current
 
 - **FR-015**: The retention job MUST reclaim expired data by dropping whole expired monthly partitions and MUST NOT issue bulk row deletes on these tables.
 - **FR-016**: For any table whose raw rows feed the daily rollups, the retention job MUST verify that the rollups covering a partition's date range are complete before dropping that partition; if coverage is missing or incomplete, the partition MUST be retained and the skip recorded.
-- **FR-017**: The retention job MUST apply each table's own retention window (observations 90 days, attempts 90 days, alert events 1 year, webhook events 90 days, daily rollups 2 years) and MUST leave any partition still within its window in place.
+- **FR-017**: The retention job MUST apply each table's own retention window (the canonical values defined in FR-001) and MUST leave any partition still within its window in place.
 - **FR-018**: The retention cutoff MUST be applied deterministically at partition granularity: a partition is eligible for drop only when its entire date range is older than the table's retention cutoff.
 - **FR-019**: For tables with no rollup dependency, the retention job MUST drop expired partitions by age alone (no rollup check), using that table's retention window.
 - **FR-020**: Retention MUST be idempotent and safe to re-run and to run concurrently: an already-dropped partition is not an error, and a partition is never dropped twice.
@@ -137,7 +137,7 @@ Current-state tables (e.g. a match's current price, a competitor match's current
 **Operability**
 
 - **FR-023**: Each maintenance job MUST record what it did (partitions created, rollups written, partitions dropped or skipped-pending-rollups, tables skipped as absent) for operator observability.
-- **FR-024**: Optional vacuum/analyze housekeeping on partitions MUST NOT be able to block or fail the core create / rollup / drop guarantees.
+- **FR-024**: This is a *non-blocking constraint*, not a build item: any optional vacuum/analyze housekeeping on partitions MUST NOT be able to block or fail the core create / rollup / drop guarantees. Active vacuum/analyze scheduling is **out of scope for v1** — retention-by-partition-drop deliberately avoids the vacuum storms that would necessitate it (doc §29 lists it as "if needed"), so v1 satisfies this requirement vacuously by not running such housekeeping on the critical path. If added later it must remain isolated from the three core jobs.
 - **FR-025**: All timestamps used for partition bounds, retention cutoffs, and rollup dates MUST be timezone-aware (TIMESTAMPTZ semantics), computed consistently in UTC.
 
 ### Key Entities *(include if feature involves data)*

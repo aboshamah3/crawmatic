@@ -324,7 +324,9 @@ tolerated. (quickstart US4)
 - [ ] T033 [US4] Wire the tolerance check into the retention task in
   `apps/workers/app/workers/tasks_maintenance.py`: after `run_retention`, best-effort call
   `count_tolerated_dangling_refs(session)` and add `dangling_soft_refs_tolerated` to the run-report log
-  line, wrapped so it can NEVER block or fail the core create/rollup/drop guarantees (FR-024). (FR-022/024)
+  line, wrapped so it can NEVER block or fail the core create/rollup/drop guarantees — applying FR-024's
+  non-blocking principle to this optional check (FR-024 itself builds no vacuum/analyze; out of v1 scope
+  per spec). (FR-022)
 - [ ] T034 [P] [US4] Live integration test `tests/integration/test_soft_ref_tolerance_live.py` (`skipif`
   probe): a `match_current_prices` row whose `observation_id` points into an already-dropped partition
   still loads and returns correct denormalized data with no error/500/row-drop (US4 AS-1); an explicit

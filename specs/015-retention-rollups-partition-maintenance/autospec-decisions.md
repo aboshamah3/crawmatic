@@ -31,3 +31,14 @@ Two codebase-grounded corrections to the spec's assumptions, both self-resolved 
 - [plan] Correction: partition CREATE/DROP is runtime DDL (CREATE/DROP TABLE ... PARTITION OF issued by the job), NOT alembic migrations — matches §29 runtime-maintenance framing and the repo's zero-runtime-partition-management starting point. Alembic used only for the one new durable table (source: doc §29 + codebase partition patterns).
 
 Plan Constitution Check: PASS with 2 documented deviations — (1) maintenance tasks use BYPASSRLS system session for inherently cross-tenant scans, app-level workspace scoping preserved on every write (identical to sanctioned SPEC-13 refresh-pass seam); (2) one bounded DELETE WHERE date<cutoff on the NON-partitioned rollup table for its 2-year age policy (it has no partition to drop; SC-003's "0% bulk DELETE" targets raw append-heavy partitions, which this table is not).
+
+## analyze
+
+Report: 0 CRITICAL, 0 HIGH, 1 MEDIUM, 3 LOW. No constitution MUST violations; 26/26 FR mapped (100%). Remediations applied by orchestrator (analyze is read-only):
+
+- [analyze] C1 (MEDIUM): FR-024 "vacuum/analyze non-blocking" had no implementing task (T033 embodied only the non-blocking principle for the soft-ref check). → Fixed: reworded FR-024 as a non-blocking *constraint*, explicitly marking active vacuum/analyze scheduling OUT OF v1 SCOPE (vacuously satisfied — retention-by-drop avoids vacuum storms; §29 lists it "if needed"); corrected T033 citation to reference FR-022 + FR-024's principle, not FR-024 implementation.
+- [analyze] I1 (LOW): terminology drift min/avg/max (spec) vs cheapest_/average_/highest_competitor_price (data-model columns). → Fixed: added the mapping inline in FR-011.
+- [analyze] D1 (LOW): retention windows restated verbatim in FR-001/FR-017/SC-005 (drift risk). → Fixed: FR-017 now references FR-001 as canonical (FR-001 + SC-005 keep the values; code single-sources them as Settings knobs per T001).
+- [analyze] U1 (LOW): T036 docker-compose scheduler→redis depends_on has no backing FR. → Accepted as-is (legitimate plan-derived operability fix; no action).
+
+Re-run not required: only MEDIUM/LOW remediated (no CRITICAL/HIGH); edits are scope/citation/terminology clarifications that introduce no new coverage gaps.
