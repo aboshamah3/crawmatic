@@ -40,6 +40,15 @@ fire-and-forget enqueues ``MAINTENANCE_DAILY_ROLLUP`` on the
 ``maintenance`` queue — same fixed-cadence shape as the partition-create
 accumulator above (no arguments; the task itself defaults to yesterday
 UTC).
+
+SPEC-15 US3 (contracts/retention-drop.md) adds a **fifth, independent**
+interval accumulator driven by ``RETENTION_INTERVAL_SECONDS`` that
+fire-and-forget enqueues ``MAINTENANCE_RETENTION_DROP`` on the
+``maintenance`` queue — same fixed-cadence shape as the
+partition-create/daily-rollup accumulators above (no arguments; the
+task re-checks partition-drop eligibility + rollup coverage on every
+pass, so a not-yet-verified partition is simply retained until a later
+run, self-healing).
 """
 
 from __future__ import annotations
@@ -56,6 +65,7 @@ from app_shared.messaging import enqueue
 from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RETENTION_DROP,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_STATS_FLUSH,
 )
@@ -139,6 +149,23 @@ def _enqueue_daily_rollup() -> None:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_DAILY_ROLLUP)
 
 
+def _enqueue_retention_drop() -> None:
+    """Fire-and-forget `MAINTENANCE_RETENTION_DROP` on the `maintenance`
+    queue (SPEC-15 US3, contracts/retention-drop.md) -- drops whole
+    expired partitions (verify-before-drop for `price_observations`) and
+    ages the non-partitioned rollup table. Errors are logged and
+    swallowed for the same reason
+    `_enqueue_light_recheck`/`_enqueue_stats_flush`/
+    `_enqueue_partition_create`/`_enqueue_daily_rollup` swallow them: a
+    missed tick just means retention is retried on the next interval,
+    never a crashed scheduler process.
+    """
+    try:
+        enqueue(MAINTENANCE_RETENTION_DROP, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_RETENTION_DROP)
+
+
 def _run_refresh_pass_tick(batch_limit: int) -> None:
     """Run one SPEC-13 refresh pass (`app.scheduler.refresh.run_refresh_pass`)
     on the BYPASSRLS system sessionmaker, claiming/firing up to
@@ -171,25 +198,30 @@ def main() -> None:
     refresh_batch_limit = settings.SCHEDULER_CLAIM_BATCH_LIMIT
     partition_create_interval = settings.PARTITION_CREATE_INTERVAL_SECONDS
     daily_rollup_interval = settings.DAILY_ROLLUP_INTERVAL_SECONDS
+    retention_interval = settings.RETENTION_INTERVAL_SECONDS
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush every %ss; "
-        "refresh pass every %ss; partition_create every %ss; daily_rollup every %ss)",
+        "refresh pass every %ss; partition_create every %ss; daily_rollup every %ss; "
+        "retention_drop every %ss)",
         interval,
         refresh_interval,
         partition_create_interval,
         daily_rollup_interval,
+        retention_interval,
     )
     elapsed = 0.0
     refresh_elapsed = 0.0
     partition_create_elapsed = 0.0
     daily_rollup_elapsed = 0.0
+    retention_elapsed = 0.0
     while not _shutdown_requested:
         time.sleep(_TICK_SECONDS)
         elapsed += _TICK_SECONDS
         refresh_elapsed += _TICK_SECONDS
         partition_create_elapsed += _TICK_SECONDS
         daily_rollup_elapsed += _TICK_SECONDS
+        retention_elapsed += _TICK_SECONDS
         if elapsed >= interval:
             elapsed = 0.0
             _enqueue_light_recheck()
@@ -203,6 +235,9 @@ def main() -> None:
         if daily_rollup_elapsed >= daily_rollup_interval:
             daily_rollup_elapsed = 0.0
             _enqueue_daily_rollup()
+        if retention_elapsed >= retention_interval:
+            retention_elapsed = 0.0
+            _enqueue_retention_drop()
 
     logger.info("scheduler stopped")
 

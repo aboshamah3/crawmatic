@@ -6,8 +6,13 @@ registered table (`app_shared.maintenance.registry.PARTITIONED_TABLES`),
 self-healing and idempotent, so the calendar never causes a write outage
 (SC-001). US2 (contracts/daily-rollup.md): ``daily_rollup`` upserts one
 ``variant_price_daily_rollups`` row per (workspace, variant, day) that
-had observations that day. US3's ``retention_drop`` task lands in a
-later phase of this same module.
+had observations that day. US3 (contracts/retention-drop.md):
+``retention_drop`` drops whole expired monthly partitions via
+``DROP TABLE`` — never bulk ``DELETE`` on a raw table — verifying daily-
+rollup coverage first for ``price_observations`` (the only
+``feeds_rollups`` table), and ages the small, non-partitioned
+``variant_price_daily_rollups`` table via the one sanctioned bulk
+``DELETE`` (R7).
 
 All three maintenance tasks run on the BYPASSRLS system session
 (`app_shared.database.get_system_session`) — the sanctioned SPEC-13
@@ -15,11 +20,13 @@ cross-tenant seam (research R9): partition ``CREATE``/``DROP`` DDL and
 the rollup/retention cross-tenant source scans need an elevated role
 under `FORCE ROW LEVEL SECURITY`. App-level workspace scoping is
 preserved wherever a workspace-owned row is actually read/written —
-`create_missing_partitions` touches no workspace rows (only DDL +
-catalog reads); `run_daily_rollup` carries an explicit ``workspace_id=``
-on every rollup read/write (its one cross-tenant scan, the driver query,
-is annotated ``# noqa: workspace-scope`` at its source in
-``app_shared.maintenance.rollups``).
+`create_missing_partitions`/`run_retention` touch no workspace rows
+(only DDL + catalog/coverage reads, plus the rollup table's age
+``DELETE`` which is deliberately unscoped — it ages every workspace's
+rollups past the same cutoff, R7); `run_daily_rollup` carries an
+explicit ``workspace_id=`` on every rollup read/write (its one
+cross-tenant scan, the driver query, is annotated ``# noqa:
+workspace-scope`` at its source in ``app_shared.maintenance.rollups``).
 """
 
 from __future__ import annotations
@@ -31,8 +38,13 @@ from app.workers.celery_app import app
 from app_shared.config import get_settings
 from app_shared.database import get_system_session
 from app_shared.maintenance.partitions import create_missing_partitions
+from app_shared.maintenance.retention import run_retention
 from app_shared.maintenance.rollups import run_daily_rollup
-from app_shared.task_names import MAINTENANCE_DAILY_ROLLUP, MAINTENANCE_PARTITION_CREATE
+from app_shared.task_names import (
+    MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RETENTION_DROP,
+)
 
 logger = logging.getLogger("workers.maintenance")
 
@@ -87,4 +99,35 @@ def daily_rollup(target_date: str | None = None) -> None:
         "maintenance_daily_rollup rollups_upserted=%s variants_skipped_no_state=%s",
         report.rollups_upserted,
         report.variants_skipped_no_state,
+    )
+
+
+@app.task(name=MAINTENANCE_RETENTION_DROP)
+def retention_drop() -> None:
+    """`MAINTENANCE_RETENTION_DROP` (`maintenance` queue,
+    contracts/retention-drop.md, FR-015/016/017/018/019/020).
+
+    Opens a BYPASSRLS system session, calls `run_retention` for the
+    current time, commits, and emits one structured run-report log line
+    (FR-023) — `tables_skipped_absent` (e.g. `webhook_events` until
+    SPEC-16, FR-002), `partitions_dropped` (whole expired partitions
+    reclaimed via `DROP TABLE`, never bulk `DELETE` on a raw table,
+    FR-015), `partitions_skipped_pending_rollups` (an expired
+    `price_observations` partition retained because its daily-rollup
+    coverage is incomplete, FR-016), and `rollup_rows_deleted` (the one
+    sanctioned bulk `DELETE` aging the non-partitioned
+    `variant_price_daily_rollups` table, R7). The
+    `dangling_soft_refs_tolerated` field is wired in by US4/T033.
+    """
+    with get_system_session() as session:
+        report = run_retention(session, now_utc=datetime.now(timezone.utc))
+        session.commit()
+
+    logger.info(
+        "maintenance_retention_drop tables_skipped_absent=%s partitions_dropped=%s "
+        "partitions_skipped_pending_rollups=%s rollup_rows_deleted=%s",
+        report.tables_skipped_absent,
+        report.partitions_dropped,
+        report.partitions_skipped_pending_rollups,
+        report.rollup_rows_deleted,
     )

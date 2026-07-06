@@ -252,11 +252,11 @@ untouched, and `request_attempts`/`price_alert_events` drop by age alone with th
 
 ### Implementation for User Story 3
 
-- [ ] T024 [US3] Add `drop_partition(session, name)` to
+- [X] T024 [US3] Add `drop_partition(session, name)` to
   `libs/shared/app_shared/maintenance/partitions.py` — `DROP TABLE IF EXISTS {name}` (partition-drop,
   never bulk DELETE — FR-015; idempotent/concurrent-safe via `IF EXISTS` — FR-020). No workspace rows;
   DDL on the system session. (FR-015/020; contract retention-drop.md)
-- [ ] T025 [US3] Implement retention logic in `libs/shared/app_shared/maintenance/retention.py` (contract
+- [X] T025 [US3] Implement retention logic in `libs/shared/app_shared/maintenance/retention.py` (contract
   retention-drop.md, research R7): `partition_eligible(part, cutoff) -> bool` (whole half-open range
   `end <= cutoff`, deterministic — FR-018); `rollups_cover(session, part) -> bool` — the date-level
   verify-before-drop `SELECT DISTINCT scraped_at::date FROM {part.name} EXCEPT SELECT DISTINCT date FROM
@@ -269,21 +269,21 @@ untouched, and `request_attempts`/`price_alert_events` drop by age alone with th
   `DELETE FROM variant_price_daily_rollups WHERE date < (now_utc::date -
   RETENTION_VARIANT_PRICE_DAILY_ROLLUPS_DAYS)` (age policy for the non-partitioned rollup table, R7).
   Return the RunReport. (FR-015/016/017/018/019/020; SC-003/004/005)
-- [ ] T026 [US3] Add the `@app.task(name=MAINTENANCE_RETENTION_DROP)` wrapper to
+- [X] T026 [US3] Add the `@app.task(name=MAINTENANCE_RETENTION_DROP)` wrapper to
   `apps/workers/app/workers/tasks_maintenance.py` — opens `get_system_session()`, calls
   `run_retention(session, now_utc=utcnow())`, commits, emits the structured run-report log line (the
   `dangling_soft_refs_tolerated` field is wired in by US4/T033). (research R8/R9; FR-023)
-- [ ] T027 [US3] Add `MAINTENANCE_RETENTION_DROP` to the `task_routes` mapping → `maintenance` queue in
+- [X] T027 [US3] Add `MAINTENANCE_RETENTION_DROP` to the `task_routes` mapping → `maintenance` queue in
   `apps/workers/app/workers/celery_app.py` (extends T010/T019). (research R8)
-- [ ] T028 [US3] Add a `RETENTION_INTERVAL_SECONDS` interval accumulator to
+- [X] T028 [US3] Add a `RETENTION_INTERVAL_SECONDS` interval accumulator to
   `apps/scheduler/app/scheduler/scheduler_app.py` that enqueues `MAINTENANCE_RETENTION_DROP`
   fire-and-forget (mirrors T011/T020). Preserve existing accumulators. (research R8)
-- [ ] T029 [P] [US3] Unit test `tests/unit/test_retention_eligibility.py`: `partition_eligible` true only
+- [X] T029 [P] [US3] Unit test `tests/unit/test_retention_eligibility.py`: `partition_eligible` true only
   when the whole half-open range is `<= cutoff` (boundary partition deterministic — FR-018), per-table
   window resolution (obs/attempts 90, alerts 365, rollups 730 — FR-017), and that `feeds_rollups=False`
   entries skip the coverage check (FR-019). Assert the `rollups_cover` EXCEPT query shape without a live
   DB. (FR-017/018/019)
-- [ ] T030 [P] [US3] Live integration test `tests/integration/test_retention_drop_live.py` (`skipif`
+- [X] T030 [P] [US3] Live integration test `tests/integration/test_retention_drop_live.py` (`skipif`
   probe): an expired `price_observations` partition with complete date coverage is dropped via
   `DROP TABLE` (assert no bulk DELETE issued on raw tables — SC-003); one with missing coverage is
   **retained** + reported `skipped_pending_rollups` (SC-004); an in-window partition is untouched;

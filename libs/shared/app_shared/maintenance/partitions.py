@@ -21,9 +21,11 @@ name/suffix helpers every partition operation keys off of:
   contracts/partition-creation.md) — the current + next-month
   self-healing, idempotent ``CREATE TABLE ... PARTITION OF`` runtime DDL.
 
-Partition ``DROP`` lives in US3 (``drop_partition``, T024, not yet
-implemented in this phase). Scraping-free (Constitution I/V) —
-SQLAlchemy + stdlib only.
+:func:`drop_partition` (US3, T024, contracts/retention-drop.md) issues
+the partition-drop DDL retention relies on — ``DROP TABLE IF EXISTS``,
+never a bulk ``DELETE`` on a raw partition (FR-015), idempotent against
+an already-dropped partition (FR-020). Scraping-free (Constitution I/V)
+— SQLAlchemy + stdlib only.
 """
 
 from __future__ import annotations
@@ -247,3 +249,31 @@ def create_missing_partitions(
             report.partitions_created.append(child_name)
 
     return report
+
+
+def _drop_partition_stmt(name: str):
+    """Build the (unexecuted) idempotent partition-drop DDL statement.
+
+    Split out from :func:`drop_partition` so its rendered SQL can be
+    asserted in a pure unit test without a live DB or session (mirrors
+    :func:`_create_partition_stmt`/:func:`_to_regclass_stmt`). ``name``
+    is always a catalog-discovered or code-constructed partition name
+    (:func:`partition_name`/:func:`existing_partitions`) — never user
+    input — rendered directly into the statement exactly like the
+    migration-time ``op.execute`` convention (research R2).
+    """
+    return text(f"DROP TABLE IF EXISTS {name}")
+
+
+def drop_partition(session: Session, name: str) -> None:
+    """Drop partition ``name`` via ``DROP TABLE IF EXISTS`` (contracts/
+    retention-drop.md, FR-015/020).
+
+    Partition-drop only — this is the ONLY way a raw partition's rows
+    are ever reclaimed by retention; never a bulk ``DELETE`` on a raw
+    table (FR-015, SC-003). ``IF EXISTS`` makes dropping an
+    already-absent partition (e.g. a concurrent/re-run retention pass) a
+    no-op rather than an error (FR-020). No workspace-owned rows are
+    touched — this is DDL on the system session, not a data query.
+    """
+    session.execute(_drop_partition_stmt(name))

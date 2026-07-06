@@ -35,6 +35,7 @@ from app_shared.database import dispose_engine
 from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RETENTION_DROP,
     PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
@@ -91,6 +92,13 @@ app = Celery(
 # also a `maintenance` task — aggregates that day's `price_observations`
 # into `variant_price_daily_rollups` on the BYPASSRLS system session, no
 # blocking fetch.
+#
+# `MAINTENANCE_RETENTION_DROP` (SPEC-15 US3, contracts/retention-drop.md)
+# is also a `maintenance` task — drops whole expired monthly partitions
+# (never bulk DELETE on a raw table) after verifying daily-rollup
+# coverage for `price_observations`, plus the one sanctioned bulk DELETE
+# aging `variant_price_daily_rollups`, on the BYPASSRLS system session,
+# no blocking fetch.
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
@@ -108,6 +116,7 @@ app.conf.task_routes = {
     STRATEGY_PATTERN_BACKFILL: {"queue": "maintenance"},
     MAINTENANCE_PARTITION_CREATE: {"queue": "maintenance"},
     MAINTENANCE_DAILY_ROLLUP: {"queue": "maintenance"},
+    MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
 }
 
 
