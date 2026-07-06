@@ -115,7 +115,7 @@ page renders its price only after JS (with `wait_for_selector`); assert exactly 
 (valid Decimal), one `MatchCurrentPrice`, one `RequestAttempt` (`access_method=PLAYWRIGHT_PROXY`), and
 one `PRICE_ANALYSIS_RECOMPUTE` enqueued (quickstart scenarios 5–7).
 
-- [ ] T013 [US1] Create `libs/scrape-core/scrape_core/browser/page.py` with
+- [X] T013 [US1] Create `libs/scrape-core/scrape_core/browser/page.py` with
   `effective_timeout(target, settings)` (= `target.browser_timeout_ms` if set else
   `Settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS`, R10) and `build_page_methods(target)` returning the
   ordered `scrapy_playwright.page.PageMethod` list — for US1 the profile `wait_for_selector` (if set) as
@@ -125,7 +125,7 @@ one `PRICE_ANALYSIS_RECOMPUTE` enqueued (quickstart scenarios 5–7).
   default explicitly — append a `wait_for_load_state("networkidle")` PageMethod (bounded by the effective
   timeout) rather than relying solely on the goto load event — so extraction always runs against a
   settled rendered DOM.
-- [ ] T014 [US1] Complete `apps/scrapers-browser/price_monitor_browser/settings.py` for shared-runtime
+- [X] T014 [US1] Complete `apps/scrapers-browser/price_monitor_browser/settings.py` for shared-runtime
   parity (R9): `ITEM_PIPELINES = {BatchedPersistencePipeline: 300}`; keep the scrapy-playwright
   `DOWNLOAD_HANDLERS` + `AsyncioSelectorReactor`; set `PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT`,
   `CONCURRENT_REQUESTS = BROWSER_CONCURRENT_REQUESTS`, `PLAYWRIGHT_MAX_CONTEXTS = BROWSER_MAX_CONTEXTS`,
@@ -135,7 +135,7 @@ one `PRICE_ANALYSIS_RECOMPUTE` enqueued (quickstart scenarios 5–7).
   are added in T030/T031 — a **required MVP safety gate** per Constitution §VI, NON-NEGOTIABLE; the
   browser path MUST NOT be dispatched in production until T030/T031 land, even though they are
   authored in the US4 phase.)
-- [ ] T015 [US1] Create `apps/scrapers-browser/price_monitor_browser/spiders/generic_browser_price_spider.py`
+- [X] T015 [US1] Create `apps/scrapers-browser/price_monitor_browser/spiders/generic_browser_price_spider.py`
   → `GenericBrowserPriceSpider(scrapy.Spider)`, `name = "generic_browser_price_spider"`. Accept the same
   args as the HTTP spider (`workspace_id`, `scrape_job_id`, `match_ids`, `mode`) via shared
   `_parse_match_ids` (FR-002). Implement async `start()`: `run_in_thread(load_targets, ...)` off-reactor,
@@ -144,31 +144,31 @@ one `PRICE_ANALYSIS_RECOMPUTE` enqueued (quickstart scenarios 5–7).
   admission + in-flight match lock (`acquire_lock(mode=PLAYWRIGHT_PROXY)`,
   `MATCH_LOCK_BROWSER_TTL_SECONDS`; held → `SKIPPED`/`LOCKED_ALREADY_RUNNING`), then `yield` **one**
   Playwright request (R4 — no `_dispatch` retry loop) (browser-spider.md `start()`).
-- [ ] T016 [US1] In the same spider, implement `_browser_request_for(target, plan, perm, lock)` building
+- [X] T016 [US1] In the same spider, implement `_browser_request_for(target, plan, perm, lock)` building
   the Playwright `scrapy.Request`: `meta["playwright"]=True`, `meta["playwright_include_page"]=False`
   (handler auto-closes the page — no leak), `meta["playwright_page_methods"]=build_page_methods(target)`,
   the shared meta keys (`match_id`/`robots_policy`/`access_method=PLAYWRIGHT_PROXY`/`attempt_number=1`/
   proxy-audit/`match_lock_*`/`semaphore_*` stamped exactly as HTTP), goto bounded by the effective
   timeout, `callback=self.parse`, `errback=self.errback`, `dont_filter=True`. **Direct/default context
   only** in US1 (proxied context branch is added in US4/T025).
-- [ ] T017 [US1] Implement async `parse(response)` (browser-spider.md): release the concurrency slot
+- [X] T017 [US1] Implement async `parse(response)` (browser-spider.md): release the concurrency slot
   (shared), `_attempt_kwargs_from_meta(response.meta)`, `classify_http_status(response.status)` →
   failed result; else reuse `extract(response.text, ...)` on the **rendered** DOM (`None` →
   `PRICE_NOT_FOUND`) then `validate_candidate(...)` (`Rejected` → its code; `Accepted` → success). Every
   yield via `build_scrape_result(..., access_method=PLAYWRIGHT_PROXY)` so the reused pipeline persists +
   terminalizes the target + enqueues one `price_analysis` per variant (FR-006, R11) — no
   alert/variant-state/webhook here.
-- [ ] T018 [US1] Implement async `errback(failure)` for the single-attempt, no-retry path (R4): release
+- [X] T018 [US1] Implement async `errback(failure)` for the single-attempt, no-retry path (R4): release
   the slot, compute `error_code` via a `classify_browser_failure(failure, hostname)` helper — for US1
   wire `classify_playwright_exception` (`TimeoutError`→`TIMEOUT`, else `PLAYWRIGHT_FAILED`); yield one
   failed `build_scrape_result(success=False, error_code=...)` and **stop** (no next attempt). (SSRF/
   robots `BLOCKED` and variant `VARIANT_NOT_FOUND`/`SELECTOR_BROKEN` branches are completed in US3/US4.)
-- [ ] T019 [P] [US1] Live test `tests/integration/test_browser_spider_render_live.py` (`skipif`
+- [X] T019 [P] [US1] Live test `tests/integration/test_browser_spider_render_live.py` (`skipif`
   Chromium+DB): JS-injected-price fixture + `wait_for_selector` → assert one valid-Decimal
   `PriceObservation`, one `MatchCurrentPrice`, one `RequestAttempt` (`PLAYWRIGHT_PROXY`), one
   `PRICE_ANALYSIS_RECOMPUTE` (SC-001, US1 AS1/AS3); a static-server-HTML-price fixture still extracts
   (US1 AS4).
-- [ ] T020 [P] [US1] Live test `tests/integration/test_browser_spider_timeout_live.py` (`skipif`):
+- [X] T020 [P] [US1] Live test `tests/integration/test_browser_spider_timeout_live.py` (`skipif`):
   `wait_for_selector` never appears within a small `browser_timeout_ms` → exactly one **failed**
   `RequestAttempt` `error_code=TIMEOUT`, no priced observation, bounded (no hang), page/context released
   (US1 AS2, edge cases).
