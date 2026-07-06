@@ -16,13 +16,33 @@ extraction + validation and yields a
 The spider stops at persistence: it never computes alerts, variant
 price states, or a ``price_analysis`` task (FR-020).
 
-The profile-resolution helpers below duplicate (rather than import) the
-**bounded-load** shape of ``apps/api/app/services/profile_resolution.py``
-because ``apps/scrapers`` may depend on ``libs/scrape-core`` +
-``libs/shared/app_shared`` only (never on another ``apps/*`` member,
-`plan.md` "apps -> libs only") — but they read/write the *exact same*
-Redis cache key (``app_shared.profiles.resolution.resolution_cache_key``)
-that orchestrator populates, so a warm cache is genuinely reused, not
+SPEC-14 (`contracts/shared-extraction.md`, Constitution Principle I): the
+transport-agnostic machinery this module used to define directly --
+``SpiderTarget``, ``load_targets``, ``_prepare_dispatch``, the Redis
+resolution-cache helpers, ``_parse_match_ids``/``_parse_host_port``/
+``_attempt_kwargs_from_meta``/``_elapsed_ms``/``_RequeueState``, and the
+admission machinery (``_acquire_fetch_permission``/
+``_overflow_to_dispatch``/the reusable part of ``_dispatch``) -- now
+lives in :mod:`scrape_core.targets`, imported here (and re-exported at
+this module's top level so every existing call site, including this
+module's own test suite, keeps working unchanged) so the browser spider
+(``apps/scrapers-browser``) can share the identical machinery without
+importing this ``apps/scrapers`` module (an ``apps -> apps`` import is
+forbidden). This module now keeps only what is genuinely
+HTTP-transport-specific: ``_request_for`` (the Scrapy request builder,
+including the ``Proxy-Authorization`` header), and the multi-attempt
+``parse``/``errback``/``_dispatch`` ladder -- the latter now thin
+wrappers over the shared admission functions. **Behavior preserved** --
+guarded by this module's existing unit + integration suite.
+
+The profile-resolution helpers this module's `load_targets` reuses
+duplicate (rather than import) the **bounded-load** shape of
+``apps/api/app/services/profile_resolution.py`` because ``apps/scrapers``
+(via ``libs/scrape-core``) may depend on ``libs/shared/app_shared`` only
+(never on another ``apps/*`` member, `plan.md` "apps -> libs only") --
+but they read/write the *exact same* Redis cache key
+(``app_shared.profiles.resolution.resolution_cache_key``) that
+orchestrator populates, so a warm cache is genuinely reused, not
 re-derived under a different key.
 
 SPEC-10 US2 (`contracts/spider-integration.md`) extends this same
@@ -40,14 +60,14 @@ request-side seam, duplicating the analogous bounded-load shape for
   (never inside ``_request_for``, never logged) so the reactor-thread
   request-building code only ever touches an already-decrypted string.
 * Before every dispatch (initial in ``start()`` or a retry in
-  ``errback``), :func:`_prepare_dispatch` runs the pure
-  ``app_shared.access.engine.next_attempt``/``assign_proxy`` decision
-  plus the Redis ceiling/cooldown/budget checks (``app_shared.access.
-  budget``) **off-reactor** via :func:`scrape_core.db.run_in_thread` —
-  never synchronously on the reactor thread. A not-allowed decision
-  short-circuits to a terminal :class:`~scrape_core.items.ScrapeResult`
-  (``RATE_LIMITED``/``PROXY_FAILED``/``LIMIT_REACHED``) instead of
-  dispatching a request.
+  ``errback``), :func:`~scrape_core.targets._prepare_dispatch` runs the
+  pure ``app_shared.access.engine.next_attempt``/``assign_proxy``
+  decision plus the Redis ceiling/cooldown/budget checks
+  (``app_shared.access.budget``) **off-reactor** via
+  :func:`scrape_core.db.run_in_thread` — never synchronously on the
+  reactor thread. A not-allowed decision short-circuits to a terminal
+  :class:`~scrape_core.items.ScrapeResult` (``RATE_LIMITED``/
+  ``PROXY_FAILED``/``LIMIT_REACHED``) instead of dispatching a request.
 * ``errback`` is ``async def`` so it can ``await run_in_thread(...)`` for
   the same off-reactor precheck before yielding a retry ``scrapy.Request``
   — Scrapy 2.x + the project's ``AsyncioSelectorReactor`` support
@@ -70,785 +90,72 @@ single terminal row (FR-012/013/015, SC-002).
 from __future__ import annotations
 
 import base64
-import json
 import logging
-import random
-import secrets
 import time
 import uuid
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
 import scrapy
 from scrapy.http import Response
-from sqlalchemy import select
 
-from app_shared.access.budget import check_domain_cooldown, check_rate_ceilings, incr_and_check_monthly_budget
-from app_shared.access.engine import STOP, AttemptPlan, ProxyAssignment, assign_proxy, next_attempt
-from app_shared.access.repository import (
-    GLOBAL_DEFAULT_POLICY_NAME,
-    WORKSPACE_DEFAULT_POLICY_NAME,
-    visible_policies_select,
-    visible_providers_select,
-)
-from app_shared.access.resolution import (
-    ResolutionResult as AccessResolutionResult,
-    ResolvedPolicy as AccessResolvedPolicy,
-    access_resolution_cache_key,
-    decode_result as decode_access_result,
-    encode_result as encode_access_result,
-    resolve_effective_policy,
-    select_domain_rule,
-)
-from app_shared.enums import (
-    AccessMethod,
-    ProxyProviderStatus,
-    ProxyType,
-    RobotsPolicy,
-    ScrapeErrorCode,
-    ScrapeTargetStatus,
-)
-from app_shared.jobs.targets import mark_target
-from app_shared.limiter.limits import resolve_limits
-from app_shared.messaging import enqueue
-from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
-from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
-from app_shared.models.identity import Workspace
-from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.access.engine import AttemptPlan, ProxyAssignment
+from app_shared.enums import AccessMethod
+from app_shared.models.access import ProxyProvider
 from app_shared.profiles.confidence import resolve_confidence_rules
-from app_shared.profiles.repository import GLOBAL_DEFAULT_PROFILE_NAME, profile_visibility_map
-from app_shared.profiles.resolution import (
-    ResolutionResult,
-    ResolvedProfile,
-    apply_match_override,
-    decode_group_result,
-    encode_group_result,
-    group_matches,
-    resolution_cache_key,
-    resolve_group,
-)
 from app_shared.redis_client import get_redis_client
-from app_shared.repository import scoped_select
-from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
-from app_shared.strategy.resolution import (
-    StrategyStart,
-    resolve_or_create_strategy_profile,
-    resolve_strategy_start,
-)
-from app_shared.task_names import SCRAPE_DISPATCH_JOB
-from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 
-from scrape_core.db import run_in_thread, workspace_txn
+from scrape_core.db import run_in_thread
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
-from scrape_core.observability import log_event
-from scrape_core.reactor import deferred_delay
+from scrape_core.limiter import LockGrant, Permission, release_slot
+from scrape_core.result_builder import build_scrape_result
+from scrape_core.targets import (
+    AdmissionContext,
+    VisibleProviders,
+    _attempt_kwargs_from_meta,
+    _DispatchDecision,
+    _LoadedTargets,
+    _mark_target_deferred_rate_limited,
+    _parse_host_port,
+    _parse_match_ids,
+    _prepare_dispatch,
+    _RequeueState,
+    SpiderTarget,
+    acquire_fetch_permission,
+    dispatch_admission,
+    load_targets,
+    overflow_to_dispatch,
+)
 from scrape_core.validation import Accepted, Rejected, validate_candidate
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODE = "HTTP"
 
-#: `{provider_id: (status, type, country)}` -- the shape `assign_proxy` expects.
-VisibleProviders = dict[uuid.UUID, tuple[ProxyProviderStatus, ProxyType, str | None]]
-
-
-@dataclass(frozen=True)
-class SpiderTarget:
-    """One match bundled with its resolved scrape profile + access policy.
-
-    ``domain``/``access_policy``/``domain_rule`` default to empty/``None``
-    so existing hand-built targets (unit tests predating SPEC-10) keep
-    constructing without changes -- see `_request_for`'s matching
-    defaults.
-    """
-
-    match_id: uuid.UUID
-    product_id: uuid.UUID
-    product_variant_id: uuid.UUID
-    competitor_id: uuid.UUID
-    url: str
-    profile: ScrapeProfile | None
-    robots_policy: RobotsPolicy
-    domain: str = ""
-    access_policy: AccessPolicy | None = None
-    domain_rule: DomainAccessRule | None = None
-    # SPEC-12 US2 (contracts/consumption.md, D5/D6): this target's group's
-    # `domain_strategy_profiles` row id (always present post-T021 -- the
-    # get-or-create seam never leaves a group unresolved) and the learned
-    # `(access, extraction)` start `resolve_strategy_start` decided for it,
-    # `None` when the profile isn't eligible yet (the default ladder is
-    # used unchanged). Both default so existing hand-built targets (unit
-    # tests predating SPEC-12) keep constructing without changes.
-    domain_strategy_profile_id: uuid.UUID | None = None
-    strategy_start: StrategyStart | None = None
-
-
-@dataclass
-class _RequeueState:
-    """SPEC-11 US1 (`contracts/spider-integration.md`) per-target
-    in-spider rate-limit backoff bookkeeping — keyed by ``match_id`` on
-    the spider instance (mirrors ``_targets_by_match_id``), initialized
-    once per fresh target in ``start()`` and accumulated across every
-    denial this target's attempts hit (including across SPEC-10 retry
-    attempts, T013). SPEC-11 US3 (T027, `contracts/overflow-dispatch.md`)
-    checks this state on every denial: once ``requeue_count`` exceeds
-    ``REQUEUE_MAX_ATTEMPTS`` or ``cumulative_wait`` exceeds
-    ``REQUEUE_MAX_TOTAL_WAIT_SECONDS``, the target overflows back to
-    Celery instead of looping again.
-    """
-
-    requeue_count: int = 0
-    cumulative_wait: float = 0.0
-
-
-def _mark_target_deferred_rate_limited(
-    workspace_id: uuid.UUID,
-    scrape_job_id: uuid.UUID,
-    match_id: uuid.UUID,
-) -> None:
-    """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3): mark one
-    overflowed target ``DEFERRED`` + ``RATE_LIMITED`` in a single
-    off-reactor ``workspace_txn`` -- **Blocking** (DB round trip). Must
-    only ever be called inside :func:`scrape_core.db.run_in_thread`,
-    never on the reactor thread. Reuses the single ``mark_target``
-    writer (T026) -- no new persistence path.
-    """
-    with workspace_txn(workspace_id) as session:
-        mark_target(
-            session,
-            workspace_id=workspace_id,
-            scrape_job_id=scrape_job_id,
-            match_id=match_id,
-            status=ScrapeTargetStatus.DEFERRED,
-            error_code=ScrapeErrorCode.RATE_LIMITED,
-        )
-
-
-# --- match_ids arg parsing (contracts/spider-args.md) -----------------------
-
-
-def _parse_match_ids(raw: Any) -> list[uuid.UUID]:
-    """Accept a comma-separated string or a JSON list of UUID strings."""
-    if raw is None:
-        return []
-    if isinstance(raw, (list, tuple)):
-        values = list(raw)
-    else:
-        text = str(raw).strip()
-        if not text:
-            return []
-        if text.startswith("["):
-            values = json.loads(text)
-        else:
-            values = [part.strip() for part in text.split(",") if part.strip()]
-    return [uuid.UUID(str(v)) for v in values]
-
-
-# --- Redis resolution-cache get/set (value codec shared via app_shared) -----
-#
-# The encode/decode codec itself (`encode_group_result`/`decode_group_result`)
-# lives in `app_shared.profiles.resolution` (SPEC-07 tasks.md T055) — shared
-# with `apps/api/app/services/profile_resolution.py`, the SPEC-06
-# orchestrator that populates this same cache, so the two can never
-# silently drift apart. This module only duplicates the **bounded-load**
-# shape (see module docstring) — never this codec.
-
-
-def _cache_get_group_result(redis: Any, cache_key: str) -> ResolutionResult | None:
-    """``None`` = cache miss or a Redis read error — fail-open, re-walk the chain."""
-    try:
-        cached = redis.get(cache_key)
-    except Exception:  # noqa: BLE001 - Redis must never be a hard dependency here
-        return None
-    if cached is None:
-        return None
-    if isinstance(cached, bytes):
-        cached = cached.decode("utf-8")
-    try:
-        return decode_group_result(cached)
-    except (ValueError, AttributeError):
-        return None
-
-
-def _cache_set_group_result(redis: Any, cache_key: str, result: ResolutionResult) -> None:
-    try:
-        from app_shared.config import get_settings
-
-        ttl_seconds = get_settings().PROFILE_RESOLUTION_CACHE_TTL_SECONDS
-        redis.set(cache_key, encode_group_result(result), ex=ttl_seconds)
-    except Exception:  # noqa: BLE001 - best-effort repopulate only
-        pass
-
-
-# --- Redis access-resolution-cache get/set (SPEC-10 US2, same duplication shape) --
-#
-# Reads/writes the exact same cache
-# `app_shared.access.resolution.access_resolution_cache_key` that
-# `apps/api/app/services/access_resolution.py` populates -- see module
-# docstring.
-
-
-def _cache_get_access_result(redis: Any, cache_key: str) -> AccessResolutionResult | None:
-    """``None`` = cache miss or a Redis read error — fail-open, re-walk the chain."""
-    try:
-        cached = redis.get(cache_key)
-    except Exception:  # noqa: BLE001 - Redis must never be a hard dependency here
-        return None
-    if cached is None:
-        return None
-    if isinstance(cached, bytes):
-        cached = cached.decode("utf-8")
-    try:
-        return decode_access_result(cached)
-    except (ValueError, AttributeError):
-        return None
-
-
-def _cache_set_access_result(redis: Any, cache_key: str, result: AccessResolutionResult) -> None:
-    try:
-        from app_shared.config import get_settings
-
-        ttl_seconds = get_settings().ACCESS_RESOLUTION_CACHE_TTL_SECONDS
-        redis.set(cache_key, encode_access_result(result), ex=ttl_seconds)
-    except Exception:  # noqa: BLE001 - best-effort repopulate only
-        pass
-
-
-@dataclass(frozen=True)
-class _LoadedTargets:
-    """The bounded-load result: targets plus the workspace-wide provider state
-    every target's `_prepare_dispatch` call needs (shared, not duplicated
-    per target -- see `load_targets` docstring)."""
-
-    targets: list[SpiderTarget]
-    visible_providers: VisibleProviders = field(default_factory=dict)
-    provider_rows: dict[uuid.UUID, ProxyProvider] = field(default_factory=dict)
-    provider_passwords: dict[uuid.UUID, str | None] = field(default_factory=dict)
-
-
-# --- bounded profile + access-policy resolution + target load (blocking) ---
-
-
-def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _LoadedTargets:
-    """Load the workspace-scoped matches + their resolved scrape profile + access policy.
-
-    **Blocking** — DB + Redis round trips. Must only ever be called
-    inside :func:`scrape_core.db.run_in_thread`, never on the reactor
-    thread. Bounded regardless of ``len(match_ids)`` (mirrors
-    ``apps/api/app/services/profile_resolution.resolve_profiles_for_matches``
-    and, for the SPEC-10 access-policy half,
-    ``apps/api/app/services/access_resolution.resolve_access_policies_for_matches``):
-    one query for matches, one for the workspace default profile, one
-    ``IN`` query for competitor defaults/domains/robots-policy, one for
-    the global default profile, one ``IN`` query for profile visibility,
-    one for the workspace+global default *access policies*, one ``IN``
-    query for enabled domain rules, one ``IN`` query for access-policy
-    visibility, one ``IN`` load of the resolved access-policy rows
-    themselves, and one load of every workspace-visible ``ProxyProvider``
-    — then one Redis-cached chain walk per distinct
-    ``(competitor_id, url_pattern)`` group (never per match) for each of
-    the two resolution chains.
-
-    Every visible provider's password is decrypted **once here**
-    (off-reactor) so `_prepare_dispatch`/`_request_for` (which may run
-    on the reactor thread) never call :func:`decrypt_secret` themselves
-    and the plaintext is never logged.
-
-    A ``match_id`` not found in ``workspace_id`` is simply absent from
-    the result (no cross-read, FR-002).
-    """
-    if not match_ids:
-        return _LoadedTargets(targets=[])
-
-    with workspace_txn(workspace_id) as session:
-        matches = (
-            session.execute(
-                scoped_select(CompetitorProductMatch, workspace_id).where(
-                    CompetitorProductMatch.id.in_(match_ids)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if not matches:
-            return _LoadedTargets(targets=[])
-
-        groups = group_matches(matches)
-        competitor_ids = {competitor_id for competitor_id, _url_pattern in groups}
-
-        workspace = session.get(Workspace, workspace_id)
-        workspace_default_id = workspace.default_scrape_profile_id if workspace else None
-
-        competitor_rows = (
-            session.execute(scoped_select(Competitor, workspace_id).where(Competitor.id.in_(competitor_ids)))
-            .scalars()
-            .all()
-        )
-        competitor_default_by_id = {row.id: row.default_scrape_profile_id for row in competitor_rows}
-        competitor_robots_policy_by_id = {row.id: row.robots_policy for row in competitor_rows}
-        competitor_domain_by_id = {row.id: row.domain for row in competitor_rows}
-
-        global_default_id = session.execute(
-            select(ScrapeProfile.id).where(
-                ScrapeProfile.workspace_id.is_(None),
-                ScrapeProfile.name == GLOBAL_DEFAULT_PROFILE_NAME,
-            )
-        ).scalar_one_or_none()
-
-        candidate_ids: set[uuid.UUID] = {
-            cid
-            for cid in (
-                workspace_default_id,
-                global_default_id,
-                *competitor_default_by_id.values(),
-                *(m.scrape_profile_id for m in matches),
-            )
-            if cid is not None
-        }
-        visibility = profile_visibility_map(session, workspace_id, candidate_ids) if candidate_ids else {}
-        visible_ids = set(visibility.keys())
-
-        redis = get_redis_client()
-        group_results: dict[tuple[uuid.UUID, str], ResolutionResult] = {}
-        for (competitor_id, url_pattern), _group in groups.items():
-            cache_key = resolution_cache_key(workspace_id, competitor_id, url_pattern)
-            cached_result = _cache_get_group_result(redis, cache_key)
-            if cached_result is not None:
-                group_results[(competitor_id, url_pattern)] = cached_result
-                continue
-            result = resolve_group(
-                competitor_default_id=competitor_default_by_id.get(competitor_id),
-                workspace_default_id=workspace_default_id,
-                global_default_id=global_default_id,
-                visible_ids=visible_ids,
-            )
-            _cache_set_group_result(redis, cache_key, result)
-            group_results[(competitor_id, url_pattern)] = result
-
-        resolved_profile_id_by_match: dict[uuid.UUID, uuid.UUID | None] = {}
-        for (competitor_id, url_pattern), group in groups.items():
-            group_result = group_results[(competitor_id, url_pattern)]
-            for match in group:
-                match_result = apply_match_override(group_result, match.scrape_profile_id, visible_ids)
-                resolved_profile_id_by_match[match.id] = (
-                    match_result.profile_id if isinstance(match_result, ResolvedProfile) else None
-                )
-
-        resolved_ids = {pid for pid in resolved_profile_id_by_match.values() if pid is not None}
-        profiles_by_id: dict[uuid.UUID, ScrapeProfile] = {}
-        if resolved_ids:
-            rows = session.execute(select(ScrapeProfile).where(ScrapeProfile.id.in_(resolved_ids))).scalars().all()
-            profiles_by_id = {row.id: row for row in rows}
-
-        # --- SPEC-10 US2: effective access-policy resolution -----------------
-        # Duplicates the bounded-load shape of
-        # `apps/api/app/services/access_resolution.py` (apps -> libs only) but
-        # reads/writes the exact same Redis cache key.
-
-        access_workspace_default_id, access_global_default_id = None, None
-        default_policy_rows = (
-            session.execute(
-                visible_policies_select(workspace_id).where(
-                    AccessPolicy.name.in_([WORKSPACE_DEFAULT_POLICY_NAME, GLOBAL_DEFAULT_POLICY_NAME])
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for row in default_policy_rows:
-            if row.workspace_id == workspace_id and row.name == WORKSPACE_DEFAULT_POLICY_NAME:
-                access_workspace_default_id = row.id
-            elif row.workspace_id is None and row.name == GLOBAL_DEFAULT_POLICY_NAME:
-                access_global_default_id = row.id
-
-        domain_rules = (
-            session.execute(
-                scoped_select(DomainAccessRule, workspace_id).where(
-                    DomainAccessRule.competitor_id.in_(competitor_ids),
-                    DomainAccessRule.enabled.is_(True),
-                )
-            )
-            .scalars()
-            .all()
-        )
-        domain_rules_by_competitor: dict[uuid.UUID, list[DomainAccessRule]] = {}
-        for rule in domain_rules:
-            domain_rules_by_competitor.setdefault(rule.competitor_id, []).append(rule)
-
-        access_candidate_ids: set[uuid.UUID | None] = {access_workspace_default_id, access_global_default_id}
-        access_candidate_ids.update(rule.access_policy_id for rule in domain_rules)
-        access_non_null_ids = {cid for cid in access_candidate_ids if cid is not None}
-        access_visible_ids: set[uuid.UUID] = set()
-        if access_non_null_ids:
-            access_visible_ids = {
-                row.id
-                for row in session.execute(
-                    visible_policies_select(workspace_id).where(AccessPolicy.id.in_(access_non_null_ids))
-                ).scalars()
-            }
-
-        access_group_results: dict[tuple[uuid.UUID, str], AccessResolutionResult] = {}
-        matched_domain_rule_by_group: dict[tuple[uuid.UUID, str], DomainAccessRule | None] = {}
-        for (competitor_id, url_pattern), group in groups.items():
-            domain = competitor_domain_by_id.get(competitor_id, "")
-            candidate_rules = domain_rules_by_competitor.get(competitor_id, [])
-            sample_url = group[0].competitor_url
-            matched_rule = select_domain_rule(candidate_rules, domain=domain, url=sample_url)
-            matched_domain_rule_by_group[(competitor_id, url_pattern)] = matched_rule
-
-            cache_key = access_resolution_cache_key(workspace_id, competitor_id, domain, url_pattern)
-            cached_access_result = _cache_get_access_result(redis, cache_key)
-            if cached_access_result is not None:
-                access_group_results[(competitor_id, url_pattern)] = cached_access_result
-                continue
-
-            domain_rule_policy_id = matched_rule.access_policy_id if matched_rule is not None else None
-            access_result = resolve_effective_policy(
-                domain_rule_policy_id=domain_rule_policy_id,
-                workspace_default_policy_id=access_workspace_default_id,
-                global_default_policy_id=access_global_default_id,
-                visible_ids=access_visible_ids,
-            )
-            _cache_set_access_result(redis, cache_key, access_result)
-            access_group_results[(competitor_id, url_pattern)] = access_result
-
-        resolved_policy_id_by_match: dict[uuid.UUID, uuid.UUID | None] = {}
-        domain_rule_by_match: dict[uuid.UUID, DomainAccessRule | None] = {}
-        for (competitor_id, url_pattern), group in groups.items():
-            access_result = access_group_results[(competitor_id, url_pattern)]
-            matched_rule = matched_domain_rule_by_group[(competitor_id, url_pattern)]
-            for match in group:
-                resolved_policy_id_by_match[match.id] = (
-                    access_result.policy_id if isinstance(access_result, AccessResolvedPolicy) else None
-                )
-                domain_rule_by_match[match.id] = matched_rule
-
-        # --- SPEC-12 US2: per-group domain-strategy profile get-or-create +
-        # learned-start resolution (contracts/consumption.md, D5/D6). One
-        # query (or, on a brand-new key, one insert + one enqueue) per
-        # distinct (competitor_id, url_pattern) group -- never per match
-        # (Principle IV) -- reusing the exact `matched_domain_rule_by_group`
-        # this function already computed for access-policy resolution just
-        # above, so `domain_access_rules.url_pattern_override` (FR-006) is
-        # honored from the very same domain rule, no second lookup. The
-        # lookup pattern is that manual override when one matched, else a
-        # fresh `derive_url_pattern` at the *current*
-        # `URL_PATTERN_ALGORITHM_VERSION` -- never the group's own
-        # (possibly stale) stored `competitor_product_matches.url_pattern`,
-        # so a version bump can never silently mix patterns (FR-005).
-        strategy_profile_id_by_group: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
-        strategy_start_by_group: dict[tuple[uuid.UUID, str], StrategyStart | None] = {}
-        for (competitor_id, url_pattern), group in groups.items():
-            domain = competitor_domain_by_id.get(competitor_id, "")
-            matched_rule = matched_domain_rule_by_group[(competitor_id, url_pattern)]
-            override = matched_rule.url_pattern_override if matched_rule is not None else None
-            lookup_pattern = override or derive_url_pattern(group[0].competitor_url)
-
-            strategy_profile = resolve_or_create_strategy_profile(
-                session,
-                redis,
-                workspace_id=workspace_id,
-                competitor_id=competitor_id,
-                domain=domain,
-                url_pattern=lookup_pattern,
-            )
-            strategy_profile_id_by_group[(competitor_id, url_pattern)] = strategy_profile.id
-            learned_start = resolve_strategy_start(
-                strategy_profile, algorithm_version=URL_PATTERN_ALGORITHM_VERSION
-            )
-            strategy_start_by_group[(competitor_id, url_pattern)] = learned_start
-            if learned_start is not None:
-                # Structured observability event (contracts/api-and-observability.md
-                # §Observability, T040, SC-001): the consumption resolver returned a
-                # learned start, so this group skips the default escalation ladder.
-                logger.info(
-                    "generic_price_spider: strategy_learned_start_used "
-                    "profile_id=%s access_method=%s extraction_method=%s",
-                    strategy_profile.id,
-                    learned_start.access_method.value,
-                    learned_start.extraction_method.value
-                    if learned_start.extraction_method is not None
-                    else None,
-                )
-
-        resolved_policy_ids = {pid for pid in resolved_policy_id_by_match.values() if pid is not None}
-        access_policies_by_id: dict[uuid.UUID, AccessPolicy] = {}
-        if resolved_policy_ids:
-            rows = session.execute(
-                select(AccessPolicy).where(AccessPolicy.id.in_(resolved_policy_ids))
-            ).scalars().all()
-            access_policies_by_id = {row.id: row for row in rows}
-
-        # Every workspace-visible provider (own+global) -- bounded, loaded
-        # once regardless of batch size, not per resolved policy.
-        provider_rows_list = session.execute(visible_providers_select(workspace_id)).scalars().all()
-        provider_rows_by_id: dict[uuid.UUID, ProxyProvider] = {row.id: row for row in provider_rows_list}
-        visible_providers: VisibleProviders = {
-            row.id: (row.status, row.type, row.country_code) for row in provider_rows_list
-        }
-        provider_passwords: dict[uuid.UUID, str | None] = {}
-        for row in provider_rows_list:
-            if not row.password_encrypted or row.password_key_version is None:
-                provider_passwords[row.id] = None
-                continue
-            try:
-                provider_passwords[row.id] = decrypt_secret(row.password_encrypted, row.password_key_version)
-            except SecretDecryptionError:
-                # Never crash the run over one undecryptable credential --
-                # degrade to "no password" for this provider (its request
-                # will go out unauthenticated; the target proxy vendor may
-                # still allow IP-based auth, or the fetch will simply fail
-                # and get classified PROXY_FAILED downstream).
-                logger.warning(
-                    "generic_price_spider: could not decrypt password for proxy_provider_id=%s",
-                    row.id,
-                )
-                provider_passwords[row.id] = None
-
-        targets: list[SpiderTarget] = []
-        for match in matches:
-            profile_id = resolved_profile_id_by_match.get(match.id)
-            profile = profiles_by_id.get(profile_id) if profile_id else None
-            policy_id = resolved_policy_id_by_match.get(match.id)
-            strategy_group_key = (match.competitor_id, match.url_pattern)
-            targets.append(
-                SpiderTarget(
-                    match_id=match.id,
-                    product_id=match.product_id,
-                    product_variant_id=match.product_variant_id,
-                    competitor_id=match.competitor_id,
-                    url=match.competitor_url,
-                    profile=profile,
-                    robots_policy=competitor_robots_policy_by_id.get(
-                        match.competitor_id, RobotsPolicy.RESPECT
-                    ),
-                    domain=competitor_domain_by_id.get(match.competitor_id, ""),
-                    access_policy=access_policies_by_id.get(policy_id) if policy_id else None,
-                    domain_rule=domain_rule_by_match.get(match.id),
-                    domain_strategy_profile_id=strategy_profile_id_by_group.get(strategy_group_key),
-                    strategy_start=strategy_start_by_group.get(strategy_group_key),
-                )
-            )
-        return _LoadedTargets(
-            targets=targets,
-            visible_providers=visible_providers,
-            provider_rows=provider_rows_by_id,
-            provider_passwords=provider_passwords,
-        )
-
-
-# --- SPEC-10 US2: per-attempt dispatch decision (blocking; run_in_thread only) --
-
-
-@dataclass(frozen=True)
-class _DispatchDecision:
-    """The outcome of :func:`_prepare_dispatch` for one attempt.
-
-    ``plan is None`` means "do not dispatch a request for this attempt"
-    -- either because there is genuinely nothing left to try
-    (``skip_error_code`` set, e.g. ``RATE_LIMITED``/``PROXY_FAILED``/
-    ``LIMIT_REACHED``) or because the target's access policy never
-    resolved at all (``skip_error_code is None`` -- `NONE_RESOLVED`,
-    per `contracts/policy-resolution.md`: "target skipped, not scraped
-    with an implicit policy" -- silently skipped, no `ScrapeResult`).
-
-    ``attempted_method``/``attempted_proxy`` (SPEC-10 US3, T034) record
-    the transport that was *decided but never dispatched* when
-    ``skip_error_code`` is set -- there is no real `scrapy.Request`/
-    response for these attempts, so `request.meta` can't supply the
-    audit fields the way it does for a dispatched attempt (`parse`/
-    `errback` read those from the response/failure instead). Unused
-    (left at their defaults) whenever ``skip_error_code is None``, since
-    that path never calls `_build_result`.
-    """
-
-    plan: AttemptPlan | None
-    proxy: ProxyAssignment | None
-    skip_error_code: ScrapeErrorCode | None = None
-    attempted_method: AccessMethod = AccessMethod.DIRECT_HTTP
-    attempted_proxy: ProxyAssignment | None = None
-
-
-def _prepare_dispatch(
-    target: SpiderTarget,
-    attempt_number: int,
-    visible_providers: VisibleProviders,
-    provider_rows: dict[uuid.UUID, ProxyProvider],
-) -> _DispatchDecision:
-    """Decide + Redis-gate the next attempt for `target`. **Blocking** (Redis).
-
-    Must only ever be called inside :func:`scrape_core.db.run_in_thread`
-    -- never synchronously on the reactor thread (`contracts/
-    spider-integration.md` §2/§3). Runs, in order: the per-domain rate
-    ceilings + cooldown gate (always, direct or proxied); the pure
-    `next_attempt` transport decision; for a proxied plan, `assign_proxy`
-    then the monthly-budget gate, rerouting/stopping on exhaustion or a
-    disabled/missing provider (`proxy_budget_exhausted=True` reuse -- see
-    `app_shared.access.engine` module docstring judgment call 4).
-    """
-    policy = target.access_policy
-    if policy is None:
-        # NONE_RESOLVED (no workspace/global default AccessPolicy seeded,
-        # and no matching domain rule) -- skip silently per the
-        # resolution contract rather than guessing an implicit policy.
-        return _DispatchDecision(plan=None, proxy=None, skip_error_code=None)
-
-    redis = get_redis_client()
-
-    per_minute = (
-        target.domain_rule.max_requests_per_minute
-        if target.domain_rule is not None
-        else policy.max_requests_per_minute
-    )
-    rate_decision = check_rate_ceilings(
-        redis,
-        policy_id=policy.id,
-        domain=target.domain,
-        per_minute=per_minute,
-        per_hour=policy.max_requests_per_hour,
-        per_day=policy.max_requests_per_day,
-    )
-    if not rate_decision.allowed:
-        # Gated before any transport decision is even made -- there is no
-        # real "attempted method" to report, so this leaves
-        # `_DispatchDecision`'s DIRECT_HTTP/None defaults in place.
-        return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.RATE_LIMITED)
-
-    cooldown_seconds = target.domain_rule.cooldown_seconds if target.domain_rule is not None else 0
-    if not check_domain_cooldown(redis, domain=target.domain, cooldown_seconds=cooldown_seconds):
-        return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.RATE_LIMITED)
-
-    def _decide(*, proxy_budget_exhausted: bool = False) -> AttemptPlan | Any:
-        return next_attempt(
-            policy.strategy,
-            attempt_number=attempt_number,
-            max_retries=policy.max_retries,
-            use_proxy_on_first_attempt=policy.use_proxy_on_first_attempt,
-            use_proxy_on_retry=policy.use_proxy_on_retry,
-            allow_browser_fallback=policy.allow_browser_fallback,
-            # SPEC-12 US2 (contracts/consumption.md step 3, D6): a learned
-            # start seeds attempt 1's access method only -- `next_attempt`
-            # itself only ever consults `preferred_method` when
-            # `attempt_number == 1` (see its module docstring judgment call
-            # "SPEC-12 forward-compat"), so passing this unconditionally on
-            # every call (including retries) is safe: it's simply ignored
-            # for `attempt_number > 1`.
-            preferred_method=(
-                target.strategy_start.access_method if target.strategy_start is not None else None
-            ),
-            proxy_budget_exhausted=proxy_budget_exhausted,
-        )
-
-    plan = _decide()
-    if plan is STOP:
-        return _DispatchDecision(plan=None, proxy=None, skip_error_code=None)
-
-    proxy_assignment: ProxyAssignment | None = None
-    if plan.use_proxy:
-        proxy_assignment = assign_proxy(
-            strategy=policy.strategy,
-            policy_provider_id=policy.provider_id,
-            policy_country=policy.country_code,
-            # DomainAccessRule carries no country_code column in this
-            # slice -- always None (documented simplification).
-            domain_rule_country=None,
-            visible_providers=visible_providers,
-            attempt_number=attempt_number,
-            rotate_per_request=policy.rotate_per_request,
-            sticky_session=policy.sticky_session,
-            session_seed=f"{target.competitor_id}:{target.domain}",
-        )
-        if proxy_assignment is None:
-            # No eligible provider (disabled/absent) -- degrade per
-            # strategy by reusing the budget-exhausted fallback shape
-            # (same "wanted a proxy, can't use one" outcome); STOP here
-            # means PROXY_FAILED, not a budget/rate issue. `plan` (still
-            # the pre-degrade decision here) was a proxied plan -- record
-            # that as the attempted method (no provider was ever
-            # assigned, so `attempted_proxy` stays None).
-            intended_method = plan.access_method
-            plan = _decide(proxy_budget_exhausted=True)
-            if plan is STOP:
-                return _DispatchDecision(
-                    plan=None,
-                    proxy=None,
-                    skip_error_code=ScrapeErrorCode.PROXY_FAILED,
-                    attempted_method=intended_method,
-                )
-        else:
-            provider = provider_rows.get(proxy_assignment.provider_id)
-            limit = provider.monthly_budget_limit if provider is not None else None
-            budget_result = incr_and_check_monthly_budget(
-                redis, provider_id=proxy_assignment.provider_id, limit=limit, now=datetime.now(UTC)
-            )
-            if not budget_result.allowed:
-                # `proxy_assignment` (the provider that hit its budget)
-                # is worth recording even though the attempt never
-                # dispatched -- it's exactly what US3's audit/tuning
-                # goal needs ("which provider is exhausted").
-                intended_method = plan.access_method
-                intended_proxy = proxy_assignment
-                plan = _decide(proxy_budget_exhausted=True)
-                if plan is STOP:
-                    return _DispatchDecision(
-                        plan=None,
-                        proxy=None,
-                        skip_error_code=ScrapeErrorCode.LIMIT_REACHED,
-                        attempted_method=intended_method,
-                        attempted_proxy=intended_proxy,
-                    )
-                proxy_assignment = None  # the fallback plan is guaranteed non-proxy
-
-    return _DispatchDecision(plan=plan, proxy=proxy_assignment)
-
-
-def _elapsed_ms(dispatch_monotonic: float | None) -> int | None:
-    """``response_time_ms`` (SPEC-10 US3, T034) -- elapsed wall time since
-    ``_request_for`` stashed ``time.monotonic()`` on dispatch, or ``None``
-    when the attempt was never dispatched (no request exists to time)."""
-    if dispatch_monotonic is None:
-        return None
-    return round((time.monotonic() - dispatch_monotonic) * 1000)
-
-
-def _attempt_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
-    """The SPEC-10 US3 (T034) per-attempt audit fields for a *dispatched*
-    attempt, read back from ``request.meta``/``response.meta`` (stamped by
-    ``_request_for`` at dispatch time) -- the real ``access_method``/
-    ``proxy_provider_id``/``proxy_country``/``attempt_number``/
-    ``response_time_ms`` for `_build_result`, never a hardcoded default.
-
-    SPEC-11 US2 (T022): also carries ``match_lock_key``/
-    ``match_lock_token`` (absent -> ``None``) so a dispatched attempt's
-    eventual `ScrapeResult` threads its match lock through to the
-    persistence pipeline's release (T023).
-    """
-    return {
-        "access_method": meta.get("access_method", AccessMethod.DIRECT_HTTP),
-        "attempt_number": meta.get("attempt_number", 1),
-        "proxy_provider_id": meta.get("proxy_provider_id"),
-        "proxy_country": meta.get("proxy_country"),
-        "response_time_ms": _elapsed_ms(meta.get("dispatch_monotonic")),
-        "match_lock_key": meta.get("match_lock_key"),
-        "match_lock_token": meta.get("match_lock_token"),
-    }
-
-
-def _parse_host_port(base_url: str) -> tuple[str, int]:
-    """Extract `(host, port)` from a `ProxyProvider.base_url`, defaulting the
-    port by scheme when absent (providers are expected to set one explicitly)."""
-    parsed = urlsplit(base_url)
-    host = parsed.hostname or base_url
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-    return host, port
+# Re-exported so every pre-SPEC-14 import site (this module's own test
+# suite: `SpiderTarget`/`_RequeueState`/`_prepare_dispatch`/`load_targets`/
+# `_attempt_kwargs_from_meta`/`_mark_target_deferred_rate_limited`, and
+# unit tests that construct/patch these directly against this module)
+# keeps working unchanged -- shared-extraction.md's behavior-preservation
+# contract. The names live in `scrape_core.targets` now; nothing below
+# redefines them.
+__all__ = [
+    "GenericPriceSpider",
+    "SpiderTarget",
+    "VisibleProviders",
+    "_LoadedTargets",
+    "load_targets",
+    "_DispatchDecision",
+    "_prepare_dispatch",
+    "_RequeueState",
+    "_parse_match_ids",
+    "_parse_host_port",
+    "_attempt_kwargs_from_meta",
+    "_mark_target_deferred_rate_limited",
+]
 
 
 class GenericPriceSpider(scrapy.Spider):
@@ -890,6 +197,20 @@ class GenericPriceSpider(scrapy.Spider):
         self._visible_providers: VisibleProviders = {}
         self._provider_rows: dict[uuid.UUID, ProxyProvider] = {}
         self._provider_passwords: dict[uuid.UUID, str | None] = {}
+
+    def _admission_context(self) -> AdmissionContext:
+        """SPEC-14 T006: the small bundle
+        :func:`~scrape_core.targets.acquire_fetch_permission`/
+        :func:`~scrape_core.targets.overflow_to_dispatch`/
+        :func:`~scrape_core.targets.dispatch_admission` need --
+        ``requeue_state_by_match_id`` is this spider's own dict (mutated
+        in place by the shared functions, never copied), so this
+        instance's bookkeeping stays in sync across calls."""
+        return AdmissionContext(
+            workspace_id=self.workspace_id,
+            scrape_job_id=self.scrape_job_id,
+            requeue_state_by_match_id=self._requeue_state_by_match_id,
+        )
 
     async def start(self) -> AsyncIterator[scrapy.Request]:
         loaded = await run_in_thread(load_targets, self.workspace_id, self.match_ids)
@@ -936,164 +257,19 @@ class GenericPriceSpider(scrapy.Spider):
     async def _acquire_fetch_permission(
         self, target: SpiderTarget, access_method: AccessMethod
     ) -> Permission | None:
-        """Resolve this target's effective limits and acquire a domain
-        token + concurrency slot before it may fetch (SPEC-11 US1,
-        `contracts/spider-integration.md` steps 1-2).
+        """Thin wrapper (SPEC-14 T006) over the shared
+        :func:`scrape_core.targets.acquire_fetch_permission` -- see that
+        function's docstring for the full behavior (domain-token +
+        concurrency-slot acquisition, backoff-loop-on-denial, requeue-cap
+        overflow). Kept as a spider method so existing call sites/tests
+        that drive this directly (``spider._acquire_fetch_permission(...)``)
+        keep working unchanged."""
+        return await acquire_fetch_permission(self._admission_context(), target, access_method)
 
-        Loops on denial: the backoff delay is
-        ``max(wait_hint_seconds, cooldown_seconds) + jitter`` (the
-        cooldown is a floor, FR-006), then waits via the non-blocking
-        :func:`~scrape_core.reactor.deferred_delay` (never
-        ``time.sleep``) before retrying from limit-resolution. This
-        target's ``requeue_count``/``cumulative_wait`` (kept on
-        ``self._requeue_state_by_match_id``, reset only when the target
-        was first seen in ``start()``) are bumped on every denial. No
-        semaphore/lock is taken on a denied permission, so there is
-        nothing to release on denial.
-
-        SPEC-11 US3 (T027, `contracts/overflow-dispatch.md`): once either
-        cap is exceeded after a denial (``requeue_count >
-        REQUEUE_MAX_ATTEMPTS`` or ``cumulative_wait >
-        REQUEUE_MAX_TOTAL_WAIT_SECONDS``), this does **not** wait/retry
-        again -- :meth:`_overflow_to_dispatch` hands the target back to
-        Celery and this returns ``None`` instead of a granted
-        :class:`Permission`, signalling the caller to dispatch nothing
-        for this target (the Scrapyd slot is freed immediately, SC-003).
-
-        SPEC-11 US4 (T031, `contracts/observability.md`): every denial
-        emits exactly one of ``rate_limit.hit`` (the token bucket itself
-        denied) or ``semaphore.denied`` (the bucket granted but the
-        concurrency slot was full) -- see `Permission.denied_by` -- and
-        every backoff this loop actually takes (i.e. every denial that
-        does *not* immediately overflow) also emits ``rate_limit.requeue``.
-        """
-        from app_shared.config import get_settings
-
-        settings = get_settings()
-        redis = get_redis_client()
-        state = self._requeue_state_by_match_id[target.match_id]
-
-        while True:
-            limits = resolve_limits(
-                domain_rule=target.domain_rule,
-                access_policy=target.access_policy,
-                settings=settings,
-            )
-            sem_token = secrets.token_hex(16)
-            perm = await acquire_permission(
-                redis,
-                workspace_id=self.workspace_id,
-                domain=target.domain,
-                access_method=access_method,
-                limits=limits,
-                settings=settings,
-                sem_token=sem_token,
-            )
-            if perm.granted:
-                return perm
-
-            # SPEC-11 US4 (T031, contracts/observability.md): distinguish
-            # which gate denied -- `semaphore.denied` (concurrency slot
-            # full) vs `rate_limit.hit` (token bucket denied, the
-            # semaphore was never touched, Permission.denied_by).
-            if perm.denied_by == "semaphore":
-                log_event(
-                    logger,
-                    "semaphore.denied",
-                    workspace_id=self.workspace_id,
-                    domain=target.domain,
-                    access_method=access_method,
-                )
-            else:
-                log_event(
-                    logger,
-                    "rate_limit.hit",
-                    workspace_id=self.workspace_id,
-                    domain=target.domain,
-                    access_method=access_method,
-                    wait_hint=perm.wait_hint_seconds,
-                )
-
-            delay = max(perm.wait_hint_seconds, limits.cooldown_seconds) + random.uniform(
-                settings.RATE_LIMIT_JITTER_MIN_SECONDS, settings.RATE_LIMIT_JITTER_MAX_SECONDS
-            )
-            state.requeue_count += 1
-            state.cumulative_wait += delay
-
-            if (
-                state.requeue_count > settings.REQUEUE_MAX_ATTEMPTS
-                or state.cumulative_wait > settings.REQUEUE_MAX_TOTAL_WAIT_SECONDS
-            ):
-                await self._overflow_to_dispatch(target, perm, redis=redis)
-                return None
-
-            log_event(
-                logger,
-                "rate_limit.requeue",
-                workspace_id=self.workspace_id,
-                match_id=target.match_id,
-                requeue_count=state.requeue_count,
-                delay=delay,
-            )
-            await deferred_delay(delay)
-
-    async def _overflow_to_dispatch(
-        self, target: SpiderTarget, perm: Permission, *, redis: object
-    ) -> None:
-        """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3):
-        requeue-cap exceeded for `target` -- release any held semaphore
-        slot (defensive no-op: a denied `Permission` never carries a
-        `semaphore_key`/`semaphore_token`, since the semaphore is never
-        acquired on a denied bucket check), mark the target `DEFERRED` +
-        `RATE_LIMITED` in one off-reactor `workspace_txn`
-        (:func:`_mark_target_deferred_rate_limited`), then re-dispatch
-        the whole job via the existing `scrape_dispatch` Celery producer
-        (`app_shared.messaging.enqueue` + `app_shared.task_names`, never
-        `apps/workers` -- Constitution Principle I) so a fresh
-        `dispatch_job` run picks this (now-DEFERRED) target back up
-        (T028) and it re-enters the full lock+limiter gate. No request
-        is yielded for this attempt -- the Scrapyd slot is freed
-        immediately (SC-003).
-        """
-        if perm.semaphore_key and perm.semaphore_token:
-            await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
-
-        scrape_job_id = self.scrape_job_id
-        if scrape_job_id is None:
-            # No job context to mark/re-dispatch against -- nothing more
-            # can be done for this overflowed target (spider-args.md:
-            # `scrape_job_id` is expected on every real Scrapyd-dispatched
-            # run; only hand-built unit-test spiders may omit it).
-            logger.error(
-                "generic_price_spider: requeue-cap overflow with no scrape_job_id -- "
-                "cannot mark DEFERRED or re-dispatch match_id=%s",
-                target.match_id,
-            )
-            return
-
-        await run_in_thread(
-            _mark_target_deferred_rate_limited,
-            self.workspace_id,
-            scrape_job_id,
-            target.match_id,
-        )
-        await run_in_thread(
-            enqueue,
-            SCRAPE_DISPATCH_JOB,
-            queue="scrape_dispatch",
-            kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(self.workspace_id)},
-        )
-        # SPEC-11 US4 (T031, contracts/observability.md): the requeue cap
-        # was exceeded and the target is now DEFERRED + re-dispatched --
-        # emitted after both the mark and the re-dispatch enqueue commit,
-        # mirroring the order the outcomes actually happen in.
-        log_event(
-            logger,
-            "rate_limit.overflow",
-            workspace_id=self.workspace_id,
-            scrape_job_id=scrape_job_id,
-            match_id=target.match_id,
-        )
+    async def _overflow_to_dispatch(self, target: SpiderTarget, perm: Permission, *, redis: object) -> None:
+        """Thin wrapper (SPEC-14 T006) over the shared
+        :func:`scrape_core.targets.overflow_to_dispatch`."""
+        await overflow_to_dispatch(self._admission_context(), target, perm, redis=redis)
 
     async def _dispatch(
         self,
@@ -1102,67 +278,21 @@ class GenericPriceSpider(scrapy.Spider):
         plan: AttemptPlan,
         proxy_assignment: ProxyAssignment | None,
     ) -> "scrapy.Request | ScrapeResult | None":
-        """SPEC-11 US1+US2+US3 combined dispatch gate (`contracts/spider-integration.md`
-        steps 1-4): acquire the domain token + concurrency slot
-        (:meth:`_acquire_fetch_permission`, looping on denial until
-        granted or the requeue cap overflows, US3 T027), then the
-        in-flight match lock **immediately before fetch** (step 3,
-        off-reactor via :func:`~scrape_core.limiter.acquire_lock`).
-
-        Returns ``None`` when :meth:`_acquire_fetch_permission` overflowed
-        (requeue cap exceeded -- the target was already marked `DEFERRED`
-        and re-dispatched, US3 T027): nothing further to do, no request/
-        result for this attempt.
-
-        On a held lock (``None``): releases the semaphore slot just
-        acquired in step 2 (nothing else was taken -- no requeue, FR-011/
-        014, US2 AS1) and returns a terminal ``SKIPPED``/
-        ``LOCKED_ALREADY_RUNNING`` :class:`~scrape_core.items.ScrapeResult`
-        (the existing skip-emission shape SPEC-10 uses for not-dispatched
-        attempts) instead of a request -- no fetch. On a grant, returns
-        the built ``scrapy.Request`` with both the semaphore and match-lock
-        key/token stamped onto its meta (:meth:`_request_for`) so
-        `parse`/`errback` release the slot on response and the
-        persistence pipeline releases the lock after the write commits.
-        """
-        from app_shared.config import get_settings
-
-        perm = await self._acquire_fetch_permission(target, plan.access_method)
-        if perm is None:
-            return None
-
-        redis = get_redis_client()
-        lock = await acquire_lock(
-            redis,
-            workspace_id=self.workspace_id,
-            match_id=target.match_id,
-            mode=plan.access_method,
-            settings=get_settings(),
+        """Thin wrapper (SPEC-14 T006) over the shared
+        :func:`scrape_core.targets.dispatch_admission` -- supplies this
+        spider's own HTTP-transport-specific request builder
+        (:meth:`_request_for`) as the ``build_request`` callback, so the
+        admission gate (permission + match lock) stays identical to the
+        browser spider's while the actual request built differs per
+        transport."""
+        return await dispatch_admission(
+            self._admission_context(),
+            target,
+            attempt_number,
+            plan,
+            proxy_assignment,
+            build_request=self._request_for,
         )
-        if lock is None:
-            await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
-            # SPEC-11 US4 (T031, contracts/observability.md): the match
-            # lock was already held -- this attempt is skipped, no fetch
-            # (dedup.skip -- LOCKED_ALREADY_RUNNING).
-            log_event(
-                logger,
-                "dedup.skip",
-                workspace_id=self.workspace_id,
-                match_id=target.match_id,
-            )
-            return self._build_result(
-                target,
-                target.url,
-                datetime.now(UTC),
-                status_code=None,
-                success=False,
-                error_code=ScrapeErrorCode.LOCKED_ALREADY_RUNNING,
-                error_message="match lock already held -- another attempt is in flight",
-                access_method=plan.access_method,
-                attempt_number=attempt_number,
-            )
-
-        return self._request_for(target, attempt_number, plan, proxy_assignment, perm, lock)
 
     def _request_for(
         self,
@@ -1451,85 +581,21 @@ class GenericPriceSpider(scrapy.Spider):
         target: SpiderTarget,
         url: str,
         scraped_at: datetime,
-        *,
-        status_code: int | None,
-        success: bool,
-        access_method: AccessMethod = AccessMethod.DIRECT_HTTP,
-        attempt_number: int = 1,
-        proxy_provider_id: uuid.UUID | None = None,
-        proxy_country: str | None = None,
-        response_time_ms: int | None = None,
-        error_code: Any = None,
-        error_message: str | None = None,
-        comparable: bool = True,
-        price: Decimal | None = None,
-        candidate_extras: Any = None,
-        match_lock_key: str | None = None,
-        match_lock_token: str | None = None,
+        **kwargs: Any,
     ) -> ScrapeResult:
-        """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034).
-
-        ``access_method``/``attempt_number``/``proxy_provider_id``/
-        ``proxy_country``/``response_time_ms`` default to a plain
-        ``DIRECT_HTTP`` first attempt (pre-SPEC-10 callers, and unit
-        tests, may call this with only the required kwargs) but every
-        SPEC-10 call site now passes the **actual** attempt's values --
-        see `_attempt_kwargs_from_meta` (dispatched attempts, `parse`/
-        `errback`) and `_DispatchDecision.attempted_method`/
-        `attempted_proxy` (never-dispatched rate/proxy/budget skips,
-        `start`/`errback`) -- never the previously hardcoded
-        `DIRECT_HTTP`. One `ScrapeResult` is emitted per attempt
-        (including retries), so the unchanged `BatchedPersistencePipeline`
-        writes one `RequestAttempt` row per attempt (FR-012/FR-013/FR-015).
-
-        ``match_lock_key``/``match_lock_token`` (SPEC-11 US2, T020/T022)
-        default to ``None`` -- a never-dispatched attempt (rate/proxy/
-        budget skip, or a SPEC-11 match-lock collision) never acquired a
-        lock, so there is nothing to release. A dispatched attempt passes
-        them via `_attempt_kwargs_from_meta` (read back from
-        `request.meta`/`response.meta`, stamped by `_request_for`).
-
-        ``domain_strategy_profile_id`` (SPEC-12 US2, T022, contracts/
-        consumption.md step 4) is read straight off `target` -- every
-        target this spider builds carries the profile id its
-        `(competitor_id, url_pattern)` group resolved in `load_targets`
-        (`None` only for a hand-built pre-SPEC-12 target, e.g. a unit
-        test) -- so every `ScrapeResult` this method emits for a real
-        dispatched target threads it through without a second query,
-        ready for US5's off-reactor stats recorder.
-        """
-        kwargs: dict[str, Any] = {}
-        if candidate_extras is not None:
-            kwargs.update(
-                currency=candidate_extras.currency,
-                stock_status=candidate_extras.stock,
-                raw_title=candidate_extras.raw_title,
-                extraction_method=candidate_extras.method,
-                extraction_confidence=Decimal(str(candidate_extras.confidence)),
-                selector_used=candidate_extras.selector_used,
-            )
-        return ScrapeResult(
+        """Thin wrapper (SPEC-14 T007) over the shared
+        :func:`scrape_core.result_builder.build_scrape_result` -- supplies
+        this spider's own ``workspace_id``/``scrape_job_id`` (the free
+        function takes them as explicit parameters instead of reading
+        ``self.*``). See that function's docstring for the full field
+        contract; kept as a spider method so existing call sites/tests
+        that drive this directly (``spider._build_result(...)``) keep
+        working unchanged."""
+        return build_scrape_result(
+            target,
+            url,
+            scraped_at,
             workspace_id=self.workspace_id,
-            match_id=target.match_id,
-            product_id=target.product_id,
-            product_variant_id=target.product_variant_id,
-            competitor_id=target.competitor_id,
             scrape_job_id=self.scrape_job_id,
-            url=url,
-            access_method=access_method,
-            attempt_number=attempt_number,
-            proxy_provider_id=proxy_provider_id,
-            proxy_country=proxy_country,
-            status_code=status_code,
-            response_time_ms=response_time_ms,
-            scraped_at=scraped_at,
-            price=price,
-            success=success,
-            comparable=comparable,
-            error_code=error_code,
-            error_message=error_message,
-            match_lock_key=match_lock_key,
-            match_lock_token=match_lock_token,
-            domain_strategy_profile_id=target.domain_strategy_profile_id,
             **kwargs,
         )

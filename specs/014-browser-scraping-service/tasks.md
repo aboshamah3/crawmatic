@@ -63,39 +63,39 @@ guarded by the existing HTTP-spider suite. It BLOCKS every user story (both spid
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete and the regression guard
 (T010) is green.
 
-- [ ] T004 Create `libs/scrape-core/scrape_core/targets.py` by **moving** (not copying) the
+- [X] T004 Create `libs/scrape-core/scrape_core/targets.py` by **moving** (not copying) the
   transport-agnostic machinery out of `apps/scrapers/price_monitor/spiders/generic_price_spider.py`:
   `SpiderTarget`, `_LoadedTargets`, `load_targets`, `_DispatchDecision`, `_prepare_dispatch`,
   `VisibleProviders`, the Redis resolution-cache get/set helpers (`_cache_*_group_result`,
   `_cache_*_access_result`), `_parse_match_ids`, `_parse_host_port`, `_attempt_kwargs_from_meta`,
   `_elapsed_ms`, `_RequeueState` (shared-extraction.md). Import only `app_shared.*` + `scrape_core.*`.
-- [ ] T005 In `libs/scrape-core/scrape_core/targets.py`, extend `SpiderTarget` with the browser-relevant
+- [X] T005 In `libs/scrape-core/scrape_core/targets.py`, extend `SpiderTarget` with the browser-relevant
   already-loaded fields — resolved `wait_for_selector`, `browser_timeout_ms`, `variant_selector_config`,
   and a slot for its resolved `value_from` values (e.g. `match_variant_values`) — all with defaults so
   existing HTTP constructors stay valid (shared-extraction.md "What moves"). `load_targets` reads these
   from the already-resolved profile/match rows; no new query.
-- [ ] T006 Extract the admission machinery bodies (`_acquire_fetch_permission`, `_overflow_to_dispatch`,
+- [X] T006 Extract the admission machinery bodies (`_acquire_fetch_permission`, `_overflow_to_dispatch`,
   and the reusable part of `_dispatch`) from the HTTP spider into
   `libs/scrape-core/scrape_core/targets.py` as functions taking a small `AdmissionContext`
   (workspace_id, scrape_job_id, `_requeue_state_by_match_id`), so both spiders share identical admission
   behavior without duplication (shared-extraction.md Note).
-- [ ] T007 [P] Create `libs/scrape-core/scrape_core/result_builder.py` with free function
+- [X] T007 [P] Create `libs/scrape-core/scrape_core/result_builder.py` with free function
   `build_scrape_result(...)` (formerly the spider's `_build_result`) constructing the identical
   `ScrapeResult` from target + attempt fields (shared-extraction.md).
-- [ ] T008 [P] Edit `libs/scrape-core/scrape_core/errors.py`: add
+- [X] T008 [P] Edit `libs/scrape-core/scrape_core/errors.py`: add
   `classify_playwright_exception(exc)` mapping Playwright `TimeoutError` → `TIMEOUT` and any other
   Playwright error → `PLAYWRIGHT_FAILED` (R3). Reuse existing `ScrapeErrorCode` members only — add none.
-- [ ] T009 [P] Create `libs/scrape-core/scrape_core/browser/__init__.py` (empty package marker) so
+- [X] T009 [P] Create `libs/scrape-core/scrape_core/browser/__init__.py` (empty package marker) so
   `scrape_core.browser.*` exists for later modules.
-- [ ] T010 Refactor `apps/scrapers/price_monitor/spiders/generic_price_spider.py` to import the moved
+- [X] T010 Refactor `apps/scrapers/price_monitor/spiders/generic_price_spider.py` to import the moved
   helpers from `scrape_core.targets` / `scrape_core.result_builder`; keep only HTTP-transport specifics
   (`_request_for` with `Proxy-Authorization`, the multi-attempt `parse`/`errback`/`_dispatch` ladder as
   thin wrappers over the shared admission functions). **Behavior preserved.**
-- [ ] T011 Run the regression guard and make it green: `uv run pytest
+- [X] T011 Run the regression guard and make it green: `uv run pytest
   tests/unit/test_generic_price_spider.py tests/integration/test_spider_access.py -q` plus the
   import-boundary test — repoint imports to moved symbols if a test reaches a moved private symbol;
   assertions unchanged (shared-extraction.md behavior-preservation contract).
-- [ ] T012 [P] Add a unit test for `classify_playwright_exception` (Playwright `TimeoutError` →
+- [X] T012 [P] Add a unit test for `classify_playwright_exception` (Playwright `TimeoutError` →
   `TIMEOUT`; generic Playwright error → `PLAYWRIGHT_FAILED`) in
   `tests/unit/test_browser_errors.py` (quickstart scenario 3; must pass in this env).
 

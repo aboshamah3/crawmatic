@@ -46,6 +46,19 @@ from app_shared.enums import ScrapeErrorCode
 
 from scrape_core.safety.rejection_registry import was_recently_rejected
 
+# SPEC-14 (R3): Playwright's own `TimeoutError` is imported defensively --
+# the browser-only project (`apps/scrapers-browser`) always has `playwright`
+# installed, but this module is also imported by `apps/scrapers` (the HTTP
+# project) and by `app_shared`-adjacent test environments that may not have
+# it, so a hard top-level `import playwright` here would make this whole
+# module (and everything that imports it) fail to import wherever Playwright
+# isn't present. `None` on `ImportError` keeps `classify_playwright_exception`
+# working via its duck-typed-by-name fallback below.
+try:
+    from playwright.async_api import TimeoutError as _PlaywrightTimeoutError
+except ImportError:  # pragma: no cover - exercised only where playwright is absent
+    _PlaywrightTimeoutError = None
+
 __all__ = [
     "HTTP_403",
     "HTTP_404",
@@ -61,10 +74,12 @@ __all__ = [
     "PROXY_FAILED",
     "RATE_LIMITED",
     "LIMIT_REACHED",
+    "PLAYWRIGHT_FAILED",
     "SSRF_REJECTED_ERROR_CODE",
     "ROBOTS_BLOCKED_ERROR_CODE",
     "classify_http_status",
     "classify_exception",
+    "classify_playwright_exception",
 ]
 
 # --- §34 codes this slice emits, re-exported as module-level constants for
@@ -88,6 +103,11 @@ UNKNOWN_ERROR = ScrapeErrorCode.UNKNOWN_ERROR
 PROXY_FAILED = ScrapeErrorCode.PROXY_FAILED
 RATE_LIMITED = ScrapeErrorCode.RATE_LIMITED
 LIMIT_REACHED = ScrapeErrorCode.LIMIT_REACHED
+
+# SPEC-14 (R3): the browser spider's single-attempt failure classification
+# reuses this same forward-compat member (declared by SPEC-07, never a new
+# enum value) -- see classify_playwright_exception below.
+PLAYWRIGHT_FAILED = ScrapeErrorCode.PLAYWRIGHT_FAILED
 
 # An SSRF/unsafe-target rejection (no body download) and a robots-policy
 # skip both surface as BLOCKED — there is no dedicated SSRF code in §34
@@ -205,3 +225,33 @@ def _chained_error_code(exc: BaseException) -> ScrapeErrorCode | None:
             return ScrapeErrorCode.BLOCKED
         current = current.__cause__ or current.__context__
     return None
+
+
+def classify_playwright_exception(exc: BaseException) -> ScrapeErrorCode:
+    """Classify a browser (Playwright) fetch-time exception into a §34
+    error code (SPEC-14, R3, `contracts/browser-spider.md`).
+
+    Playwright's own ``TimeoutError`` (raised on a navigation/
+    ``wait_for_selector``/``wait_for_load_state`` timeout) classifies as
+    ``TIMEOUT``; any other Playwright error (browser/context crash,
+    protocol error, target closed, etc.) classifies as
+    ``PLAYWRIGHT_FAILED`` — both reuse existing `ScrapeErrorCode`
+    members declared forward-compat by SPEC-07 (no enum change).
+
+    Checks the imported ``playwright.async_api.TimeoutError`` type first
+    (precise); falls back to a duck-typed by-name check (``"timeout" in
+    type(exc).__name__.lower()``) so this still classifies correctly in
+    an environment where Playwright wasn't importable at module load
+    time (this module's own top-level import of it is defensive — see
+    the module docstring) or where a wrapper reraises a differently
+    packaged timeout exception. Every other exception (browser crashed,
+    a selector/element error not otherwise recognized, etc.) is
+    ``PLAYWRIGHT_FAILED`` — the single-attempt browser path has no
+    retry ladder to fall back through (R4), so this is the catch-all
+    "the browser fetch itself failed" code.
+    """
+    if _PlaywrightTimeoutError is not None and isinstance(exc, _PlaywrightTimeoutError):
+        return ScrapeErrorCode.TIMEOUT
+    if "timeout" in type(exc).__name__.lower():
+        return ScrapeErrorCode.TIMEOUT
+    return ScrapeErrorCode.PLAYWRIGHT_FAILED

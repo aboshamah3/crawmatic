@@ -1,6 +1,22 @@
 """Structured observability log/event unit tests (SPEC-11 US4 T030,
 `contracts/observability.md`, Constitution §31).
 
+SPEC-14 T004/T006 (`contracts/shared-extraction.md`) moved the admission
+machinery this file drives (`_acquire_fetch_permission`/
+`_overflow_to_dispatch`/`_dispatch`'s reusable body) out of
+``price_monitor.spiders.generic_price_spider`` into
+``scrape_core.targets`` as free functions (so the browser spider can
+share it too) -- the spider's own methods are now thin wrappers. The
+actual ``acquire_permission``/``deferred_delay``/``get_redis_client``/
+``acquire_lock``/``release_slot``/``run_in_thread`` calls this test
+forces now execute with ``scrape_core.targets``'s own globals (where
+they're defined), and the ``log_event`` calls in that code use
+``scrape_core.targets``'s own module logger -- so this file monkeypatches
+``scrape_core.targets`` (not the spider module) and reads events back
+off the ``scrape_core.targets`` logger name. The spider-level assertions
+(return values, event names/fields) are unchanged -- only *where* the
+code now lives moved.
+
 Runs entirely without infra (no Docker daemon in this build env, project
 memory) -- every Redis/DB/Celery/reactor touchpoint on each exercised
 code path is monkeypatched with a pure, synchronous (or already-fired
@@ -48,6 +64,7 @@ from app_shared.enums import AccessMethod, RobotsPolicy
 
 from price_monitor.spiders import generic_price_spider as gps
 from scrape_core import pipelines as pipelines_mod
+from scrape_core import targets as targets_mod
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import Permission
 
@@ -97,7 +114,10 @@ def _target(match_id: uuid.UUID | None = None, *, domain: str = "shop.example.co
     )
 
 
-_SPIDER_LOGGER = "price_monitor.spiders.generic_price_spider"
+#: SPEC-14 T006: the admission machinery (and its `log_event` calls) now
+#: lives in `scrape_core.targets`, not the spider module -- see the module
+#: docstring.
+_SPIDER_LOGGER = "scrape_core.targets"
 _PIPELINE_LOGGER = "scrape_core.pipelines"
 
 
@@ -122,12 +142,13 @@ class _FakeSettings:
 
 
 def _patch_get_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`_acquire_fetch_permission`/`_dispatch` both do a fresh, local
+    """`acquire_fetch_permission`/`dispatch_admission` (`scrape_core.targets`,
+    SPEC-14 T006 -- moved out of the spider) both do a fresh, local
     ``from app_shared.config import get_settings`` on every call -- so
     patching the real ``app_shared.config.get_settings`` name (rather
-    than anything on the ``gps`` module) is what those local imports
-    actually resolve to. Also stubs ``gps.get_redis_client`` -- its real
-    implementation (``app_shared.redis_client``) calls its own
+    than anything on the ``targets_mod`` module) is what those local
+    imports actually resolve to. Also stubs ``targets_mod.get_redis_client``
+    -- its real implementation (``app_shared.redis_client``) calls its own
     module-level ``get_settings`` reference (bound at import time, so
     patching ``app_shared.config.get_settings`` alone would not reach
     it) to build a real ``Settings()``, which needs every required env
@@ -135,7 +156,7 @@ def _patch_get_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     already-monkeypatched ``acquire_permission``/``acquire_lock``/
     ``release_slot`` that never actually uses the client it's given."""
     monkeypatch.setattr("app_shared.config.get_settings", lambda: _FakeSettings())
-    monkeypatch.setattr(gps, "get_redis_client", lambda: object())
+    monkeypatch.setattr(targets_mod, "get_redis_client", lambda: object())
 
 
 # --- rate_limit.hit + rate_limit.requeue (bucket denial then grant) ---------
@@ -155,8 +176,8 @@ def test_rate_limit_hit_and_requeue_events_carry_documented_fields(
             return Permission(granted=False, wait_hint_seconds=5, denied_by="bucket")
         return Permission(granted=True, wait_hint_seconds=0, semaphore_key="sem-key", semaphore_token="sem-token")
 
-    monkeypatch.setattr(gps, "acquire_permission", _fake_acquire_permission)
-    monkeypatch.setattr(gps, "deferred_delay", _instant_delay)
+    monkeypatch.setattr(targets_mod, "acquire_permission", _fake_acquire_permission)
+    monkeypatch.setattr(targets_mod, "deferred_delay", _instant_delay)
     _patch_get_settings(monkeypatch)
 
     spider = gps.GenericPriceSpider(workspace_id=str(uuid.uuid4()), match_ids=str(uuid.uuid4()))
@@ -200,8 +221,8 @@ def test_semaphore_denied_event_carries_documented_fields(
             return Permission(granted=False, wait_hint_seconds=1, denied_by="semaphore")
         return Permission(granted=True, wait_hint_seconds=0, semaphore_key="sem-key", semaphore_token="sem-token")
 
-    monkeypatch.setattr(gps, "acquire_permission", _fake_acquire_permission)
-    monkeypatch.setattr(gps, "deferred_delay", _instant_delay)
+    monkeypatch.setattr(targets_mod, "acquire_permission", _fake_acquire_permission)
+    monkeypatch.setattr(targets_mod, "deferred_delay", _instant_delay)
     _patch_get_settings(monkeypatch)
 
     spider = gps.GenericPriceSpider(workspace_id=str(uuid.uuid4()), match_ids=str(uuid.uuid4()))
@@ -239,7 +260,7 @@ def test_rate_limit_overflow_event_carries_documented_fields(
         run_in_thread_calls.append((fn, args, kwargs))
         return None
 
-    monkeypatch.setattr(gps, "run_in_thread", _fake_run_in_thread)
+    monkeypatch.setattr(targets_mod, "run_in_thread", _fake_run_in_thread)
 
     scrape_job_id = uuid.uuid4()
     spider = gps.GenericPriceSpider(
@@ -282,9 +303,9 @@ def test_dedup_skip_event_carries_documented_fields(
     async def _fake_release_slot(redis: Any, *, key: Any, token: Any) -> None:
         return None
 
-    monkeypatch.setattr(gps, "acquire_permission", _fake_acquire_permission)
-    monkeypatch.setattr(gps, "acquire_lock", _fake_acquire_lock)
-    monkeypatch.setattr(gps, "release_slot", _fake_release_slot)
+    monkeypatch.setattr(targets_mod, "acquire_permission", _fake_acquire_permission)
+    monkeypatch.setattr(targets_mod, "acquire_lock", _fake_acquire_lock)
+    monkeypatch.setattr(targets_mod, "release_slot", _fake_release_slot)
     _patch_get_settings(monkeypatch)
 
     spider = gps.GenericPriceSpider(workspace_id=str(uuid.uuid4()), match_ids=str(uuid.uuid4()))
