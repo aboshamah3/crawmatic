@@ -38,7 +38,15 @@ ROBOTSTXT_OBEY = False
 DNS_RESOLVER = "scrape_core.safety.resolver.SafeResolver"
 
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
-TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+# Scrapyd's daemon process installs the classic epoll reactor before
+# spawning each crawl subprocess, and a Twisted reactor can never be
+# swapped once installed. Scrapy's own default_settings.py requests the
+# asyncio reactor unconditionally (even with no project-level override),
+# which crashed every crawl with "The installed reactor ... does not
+# match the requested one" before it could send a single request — so
+# this must explicitly match Scrapyd's already-installed reactor, not
+# simply omit the setting.
+TWISTED_REACTOR = "twisted.internet.epollreactor.EPollReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
 ITEM_PIPELINES = {
