@@ -139,6 +139,21 @@ _EXTRACTION_COST_ORDER: dict[ExtractionMethod, int] = {
 #: purely an implementation constant of this task's own probe loop.
 _PROBE_TIMEOUT_SECONDS = 15.0
 
+#: Realistic browser headers for probe fetches. `requests`' default
+#: `python-requests/x.y` User-Agent is a canonical bot-block target --
+#: live jarir.com 403s it in ~0.1s (verified 2026-07-11), which made
+#: every jarir discovery probe fail instantly and the run end NO_WINNER
+#: despite the pages being fully fetchable. The same page serves 200 to
+#: a browser UA, so a probe that claims to measure "is DIRECT_HTTP
+#: viable for this domain" must present one.
+_PROBE_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en",
+}
+
 
 @dataclass
 class _Tally:
@@ -230,7 +245,7 @@ def _fetch_direct(url: str, *, retry: bool) -> str | None:
     attempts = 2 if retry else 1
     for attempt in range(attempts):
         try:
-            response = requests.get(url, timeout=_PROBE_TIMEOUT_SECONDS)
+            response = requests.get(url, timeout=_PROBE_TIMEOUT_SECONDS, headers=_PROBE_HEADERS)
         except requests.RequestException as exc:
             logger.info(
                 "strategy_discovery: direct fetch failed url=%s attempt=%d error=%s",
@@ -288,6 +303,7 @@ def _fetch_via_proxy(session: Session, workspace_id: uuid.UUID, url: str) -> str
     proxy_kwargs = _build_proxy_kwargs(session, workspace_id)
     if proxy_kwargs is None:
         return None
+    proxy_kwargs["headers"] = {**_PROBE_HEADERS, **proxy_kwargs.get("headers", {})}
     try:
         response = requests.get(url, timeout=_PROBE_TIMEOUT_SECONDS, **proxy_kwargs)
     except requests.RequestException as exc:
@@ -324,7 +340,21 @@ def _probe_sample(
             if html is None:
                 continue
 
-            candidate = extract(html)
+            try:
+                candidate = extract(html)
+            except Exception:  # noqa: BLE001
+                # One pathological page (e.g. a payload that crashes a
+                # parser) must cost only its own observation, never the
+                # whole run -- pre-guard, a single such URL FAILED the
+                # entire discovery task for its domain (seen live on
+                # amazon.sa, 2026-07-11).
+                logger.warning(
+                    "strategy_discovery: extraction crashed url=%s access_method=%s",
+                    url,
+                    access_method.value,
+                    exc_info=True,
+                )
+                continue
             if candidate is None:
                 continue
 

@@ -80,7 +80,12 @@ def extract_css(html: str, *, profile: Any = None) -> ExtractionCandidate | None
     if not price_selector:
         return None
 
-    selector = Selector(text=html)
+    # parsel (<=1.11) tries json.loads(text) BEFORE honoring type="html";
+    # a JSON-parseable body yields a 'json' Selector on which .css()
+    # raises (see regex.py). No HTML -> the selector cannot match.
+    selector = Selector(text=html, type="html")
+    if selector.type != "html":
+        return None
     raw_price_text = _first_text(selector, price_selector)
     if not raw_price_text:
         return None

@@ -216,3 +216,48 @@ def test_pipeline_prefers_jsonld_over_css_and_regex_when_all_are_configured() ->
     assert candidate is not None
     assert candidate.method == ExtractionMethod.JSON_LD
     assert candidate.confidence == 0.95
+
+
+# --- parsel type pinning (2026-07-11 live-amazon.sa regression) ---------------
+# parsel's Selector auto-detection can misclassify a page whose leading
+# bytes look JSON-ish as a 'json' Selector, on which .xpath()/.css()
+# raise ValueError instead of scanning -- seen live on amazon.sa product
+# HTML, where it crashed the whole extraction chain (and with it the
+# domain's entire discovery run). Every strategy pins type="html" now;
+# a JSON document must flow through as "no price found", never a crash.
+
+_JSON_DOCUMENT = '{"product": {"name": "widget", "price": 129.99, "currency": "USD"}}'
+
+
+def test_extract_regex_on_json_document_returns_without_crashing() -> None:
+    candidate = extract_regex(_JSON_DOCUMENT)
+
+    # The single-number heuristic may or may not match inside the JSON
+    # text -- the contract under test is only "never raises".
+    assert candidate is None or candidate.method in (
+        ExtractionMethod.REGEX,
+        ExtractionMethod.SINGLE_NUMBER,
+    )
+
+
+def test_extract_jsonld_on_json_document_returns_none_without_crashing() -> None:
+    assert extract_jsonld(_JSON_DOCUMENT) is None
+
+
+def test_extract_css_on_json_document_returns_none_without_crashing() -> None:
+    class _CssProfile:
+        price_selector = "span.price"
+        confidence_rules: dict[str, float] | None = None
+
+    assert extract_css(_JSON_DOCUMENT, profile=_CssProfile()) is None
+
+
+def test_full_pipeline_on_json_document_never_crashes() -> None:
+    class _AllStrategiesProfile:
+        jsonld_enabled = True
+        price_selector = "span.price"
+        price_regex = r'"price"\s*:\s*"?([0-9.,]+)'
+        confidence_rules: dict[str, float] | None = None
+
+    # Must not raise; a JSON body either yields a regex candidate or None.
+    extract(_JSON_DOCUMENT, profile=_AllStrategiesProfile())

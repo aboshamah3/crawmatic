@@ -99,7 +99,12 @@ def extract_jsonld(html: str, *, profile: Any = None) -> ExtractionCandidate | N
     if profile is not None and getattr(profile, "jsonld_enabled", True) is False:
         return None
 
-    selector = Selector(text=html)
+    # parsel (<=1.11) tries json.loads(text) BEFORE honoring type="html";
+    # a JSON-parseable body yields a 'json' Selector on which .css()
+    # raises (see regex.py). No HTML -> no <script type="application/ld+json">.
+    selector = Selector(text=html, type="html")
+    if selector.type != "html":
+        return None
     for raw in selector.css(_JSONLD_SCRIPT_CSS).getall():
         try:
             data = json.loads(raw)

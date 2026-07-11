@@ -37,6 +37,21 @@ ROBOTSTXT_OBEY = False
 # to an internal address even via DNS rebinding after request-build time.
 DNS_RESOLVER = "scrape_core.safety.resolver.SafeResolver"
 
+# Scrapy's default "Scrapy/x.y (+https://scrapy.org)" User-Agent is a
+# canonical bot-block target -- live amazon.sa answers it with HTTP 500
+# and jarir.com 403s the equally-default python-requests UA (verified
+# 2026-07-11), so real fetches need a realistic browser UA. Also the UA
+# `RobotsPolicyMiddleware` matches robots.txt rules against (both sites'
+# robots.txt allow our product-page paths for this agent).
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+DEFAULT_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en",
+}
+
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
 # Scrapyd's daemon process installs the classic epoll reactor before
 # spawning each crawl subprocess, and a Twisted reactor can never be

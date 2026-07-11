@@ -51,7 +51,14 @@ def _text_nodes(html: str, *, exclude_tags: frozenset[str] = frozenset()) -> lis
     ``matched_text`` a ``reject_if_text_contains`` rule checks against —
     without also matching inside tag markup/attributes.
     """
-    selector = Selector(text=html)
+    # parsel (<=1.11) tries json.loads(text) BEFORE honoring type="html":
+    # any JSON-parseable body becomes a 'json' Selector regardless, and
+    # .xpath() on it raises ValueError instead of scanning text nodes
+    # (live amazon.sa serves such bodies; pre-guard this crashed the whole
+    # extraction chain). A JSON document has no HTML text nodes -- empty.
+    selector = Selector(text=html, type="html")
+    if selector.type != "html":
+        return []
     nodes: list[str] = []
     for text_node in selector.xpath("//text()"):
         if exclude_tags:
