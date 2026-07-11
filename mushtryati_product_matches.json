@@ -1,0 +1,436 @@
+{
+  "_meta": {
+    "purpose": "Hand-picked product/competitor-match test fixture for crawmatic, sourced live from mushtryati.com (WooCommerce) and cross-checked against jarir.com, noon.com, amazon.sa (all KSA storefronts).",
+    "generated": "2026-07-08",
+    "updated": "2026-07-11",
+    "source_store": "mushtryati.com",
+    "competitors": ["jarir.com", "noon.com", "amazon.sa"],
+    "schema_ref": "specs/004-catalog-products-variants-groups/data-model.md, specs/005-competitors-matches/data-model.md",
+    "confidence_levels": {
+      "high": "Exact SKU/ASIN or identical spec string confirmed on the competitor page",
+      "medium": "Same model line confirmed but a spec (RAM/connectivity/storage) differs slightly, or exact variant not isolated from a category/variant-selector page",
+      "gap": "No matching listing found on this competitor after multiple search attempts — kept as a deliberate negative test case"
+    },
+    "note": "amazon.sa URLs are the bare canonical https://www.amazon.sa/dp/{ASIN} form (Amazon always accepts this, slug is decorative/optional) rather than the full pretty-URL form. url_pattern grouping/discovery-phase concerns are being handled separately on the crawmatic side."
+  },
+  "products": [
+    {
+      "source": {
+        "external_id": "62303",
+        "sku": "MBP16-M4PRO-48-512",
+        "title": "MacBook Pro 16 (M4 Pro, 2024) 48GB/512GB",
+        "brand": "Apple",
+        "url": "https://mushtryati.com/product/macbook-pro-16-m4-pro-2024-%d8%ac%d8%af%d9%8a%d8%af-new/",
+        "price": 10159,
+        "currency": "SAR",
+        "category": "laptop"
+      },
+      "has_variants": true,
+      "variant_note": "Mushtryati sells one fixed config (Silver implied); Amazon/Noon expose Space Black vs Silver as separate listings/options — good test case for option_values reconciliation.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/apple-macbook-pro-16-m4-pro-laptops-646493.html",
+          "external_title": "Apple Retina XDR Laptop 16\" M4 Pro 14-core CPU",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/macbook-pro-mx2u3-with-16-2-inch-display-m4-pro-chip-14-core-cpu-20-core-gpu-48gb-ram-512gb-ssd-macos-english-arabic-silver/N70125952V/p/",
+          "competitor_variant_identifier": "N70125952V",
+          "competitor_variant_options": { "color": "Silver" },
+          "external_title": "Apple MacBook Pro MX2U3 48GB RAM 512GB SSD Silver",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0DLHZSDXT",
+          "competitor_variant_identifier": "B0DLHZSDXT",
+          "competitor_variant_options": { "color": "Silver" },
+          "external_title": "Apple 2024 MacBook Pro 16-inch M4 Pro 48GB 512GB - Silver",
+          "confidence": "high",
+          "alt_color_asin": "B0DLHGK43P"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "61472",
+        "sku": "samsung-galaxy-tab-a11plus-5g-128",
+        "title": "Samsung Galaxy Tab A11+ 5G 128GB 6GB RAM",
+        "brand": "Samsung",
+        "url": "https://mushtryati.com/product/samsung-galaxy-tab-a11-5g-128gb-6gb-ram-tablet/",
+        "price": 1145,
+        "currency": "SAR",
+        "category": "tablet"
+      },
+      "has_variants": true,
+      "variant_note": "Same model line as the WiFi/256GB SKU below; jarir bundles storage/connectivity as options on one product page rather than separate SKUs — reconciliation test case.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/samsung-galaxy-tab-a11-tablet-pc-jpm1776.html",
+          "external_title": "Samsung Galaxy Tab A11+ Tablet - Wi-Fi 11\" Grey (128GB/256GB options on page)",
+          "confidence": "medium",
+          "note": "Jarir's page exposes Wi-Fi only; no separate 5G SKU found — treat as closest variant-group match, not exact connectivity match."
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/galaxy-tab-a11-plus-5g-silver-6gb-ram-128gb-middle-east-version/N70243992V/p/",
+          "competitor_variant_identifier": "N70243992V",
+          "competitor_variant_options": { "color": "Silver", "connectivity": "5G", "ram": "6GB", "storage": "128GB" },
+          "external_title": "Samsung Galaxy Tab A11 Plus 5G Silver 6GB RAM 128GB",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0FZBBW4DK",
+          "competitor_variant_identifier": "B0FZBBW4DK",
+          "competitor_variant_options": { "color": "Silver", "connectivity": "5G", "ram": "6GB", "storage": "128GB" },
+          "external_title": "Samsung Galaxy Tab A11+, 5G, Silver, 6GB RAM, 128GB Storage (KSA Version)",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "61473",
+        "sku": "samsung-galaxy-tab-a11plus-wifi-256",
+        "title": "Samsung Galaxy Tab A11+ WiFi 256GB 8GB RAM",
+        "brand": "Samsung",
+        "url": "https://mushtryati.com/product/samsung-galaxy-tab-a11plus-wifi-256gb-8gb-ram-tablet/",
+        "price": 1185,
+        "currency": "SAR",
+        "category": "tablet"
+      },
+      "has_variants": true,
+      "variant_note": "Paired with #61472 above — same base product, different storage/connectivity SKU at mushtryati vs a single variant-selector page at jarir.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/samsung-galaxy-tab-a11-tablet-pc-jpm1776.html",
+          "external_title": "Samsung Galaxy Tab A11+ Tablet - Wi-Fi 11\" (256GB option, SM-X230NZSEMEA)",
+          "confidence": "medium",
+          "note": "Same jarir page as the 128GB/5G entry; 256GB appears as an in-page storage option, not a distinct URL."
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/galaxy-tab-a11-plus-wifi-silver-8gb-ram-256gb-middle-east-version/N70243998V/p/",
+          "competitor_variant_identifier": "N70243998V",
+          "competitor_variant_options": { "color": "Silver", "connectivity": "WiFi", "ram": "8GB", "storage": "256GB" },
+          "external_title": "Samsung Galaxy Tab A11 Plus WiFi Silver 8GB RAM 256GB",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0FZBHD6YK",
+          "competitor_variant_identifier": "B0FZBHD6YK",
+          "competitor_variant_options": { "color": "Silver", "connectivity": "WiFi", "ram": "8GB", "storage": "256GB" },
+          "external_title": "Samsung Galaxy Tab A11+, WiFi, Silver, 8GB RAM, 256GB Storage (KSA Version)",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "59189",
+        "sku": null,
+        "title": "Acer Nitro V15 i5, RTX 3050 6GB, 16GB RAM, 512GB SSD",
+        "brand": "Acer",
+        "url": "https://mushtryati.com/product/acer-laptop-i5-nitro-v15/",
+        "price": 3399,
+        "currency": "SAR",
+        "category": "laptop"
+      },
+      "has_variants": false,
+      "variant_note": "Simple product at mushtryati; CPU naming and RAM drift across competitor listings — realistic fuzzy-match case rather than an exact SKU match.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/acer-nitro-v-laptops-627226.html",
+          "external_title": "Acer Gaming Laptop 15.6\" Intel Core i5-13420H (13th Gen)",
+          "confidence": "medium",
+          "note": "RAM config not confirmed as 16GB on this jarir listing."
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/nitro-v-15-gaming-laptop-with-15-6-inch-full-hd-1920x1080-display-intel-core-5-210h-processor-16gb-ram-ddr5-512gb-ssd-6gb-nvidia-geforce-rtx-3050-graphics-dos-without-windows-english-arabic-black/N70279267V/p/",
+          "competitor_variant_identifier": "N70279267V",
+          "external_title": "Acer Nitro V 15, Intel Core 5-210H, 16GB RAM, 512GB SSD, RTX 3050 6GB",
+          "confidence": "high",
+          "note": "Exact spec match (16GB RAM, 512GB SSD, RTX3050); CPU listed under Intel's newer 'Core 5' branding rather than 'i5'."
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0CMLV452T",
+          "competitor_variant_identifier": "B0CMLV452T",
+          "external_title": "Acer Nitro V 15 ANV15-51, i5-13420H, 8GB DDR5 RAM, 512GB SSD, RTX 3050 6GB",
+          "confidence": "medium",
+          "note": "RAM is 8GB here vs 16GB at mushtryati/noon — same model family, different memory config."
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "52400",
+        "sku": "9720",
+        "title": "HP OfficeJet Pro 9720 Wide Format A3 All-in-One Printer",
+        "brand": "HP",
+        "url": "https://mushtryati.com/product/%d8%b7%d8%a7%d8%a8%d8%b9%d8%a9-%d8%a7%d8%aa%d8%b4-%d8%a8%d9%8a-%d8%a7%d9%88%d9%81%d9%8a%d8%b3-%d8%ac%d9%8a%d8%aa-9720-a3/",
+        "price": 749,
+        "currency": "SAR",
+        "category": "printer"
+      },
+      "has_variants": false,
+      "variant_note": "Simple product on all four sites — clean 3/3 exact match, good baseline/control case.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/hp-officejet-pro-9720-multifunction-machines-632020.html",
+          "external_title": "HP OfficeJet Pro 9720 Wide Format Multi-function Printer",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/officejet-pro-9720-wide-format-all-in-one-printer-print-scan-copy-53n94c-cement/N70049973V/p/",
+          "competitor_variant_identifier": "N70049973V",
+          "competitor_variant_sku": "53N94C",
+          "external_title": "HP OfficeJet Pro 9720 Wide Format All-in-One Printer - Cement",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0CW1HYTWC",
+          "competitor_variant_identifier": "B0CW1HYTWC",
+          "competitor_variant_sku": "53N94C",
+          "external_title": "HP OfficeJet Pro 9720 Wide Format All-in-One Printer, Cement",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "62284",
+        "sku": "210000114",
+        "title": "Epson CO-W01 Projector 3000 Lumens",
+        "brand": "Epson",
+        "url": "https://mushtryati.com/product/epson-co-w01-projector-3000-lumens-v11ha86040da/",
+        "price": 1569,
+        "currency": "SAR",
+        "category": "projector"
+      },
+      "has_variants": false,
+      "variant_note": "Another clean 3/3 exact-model control case, different category from the printer above.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/epson-cow01-multimedia-projector-607185.html",
+          "external_title": "Epson CO-W01 Home Theater Projector LCD Display 3000 ISO Lumens",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/projector-epson-3lcd-3000-lumens-portable-wxga-projector-co-w01-white/N53400533A/p/",
+          "competitor_variant_identifier": "N53400533A",
+          "external_title": "EPSON Projector 3LCD 3000 Lumens Portable WXGA - CO-W01 White",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0B985KPML",
+          "competitor_variant_identifier": "B0B985KPML",
+          "external_title": "Epson CO-W01 WXGA Projector, 3LCD, 3000 lumens, White, Compact",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "60135",
+        "sku": "B00YUOVBZK",
+        "title": "Logitech G29 Driving Force Racing Wheel and Floor Pedals (PS5/PS4/PC/Mac) - KSA Version",
+        "brand": "Logitech",
+        "url": "https://mushtryati.com/product/logitech-g29-driving-force-racing-wheel-and-floor-pedals/",
+        "price": 899,
+        "currency": "SAR",
+        "category": "gaming accessory"
+      },
+      "has_variants": false,
+      "variant_note": "Mushtryati's own SKU is the literal Amazon ASIN (B00YUOVBZK) — dropship-sourced listing, so the amazon.sa match is a direct identifier match rather than fuzzy title matching.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/logitech-driving-force-g29-gaming-controller-447272.html",
+          "external_title": "Logitech Driving Force G29 Racing Wheel + Pedals Wired Black",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/g29-driving-force-racing-wheel-and-floor-pedalsfor-ps5-ps4-ps3-and-pc-black/N13233113A/p/",
+          "competitor_variant_identifier": "N13233113A",
+          "external_title": "Logitech G29 Driving Force Racing Wheel and Floor Pedals for PS5, PS4, PS3, PC - Black",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B00YUOVBZK",
+          "competitor_variant_identifier": "B00YUOVBZK",
+          "external_title": "Logitech G29 Driving Force Racing Wheel and Floor Pedals for PS5, PS4, PC, Mac - Black - KSA Version",
+          "confidence": "high",
+          "note": "Identical SKU/ASIN to mushtryati's own listing — same identifier on both ends."
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "62270",
+        "sku": "160000262",
+        "title": "Canon i-SENSYS MF3010 Laser Printer",
+        "brand": "Canon",
+        "url": "https://mushtryati.com/product/canon-i-sensys-mf3010-laser-printer-%d8%ac%d8%af%d9%8a%d8%af-new/",
+        "price": 779,
+        "currency": "SAR",
+        "category": "printer"
+      },
+      "has_variants": false,
+      "variant_note": "Second printer control case (different brand/tier from the HP OfficeJet above) — clean 3/3.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/canon-mf3010-multifunction-machines-569534.html",
+          "external_title": "Canon i-SENSYS MF3010 All-in-One Multi-function Printer",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/laser-mfp-i-sensys-mf3010-black/N53426499A/p/",
+          "competitor_variant_identifier": "N53426499A",
+          "external_title": "Canon LASER MFP I-Sensys MF3010 Black",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B09DQ2YTF9",
+          "competitor_variant_identifier": "B09DQ2YTF9",
+          "external_title": "Canon i-SENSYS MF3010 Multifunction Monochrome Laser Printer",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "60224",
+        "sku": "Motorola edge 60",
+        "title": "Motorola Edge 60 Fusion 5G — Pantone Slipstream",
+        "brand": "Motorola",
+        "url": "https://mushtryati.com/product/motorola-edge-60-fusion-slipstream-5g/",
+        "price": 849,
+        "currency": "SAR",
+        "category": "smartphone"
+      },
+      "has_variants": true,
+      "variant_note": "Mushtryati lists each Pantone color as its own product (see Amazonite below) rather than one variable product with a color option — the classic separate-SKU-vs-variant-selector reconciliation case, this time on a phone instead of a tablet.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/motorola-edge-60-fusion-smartphones-658784.html",
+          "external_title": "Motorola edge 60 fusion 256 GB Slipstream",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/edge-60-fusion-5g-dual-sim-pantone-slipstream-12gb-ram-256gb-middle-east-version/N70164930V/p/",
+          "competitor_variant_identifier": "N70164930V",
+          "competitor_variant_options": { "color": "Pantone Slipstream", "ram": "12GB", "storage": "256GB" },
+          "external_title": "Motorola Edge 60 Fusion 5G Dual SIM Pantone Slipstream 12GB RAM 256GB",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0F2PV4WQJ",
+          "competitor_variant_identifier": "B0F2PV4WQJ",
+          "competitor_variant_options": { "color": "Pantone Slipstream", "ram": "12GB", "storage": "256GB" },
+          "external_title": "MOTOROLA Edge 60 Fusion 5G, 12GB RAM, 256GB ROM, PANTONE Slipstream",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "60232",
+        "sku": "Motorola edge 60-1",
+        "title": "Motorola Edge 60 Fusion 5G — Pantone Amazonite",
+        "brand": "Motorola",
+        "url": "https://mushtryati.com/product/motorola-edge-60-fusion-amazonite-5g/",
+        "price": 849,
+        "currency": "SAR",
+        "category": "smartphone"
+      },
+      "has_variants": true,
+      "variant_note": "Same base phone as the Slipstream entry above, different Pantone color — pair them to test that a matcher treats these as related-but-distinct variants, not duplicates.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/motorola-edge-60-fusion-smartphones-658785.html",
+          "external_title": "Motorola edge 60 fusion 256 GB Amazonite",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/edge-60-fusion-5g-dual-sim-pantone-amazonite-blue-12gb-ram-256gb-middle-east-version/N70164932V/p/",
+          "competitor_variant_identifier": "N70164932V",
+          "competitor_variant_options": { "color": "Pantone Amazonite", "ram": "12GB", "storage": "256GB" },
+          "external_title": "Motorola Edge 60 Fusion 5G Dual SIM Pantone Amazonite (Blue) 12GB RAM 256GB",
+          "confidence": "high"
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0F2QB6QHX",
+          "competitor_variant_identifier": "B0F2QB6QHX",
+          "competitor_variant_options": { "color": "Pantone Amazonite", "ram": "12GB", "storage": "256GB" },
+          "external_title": "MOTOROLA Edge 60 Fusion 5G, 12GB RAM Boost, 256GB ROM, PANTONE Amazonite",
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "source": {
+        "external_id": "61598",
+        "sku": "xiaomi-14-ultra-512",
+        "title": "Xiaomi 14 Ultra 512GB 16GB RAM 5G Dual SIM Smartphone",
+        "brand": "Xiaomi",
+        "url": "https://mushtryati.com/product/xiaomi-14-ultra-512gb-16gb-ram-5g-dual-sim-smartphone/",
+        "price": 4194,
+        "currency": "SAR",
+        "category": "smartphone"
+      },
+      "has_variants": true,
+      "variant_note": "Flagship-tier phone, third distinct smartphone brand in the fixture (after Samsung tablets and Motorola) — Black/White color variants confirmed on all three competitors.",
+      "competitor_matches": [
+        {
+          "competitor": "jarir.com",
+          "competitor_url": "https://www.jarir.com/sa-en/xiaomi-14-ultra-smartphones-632646.html",
+          "external_title": "Xiaomi 14 Ultra 512 GB Black",
+          "confidence": "high"
+        },
+        {
+          "competitor": "noon.com",
+          "competitor_url": "https://www.noon.com/saudi-en/14-ultra-dual-sim-black-16gb-ram-512gb-5g-global-version-with-xiaomi-watch-2-black-and-80w-adaptive-wireless-charging-stand-vip-warranty-service/N70060968V/p/",
+          "competitor_variant_identifier": "N70060968V",
+          "competitor_variant_options": { "color": "Black", "ram": "16GB", "storage": "512GB" },
+          "external_title": "Xiaomi 14 Ultra Dual SIM Black 16GB RAM 512GB 5G - Global Version (bundled with Xiaomi Watch 2 + charging stand)",
+          "confidence": "high",
+          "note": "Noon's listing bundles extra free accessories (watch, charging stand) not present in the base mushtryati/jarir/amazon SKU — same phone, richer bundle."
+        },
+        {
+          "competitor": "amazon.sa",
+          "competitor_url": "https://www.amazon.sa/dp/B0CYQ2NHTW",
+          "competitor_variant_identifier": "B0CYQ2NHTW",
+          "competitor_variant_options": { "color": "Black", "ram": "16GB", "storage": "512GB" },
+          "external_title": "Xiaomi 14 Ultra Dual SIM Black 16GB RAM 512GB 5G - Global Version",
+          "confidence": "high"
+        }
+      ]
+    }
+  ]
+}

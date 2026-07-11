@@ -398,6 +398,10 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
     if not match_ids:
         return _LoadedTargets(targets=[])
 
+    from app_shared.config import get_settings
+
+    strategy_profile_scope = get_settings().STRATEGY_PROFILE_SCOPE
+
     with workspace_txn(workspace_id) as session:
         matches = (
             session.execute(
@@ -580,7 +584,9 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
             domain = competitor_domain_by_id.get(competitor_id, "")
             matched_rule = matched_domain_rule_by_group[(competitor_id, url_pattern)]
             override = matched_rule.url_pattern_override if matched_rule is not None else None
-            lookup_pattern = override or derive_url_pattern(group[0].competitor_url)
+            lookup_pattern = override or (
+                domain if strategy_profile_scope == "domain" else derive_url_pattern(group[0].competitor_url)
+            )
 
             strategy_profile = resolve_or_create_strategy_profile(
                 session,

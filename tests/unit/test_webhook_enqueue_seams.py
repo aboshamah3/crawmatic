@@ -790,7 +790,7 @@ def fake_build_recent_signals(session, profile):
     return object()
 
 
-def fake_evaluate_rediscovery(profile, combined, recent_signals, thresholds):
+def fake_evaluate_rediscovery(profile, combined, recent_signals, thresholds, *, scope="domain"):
     class _Decision:
         trigger = True
         reason = "test"

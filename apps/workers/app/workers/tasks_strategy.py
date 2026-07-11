@@ -159,18 +159,25 @@ def _select_sample_urls(
     competitor_id: uuid.UUID,
     url_pattern: str,
     max_sample: int,
+    scope: str = "domain",
 ) -> list[str]:
     """Auto-trigger fallback (contracts/discovery.md "Payload"): select up
     to `max_sample` matched URLs for this key from `competitor_product_matches`
-    when the caller didn't supply `sample_urls` (US2's AUTO enqueue, empty list)."""
-    stmt = (
-        scoped_select(CompetitorProductMatch, workspace_id)
-        .where(
-            CompetitorProductMatch.competitor_id == competitor_id,
-            CompetitorProductMatch.url_pattern == url_pattern,
-        )
-        .limit(max_sample)
+    when the caller didn't supply `sample_urls` (US2's AUTO enqueue, empty list).
+
+    `scope == "domain"` (default, `Settings.STRATEGY_PROFILE_SCOPE`): the
+    `url_pattern` filter is dropped -- `competitor_id` + the workspace RLS
+    scoping already bound the sample to the domain, so this gate no longer
+    depends on stored match `url_pattern` values at all (fixes the
+    discovery gate never firing for per-product-slug catalogs, where every
+    match is its own n=1 pattern). `scope == "url_pattern"` keeps the exact
+    legacy filtered behavior."""
+    stmt = scoped_select(CompetitorProductMatch, workspace_id).where(
+        CompetitorProductMatch.competitor_id == competitor_id,
     )
+    if scope != "domain":
+        stmt = stmt.where(CompetitorProductMatch.url_pattern == url_pattern)
+    stmt = stmt.limit(max_sample)
     return [row.competitor_url for row in session.execute(stmt).scalars().all()]
 
 
@@ -433,6 +440,7 @@ def run_discovery(
                 competitor_id=comp_id,
                 url_pattern=url_pattern,
                 max_sample=settings.STRATEGY_DISCOVERY_MAX_SAMPLE,
+                scope=settings.STRATEGY_PROFILE_SCOPE,
             )
 
         size_ok = validate_sample_size(
@@ -670,7 +678,9 @@ def light_recheck() -> None:
 
             combined = _combined_stats_for_profile(session, redis, profile)
             recent_signals = build_recent_signals(session, profile)
-            decision = evaluate_rediscovery(profile, combined, recent_signals, thresholds)
+            decision = evaluate_rediscovery(
+                profile, combined, recent_signals, thresholds, scope=settings.STRATEGY_PROFILE_SCOPE
+            )
 
             triggered = apply_rediscovery(session, profile, decision)
             if triggered:

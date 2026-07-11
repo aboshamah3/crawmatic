@@ -197,6 +197,16 @@ class Settings(BaseSettings):
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
     STRATEGY_STATS_KEY_TTL_SECONDS: int = 3600
 
+    # --- Strategy profile lookup-key scope (2026-07-11 domain-scope fix) ---
+    # "domain": the profile/discovery lookup key is the bare competitor
+    # domain (caps discovery cost at O(#competitors), fixes the discovery
+    # gate never firing for per-product-slug catalogs). "url_pattern":
+    # legacy exact-current behavior, kept as a config-only rollback (no
+    # deploy needed). `derive_url_pattern`/`URL_PATTERN_ALGORITHM_VERSION`
+    # are unchanged either way -- matches still stamp `url_pattern` so
+    # pattern-level keying can be re-enabled later, data-driven.
+    STRATEGY_PROFILE_SCOPE: str = "domain"
+
     # --- Scheduler refresh-pass tuning (SPEC-13 US2, research R8,
     # Principle IV — env-tunable, never a hardcoded literal). Poll
     # cadence and per-pass claim ceiling for `apps/scheduler`'s due-rule
@@ -254,6 +264,15 @@ class Settings(BaseSettings):
                 f"{self.ENCRYPTION_PRIMARY_KEY_VERSION} not present in ENCRYPTION_KEYS"
             )
         return self
+
+    @field_validator("STRATEGY_PROFILE_SCOPE")
+    @classmethod
+    def _validate_strategy_profile_scope(cls, value: str) -> str:
+        if value not in ("domain", "url_pattern"):
+            raise ValueError(
+                f"STRATEGY_PROFILE_SCOPE must be 'domain' or 'url_pattern', got {value!r}"
+            )
+        return value
 
 
 @lru_cache

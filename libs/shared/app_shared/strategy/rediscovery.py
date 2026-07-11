@@ -50,6 +50,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -210,6 +211,8 @@ def evaluate_rediscovery(
     combined_stats: CombinedStats,
     recent_signals: RecentSignals,
     thresholds: RediscoveryThresholds,
+    *,
+    scope: str = "domain",
 ) -> RediscoveryDecision:
     """Any one of the 8 FR-020 conditions firing -> `trigger=True` (US4 AS1/AS2/AS3).
 
@@ -220,6 +223,13 @@ def evaluate_rediscovery(
     recent_signals confidence and/or combined avg_confidence"). Healthy
     signals (rate >= floor, no consecutive failures, confidence >=
     threshold) -> `trigger=False`, profile stays `ACTIVE`.
+
+    `scope` mirrors `Settings.STRATEGY_PROFILE_SCOPE` (caller-supplied — this
+    function stays pure/I/O-free). Under `"domain"` (default), condition 8
+    compares the observed URL's host to `profile.domain` instead of
+    re-deriving a v1 pattern, since the profile's lookup key is now the
+    domain itself and the signal should never fire on same-domain URLs.
+    `"url_pattern"` keeps the exact legacy `derive_url_pattern` comparison.
 
     Pure — no I/O, no Scrapy/Twisted/FastAPI import (Constitution I/V).
     """
@@ -303,11 +313,19 @@ def evaluate_rediscovery(
             reason=f"consecutive_unrealistic_price={unrealistic_price} >= threshold={threshold}",
         )
 
-    # --- Condition 8 (FR-020b): template appears changed (re-derived pattern). ---
-    template_changed = _consecutive(
-        attempts,
-        lambda a: a.url is not None and derive_url_pattern(a.url) != profile.url_pattern,
-    )
+    # --- Condition 8 (FR-020b): template appears changed (re-derived pattern,
+    # or -- under domain scope -- the observed URL's host no longer matches
+    # the profile's domain key; effectively never fires on same-domain URLs). ---
+    if scope == "domain":
+        template_changed_predicate: Callable[[RecentAttemptSignal], bool] = (
+            lambda a: a.url is not None
+            and (urlsplit(a.url).hostname or "").lower() != profile.domain.lower()
+        )
+    else:
+        template_changed_predicate = (
+            lambda a: a.url is not None and derive_url_pattern(a.url) != profile.url_pattern
+        )
+    template_changed = _consecutive(attempts, template_changed_predicate)
     if template_changed >= threshold:
         return RediscoveryDecision(
             trigger=True,

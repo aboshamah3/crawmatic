@@ -142,3 +142,35 @@ def test_browser_scraping_knobs_honor_env_override(monkeypatch: pytest.MonkeyPat
     assert settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS == 45000
     assert settings.BROWSER_CONCURRENT_REQUESTS == 4
     assert settings.BROWSER_MAX_CONTEXTS == 2
+
+
+def test_strategy_profile_scope_defaults_to_domain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STRATEGY_PROFILE_SCOPE defaults to "domain" (the discovery-gate fix, 2026-07-11)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("STRATEGY_PROFILE_SCOPE", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.STRATEGY_PROFILE_SCOPE == "domain"
+
+
+def test_strategy_profile_scope_honors_url_pattern_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"url_pattern" is a valid config-only rollback to the legacy exact behavior."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("STRATEGY_PROFILE_SCOPE", "url_pattern")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.STRATEGY_PROFILE_SCOPE == "url_pattern"
+
+
+def test_strategy_profile_scope_rejects_invalid_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A misconfigured scope value fails fast rather than silently misbehaving."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("STRATEGY_PROFILE_SCOPE", "bogus")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

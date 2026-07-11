@@ -124,12 +124,27 @@ def resolve_or_create_strategy_profile(
 ) -> DomainStrategyProfile:
     """Get-or-create the profile for one `(workspace, competitor, domain, url_pattern)` key.
 
-    `url_pattern` is the caller-derived lookup pattern -- a manual
-    `domain_access_rules.url_pattern_override` when one matched, else a
-    fresh `derive_url_pattern(url)` at the *current*
-    `URL_PATTERN_ALGORITHM_VERSION` (never the group's possibly-stale
-    stored `competitor_product_matches.url_pattern`, contracts/
-    consumption.md step 1, FR-006).
+    `url_pattern` is the caller-derived lookup key -- keys purely on
+    whatever the caller passes, so its meaning depends on
+    `Settings.STRATEGY_PROFILE_SCOPE` (2026-07-11 domain-scope fix):
+
+    - `"domain"` (default): the caller passes the bare competitor domain
+      (e.g. `noon.com`) as `url_pattern`, so this profile's lookup key is
+      effectively `(workspace, competitor, domain)` -- one profile per
+      competitor, capping discovery cost at O(#competitors) instead of
+      O(#distinct-URL-patterns). Fixes the discovery gate never firing for
+      catalogs where every product URL embeds a unique slug (every v1
+      pattern is n=1).
+    - `"url_pattern"`: legacy behavior -- a manual
+      `domain_access_rules.url_pattern_override` when one matched, else a
+      fresh `derive_url_pattern(url)` at the *current*
+      `URL_PATTERN_ALGORITHM_VERSION` (never the group's possibly-stale
+      stored `competitor_product_matches.url_pattern`, contracts/
+      consumption.md step 1, FR-006).
+
+    Either way, a manual `url_pattern_override` always wins when one
+    matched (unchanged precedence) -- callers resolve the scope-dependent
+    key themselves; this function has no scope logic of its own.
 
     On a hit, returns the existing row unchanged. On a miss, inserts a
     fresh `DISCOVERY_REQUIRED` profile stamped with the current

@@ -199,7 +199,6 @@ def test_active_profile_seeds_first_attempt_with_preferred_methods(seeded: Seede
     from price_monitor.spiders.generic_price_spider import _prepare_dispatch, load_targets
 
     from app_shared.enums import AccessMethod, AccessStrategy, ExtractionMethod
-    from app_shared.url_pattern import derive_url_pattern
 
     provider_id = _create_proxy_provider(seeded.workspace_id, type="DATACENTER", country_code="US")
     # DIRECT_ONLY would never proxy on its own -- proves the override, not
@@ -224,7 +223,10 @@ def test_active_profile_seeds_first_attempt_with_preferred_methods(seeded: Seede
     with get_session() as session:
         domain = session.get(Competitor, competitor_id).domain
 
-    url_pattern = derive_url_pattern(url)
+    # STRATEGY_PROFILE_SCOPE defaults to "domain" (2026-07-11 discovery-gate
+    # fix) -- `load_targets`'s lookup key is the bare domain, not a derived
+    # v1 pattern, so the pre-seeded profile must be keyed the same way.
+    url_pattern = domain
     profile_id = _seed_strategy_profile(
         seeded,
         competitor_id,
@@ -261,7 +263,7 @@ def test_unseen_key_falls_back_and_seeds_discovery_required_profile_once(
 
     from app_shared.enums import AccessStrategy
     from app_shared.redis_client import get_redis_client
-    from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
+    from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION
 
     _create_access_policy(seeded.workspace_id, strategy=AccessStrategy.DIRECT_ONLY, max_retries=0)
     competitor_id = seed_competitor(seeded, "consumption-unseen")
@@ -274,7 +276,9 @@ def test_unseen_key_falls_back_and_seeds_discovery_required_profile_once(
 
     with get_session() as session:
         domain = session.get(Competitor, competitor_id).domain
-    url_pattern = derive_url_pattern(url)
+    # STRATEGY_PROFILE_SCOPE defaults to "domain" -- the lookup key is the
+    # bare domain (2026-07-11 discovery-gate fix).
+    url_pattern = domain
 
     redis_client = get_redis_client()
     before = redis_client.llen("strategy_discovery")
@@ -306,7 +310,6 @@ def test_disabled_profile_falls_back_to_default_ladder(seeded: SeededWorkspace) 
     from price_monitor.spiders.generic_price_spider import _prepare_dispatch, load_targets
 
     from app_shared.enums import AccessMethod, AccessStrategy, ExtractionMethod
-    from app_shared.url_pattern import derive_url_pattern
 
     _create_access_policy(
         seeded.workspace_id,
@@ -326,7 +329,9 @@ def test_disabled_profile_falls_back_to_default_ladder(seeded: SeededWorkspace) 
 
     with get_session() as session:
         domain = session.get(Competitor, competitor_id).domain
-    url_pattern = derive_url_pattern(url)
+    # STRATEGY_PROFILE_SCOPE defaults to "domain" -- the lookup key is the
+    # bare domain (2026-07-11 discovery-gate fix).
+    url_pattern = domain
 
     _seed_strategy_profile(
         seeded,
@@ -346,3 +351,71 @@ def test_disabled_profile_falls_back_to_default_ladder(seeded: SeededWorkspace) 
     assert decision.plan is not None
     assert decision.plan.access_method == AccessMethod.DIRECT_HTTP
     assert decision.plan.use_proxy is False
+
+
+# --- Domain-scope discovery-gate fix (2026-07-11, PLAN_DOMAIN_STRATEGY_PROFILES.md) --
+
+
+def test_distinct_url_patterns_same_domain_share_one_profile(seeded: SeededWorkspace) -> None:
+    """The bug this fix closes: per-product-slug URLs each derive their own
+    n=1 v1 pattern, so under the old url_pattern-keyed lookup, discovery
+    never gathered >= STRATEGY_DISCOVERY_MIN_SAMPLE and never ran. Under
+    the "domain" scope default, two matches whose URLs differ (and are
+    seeded with their own literal `url_pattern`, `seed_match`'s
+    convention) still resolve to the SAME `domain_strategy_profiles` row
+    keyed by the shared competitor domain -- one profile, one discovery
+    enqueue, not one per slug."""
+    from price_monitor.spiders.generic_price_spider import load_targets
+
+    from app_shared.enums import AccessStrategy
+    from app_shared.redis_client import get_redis_client
+
+    _create_access_policy(seeded.workspace_id, strategy=AccessStrategy.DIRECT_ONLY, max_retries=0)
+    competitor_id = seed_competitor(seeded, "consumption-domain-scope")
+    unique = uuid.uuid4().hex[:8]
+    url_a = f"https://consumption-domain-scope-{unique}.invalid/products/red-shoe-111"
+    url_b = f"https://consumption-domain-scope-{unique}.invalid/products/blue-shoe-222"
+    match_id_a = seed_match(seeded, competitor_id, url_a)
+    match_id_b = seed_match(seeded, competitor_id, url_b)
+
+    redis_client = get_redis_client()
+    before = redis_client.llen("strategy_discovery")
+
+    loaded = load_targets(seeded.workspace_id, [match_id_a, match_id_b])
+    assert len(loaded.targets) == 2
+    profile_ids = {target.domain_strategy_profile_id for target in loaded.targets}
+    assert len(profile_ids) == 1, "both slug-unique matches must resolve to one shared profile"
+
+    after = redis_client.llen("strategy_discovery")
+    assert after == before + 1, "one profile -> one discovery enqueue, not one per match"
+
+
+def test_url_pattern_scope_rollback_keeps_per_pattern_profiles(
+    seeded: SeededWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`STRATEGY_PROFILE_SCOPE=url_pattern` is a config-only rollback to the
+    exact legacy per-pattern behavior -- two matches with distinct stored
+    `url_pattern` values get two distinct profiles, same as before this
+    fix."""
+    import app_shared.config as config_module
+    from price_monitor.spiders.generic_price_spider import load_targets
+
+    from app_shared.enums import AccessStrategy
+
+    monkeypatch.setenv("STRATEGY_PROFILE_SCOPE", "url_pattern")
+    config_module.get_settings.cache_clear()
+    try:
+        _create_access_policy(seeded.workspace_id, strategy=AccessStrategy.DIRECT_ONLY, max_retries=0)
+        competitor_id = seed_competitor(seeded, "consumption-legacy-scope")
+        unique = uuid.uuid4().hex[:8]
+        url_a = f"https://consumption-legacy-scope-{unique}.invalid/products/red-shoe-111"
+        url_b = f"https://consumption-legacy-scope-{unique}.invalid/products/blue-shoe-222"
+        match_id_a = seed_match(seeded, competitor_id, url_a)
+        match_id_b = seed_match(seeded, competitor_id, url_b)
+
+        loaded = load_targets(seeded.workspace_id, [match_id_a, match_id_b])
+        assert len(loaded.targets) == 2
+        profile_ids = {target.domain_strategy_profile_id for target in loaded.targets}
+        assert len(profile_ids) == 2, "legacy scope keeps one profile per distinct url_pattern"
+    finally:
+        config_module.get_settings.cache_clear()

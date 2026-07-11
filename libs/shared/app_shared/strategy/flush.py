@@ -350,7 +350,11 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
     combined_stats = _combined_stats(session, profile)
     recent_signals = build_recent_signals(session, profile)
     rediscovery_decision = evaluate_rediscovery(
-        profile, combined_stats, recent_signals, _rediscovery_thresholds(settings)
+        profile,
+        combined_stats,
+        recent_signals,
+        _rediscovery_thresholds(settings),
+        scope=settings.STRATEGY_PROFILE_SCOPE,
     )
     rediscovered = apply_rediscovery(session, profile, rediscovery_decision)
     if rediscovered:
