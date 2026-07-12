@@ -35,12 +35,36 @@ FULL_VOCABULARY = {
     "domain_rules:write",
     "refresh_rules:read",
     "refresh_rules:write",
+    "strategy:read",
+    "strategy:write",
 }
 
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 25
+    assert len(FULL_VOCABULARY) == 27
+
+
+def test_every_router_required_scope_is_in_the_vocabulary() -> None:
+    # Regression pin (2026-07-12): `strategy:read`/`strategy:write` were
+    # demanded by `routers/strategy.py` but missing from `Scope`, so
+    # `validate_scopes` 422'd any key requesting them and no API-key
+    # principal could ever reach a strategy endpoint. Scan every router
+    # for `require_scopes("...")` literals and assert each names a real
+    # member -- a new router demanding an unregistered scope fails here
+    # instead of shipping an unreachable endpoint.
+    import re
+    from pathlib import Path
+
+    routers_dir = Path(__file__).resolve().parents[2] / "apps" / "api" / "app" / "routers"
+    demanded: set[str] = set()
+    for router_file in routers_dir.glob("*.py"):
+        demanded.update(re.findall(r'require_scopes\(\s*"([^"]+)"', router_file.read_text()))
+
+    assert demanded, "no require_scopes(...) literals found -- scan is broken"
+    vocabulary = {member.value for member in Scope}
+    missing = demanded - vocabulary
+    assert not missing, f"routers demand scopes missing from Scope: {sorted(missing)}"
 
 
 def test_access_policy_scopes_are_in_the_vocabulary() -> None:
