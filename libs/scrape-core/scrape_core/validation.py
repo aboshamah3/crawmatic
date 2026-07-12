@@ -36,6 +36,7 @@ from app_shared.money import parse_money
 from app_shared.profiles.confidence import resolve_confidence_rules
 
 from scrape_core.extraction.result import ExtractionCandidate
+from scrape_core.money_text import normalize_price_text
 
 __all__ = ["Accepted", "Rejected", "ValidationOutcome", "validate_candidate"]
 
@@ -87,8 +88,13 @@ def validate_candidate(
     standalone (e.g. in tests) without every call site re-deriving it.
     """
     # --- 1. Money boundary (§19) — exact Decimal, never a float/rounded value. ---
+    # Normalize the extracted price text first (strip currency symbols /
+    # thousands separators): CSS/regex return raw DOM text like
+    # "SAR11,729.00", which the strict §19 boundary would reject outright.
+    # JSON-LD text is already clean, so it passes through unchanged.
+    normalized_price_text = normalize_price_text(candidate.raw_price_text)
     try:
-        price = parse_money(candidate.raw_price_text)
+        price = parse_money(normalized_price_text)
     except (TypeError, ValueError) as exc:
         return Rejected(ScrapeErrorCode.INVALID_PRICE_FORMAT, str(exc))
 

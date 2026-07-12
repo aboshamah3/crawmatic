@@ -313,3 +313,36 @@ def test_confidence_gate_uses_provided_confidence_cfg_override() -> None:
     outcome = validate_candidate(candidate, None, {"min_accepted_confidence": 0.3})
 
     assert isinstance(outcome, Accepted)
+
+
+# --- Price-text normalization (2026-07-12 amazon.sa regression) ---------------
+# CSS/regex price nodes carry currency symbols + thousands separators;
+# validate_candidate normalizes before the strict §19 money boundary.
+
+
+def test_currency_prefixed_thousands_separated_price_is_accepted() -> None:
+    candidate = _candidate(raw_price_text="SAR11,729.00", currency="SAR")
+
+    outcome = validate_candidate(candidate, {"required_currency": "SAR"})
+
+    assert isinstance(outcome, Accepted)
+    assert outcome.price == Decimal("11729.00")
+    assert outcome.comparable is True
+
+
+def test_european_grouped_price_is_accepted() -> None:
+    candidate = _candidate(raw_price_text="1.234,56", currency="EUR")
+
+    outcome = validate_candidate(candidate, None)
+
+    assert isinstance(outcome, Accepted)
+    assert outcome.price == Decimal("1234.56")
+
+
+def test_unparseable_price_text_is_rejected_invalid_format() -> None:
+    candidate = _candidate(raw_price_text="Price on request")
+
+    outcome = validate_candidate(candidate, None)
+
+    assert isinstance(outcome, Rejected)
+    assert outcome.error_code == ScrapeErrorCode.INVALID_PRICE_FORMAT
