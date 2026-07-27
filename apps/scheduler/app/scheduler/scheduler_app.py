@@ -66,6 +66,8 @@ from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RETENTION_DROP,
+    SCRAPE_FINALIZE_JOBS,
+    SCRAPE_RECOVER_STALLED,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_STATS_FLUSH,
 )
@@ -115,6 +117,36 @@ def _enqueue_stats_flush() -> None:
         enqueue(STRATEGY_STATS_FLUSH, queue="maintenance")
     except Exception:
         logger.exception("scheduler: failed to enqueue %s", STRATEGY_STATS_FLUSH)
+
+
+def _enqueue_finalize_jobs() -> None:
+    """Fire-and-forget periodic `SCRAPE_FINALIZE_JOBS` on the `maintenance`
+    queue (ISSUES_FULL_RUN_2026-07-17 Issue "no job finalization in the
+    scheduler"). The pipeline's own per-batch enqueue only fires when a
+    result batch actually flushes -- a job whose last targets end via
+    never-dispatched skips (or a crashed spider) otherwise dangles RUNNING
+    forever. `finalize_jobs()` is a no-arg, idempotent sweep (terminal
+    jobs are skipped outright), so re-enqueueing it every tick is safe.
+    Errors are logged and swallowed like every other maintenance enqueue.
+    """
+    try:
+        enqueue(SCRAPE_FINALIZE_JOBS, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", SCRAPE_FINALIZE_JOBS)
+
+
+def _enqueue_recover_stalled() -> None:
+    """Fire-and-forget periodic `SCRAPE_RECOVER_STALLED` on the
+    `maintenance` queue (ISSUES_FULL_RUN_2026-07-17 Issue 8: the task
+    existed but nothing ever scheduled it). Re-dispatches batches whose
+    targets sat PENDING past `SCRAPE_STALL_TIMEOUT_SECONDS`; idempotent,
+    no-arg. Errors are logged and swallowed like every other maintenance
+    enqueue.
+    """
+    try:
+        enqueue(SCRAPE_RECOVER_STALLED, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", SCRAPE_RECOVER_STALLED)
 
 
 def _enqueue_partition_create() -> None:
@@ -201,7 +233,8 @@ def main() -> None:
     retention_interval = settings.RETENTION_INTERVAL_SECONDS
 
     logger.info(
-        "scheduler up (strategy_light_recheck + strategy_stats_flush every %ss; "
+        "scheduler up (strategy_light_recheck + strategy_stats_flush + "
+        "finalize_jobs + recover_stalled_batches every %ss; "
         "refresh pass every %ss; partition_create every %ss; daily_rollup every %ss; "
         "retention_drop every %ss)",
         interval,
@@ -226,6 +259,10 @@ def main() -> None:
             elapsed = 0.0
             _enqueue_light_recheck()
             _enqueue_stats_flush()
+            # Same maintenance tick/knob (SPEC-12 precedent of reusing
+            # this cadence): sweep dangling jobs + stalled batches.
+            _enqueue_finalize_jobs()
+            _enqueue_recover_stalled()
         if refresh_elapsed >= refresh_interval:
             refresh_elapsed = 0.0
             _run_refresh_pass_tick(refresh_batch_limit)
