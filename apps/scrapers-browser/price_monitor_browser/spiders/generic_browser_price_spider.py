@@ -421,6 +421,15 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             # `PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT` default.
             "playwright_page_goto_kwargs": {"timeout": timeout_ms},
         }
+        # Headless Chromium's default UA ("HeadlessChrome") gets a
+        # bot-challenge page from amazon.sa with none of the product
+        # markup, so every fetch carries the realistic UA. Set per
+        # request rather than via PLAYWRIGHT_CONTEXTS -- see
+        # settings.USER_AGENT for why a startup context wedges this node.
+        context_kwargs: dict[str, Any] = {}
+        user_agent = self.settings.get("USER_AGENT")
+        if user_agent:
+            context_kwargs["user_agent"] = user_agent
         if permission is not None:
             meta["semaphore_key"] = permission.semaphore_key
             meta["semaphore_token"] = permission.semaphore_token
@@ -448,18 +457,15 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 # never share a browser context/proxy -- scrapy-playwright
                 # keys its context pool by this exact string.
                 meta["playwright_context"] = f"proxy:{proxy_assignment.provider_id}"
-                context_kwargs: dict[str, Any] = {"proxy": proxy_kwargs}
-                # A named context does NOT inherit PLAYWRIGHT_CONTEXTS
-                # ["default"], so the realistic UA must be set here too --
-                # headless Chromium's own default UA gets a bot-challenge
-                # page from amazon.sa with no product markup at all
-                # (verified 2026-07-27). See settings.USER_AGENT.
-                ua = self.settings.get("USER_AGENT")
-                if ua:
-                    context_kwargs["user_agent"] = ua
-                meta["playwright_context_kwargs"] = context_kwargs
+                context_kwargs["proxy"] = proxy_kwargs
                 meta["proxy_provider_id"] = proxy_assignment.provider_id
                 meta["proxy_country"] = proxy_assignment.country
+
+        # Applies to the per-provider context when proxied, and to the
+        # (lazily created) default context otherwise -- so an unproxied
+        # browser fetch carries the realistic UA too.
+        if context_kwargs:
+            meta["playwright_context_kwargs"] = context_kwargs
 
         return scrapy.Request(
             url=target.url,
