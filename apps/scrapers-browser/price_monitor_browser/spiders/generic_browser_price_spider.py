@@ -448,7 +448,16 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 # never share a browser context/proxy -- scrapy-playwright
                 # keys its context pool by this exact string.
                 meta["playwright_context"] = f"proxy:{proxy_assignment.provider_id}"
-                meta["playwright_context_kwargs"] = {"proxy": proxy_kwargs}
+                context_kwargs: dict[str, Any] = {"proxy": proxy_kwargs}
+                # A named context does NOT inherit PLAYWRIGHT_CONTEXTS
+                # ["default"], so the realistic UA must be set here too --
+                # headless Chromium's own default UA gets a bot-challenge
+                # page from amazon.sa with no product markup at all
+                # (verified 2026-07-27). See settings.USER_AGENT.
+                ua = self.settings.get("USER_AGENT")
+                if ua:
+                    context_kwargs["user_agent"] = ua
+                meta["playwright_context_kwargs"] = context_kwargs
                 meta["proxy_provider_id"] = proxy_assignment.provider_id
                 meta["proxy_country"] = proxy_assignment.country
 

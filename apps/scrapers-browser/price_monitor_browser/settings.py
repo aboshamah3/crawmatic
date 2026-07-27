@@ -53,6 +53,30 @@ ROBOTSTXT_OBEY = False
 DNS_RESOLVER = "scrape_core.safety.resolver.SafeResolver"
 
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
+
+# Parity with price_monitor/settings.py, and it must also reach the
+# *browser* -- headless Chromium's own default UA advertises
+# "HeadlessChrome", which amazon.sa answers with a bot-challenge page
+# carrying none of the product markup (verified 2026-07-27: the same URL
+# with this UA returns the real product page + price, while the headless
+# default times out waiting for `#productTitle`). Scrapy's USER_AGENT
+# alone does NOT cover Playwright navigations, so it is passed through to
+# every browser context via PLAYWRIGHT_CONTEXTS below.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+DEFAULT_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en",
+}
+#: Applied to the default browser context. Per-provider proxy contexts
+#: built in `_browser_request_for` merge this in themselves (a named
+#: context never inherits this dict), so the UA is set there too.
+PLAYWRIGHT_CONTEXTS = {
+    "default": {"user_agent": USER_AGENT},
+}
+
 # scrapy-playwright requires the asyncio reactor.
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
