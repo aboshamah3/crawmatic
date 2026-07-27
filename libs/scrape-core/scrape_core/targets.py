@@ -111,7 +111,7 @@ from app_shared.task_names import SCRAPE_DISPATCH_JOB
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 
 from scrape_core.browser.variant import VariantConfigError, resolve_variant_values
-from scrape_core.db import run_in_thread, workspace_txn
+from scrape_core.db import as_awaitable, await_in_thread, run_in_thread, workspace_txn
 from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
 from scrape_core.observability import log_event
 from scrape_core.reactor import deferred_delay
@@ -1058,7 +1058,7 @@ async def acquire_fetch_permission(
             requeue_count=state.requeue_count,
             delay=delay,
         )
-        await deferred_delay(delay)
+        await as_awaitable(deferred_delay(delay))
 
 
 async def overflow_to_dispatch(
@@ -1095,13 +1095,13 @@ async def overflow_to_dispatch(
         )
         return
 
-    await run_in_thread(
+    await await_in_thread(
         _mark_target_deferred_rate_limited,
         ctx.workspace_id,
         scrape_job_id,
         target.match_id,
     )
-    await run_in_thread(
+    await await_in_thread(
         enqueue,
         SCRAPE_DISPATCH_JOB,
         queue="scrape_dispatch",

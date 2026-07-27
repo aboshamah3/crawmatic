@@ -208,7 +208,7 @@ def test_errback_strips_lock_from_failed_result_and_reuses_it(
         dispatched["attempt"] = n
         return "RETRY_REQUEST"
 
-    monkeypatch.setattr(gps, "run_in_thread", fake_run_in_thread)
+    monkeypatch.setattr(gps, "await_in_thread", fake_run_in_thread)
     monkeypatch.setattr(spider, "_dispatch", fake_dispatch)
 
     results = _collect(spider.errback(failure))
@@ -248,7 +248,7 @@ def test_errback_keeps_lock_on_result_when_no_retry(
     async def fake_run_in_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
         return stop
 
-    monkeypatch.setattr(gps, "run_in_thread", fake_run_in_thread)
+    monkeypatch.setattr(gps, "await_in_thread", fake_run_in_thread)
 
     results = _collect(spider.errback(failure))
 
@@ -296,7 +296,7 @@ def test_errback_releases_inherited_lock_on_overflow(
         released["key"] = key
         released["token"] = token
 
-    monkeypatch.setattr(gps, "run_in_thread", fake_run_in_thread)
+    monkeypatch.setattr(gps, "await_in_thread", fake_run_in_thread)
     monkeypatch.setattr(spider, "_dispatch", fake_dispatch)
     monkeypatch.setattr(gps, "release_lock", fake_release_lock)
     monkeypatch.setattr(gps, "get_redis_client", lambda: object())

@@ -58,7 +58,7 @@ from app_shared.redis_client import get_redis_client
 
 from scrape_core.browser.page import build_page_methods, effective_timeout
 from scrape_core.browser.variant import VariantConfigError
-from scrape_core.db import run_in_thread
+from scrape_core.db import await_in_thread
 from scrape_core.errors import (
     PRICE_NOT_FOUND,
     classify_exception,
@@ -259,7 +259,7 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         )
 
     async def start(self) -> AsyncIterator[scrapy.Request]:
-        loaded = await run_in_thread(load_targets, self.workspace_id, self.match_ids)
+        loaded = await await_in_thread(load_targets, self.workspace_id, self.match_ids)
         self._visible_providers = loaded.visible_providers
         self._provider_rows = loaded.provider_rows
         self._provider_passwords = loaded.provider_passwords
@@ -309,7 +309,7 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 )
                 continue
 
-            decision = await run_in_thread(
+            decision = await await_in_thread(
                 _prepare_dispatch, target, 1, self._visible_providers, self._provider_rows
             )
             if decision.plan is None:

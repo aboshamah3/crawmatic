@@ -260,7 +260,7 @@ def test_rate_limit_overflow_event_carries_documented_fields(
         run_in_thread_calls.append((fn, args, kwargs))
         return None
 
-    monkeypatch.setattr(targets_mod, "run_in_thread", _fake_run_in_thread)
+    monkeypatch.setattr(targets_mod, "await_in_thread", _fake_run_in_thread)
 
     scrape_job_id = uuid.uuid4()
     spider = gps.GenericPriceSpider(

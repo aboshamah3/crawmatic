@@ -36,7 +36,7 @@ from app_shared.limiter.keys import match_lock_key as _match_lock_key
 from app_shared.limiter.keys import rate_key as _rate_key
 from app_shared.limiter.keys import semaphore_key as _semaphore_key
 
-from scrape_core.db import run_in_thread
+from scrape_core.db import await_in_thread
 
 #: Fixed wait hint (seconds) used when the token bucket grants but the
 #: concurrency semaphore is full — the bucket carries no information
@@ -101,7 +101,7 @@ async def acquire_permission(
 ) -> Permission:
     """Grant/deny an outbound-fetch permission (token bucket THEN semaphore).
 
-    Both checks run via ``await run_in_thread(...)`` — never a
+    Both checks run via ``await await_in_thread(...)`` — never a
     synchronous Redis call on the reactor thread. The token bucket is
     checked first; if it denies, the semaphore is **never touched** and
     its denial's ``wait_hint_seconds`` is returned as-is. If the bucket
@@ -113,7 +113,7 @@ async def acquire_permission(
     """
     ttl_seconds = 2 * 60 + settings.RATE_LIMIT_KEY_TTL_SLACK_SECONDS
     key = _rate_key(workspace_id, domain, access_method)
-    bucket_result = await run_in_thread(
+    bucket_result = await await_in_thread(
         _bucket.acquire_token,
         redis,
         key=key,
@@ -127,7 +127,7 @@ async def acquire_permission(
 
     sem_key = _semaphore_key(workspace_id, domain, access_method)
     key_ttl_seconds = settings.SEMAPHORE_SLOT_TTL_SECONDS + settings.RATE_LIMIT_KEY_TTL_SLACK_SECONDS
-    slot_granted = await run_in_thread(
+    slot_granted = await await_in_thread(
         _bucket.acquire_slot,
         redis,
         key=sem_key,
@@ -157,7 +157,7 @@ async def release_slot(redis: object, *, key: str, token: str) -> None:
     Redis errors are logged and swallowed inside
     ``app_shared.limiter.bucket.release_slot`` (D3) — this never raises.
     """
-    await run_in_thread(_bucket.release_slot, redis, key=key, token=token)
+    await await_in_thread(_bucket.release_slot, redis, key=key, token=token)
 
 
 async def acquire_lock(
@@ -174,7 +174,7 @@ async def acquire_lock(
     ``AccessMethod.PLAYWRIGHT_PROXY``, ``MATCH_LOCK_HTTP_TTL_SECONDS``
     otherwise — contracts/match-lock.md "TTL"), generates a fresh fencing
     token (:func:`app_shared.limiter.locks.new_fencing_token`), and calls
-    ``await run_in_thread(acquire_match_lock, ...)`` — off-reactor, never
+    ``await await_in_thread(acquire_match_lock, ...)`` — off-reactor, never
     a synchronous Redis call on the reactor thread. Fail-closed surfaces
     as ``None`` (an acquire Redis error is indistinguishable from "already
     held" to the caller -- both mean "do not fetch", reactor-seam.md).
@@ -186,7 +186,7 @@ async def acquire_lock(
     )
     key = _match_lock_key(workspace_id, match_id)
     token = _locks.new_fencing_token()
-    acquired = await run_in_thread(
+    acquired = await await_in_thread(
         _locks.acquire_match_lock,
         redis,
         key=key,
@@ -205,4 +205,4 @@ async def release_lock(redis: object, *, key: str, token: str) -> None:
     swallowed inside ``app_shared.limiter.locks.release_match_lock``
     (TTL reclaims regardless, D3) -- this never raises.
     """
-    await run_in_thread(_locks.release_match_lock, redis, key=key, token=token)
+    await await_in_thread(_locks.release_match_lock, redis, key=key, token=token)

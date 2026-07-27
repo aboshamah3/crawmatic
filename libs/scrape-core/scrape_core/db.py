@@ -16,6 +16,7 @@ by :func:`run_in_thread`, never on the reactor itself.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -29,7 +30,7 @@ from sqlalchemy.orm import Session
 
 _T = TypeVar("_T")
 
-__all__ = ["run_in_thread", "workspace_txn"]
+__all__ = ["as_awaitable", "await_in_thread", "run_in_thread", "workspace_txn"]
 
 
 def run_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Deferred:
@@ -43,6 +44,36 @@ def run_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Deferr
     (reactor) thread itself.
     """
     return deferToThread(fn, *args, **kwargs)
+
+
+def as_awaitable(d: Deferred) -> Any:
+    """Make a ``Deferred`` awaitable under whichever machinery drives the caller.
+
+    The HTTP node (``EPollReactor``) drives spider coroutines through
+    Twisted's own ``ensureDeferred`` path, where awaiting a raw
+    ``Deferred`` is native — returned as-is. The browser node
+    (``AsyncioSelectorReactor`` + Scrapy's ``AsyncCrawlerProcess``)
+    drives them as **asyncio tasks**, where a raw ``Deferred`` yield
+    crashes with ``Task got bad yield`` — there, the running loop is
+    detectable and the Deferred is bridged via ``asFuture``.
+    """
+    if not isinstance(d, Deferred):
+        # Already awaitable some other way (a coroutine/Future from a
+        # monkeypatched helper in unit tests) -- nothing to bridge.
+        return d
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return d
+    return d.asFuture(loop)
+
+
+async def await_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    """``await``-safe :func:`run_in_thread` — same thread-pool offload,
+    usable from coroutines on BOTH scraper nodes (see :func:`as_awaitable`).
+    Callers that need the ``Deferred`` API (``addCallback``/``addBoth``,
+    e.g. the persistence pipeline) keep using :func:`run_in_thread`."""
+    return await as_awaitable(deferToThread(fn, *args, **kwargs))
 
 
 @contextmanager

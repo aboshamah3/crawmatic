@@ -74,7 +74,7 @@ _TARGET_PATHS = (
     _REACTOR_PATH,
 )
 
-_THREAD_BOUNDARY_CALLERS = {"run_in_thread", "deferToThread"}
+_THREAD_BOUNDARY_CALLERS = {"run_in_thread", "await_in_thread", "deferToThread"}
 
 #: Synchronous redis-client method names that must never be invoked
 #: directly outside the thread-pool boundary (Lua `EVAL`/`EVALSHA` are

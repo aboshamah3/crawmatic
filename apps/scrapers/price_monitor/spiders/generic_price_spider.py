@@ -68,7 +68,7 @@ request-side seam, duplicating the analogous bounded-load shape for
   reactor thread. A not-allowed decision short-circuits to a terminal
   :class:`~scrape_core.items.ScrapeResult` (``RATE_LIMITED``/
   ``PROXY_FAILED``/``LIMIT_REACHED``) instead of dispatching a request.
-* ``errback`` is ``async def`` so it can ``await run_in_thread(...)`` for
+* ``errback`` is ``async def`` so it can ``await await_in_thread(...)`` for
   the same off-reactor precheck before yielding a retry ``scrapy.Request``
   — Scrapy 2.x + the project's ``AsyncioSelectorReactor`` support
   coroutine callbacks/errbacks natively (no ``twisted.inlineCallbacks``
@@ -106,7 +106,7 @@ from app_shared.models.access import ProxyProvider
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
-from scrape_core.db import run_in_thread
+from scrape_core.db import await_in_thread
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
@@ -214,7 +214,7 @@ class GenericPriceSpider(scrapy.Spider):
         )
 
     async def start(self) -> AsyncIterator[scrapy.Request]:
-        loaded = await run_in_thread(load_targets, self.workspace_id, self.match_ids)
+        loaded = await await_in_thread(load_targets, self.workspace_id, self.match_ids)
         self._visible_providers = loaded.visible_providers
         self._provider_rows = loaded.provider_rows
         self._provider_passwords = loaded.provider_passwords
@@ -225,7 +225,7 @@ class GenericPriceSpider(scrapy.Spider):
             # only here, on first sight of this target -- see
             # `_RequeueState`).
             self._requeue_state_by_match_id[target.match_id] = _RequeueState()
-            decision = await run_in_thread(
+            decision = await await_in_thread(
                 _prepare_dispatch, target, 1, self._visible_providers, self._provider_rows
             )
             if decision.plan is None:
@@ -556,7 +556,7 @@ class GenericPriceSpider(scrapy.Spider):
         # out from under the in-flight retry. Without this, the retry's
         # fresh `acquire_lock` collided with its own predecessor's held
         # lock and the DIRECT->PROXY escalation died LOCKED_ALREADY_RUNNING.
-        decision = await run_in_thread(
+        decision = await await_in_thread(
             _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
         )
         prior_lock_key = failure.request.meta.get("match_lock_key")
