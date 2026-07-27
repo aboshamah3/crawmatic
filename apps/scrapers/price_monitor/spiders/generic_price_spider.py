@@ -110,7 +110,7 @@ from scrape_core.db import run_in_thread
 from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import LockGrant, Permission, release_slot
+from scrape_core.limiter import LockGrant, Permission, release_lock, release_slot
 from scrape_core.result_builder import build_scrape_result
 from scrape_core.targets import (
     AdmissionContext,
@@ -128,6 +128,7 @@ from scrape_core.targets import (
     dispatch_admission,
     load_targets,
     overflow_to_dispatch,
+    sticky_proxy_username,
 )
 from scrape_core.validation import Accepted, Rejected, validate_candidate
 
@@ -277,6 +278,7 @@ class GenericPriceSpider(scrapy.Spider):
         attempt_number: int,
         plan: AttemptPlan,
         proxy_assignment: ProxyAssignment | None,
+        reuse_lock: LockGrant | None = None,
     ) -> "scrapy.Request | ScrapeResult | None":
         """Thin wrapper (SPEC-14 T006) over the shared
         :func:`scrape_core.targets.dispatch_admission` -- supplies this
@@ -284,7 +286,9 @@ class GenericPriceSpider(scrapy.Spider):
         (:meth:`_request_for`) as the ``build_request`` callback, so the
         admission gate (permission + match lock) stays identical to the
         browser spider's while the actual request built differs per
-        transport."""
+        transport. ``reuse_lock`` (Issue 3) lets ``errback``'s retry of
+        the same target inherit the still-held match lock instead of
+        failing ``LOCKED_ALREADY_RUNNING`` against itself."""
         return await dispatch_admission(
             self._admission_context(),
             target,
@@ -292,6 +296,7 @@ class GenericPriceSpider(scrapy.Spider):
             plan,
             proxy_assignment,
             build_request=self._request_for,
+            reuse_lock=reuse_lock,
         )
 
     def _request_for(
@@ -358,7 +363,16 @@ class GenericPriceSpider(scrapy.Spider):
             # is otherwise threaded through Scrapy's request/response
             # cycle here).
             "dispatch_monotonic": time.monotonic(),
+            # ISSUES_FULL_RUN_2026-07-17 Issue 4: the access engine owns
+            # retry semantics (`next_attempt`/`max_retries`), so Scrapy's
+            # own RetryMiddleware must not multiply attempts underneath it.
+            "dont_retry": True,
         }
+        if target.access_policy is not None and target.access_policy.timeout_ms:
+            # Issue 4: the resolved policy timeout was never translated
+            # into the request -- Scrapy's 180 s DOWNLOAD_TIMEOUT applied
+            # instead (546 s noon hangs). `download_timeout` is seconds.
+            meta["download_timeout"] = target.access_policy.timeout_ms / 1000.0
         if permission is not None:
             # SPEC-11 US1 (T014): threaded through so `parse`/`errback`
             # can release this fetch's concurrency slot as soon as the
@@ -383,7 +397,13 @@ class GenericPriceSpider(scrapy.Spider):
                 meta["proxy_country"] = proxy_assignment.country
                 if provider.username:
                     password = self._provider_passwords.get(proxy_assignment.provider_id) or ""
-                    token = base64.b64encode(f"{provider.username}:{password}".encode("utf-8")).decode("ascii")
+                    # Issue 5: carry the engine's sticky session onto the
+                    # upstream credentials (DataImpulse `;sessid.<id>`
+                    # username suffix) so challenge flows can hold an IP.
+                    username = sticky_proxy_username(
+                        provider.username, provider.base_url, proxy_assignment.sticky_key
+                    )
+                    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
                     headers["Proxy-Authorization"] = f"Basic {token}"
 
         return scrapy.Request(
@@ -524,6 +544,31 @@ class GenericPriceSpider(scrapy.Spider):
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname
         failed_error_code = classify_exception(failure.value, hostname=hostname)
+
+        attempt_number = failure.request.meta.get("attempt_number", 1)
+        next_attempt_number = attempt_number + 1
+
+        # ISSUES_FULL_RUN_2026-07-17 Issue 3: decide the retry BEFORE
+        # emitting the failed attempt's result. If a retry will dispatch,
+        # it inherits the match lock this failed attempt still holds
+        # (`reuse_lock` below) -- so the failed result must NOT carry the
+        # lock key/token, else the persistence pipeline releases the lock
+        # out from under the in-flight retry. Without this, the retry's
+        # fresh `acquire_lock` collided with its own predecessor's held
+        # lock and the DIRECT->PROXY escalation died LOCKED_ALREADY_RUNNING.
+        decision = await run_in_thread(
+            _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
+        )
+        prior_lock_key = failure.request.meta.get("match_lock_key")
+        prior_lock_token = failure.request.meta.get("match_lock_token")
+        reuse_lock: LockGrant | None = None
+        if decision.plan is not None and prior_lock_key and prior_lock_token:
+            reuse_lock = LockGrant(key=prior_lock_key, token=prior_lock_token)
+
+        failed_attempt_kwargs = _attempt_kwargs_from_meta(failure.request.meta)
+        if reuse_lock is not None:
+            failed_attempt_kwargs["match_lock_key"] = None
+            failed_attempt_kwargs["match_lock_token"] = None
         yield self._build_result(
             target,
             failure.request.url,
@@ -532,21 +577,23 @@ class GenericPriceSpider(scrapy.Spider):
             success=False,
             error_code=failed_error_code,
             error_message=str(failure.value),
-            **_attempt_kwargs_from_meta(failure.request.meta),
+            **failed_attempt_kwargs,
         )
 
-        attempt_number = failure.request.meta.get("attempt_number", 1)
-        next_attempt_number = attempt_number + 1
-
-        decision = await run_in_thread(
-            _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
-        )
         if decision.plan is not None:
-            result = await self._dispatch(target, next_attempt_number, decision.plan, decision.proxy)
-            if result is not None:
+            result = await self._dispatch(
+                target, next_attempt_number, decision.plan, decision.proxy, reuse_lock=reuse_lock
+            )
+            if result is None:
                 # SPEC-11 US3 (T027): `None` means the requeue cap
                 # overflowed and the target was already marked `DEFERRED`
                 # + re-dispatched -- nothing to yield for this attempt.
+                # An inherited lock must be released here (its normal
+                # release path -- the retry's result row -- never
+                # happens), or the re-dispatched run would be locked out.
+                if reuse_lock is not None:
+                    await release_lock(get_redis_client(), key=reuse_lock.key, token=reuse_lock.token)
+            else:
                 yield result
             return
 

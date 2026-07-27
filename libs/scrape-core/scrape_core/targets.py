@@ -42,6 +42,7 @@ Import policy (shared-extraction.md): only ``app_shared.*`` +
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -134,6 +135,7 @@ __all__ = [
     "acquire_fetch_permission",
     "overflow_to_dispatch",
     "dispatch_admission",
+    "sticky_proxy_username",
 ]
 
 #: `{provider_id: (status, type, country)}` -- the shape `assign_proxy` expects.
@@ -904,6 +906,26 @@ def _attempt_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def sticky_proxy_username(username: str, base_url: str, sticky_key: str | None) -> str:
+    """Append the sticky-session suffix to a proxy username when the
+    assignment carries a ``sticky_key`` and the provider is
+    DataImpulse-style (ISSUES_FULL_RUN_2026-07-17 Issue 5).
+
+    DataImpulse's sticky syntax is a username suffix ``;sessid.<id>``
+    (country targeting like ``__cr.sa`` is already baked into the stored
+    username). The raw ``sticky_key`` may contain ``:``/UUID characters,
+    so it is hashed down to a short alphanumeric session id -- stable for
+    the same key, so ``sticky_session`` reuses one upstream IP and
+    ``rotate_per_request`` (key varies with attempt_number) rotates it.
+    Providers whose ``base_url`` doesn't identify DataImpulse are left
+    untouched (unknown suffix syntax would break auth).
+    """
+    if not sticky_key or "dataimpulse" not in base_url.lower():
+        return username
+    session_id = hashlib.sha1(sticky_key.encode("utf-8")).hexdigest()[:16]
+    return f"{username};sessid.{session_id}"
+
+
 def _parse_host_port(base_url: str) -> tuple[str, int]:
     """Extract `(host, port)` from a `ProxyProvider.base_url`, defaulting the
     port by scheme when absent (providers are expected to set one explicitly)."""
@@ -1108,6 +1130,7 @@ async def dispatch_admission(
     build_request: Callable[
         [SpiderTarget, int, AttemptPlan, ProxyAssignment | None, Permission, LockGrant], Any
     ],
+    reuse_lock: LockGrant | None = None,
 ) -> Any:
     """SPEC-11 US1+US2+US3 combined dispatch gate (`contracts/spider-integration.md`
     steps 1-4): acquire the domain token + concurrency slot
@@ -1143,6 +1166,17 @@ async def dispatch_admission(
         return None
 
     redis = get_redis_client()
+    if reuse_lock is not None:
+        # ISSUES_FULL_RUN_2026-07-17 Issue 3: a same-spider retry of the
+        # same target inherits the lock its failed prior attempt still
+        # holds (the failed attempt's result row was stripped of the
+        # lock key/token by the caller, so the persistence pipeline
+        # won't release it out from under this attempt). Acquiring
+        # fresh here used to fail LOCKED_ALREADY_RUNNING and kill the
+        # whole DIRECT->PROXY escalation. The TTL from the original
+        # acquire still bounds the chain; if it lapses mid-retry the
+        # fencing-token release simply no-ops.
+        return build_request(target, attempt_number, plan, proxy_assignment, perm, reuse_lock)
     lock = await acquire_lock(
         redis,
         workspace_id=ctx.workspace_id,

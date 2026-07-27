@@ -80,6 +80,7 @@ from scrape_core.targets import (
     SpiderTarget,
     dispatch_admission,
     load_targets,
+    sticky_proxy_username,
 )
 from scrape_core.validation import Accepted, Rejected, validate_candidate
 
@@ -436,7 +437,11 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                     # Already decrypted off-reactor by `load_targets`
                     # (never here, never logged) -- see docstring.
                     password = self._provider_passwords.get(proxy_assignment.provider_id) or ""
-                    proxy_kwargs["username"] = provider.username
+                    # Issue 5 parity with the HTTP spider: DataImpulse
+                    # sticky sessions ride the username (`;sessid.<id>`).
+                    proxy_kwargs["username"] = sticky_proxy_username(
+                        provider.username, provider.base_url, proxy_assignment.sticky_key
+                    )
                     proxy_kwargs["password"] = password
                 # Per-provider context name (never the shared default
                 # context) so concurrent targets on different providers
