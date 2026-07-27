@@ -18,7 +18,15 @@ ENV PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    # Shared browser location, NOT the installing user's ~/.cache: the
+    # build installs as root but the container runs as `app` (home
+    # /app), so a default install lands in /root/.cache/ms-playwright
+    # while runtime looks in /app/.cache/ms-playwright -- every launch
+    # then failed "Executable doesn't exist" with the browsers present
+    # but unreachable in the image. Pinning the path (and chowning it
+    # below) keeps build and runtime pointed at the same directory.
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 
@@ -35,7 +43,8 @@ RUN mkdir -p eggs logs dbs items \
 
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \
-    && chown -R app:app /app
+    && chown -R app:app /app \
+    && chown -R app:app /ms-playwright
 USER app
 
 EXPOSE 6800
