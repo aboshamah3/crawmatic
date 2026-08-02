@@ -133,6 +133,8 @@ __all__ = [
     "_elapsed_ms",
     "AdmissionContext",
     "acquire_fetch_permission",
+    "defer_rate_limited_target",
+    "prepare_dispatch_with_backoff",
     "overflow_to_dispatch",
     "dispatch_admission",
     "sticky_proxy_username",
@@ -739,6 +741,13 @@ class _DispatchDecision:
     skip_error_code: ScrapeErrorCode | None = None
     attempted_method: AccessMethod = AccessMethod.DIRECT_HTTP
     attempted_proxy: ProxyAssignment | None = None
+    #: For a RATE_LIMITED skip: how long the denying window says to wait
+    #: (ceiling window TTL, or the domain cooldown). 0 for every other
+    #: outcome. Consumed by `prepare_dispatch_with_backoff` -- a ceiling
+    #: denial is transient and must be retried/deferred, never treated
+    #: as a terminal failure (2026-08-02: a 96-target batch at 10 rpm
+    #: instantly FAILED ~86 targets through the old skip-as-failure path).
+    retry_after_seconds: int = 0
 
 
 def _prepare_dispatch(
@@ -784,11 +793,21 @@ def _prepare_dispatch(
         # Gated before any transport decision is even made -- there is no
         # real "attempted method" to report, so this leaves
         # `_DispatchDecision`'s DIRECT_HTTP/None defaults in place.
-        return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.RATE_LIMITED)
+        return _DispatchDecision(
+            plan=None,
+            proxy=None,
+            skip_error_code=ScrapeErrorCode.RATE_LIMITED,
+            retry_after_seconds=rate_decision.retry_after_seconds,
+        )
 
     cooldown_seconds = target.domain_rule.cooldown_seconds if target.domain_rule is not None else 0
     if not check_domain_cooldown(redis, domain=target.domain, cooldown_seconds=cooldown_seconds):
-        return _DispatchDecision(plan=None, proxy=None, skip_error_code=ScrapeErrorCode.RATE_LIMITED)
+        return _DispatchDecision(
+            plan=None,
+            proxy=None,
+            skip_error_code=ScrapeErrorCode.RATE_LIMITED,
+            retry_after_seconds=cooldown_seconds,
+        )
 
     def _decide(*, proxy_budget_exhausted: bool = False) -> AttemptPlan | Any:
         return next_attempt(
@@ -1061,6 +1080,109 @@ async def acquire_fetch_permission(
         await as_awaitable(deferred_delay(delay))
 
 
+async def defer_rate_limited_target(
+    ctx: AdmissionContext, target: SpiderTarget, *, event: str = "rate_limit.overflow"
+) -> None:
+    """Hand a rate-limited target back to Celery: mark it ``DEFERRED`` +
+    ``RATE_LIMITED`` and re-enqueue ``SCRAPE_DISPATCH_JOB`` so a fresh
+    `dispatch_job` run picks it up later (`contracts/overflow-dispatch.md`
+    §3). Shared tail of :func:`overflow_to_dispatch`, also called by
+    :func:`prepare_dispatch_with_backoff` when the attempt-1 ceiling gate
+    exhausts its backoff caps -- both denial layers must end in DEFERRED,
+    never a terminal failure.
+    """
+    scrape_job_id = ctx.scrape_job_id
+    if scrape_job_id is None:
+        # No job context to mark/re-dispatch against -- nothing more
+        # can be done for this overflowed target (spider-args.md:
+        # `scrape_job_id` is expected on every real Scrapyd-dispatched
+        # run; only hand-built unit-test spiders may omit it).
+        logger.error(
+            "targets: rate-limit defer with no scrape_job_id -- "
+            "cannot mark DEFERRED or re-dispatch match_id=%s",
+            target.match_id,
+        )
+        return
+
+    await await_in_thread(
+        _mark_target_deferred_rate_limited,
+        ctx.workspace_id,
+        scrape_job_id,
+        target.match_id,
+    )
+    await await_in_thread(
+        enqueue,
+        SCRAPE_DISPATCH_JOB,
+        queue="scrape_dispatch",
+        kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(ctx.workspace_id)},
+    )
+    log_event(
+        logger,
+        event,
+        workspace_id=ctx.workspace_id,
+        scrape_job_id=scrape_job_id,
+        match_id=target.match_id,
+    )
+
+
+async def prepare_dispatch_with_backoff(
+    ctx: AdmissionContext,
+    target: SpiderTarget,
+    attempt_number: int,
+    visible_providers: VisibleProviders,
+    provider_rows: dict[uuid.UUID, ProxyProvider],
+) -> _DispatchDecision | None:
+    """:func:`_prepare_dispatch` with the SPEC-11 backoff-requeue-defer
+    treatment applied to its ``RATE_LIMITED`` outcome (2026-08-02).
+
+    The policy-ceiling/cooldown gate inside `_prepare_dispatch` used to
+    surface a denial as a terminal ``RATE_LIMITED`` skip-result -- with a
+    real batch (e.g. 96 targets on a 10 rpm domain) that instantly FAILED
+    every target past the first window. A ceiling denial is transient by
+    definition, so it now gets the same loop the token bucket gets in
+    :func:`acquire_fetch_permission`: wait ``retry_after + jitter`` (via
+    the non-blocking :func:`~scrape_core.reactor.deferred_delay`, never
+    ``time.sleep``), bump the target's shared ``_RequeueState``, and once
+    either requeue cap is exceeded hand the target back DEFERRED via
+    :func:`defer_rate_limited_target` and return ``None`` (caller
+    dispatches nothing). Every other outcome returns unchanged.
+    """
+    from app_shared.config import get_settings
+
+    settings = get_settings()
+    state = ctx.requeue_state_by_match_id.setdefault(target.match_id, _RequeueState())
+
+    while True:
+        decision = await await_in_thread(
+            _prepare_dispatch, target, attempt_number, visible_providers, provider_rows
+        )
+        if decision.skip_error_code is not ScrapeErrorCode.RATE_LIMITED:
+            return decision
+
+        delay = decision.retry_after_seconds + random.uniform(
+            settings.RATE_LIMIT_JITTER_MIN_SECONDS, settings.RATE_LIMIT_JITTER_MAX_SECONDS
+        )
+        state.requeue_count += 1
+        state.cumulative_wait += delay
+
+        if (
+            state.requeue_count > settings.REQUEUE_MAX_ATTEMPTS
+            or state.cumulative_wait > settings.REQUEUE_MAX_TOTAL_WAIT_SECONDS
+        ):
+            await defer_rate_limited_target(ctx, target, event="rate_limit.ceiling_overflow")
+            return None
+
+        log_event(
+            logger,
+            "rate_limit.requeue",
+            workspace_id=ctx.workspace_id,
+            match_id=target.match_id,
+            requeue_count=state.requeue_count,
+            delay=delay,
+        )
+        await as_awaitable(deferred_delay(delay))
+
+
 async def overflow_to_dispatch(
     ctx: AdmissionContext, target: SpiderTarget, perm: Permission, *, redis: object
 ) -> None:
@@ -1082,42 +1204,10 @@ async def overflow_to_dispatch(
     if perm.semaphore_key and perm.semaphore_token:
         await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
 
-    scrape_job_id = ctx.scrape_job_id
-    if scrape_job_id is None:
-        # No job context to mark/re-dispatch against -- nothing more
-        # can be done for this overflowed target (spider-args.md:
-        # `scrape_job_id` is expected on every real Scrapyd-dispatched
-        # run; only hand-built unit-test spiders may omit it).
-        logger.error(
-            "targets: requeue-cap overflow with no scrape_job_id -- "
-            "cannot mark DEFERRED or re-dispatch match_id=%s",
-            target.match_id,
-        )
-        return
-
-    await await_in_thread(
-        _mark_target_deferred_rate_limited,
-        ctx.workspace_id,
-        scrape_job_id,
-        target.match_id,
-    )
-    await await_in_thread(
-        enqueue,
-        SCRAPE_DISPATCH_JOB,
-        queue="scrape_dispatch",
-        kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(ctx.workspace_id)},
-    )
-    # SPEC-11 US4 (T031, contracts/observability.md): the requeue cap
-    # was exceeded and the target is now DEFERRED + re-dispatched --
-    # emitted after both the mark and the re-dispatch enqueue commit,
-    # mirroring the order the outcomes actually happen in.
-    log_event(
-        logger,
-        "rate_limit.overflow",
-        workspace_id=ctx.workspace_id,
-        scrape_job_id=scrape_job_id,
-        match_id=target.match_id,
-    )
+    # SPEC-11 US4 (T031, contracts/observability.md): `rate_limit.overflow`
+    # is emitted after both the DEFERRED mark and the re-dispatch enqueue
+    # commit, mirroring the order the outcomes actually happen in.
+    await defer_rate_limited_target(ctx, target, event="rate_limit.overflow")
 
 
 async def dispatch_admission(

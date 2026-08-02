@@ -80,6 +80,7 @@ from scrape_core.targets import (
     SpiderTarget,
     dispatch_admission,
     load_targets,
+    prepare_dispatch_with_backoff,
     sticky_proxy_username,
 )
 from scrape_core.validation import Accepted, Rejected, validate_candidate
@@ -309,9 +310,15 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 )
                 continue
 
-            decision = await await_in_thread(
-                _prepare_dispatch, target, 1, self._visible_providers, self._provider_rows
+            # Backoff-requeue-defer wrapper (2026-08-02): a RATE_LIMITED
+            # ceiling denial is retried at the domain's pace and, once the
+            # requeue caps are exceeded, handed back DEFERRED -- it never
+            # reaches the terminal skip-result branch below (exactly as HTTP).
+            decision = await prepare_dispatch_with_backoff(
+                self._admission_context(), target, 1, self._visible_providers, self._provider_rows
             )
+            if decision is None:
+                continue
             if decision.plan is None:
                 if decision.skip_error_code is not None:
                     yield self._build_result(

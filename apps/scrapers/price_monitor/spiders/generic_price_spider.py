@@ -128,6 +128,7 @@ from scrape_core.targets import (
     dispatch_admission,
     load_targets,
     overflow_to_dispatch,
+    prepare_dispatch_with_backoff,
     sticky_proxy_username,
 )
 from scrape_core.validation import Accepted, Rejected, validate_candidate
@@ -225,9 +226,17 @@ class GenericPriceSpider(scrapy.Spider):
             # only here, on first sight of this target -- see
             # `_RequeueState`).
             self._requeue_state_by_match_id[target.match_id] = _RequeueState()
-            decision = await await_in_thread(
-                _prepare_dispatch, target, 1, self._visible_providers, self._provider_rows
+            # Backoff-requeue-defer wrapper (2026-08-02): a RATE_LIMITED
+            # ceiling denial is retried at the domain's pace and, once the
+            # requeue caps are exceeded, handed back DEFERRED -- it never
+            # reaches the terminal skip-result branch below. `None` means
+            # exactly that (already deferred + re-dispatched): dispatch
+            # nothing for this target.
+            decision = await prepare_dispatch_with_backoff(
+                self._admission_context(), target, 1, self._visible_providers, self._provider_rows
             )
+            if decision is None:
+                continue
             if decision.plan is None:
                 if decision.skip_error_code is not None:
                     yield self._build_result(
