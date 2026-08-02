@@ -110,6 +110,12 @@ _EXPECTED_STATIC_SCOPES: list[tuple[str, str, tuple[str, ...]]] = [
     ("POST", "/v1/products/bulk-upsert", ("products:write",)),
     ("GET", "/v1/variants", ("variants:read",)),
     ("GET", "/v1/variants/{variant_id}", ("variants:read",)),
+    # Price-comparison reads hanging off the variants router are gated on
+    # `alerts:read` (not `variants:read`) — the payload is alert/price
+    # detail, see `routers/variants.py`.
+    ("GET", "/v1/variants/price-comparison", ("alerts:read",)),
+    ("GET", "/v1/variants/{variant_id}/price-comparison", ("alerts:read",)),
+    ("GET", "/v1/variants/{variant_id}/competitor-prices", ("alerts:read",)),
     ("PATCH", "/v1/variants/{variant_id}", ("variants:write",)),
     ("POST", "/v1/variants/bulk-upsert", ("variants:write",)),
     ("POST", "/v1/product-groups", ("products:write",)),

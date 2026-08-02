@@ -21,11 +21,16 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from app_shared.enums import AlertEventType, AlertSeverity, AlertStatus, AlertType
+from app_shared.enums import AlertEventType, AlertSeverity, AlertStatus, AlertType, HealthStatus
 
 
 class PriceComparisonResponse(BaseModel):
-    """`GET /v1/variants/{variant_id}/price-comparison` — a `variant_price_states` row."""
+    """`GET /v1/variants/{variant_id}/price-comparison` — a `variant_price_states` row.
+
+    Also the item shape of the bulk list route
+    (`GET /v1/variants/price-comparison`) — it already carries
+    `product_variant_id`, so no separate list-item DTO is needed.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -39,6 +44,64 @@ class PriceComparisonResponse(BaseModel):
     alert_type: AlertType
     alert_severity: AlertSeverity
     calculated_at: datetime
+
+
+class PriceComparisonListResponse(BaseModel):
+    """`GET /v1/variants/price-comparison` — `{items, next_cursor}` envelope.
+
+    The bulk counterpart of the per-variant route: every
+    `variant_price_states` row in the workspace, keyset-paginated over
+    `(created_at, id)` like every other list endpoint
+    (`contracts/pagination.md`). Lets a client snapshot the whole
+    price-state table in `ceil(n / limit)` calls instead of one call per
+    variant.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[PriceComparisonResponse]
+    next_cursor: str | None
+
+
+class CompetitorPriceResponse(BaseModel):
+    """One competitor's latest known price for a variant.
+
+    Item shape of `GET /v1/variants/{variant_id}/competitor-prices` — a
+    `competitor_product_matches` row (`match_id`/`competitor_id`/`url`/
+    `health_status`) joined to its `match_current_prices` row
+    (`price`/`currency`/`scraped_at`) and its competitor's `name`. The
+    price fields are nullable: a match that has never been scraped
+    successfully still has a row here (the modal shows it as "no price
+    yet"), which is why this is not modelled on `MatchCurrentPrice`
+    alone.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    match_id: uuid.UUID
+    competitor_id: uuid.UUID
+    competitor_name: str
+    url: str
+    price: Decimal | None
+    currency: str | None
+    scraped_at: datetime | None
+    health_status: HealthStatus
+
+
+class CompetitorPriceListResponse(BaseModel):
+    """`GET /v1/variants/{variant_id}/competitor-prices` — `{items, next_cursor}` envelope.
+
+    Every list route in this API returns the same envelope
+    (`contracts/pagination.md`), never a bare JSON array: the per-competitor
+    breakdown is keyset-paginated over its `competitor_product_matches`
+    rows' `(created_at, id)` like `GET /v1/variants/price-comparison` and
+    `GET /v1/alerts/current`.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[CompetitorPriceResponse]
+    next_cursor: str | None
 
 
 # --- US2 (T024) --------------------------------------------------------------

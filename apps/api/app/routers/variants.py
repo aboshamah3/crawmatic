@@ -24,12 +24,19 @@ from app_shared.catalog.upsert import plan_upsert
 from app_shared.messaging import enqueue
 from app_shared.models.alerts import VariantPriceState
 from app_shared.models.catalog import Product, ProductVariant
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.observations import MatchCurrentPrice
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 
 from app.deps import Principal, require_scopes
-from app.schemas.alerts import PriceComparisonResponse
+from app.schemas.alerts import (
+    CompetitorPriceListResponse,
+    CompetitorPriceResponse,
+    PriceComparisonListResponse,
+    PriceComparisonResponse,
+)
 from app.schemas.catalog import (
     VariantBulkUpsertResult,
     VariantListResponse,
@@ -94,6 +101,85 @@ def list_variants(
     return VariantListResponse(items=items, next_cursor=envelope["next_cursor"])
 
 
+def _price_comparison(price_state: VariantPriceState) -> PriceComparisonResponse:
+    """Map a `variant_price_states` row to its API DTO.
+
+    The DTO's `alert_type`/`alert_severity` are the row's
+    `latest_alert_type`/`latest_alert_severity` (contract names differ
+    from the column names), so this cannot be a plain
+    `model_validate(row)` — shared by the per-variant and the bulk list
+    route so the two shapes can never drift.
+    """
+    return PriceComparisonResponse(
+        product_variant_id=price_state.product_variant_id,
+        client_price=price_state.client_price,
+        currency=price_state.currency,
+        cheapest_competitor_price=price_state.cheapest_competitor_price,
+        average_competitor_price=price_state.average_competitor_price,
+        highest_competitor_price=price_state.highest_competitor_price,
+        comparable_competitor_count=price_state.comparable_competitor_count,
+        alert_type=price_state.latest_alert_type,
+        alert_severity=price_state.latest_alert_severity,
+        calculated_at=price_state.calculated_at,
+    )
+
+
+# NOTE: this STATIC route must stay registered BEFORE the dynamic
+# `/{variant_id}` route below — FastAPI matches routes in registration
+# order, and `/{variant_id}` (a `uuid.UUID` path param) would otherwise
+# swallow `/price-comparison` and 422 on the un-parseable id. Guarded by
+# `test_bulk_price_comparison_is_not_swallowed_by_variant_id_route`
+# (tests/unit/test_variants_price_routes.py).
+@router.get("/price-comparison", response_model=PriceComparisonListResponse)
+def list_price_comparisons(
+    limit: int | None = None,
+    cursor: str | None = None,
+    principal_ctx: tuple = Depends(require_scopes("alerts:read")),
+) -> PriceComparisonListResponse:
+    """`GET /v1/variants/price-comparison` — every analyzed variant's price state.
+
+    The bulk counterpart of `GET /v1/variants/{variant_id}/price-comparison`:
+    one keyset-paginated pass over this workspace's `variant_price_states`
+    instead of one request per variant. Variants that have never been
+    analyzed simply have no row (the same condition the per-variant route
+    reports as a 404) — they are absent from the list, never an error.
+
+    Orphaned rows are filtered out: deleting a product hard-deletes its
+    `product_variants` but leaves their `variant_price_states` behind
+    (there is no FK from `variant_price_states.product_variant_id` to
+    `product_variants.id`), so the list is additionally restricted to
+    price states whose variant still exists in this workspace. Without it
+    this route would surface rows for variants that
+    `GET /v1/variants/{variant_id}` 404s.
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+
+    page_limit = clamp_limit(limit)
+    stmt = scoped_select(VariantPriceState, principal.workspace_id).where(
+        VariantPriceState.product_variant_id.in_(
+            select(ProductVariant.id).where(ProductVariant.workspace_id == principal.workspace_id)
+        )
+    )
+    if cursor is not None:
+        try:
+            after = decode_cursor(cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+        stmt = stmt.where(keyset_predicate(VariantPriceState, after))
+    stmt = stmt.order_by(VariantPriceState.created_at, VariantPriceState.id).limit(page_limit + 1)
+
+    rows = session.execute(stmt).scalars().all()
+    envelope = paginate(rows, page_limit)
+    return PriceComparisonListResponse(
+        items=[_price_comparison(row) for row in envelope["items"]],
+        next_cursor=envelope["next_cursor"],
+    )
+
+
 @router.get("/{variant_id}", response_model=VariantResponse)
 def get_variant(
     variant_id: uuid.UUID,
@@ -149,18 +235,121 @@ def get_price_comparison(
             },
         )
 
-    return PriceComparisonResponse(
-        product_variant_id=price_state.product_variant_id,
-        client_price=price_state.client_price,
-        currency=price_state.currency,
-        cheapest_competitor_price=price_state.cheapest_competitor_price,
-        average_competitor_price=price_state.average_competitor_price,
-        highest_competitor_price=price_state.highest_competitor_price,
-        comparable_competitor_count=price_state.comparable_competitor_count,
-        alert_type=price_state.latest_alert_type,
-        alert_severity=price_state.latest_alert_severity,
-        calculated_at=price_state.calculated_at,
+    return _price_comparison(price_state)
+
+
+@router.get("/{variant_id}/competitor-prices", response_model=CompetitorPriceListResponse)
+def list_competitor_prices(
+    variant_id: uuid.UUID,
+    limit: int | None = None,
+    cursor: str | None = None,
+    principal_ctx: tuple = Depends(require_scopes("alerts:read")),
+) -> CompetitorPriceListResponse:
+    """`GET /v1/variants/{variant_id}/competitor-prices` — the per-competitor
+    breakdown behind a variant's price comparison.
+
+    One item per `competitor_product_matches` row of this variant, carrying
+    the match's latest known price (its `match_current_prices` row, absent
+    until the first successful scrape -> null price fields) and its
+    competitor's name. Scope `alerts:read`, matching the sibling
+    price-comparison route this feeds (the same client reads both; the
+    payload is price-comparison detail, not match management).
+
+    Returns the standard `{items, next_cursor}` envelope
+    (`contracts/pagination.md`) keyset-paginated over the *matches*'
+    `(created_at, id)` — never a bare JSON array, so a variant matched on
+    hundreds of competitors pages like every other list route.
+
+    404 only for an unknown/cross-workspace variant — a variant with no
+    matches (or no prices yet) is a legitimate empty `200 {"items": [],
+    "next_cursor": null}`, unlike the per-variant price-comparison route
+    which 404s a never-analyzed variant.
+
+    Three bounded scoped lookups (one page of matches, then their current
+    prices, then their competitors) rather than one three-way SQL join:
+    the row set is already capped at `limit + 1` by the keyset page, so
+    two extra `id IN (...)` lookups against indexed primary keys are
+    cheaper to read and to plan than a join, and the stitch stays in
+    Python. (`competitors` *is* a real FK reference from a match —
+    `fk_cpm_workspace_competitor_competitors`; only
+    `match_current_prices.match_id`/`current_price_id` are genuine soft
+    references, §22.)
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    variant = scoped_get(session, ProductVariant, variant_id, ws)
+    if variant is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "NOT_FOUND", "message": "Variant not found."}},
+        )
+
+    page_limit = clamp_limit(limit)
+    stmt = scoped_select(CompetitorProductMatch, ws).where(
+        CompetitorProductMatch.product_variant_id == variant_id
     )
+    if cursor is not None:
+        try:
+            after = decode_cursor(cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+        stmt = stmt.where(keyset_predicate(CompetitorProductMatch, after))
+    stmt = stmt.order_by(CompetitorProductMatch.created_at, CompetitorProductMatch.id).limit(
+        page_limit + 1
+    )
+
+    envelope = paginate(session.execute(stmt).scalars().all(), page_limit)
+    matches = envelope["items"]
+    if not matches:
+        return CompetitorPriceListResponse(items=[], next_cursor=envelope["next_cursor"])
+
+    prices_by_match_id = {
+        row.match_id: row
+        for row in session.execute(
+            scoped_select(MatchCurrentPrice, ws).where(
+                MatchCurrentPrice.match_id.in_([m.id for m in matches])
+            )
+        )
+        .scalars()
+        .all()
+    }
+    names_by_competitor_id = {
+        row.id: row.name
+        for row in session.execute(
+            scoped_select(Competitor, ws).where(
+                Competitor.id.in_({m.competitor_id for m in matches})
+            )
+        )
+        .scalars()
+        .all()
+    }
+
+    items: list[CompetitorPriceResponse] = []
+    for match in matches:
+        current = prices_by_match_id.get(match.id)
+        items.append(
+            CompetitorPriceResponse(
+                match_id=match.id,
+                competitor_id=match.competitor_id,
+                # Direct indexing, not `.get(..., "")`: `competitor_id` is a
+                # real FK (fk_cpm_workspace_competitor_competitors) within
+                # this workspace, so a miss is impossible — and if it ever
+                # happened it must fail loudly rather than serve a blank
+                # competitor name.
+                competitor_name=names_by_competitor_id[match.competitor_id],
+                url=match.competitor_url,
+                price=current.price if current is not None else None,
+                currency=current.currency if current is not None else None,
+                scraped_at=current.scraped_at if current is not None else None,
+                health_status=match.health_status,
+            )
+        )
+    return CompetitorPriceListResponse(items=items, next_cursor=envelope["next_cursor"])
 
 
 @router.patch("/{variant_id}", response_model=VariantResponse)

@@ -17,11 +17,13 @@ minimal support — not a rewrite of either existing fake.
 from __future__ import annotations
 
 import operator
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import Select
 from sqlalchemy.sql import operators as sa_operators
 from sqlalchemy.sql.elements import False_, Null, True_
+from sqlalchemy.sql.selectable import ScalarSelect
 
 
 def _resolve_bind_value(node: Any) -> Any:
@@ -36,10 +38,12 @@ def _eval_tuple_gt(clause: Any, obj: Any) -> bool:
     return actual > tuple(right_values)
 
 
-def _eval_clause(clause: Any, obj: Any) -> bool:
+def _eval_clause(
+    clause: Any, obj: Any, subquery_values: Callable[[ScalarSelect], list[Any]] | None = None
+) -> bool:
     clauses = getattr(clause, "clauses", None)
     if clauses is not None:
-        results = [_eval_clause(sub, obj) for sub in clauses]
+        results = [_eval_clause(sub, obj, subquery_values) for sub in clauses]
         if clause.operator is sa_operators.and_:
             return all(results)
         if clause.operator is sa_operators.or_:
@@ -54,7 +58,16 @@ def _eval_clause(clause: Any, obj: Any) -> bool:
     actual = getattr(obj, column_name)
 
     if op is sa_operators.in_op:
-        return actual in _resolve_bind_value(clause.right)
+        right = clause.right
+        if isinstance(right, ScalarSelect):
+            # `col.in_(select(Other.id).where(...))` — a correlated-free
+            # scalar subquery (e.g. the orphan filter on
+            # `GET /v1/variants/price-comparison`): evaluate the inner
+            # SELECT against the seeded rows and test membership.
+            if subquery_values is None:
+                raise NotImplementedError("subquery IN requires a session-bound evaluator")
+            return actual in subquery_values(right)
+        return actual in _resolve_bind_value(right)
     if op is sa_operators.eq:
         return actual == _resolve_bind_value(clause.right)
     if op is sa_operators.is_:
@@ -118,14 +131,23 @@ class FakeAlertsListSession:
         for obj in objs:
             self._rows.setdefault(type(obj), []).append(obj)
 
+    def _subquery_values(self, scalar_select: ScalarSelect) -> list[Any]:
+        """Evaluate `select(Model.col).where(...)` used as an `IN (...)` operand."""
+        inner: Select = scalar_select.element
+        description = inner.column_descriptions[0]
+        rows = self._filtered_rows(description["entity"], inner.whereclause)
+        return [getattr(row, description["name"]) for row in rows]
+
+    def _filtered_rows(self, entity: type, where: Any) -> list[Any]:
+        rows = list(self._rows.get(entity, []))
+        if where is None:
+            return rows
+        return [row for row in rows if _eval_clause(where, row, self._subquery_values)]
+
     def execute(self, stmt: Select) -> _FakeExecResult:
         descriptions = stmt.column_descriptions
         entity = descriptions[0]["entity"]
-        rows = list(self._rows.get(entity, []))
-
-        where = stmt.whereclause
-        if where is not None:
-            rows = [row for row in rows if _eval_clause(where, row)]
+        rows = self._filtered_rows(entity, stmt.whereclause)
 
         order_by = list(getattr(stmt, "_order_by_clauses", ()) or ())
         if order_by:
