@@ -229,8 +229,12 @@ if len(calls) != 2:
 
 dispatched_match_ids = set()
 for call in calls:
-    for match_id in call["data"]["match_ids"]:
-        dispatched_match_ids.add(str(match_id))
+    if not isinstance(call["data"]["match_ids"], str):
+        print("MATCH_IDS_NOT_SERIALIZED:" + repr(call["data"]["match_ids"]))
+        sys.exit(1)
+for call in calls:
+    for match_id in call["data"]["match_ids"].split(","):
+        dispatched_match_ids.add(match_id)
 
 if dispatched_match_ids != {str(match_pending_id), str(match_deferred_id)}:
     print("MATCH_IDS_MISMATCH:" + str(dispatched_match_ids))

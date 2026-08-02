@@ -263,7 +263,7 @@ if len(calls) != 1:
     sys.exit(1)
 
 first_call = calls[0]
-if first_call["data"]["match_ids"] != [match_stale.id]:
+if first_call["data"]["match_ids"] != str(match_stale.id):
     print("WRONG_MATCH_IDS_DISPATCHED:" + str(first_call["data"]["match_ids"]))
     sys.exit(1)
 
@@ -292,7 +292,7 @@ if len(calls) != 2:
     sys.exit(1)
 
 second_call = calls[1]
-if second_call["data"]["match_ids"] != [match_stale.id]:
+if second_call["data"]["match_ids"] != str(match_stale.id):
     print("WRONG_MATCH_IDS_ON_SECOND_DISPATCH:" + str(second_call["data"]["match_ids"]))
     sys.exit(1)
 

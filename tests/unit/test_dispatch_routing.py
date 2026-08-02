@@ -191,10 +191,10 @@ if browser_call["data"]["spider"] != "generic_browser_price_spider":
     print("BROWSER_SPIDER_MISMATCH:" + str(browser_call["data"]["spider"]))
     sys.exit(1)
 
-if str(match_http_id) not in http_call["data"]["match_ids"] and str(match_http_id) not in [str(m) for m in http_call["data"]["match_ids"]]:
+if str(match_http_id) not in http_call["data"]["match_ids"].split(","):
     print("HTTP_MATCH_ID_MISSING")
     sys.exit(1)
-if str(match_browser_id) not in [str(m) for m in browser_call["data"]["match_ids"]]:
+if str(match_browser_id) not in browser_call["data"]["match_ids"].split(","):
     print("BROWSER_MATCH_ID_MISSING")
     sys.exit(1)
 

@@ -249,8 +249,13 @@ for call in calls:
 
 dispatched_match_ids = set()
 for call in calls:
-    for match_id in call["data"]["match_ids"]:
-        dispatched_match_ids.add(str(match_id))
+    # The client serializes list-shaped match_ids to the spider's
+    # comma-separated form (Scrapyd keeps only one repeated form field).
+    if not isinstance(call["data"]["match_ids"], str):
+        print("MATCH_IDS_NOT_SERIALIZED:" + repr(call["data"]["match_ids"]))
+        sys.exit(1)
+    for match_id in call["data"]["match_ids"].split(","):
+        dispatched_match_ids.add(match_id)
 if dispatched_match_ids != {str(match_a_id), str(match_b_id)}:
     print("MATCH_IDS_MISMATCH:" + str(dispatched_match_ids))
     sys.exit(1)

@@ -180,7 +180,15 @@ class ScrapydDispatchClient:
         base = (node_url or self._settings.SCRAPYD_HTTP_URLS[0]).rstrip("/")
         url = f"{base}/schedule.json"
         auth = (self._settings.SCRAPYD_USERNAME, self._settings.SCRAPYD_PASSWORD)
-        # Spider args forwarded UNCHANGED (US4 scenario 3).
+        # A list/tuple of match ids MUST be serialized to the spider's
+        # comma-separated form here: `requests` urlencodes a list value as
+        # repeated form fields, and Scrapyd's schedule.json keeps only ONE
+        # of them — every multi-match batch silently collapsed to a single
+        # target (found 2026-08-02; the real reason full-catalog runs only
+        # advanced ~1 target per domain per dispatch).
+        if isinstance(match_ids, (list, tuple)):
+            match_ids = ",".join(str(match_id) for match_id in match_ids)
+        # Spider args otherwise forwarded UNCHANGED (US4 scenario 3).
         data = {
             "project": project,
             "spider": spider,
