@@ -22,11 +22,13 @@ resolve, and the ``rejection_registry`` side-channel a real abort needs
 so the browser errback can still recognize *why* the fetch failed —
 see below).
 
-**Scope**: applies only to navigation/document requests
-(``request.is_navigation_request()`` or ``resource_type == "document"``);
-every sub-resource (image/script/stylesheet/xhr/...) passes untouched —
-SSRF-relevant fetches are the page navigations themselves, not their
-assets.
+**Scope**: the SSRF re-validation applies only to navigation/document
+requests (``request.is_navigation_request()`` or
+``resource_type == "document"``) — SSRF-relevant fetches are the page
+navigations themselves, not their assets. Sub-resources are subject only
+to the cost guard: image/media/font/stylesheet requests are aborted so
+they never transit the paid proxy (``_COST_BLOCKED_RESOURCE_TYPES``);
+script/xhr/fetch and every other type pass untouched.
 
 **Off-event-loop-thread resolve**: ``abort_unsafe_request`` runs as a
 native coroutine inside the same asyncio loop scrapy-playwright/
@@ -76,6 +78,17 @@ if TYPE_CHECKING:  # pragma: no cover - type-checking only, never imported at ru
 logger = logging.getLogger(__name__)
 
 __all__ = ["abort_unsafe_request"]
+
+#: Sub-resource types aborted for cost, not safety (PLAN_AMAZON_NOON_PRICING
+#: Phase 2): every browser fetch rides a paid residential proxy, and letting
+#: Chromium download images/CSS/fonts made an Amazon page cost 6.15 MB of
+#: proxy traffic when its HTML is ~1.3 MB. Price extraction never needs any
+#: of these (CSS *selectors* work without CSS *files*; JSON-LD/regex read the
+#: HTML). Deliberately NOT `script`/`xhr`/`fetch` — Amazon's price block only
+#: renders with JavaScript, so JS and its data calls must keep loading.
+#: These aborts never touch `rejection_registry`: marking the hostname would
+#: make `classify_exception` misread an ordinary asset abort as BLOCKED.
+_COST_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font", "stylesheet"})
 
 
 def _system_resolver(host: str) -> list[str]:
@@ -140,7 +153,10 @@ async def abort_unsafe_request(request: "PlaywrightRequest", *, resolver: Resolv
     non-navigation request, returns `False`.
     """
     if not _is_navigation_request(request):
-        return False
+        # Cost guard, not a safety guard: heavy static assets are aborted so
+        # they never transit the paid proxy (see _COST_BLOCKED_RESOURCE_TYPES
+        # for scope and why the rejection registry is never marked here).
+        return getattr(request, "resource_type", None) in _COST_BLOCKED_RESOURCE_TYPES
 
     url = request.url
     host = urlsplit(url).hostname

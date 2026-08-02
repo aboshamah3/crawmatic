@@ -63,17 +63,43 @@ def _raising_resolver(exc: Exception):
 
 
 def test_subresource_request_passes_without_any_resolver_call() -> None:
-    """A non-navigation resource (image/script/xhr/...) is never checked --
-    `is_navigation_request()` False AND `resource_type` not "document"."""
+    """A non-navigation resource outside the cost-blocked set (script/xhr/...)
+    is never checked -- `is_navigation_request()` False AND `resource_type`
+    not "document"."""
     resolver = _resolver(["10.0.0.5"])  # would be rejected if ever consulted
-    request = _FakeRequest(
-        "https://shop.example.com/logo.png", is_navigation=False, resource_type="image"
-    )
+    for resource_type in ("script", "xhr", "fetch", "other"):
+        request = _FakeRequest(
+            "https://shop.example.com/app.js",
+            is_navigation=False,
+            resource_type=resource_type,
+        )
 
-    result = asyncio.run(abort_unsafe_request(request, resolver=resolver))
+        result = asyncio.run(abort_unsafe_request(request, resolver=resolver))
 
-    assert result is False
-    assert resolver.calls == []  # type: ignore[attr-defined]  -- no resolve attempted
+        assert result is False
+        assert resolver.calls == []  # type: ignore[attr-defined]  -- no resolve attempted
+
+
+def test_heavy_asset_subresource_aborted_without_resolver_or_registry() -> None:
+    """image/media/font/stylesheet sub-resources are aborted for proxy cost
+    (PLAN_AMAZON_NOON_PRICING Phase 2) -- no resolve attempted, and the
+    rejection registry is NEVER marked (an asset abort must not make the
+    page classify as BLOCKED)."""
+    from scrape_core.safety import rejection_registry
+
+    resolver = _resolver([_PUBLIC_IP])
+    for resource_type in ("image", "media", "font", "stylesheet"):
+        request = _FakeRequest(
+            "https://shop.example.com/logo.png",
+            is_navigation=False,
+            resource_type=resource_type,
+        )
+
+        result = asyncio.run(abort_unsafe_request(request, resolver=resolver))
+
+        assert result is True, resource_type
+        assert resolver.calls == []  # type: ignore[attr-defined]
+        assert not rejection_registry.was_recently_rejected("shop.example.com")
 
 
 def test_navigation_request_via_is_navigation_request_is_checked() -> None:
