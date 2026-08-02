@@ -41,6 +41,13 @@ WORKDIR /app/apps/scrapers-browser
 RUN mkdir -p eggs logs dbs items \
     && chmod +x docker-entrypoint.sh
 
+# Bake the spider egg into Scrapyd's eggs_dir at build time. Before this,
+# every redeploy shipped an empty eggs/ and the project had to be manually
+# re-registered via addversion.json after each `railway up`
+# (SCRAPER_FIXES_REPORT_2026-07-27 operational gotcha) — until then the
+# node answered every schedule.json with "project not found".
+RUN uvx --from scrapyd-client scrapyd-deploy --build-egg eggs/price_monitor_browser/1_0.egg
+
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \
     && chown -R app:app /app \
