@@ -152,6 +152,15 @@ class Settings(BaseSettings):
     # actually re-POST at most once per TTL window.
     SCRAPYD_DISPATCH_GUARD_TTL_SECONDS: int = 900
 
+    # --- Celery worker sizing (PLAN_AMAZON_NOON_PRICING Phase 4a) ---
+    # Prefork pool size for the `worker` service. Celery's default is one
+    # process per CPU core, which on Railway meant ~48 idle processes
+    # holding ~3.85 GB (~$31/mo of the ~$40 baseline) for a queue mix
+    # that is entirely short DB/broker calls. Raise if `scrape_dispatch`
+    # queue depth grows during a full run (under-provisioning shows up as
+    # backlog, not errors).
+    CELERY_WORKER_CONCURRENCY: int = 4
+
     # --- Price-analysis recompute dedup (SPEC-09 FR-012, FR-015, D4, D7 —
     # DB/env-tunable, never a hardcoded literal, Principle IV). TTL on the
     # emission-side Redis ``SET NX`` key (``analysis:enqueued:{job}:{variant}``)

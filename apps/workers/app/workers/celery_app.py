@@ -109,6 +109,12 @@ app = Celery(
 # status changes). Kept on its own queue so it never competes with/blocks
 # `maintenance`/`price_analysis` traffic; it does no blocking fetch, just
 # one insert.
+# Prefork pool size (PLAN_AMAZON_NOON_PRICING Phase 4a): without this,
+# Celery defaults to one process per CPU core — ~48 idle processes /
+# ~3.85 GB on Railway for a task mix that is entirely short DB/broker
+# calls. Env-tunable via CELERY_WORKER_CONCURRENCY, no rebuild needed.
+app.conf.worker_concurrency = settings.CELERY_WORKER_CONCURRENCY
+
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
