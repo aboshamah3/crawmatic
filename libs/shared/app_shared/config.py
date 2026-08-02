@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     SCRAPE_DISPATCH_HTTP_BATCH_MIN: int = 50
     SCRAPE_DISPATCH_HTTP_BATCH_MAX: int = 200
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
+    # TTL on the dispatch client's Redis idempotency guard
+    # (``dispatched:{job}:{batch_index}``). Without an expiry the guard
+    # suppressed every later re-dispatch of the same batch_index forever —
+    # the second half of the DEFERRED deadlock (PLAN_AMAZON_NOON_PRICING
+    # Phase 1). Doubles as the pacing floor: a still-deferred batch can
+    # actually re-POST at most once per TTL window.
+    SCRAPYD_DISPATCH_GUARD_TTL_SECONDS: int = 900
 
     # --- Price-analysis recompute dedup (SPEC-09 FR-012, FR-015, D4, D7 —
     # DB/env-tunable, never a hardcoded literal, Principle IV). TTL on the

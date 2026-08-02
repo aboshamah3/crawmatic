@@ -42,6 +42,7 @@ class _FakeSettings:
     )
     SCRAPYD_USERNAME: str = "scrapyd"
     SCRAPYD_PASSWORD: str = "correct-horse"
+    SCRAPYD_DISPATCH_GUARD_TTL_SECONDS: int = 900
 
 
 class _FakeRedis:

@@ -49,6 +49,7 @@ from app_shared.task_names import (
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
+    SCRAPE_REDISPATCH_JOBS,
     STRATEGY_STATS_FLUSH,
 )
 from app_shared.webhooks.payloads import build_job_event
@@ -446,6 +447,77 @@ def finalize_jobs() -> None:
                     job_id,
                     webhook_event_type,
                     exc_info=True,
+                )
+
+
+@app.task(name=SCRAPE_REDISPATCH_JOBS)
+def redispatch_pending_jobs() -> None:
+    """Re-enqueue `dispatch_job` for jobs whose targets nothing will pick up.
+
+    Closes the DEFERRED deadlock (PLAN_AMAZON_NOON_PRICING Phase 1):
+    `dispatch_job` selects PENDING **and** DEFERRED targets, but nothing
+    ever re-enqueued it — a target handed back as DEFERRED by the
+    requeue-cap overflow sat forever, wedging any run past ~20 products.
+    Two cases per non-terminal job, chosen to not overlap
+    `recover_stalled_batches` (which owns stalled bare-PENDING targets on
+    RUNNING jobs):
+
+    - job still `PENDING` with `started_at IS NULL` — its original
+      dispatch delivery was lost; re-enqueue unconditionally.
+    - job has >= 1 `DEFERRED` target — re-enqueue so `dispatch_job`
+      re-plans them; on pickup they re-enter the lock+limiter gate.
+
+    Duplicate-delivery safety is unchanged: the dispatch client's Redis
+    `SET NX` guard (now TTL-bounded, `SCRAPYD_DISPATCH_GUARD_TTL_SECONDS`)
+    still deduplicates re-POSTs of the same `(job, batch_index)` within
+    the TTL window — which also paces how often a still-deferred batch
+    can actually re-POST. Idempotent and fire-and-forget: a broker error
+    on one job is logged and the sweep moves on.
+    """
+    with get_session() as session:
+        for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
+            set_workspace_context(session, workspace_id)
+
+            job = scoped_get(session, ScrapeJob, job_id, workspace_id)
+            if job is None or job.status in _TERMINAL_JOB_STATUSES:
+                continue
+
+            needs_redispatch = job.started_at is None
+            if not needs_redispatch:
+                deferred_exists = (
+                    session.execute(
+                        scoped_select(ScrapeJobTarget, workspace_id)
+                        .where(
+                            ScrapeJobTarget.scrape_job_id == job.id,
+                            ScrapeJobTarget.status == ScrapeTargetStatus.DEFERRED,
+                        )
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                needs_redispatch = deferred_exists is not None
+            if not needs_redispatch:
+                continue
+
+            try:
+                enqueue(
+                    SCRAPE_DISPATCH_JOB,
+                    queue="scrape_dispatch",
+                    kwargs={
+                        "scrape_job_id": str(job.id),
+                        "workspace_id": str(workspace_id),
+                    },
+                )
+                logger.info(
+                    "redispatch_pending_jobs: re-enqueued dispatch for job %s "
+                    "(started_at=%s)",
+                    job.id,
+                    job.started_at,
+                )
+            except Exception:
+                logger.exception(
+                    "redispatch_pending_jobs: failed to re-enqueue job %s", job.id
                 )
 
 

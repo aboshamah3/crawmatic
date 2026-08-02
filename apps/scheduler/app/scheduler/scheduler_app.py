@@ -68,6 +68,7 @@ from app_shared.task_names import (
     MAINTENANCE_RETENTION_DROP,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
+    SCRAPE_REDISPATCH_JOBS,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_STATS_FLUSH,
 )
@@ -147,6 +148,24 @@ def _enqueue_recover_stalled() -> None:
         enqueue(SCRAPE_RECOVER_STALLED, queue="maintenance")
     except Exception:
         logger.exception("scheduler: failed to enqueue %s", SCRAPE_RECOVER_STALLED)
+
+
+def _enqueue_redispatch_pending() -> None:
+    """Fire-and-forget periodic `SCRAPE_REDISPATCH_JOBS` on the
+    `maintenance` queue (PLAN_AMAZON_NOON_PRICING Phase 1: the DEFERRED
+    deadlock). `dispatch_job` selects PENDING **and** DEFERRED targets,
+    but nothing ever re-enqueued it once the initial delivery ran — a
+    DEFERRED target (requeue-cap overflow) therefore sat forever and any
+    run past ~20 products wedged. The sweep task re-enqueues
+    `SCRAPE_DISPATCH_JOB` for every job still holding such targets;
+    idempotent (the dispatch client's TTL-bounded Redis guard paces
+    actual re-POSTs). Errors are logged and swallowed like every other
+    maintenance enqueue.
+    """
+    try:
+        enqueue(SCRAPE_REDISPATCH_JOBS, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", SCRAPE_REDISPATCH_JOBS)
 
 
 def _enqueue_partition_create() -> None:
@@ -263,6 +282,7 @@ def main() -> None:
             # this cadence): sweep dangling jobs + stalled batches.
             _enqueue_finalize_jobs()
             _enqueue_recover_stalled()
+            _enqueue_redispatch_pending()
         if refresh_elapsed >= refresh_interval:
             refresh_elapsed = 0.0
             _run_refresh_pass_tick(refresh_batch_limit)

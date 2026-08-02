@@ -18,6 +18,7 @@ from __future__ import annotations
 SCRAPE_DISPATCH_JOB = "scrape_dispatch.dispatch_job"
 SCRAPE_RECOVER_STALLED = "maintenance.recover_stalled_batches"
 SCRAPE_FINALIZE_JOBS = "maintenance.finalize_jobs"
+SCRAPE_REDISPATCH_JOBS = "maintenance.redispatch_pending_jobs"
 
 # --- Price analysis (SPEC-09 FR-012, D4) ---
 # Enqueued via ``app_shared.messaging.enqueue`` from three triggers (scrape

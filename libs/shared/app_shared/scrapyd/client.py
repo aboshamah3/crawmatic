@@ -52,6 +52,12 @@ _PENDING_SENTINEL = "__dispatch_pending__"
 # Conservative default; a dispatch POST that hangs must not block a worker.
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 
+# TTL on the in-flight sentinel: only ever needs to outlive one POST
+# (timeout 30s). Bounded so a crash between claim and release can no
+# longer leave a permanent sentinel that blocks every later dispatch of
+# that batch.
+_SENTINEL_TTL_SECONDS = 120
+
 
 class ScrapydDispatchError(RuntimeError):
     """A Scrapyd dispatch could not be completed."""
@@ -122,7 +128,7 @@ class ScrapydDispatchClient:
 
         # --- claim -----------------------------------------------------------
         # SET NX before the network call: whoever wins the claim owns the POST.
-        claimed = self._redis.set(key, _PENDING_SENTINEL, nx=True)
+        claimed = self._redis.set(key, _PENDING_SENTINEL, nx=True, ex=_SENTINEL_TTL_SECONDS)
         if not claimed:
             existing = self._redis.get(key)
             if existing and existing != _PENDING_SENTINEL:
@@ -150,8 +156,14 @@ class ScrapydDispatchClient:
             raise
 
         # --- commit ----------------------------------------------------------
-        # Persist the real jobid as the durable backstop for future retries.
-        self._redis.set(key, jobid)
+        # Persist the real jobid as the backstop for duplicate deliveries —
+        # TTL-bounded (SCRAPYD_DISPATCH_GUARD_TTL_SECONDS): a permanent key
+        # suppressed every later legitimate re-dispatch of the same
+        # batch_index, which is what wedged DEFERRED targets forever
+        # (PLAN_AMAZON_NOON_PRICING Phase 1). Within the TTL a retry still
+        # no-ops; after it, a re-plan of still-unfinished targets may POST
+        # again — per-match locks make that safe.
+        self._redis.set(key, jobid, ex=self._settings.SCRAPYD_DISPATCH_GUARD_TTL_SECONDS)
         return jobid
 
     def _post_schedule(
