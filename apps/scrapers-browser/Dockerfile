@@ -46,7 +46,8 @@ RUN mkdir -p eggs logs dbs items \
 # re-registered via addversion.json after each `railway up`
 # (SCRAPER_FIXES_REPORT_2026-07-27 operational gotcha) — until then the
 # node answered every schedule.json with "project not found".
-RUN uvx --from scrapyd-client scrapyd-deploy --build-egg eggs/price_monitor_browser/1_0.egg
+RUN mkdir -p eggs/price_monitor_browser \
+    && uvx --from scrapyd-client scrapyd-deploy --build-egg eggs/price_monitor_browser/1_0.egg
 
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \
