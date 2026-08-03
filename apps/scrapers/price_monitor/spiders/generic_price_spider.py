@@ -107,7 +107,12 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
 from scrape_core.db import await_in_thread
-from scrape_core.errors import PRICE_NOT_FOUND, classify_exception, classify_http_status
+from scrape_core.errors import (
+    PRICE_NOT_FOUND,
+    RATE_LIMITED,
+    classify_exception,
+    classify_http_status,
+)
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, release_lock, release_slot
@@ -129,6 +134,7 @@ from scrape_core.targets import (
     load_targets,
     overflow_to_dispatch,
     prepare_dispatch_with_backoff,
+    redispatch_job,
     sticky_proxy_username,
 )
 from scrape_core.validation import Accepted, Rejected, validate_candidate
@@ -618,6 +624,17 @@ class GenericPriceSpider(scrapy.Spider):
         # separate never-dispatched row, same shape as `start()`'s skip
         # branch (there is no request/response for it, so its fields
         # come from the decision itself, not `request.meta`).
+        #
+        # 2026-08-02: a RATE_LIMITED gate here is **transient**, so this
+        # row must not terminalize the target -- `defer_target` marks it
+        # DEFERRED in the same write and the job is re-enqueued, exactly
+        # as the attempt-1 gate does via `prepare_dispatch_with_backoff`.
+        # Without this the retry path terminal-failed every ceiling-gated
+        # target: 79 of S-Tech's 96 links in the 2026-08-02 Cohort B run.
+        # Backing off in-line here is deliberately NOT done -- this errback
+        # may still hold the match lock, whose TTL is shorter than the
+        # requeue wait cap.
+        defer = decision.skip_error_code is RATE_LIMITED
         yield self._build_result(
             target,
             failure.request.url,
@@ -630,7 +647,10 @@ class GenericPriceSpider(scrapy.Spider):
             attempt_number=next_attempt_number,
             proxy_provider_id=(decision.attempted_proxy.provider_id if decision.attempted_proxy else None),
             proxy_country=(decision.attempted_proxy.country if decision.attempted_proxy else None),
+            defer_target=defer,
         )
+        if defer:
+            await redispatch_job(self._admission_context(), target)
 
     def _build_result(
         self,

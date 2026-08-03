@@ -93,3 +93,14 @@ class ScrapeResult:
     # get-or-creates one) or for a hand-built pre-SPEC-12 item (unit
     # tests) that never threads it through.
     domain_strategy_profile_id: uuid.UUID | None = None
+
+    # --- 2026-08-02: "this failure must NOT terminalize the target" ---
+    # A failed attempt whose *next* attempt was rate-ceiling-gated is not a
+    # terminal outcome -- the target is going back to `scrape_dispatch` to
+    # be retried later. `_flush_batch` marks such a target `DEFERRED`
+    # instead of `FAILED`, in the SAME write that records the attempt, so
+    # the intent can never lose a race against a separate mark (blind
+    # last-writer-wins `mark_target` is what let S-Tech's retry path
+    # terminal-fail 79 of 96 links in the Cohort B run). The observation/
+    # attempt rows themselves are written exactly as any other failure.
+    defer_target: bool = False

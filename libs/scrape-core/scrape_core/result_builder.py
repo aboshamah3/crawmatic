@@ -43,6 +43,7 @@ def build_scrape_result(
     candidate_extras: Any = None,
     match_lock_key: str | None = None,
     match_lock_token: str | None = None,
+    defer_target: bool = False,
 ) -> ScrapeResult:
     """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034; extracted SPEC-14 T007).
 
@@ -121,5 +122,6 @@ def build_scrape_result(
         match_lock_key=match_lock_key,
         match_lock_token=match_lock_token,
         domain_strategy_profile_id=target.domain_strategy_profile_id,
+        defer_target=defer_target,
         **kwargs,
     )

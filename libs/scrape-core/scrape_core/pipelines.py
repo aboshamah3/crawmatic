@@ -266,6 +266,15 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 continue
             if item.success:
                 target_status = ScrapeTargetStatus.COMPLETED
+            elif item.defer_target:
+                # 2026-08-02: the next attempt was rate-ceiling-gated, so
+                # this failure is NOT terminal -- the target is handed back
+                # to `scrape_dispatch` (the spider enqueues the
+                # re-dispatch). Marking DEFERRED here, in the same write
+                # that records the attempt, is what keeps the intent from
+                # racing a separate `mark_target` call (see
+                # `ScrapeResult.defer_target`).
+                target_status = ScrapeTargetStatus.DEFERRED
             elif item.error_code == ScrapeErrorCode.LOCKED_ALREADY_RUNNING:
                 # SPEC-11 US2 (contracts/match-lock.md, data-model.md §5):
                 # a lock-collision attempt is SKIPPED, distinct from every

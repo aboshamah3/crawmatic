@@ -135,6 +135,7 @@ __all__ = [
     "acquire_fetch_permission",
     "defer_rate_limited_target",
     "prepare_dispatch_with_backoff",
+    "redispatch_job",
     "overflow_to_dispatch",
     "dispatch_admission",
     "sticky_proxy_username",
@@ -1078,6 +1079,39 @@ async def acquire_fetch_permission(
             delay=delay,
         )
         await as_awaitable(deferred_delay(delay))
+
+
+async def redispatch_job(ctx: AdmissionContext, target: SpiderTarget) -> None:
+    """Re-enqueue this target's job on `scrape_dispatch` so a fresh
+    `dispatch_job` run picks its DEFERRED targets back up.
+
+    Enqueue only — it never marks the target. Used by the spiders' errback
+    ceiling path, where the target's DEFERRED mark rides on the failed
+    attempt's own item (`ScrapeResult.defer_target`) so the status can't
+    lose a race against a separate write.
+    """
+    scrape_job_id = ctx.scrape_job_id
+    if scrape_job_id is None:
+        logger.error(
+            "targets: rate-limit defer with no scrape_job_id -- "
+            "cannot re-dispatch match_id=%s",
+            target.match_id,
+        )
+        return
+
+    await await_in_thread(
+        enqueue,
+        SCRAPE_DISPATCH_JOB,
+        queue="scrape_dispatch",
+        kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(ctx.workspace_id)},
+    )
+    log_event(
+        logger,
+        "rate_limit.retry_deferred",
+        workspace_id=ctx.workspace_id,
+        scrape_job_id=scrape_job_id,
+        match_id=target.match_id,
+    )
 
 
 async def defer_rate_limited_target(
