@@ -79,7 +79,12 @@ def mark_target(
     ``DEFERRED`` (carrying ``RATE_LIMITED`` on a requeue-cap overflow) —
     previously the gate only fired on ``status == FAILED``, silently
     dropping the code on ``SKIPPED``/``DEFERRED`` (analyze finding G1,
-    FR-020/FR-021, SC-006, `contracts/overflow-dispatch.md` §2). Touches
+    FR-020/FR-021, SC-006, `contracts/overflow-dispatch.md` §2).
+
+    **A target already in a terminal status is never transitioned again**
+    (2026-08-03) — see the inline note; this is what makes a job's
+    terminal-target count monotonic and therefore lets `finalize_jobs`
+    converge. Touches
     ONLY this target row — never the parent job's counters (D5);
     ``aggregate_counts`` is the sole counter source. A no-op if the
     target can't be resolved in-workspace (e.g. an already-deleted/
@@ -92,6 +97,18 @@ def mark_target(
     )
     target = session.execute(stmt).scalar_one_or_none()
     if target is None:
+        return
+
+    # Terminal is terminal (2026-08-03). This writer used to be a blind
+    # last-writer-wins overwrite, so a late-arriving DEFERRED from a
+    # long-lived spider could resurrect a target that had already
+    # finished -- observed live: a job's completed-target count moving
+    # *backwards*, and (2026-08-02) noon targets flip-flopping between
+    # FAILED and DEFERRED for three hours, which kept their job from ever
+    # finalizing. A job only ever dispatches PENDING/DEFERRED targets, so
+    # nothing legitimately re-opens a finished one; a genuine re-scrape
+    # creates a new job with its own target rows.
+    if target.status in _TERMINAL_TARGET_STATUSES:
         return
 
     target.status = status

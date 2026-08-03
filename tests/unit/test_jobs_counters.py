@@ -416,3 +416,59 @@ def test_mark_target_unresolvable_target_is_a_no_op() -> None:
         match_id=uuid.uuid4(),
         status=ScrapeTargetStatus.COMPLETED,
     )
+
+
+def test_mark_target_never_reopens_a_terminal_target() -> None:
+    """Terminal is terminal (2026-08-03).
+
+    `mark_target` used to be a blind overwrite, so a late DEFERRED from a
+    long-lived spider could resurrect a finished target -- observed live
+    as a job's done-count moving backwards, and as noon targets
+    flip-flopping FAILED<->DEFERRED for three hours without the job ever
+    finalizing.
+    """
+    import uuid as _uuid
+
+    from app_shared.enums import ScrapeErrorCode, ScrapeTargetStatus
+    from app_shared.jobs.targets import mark_target
+    from app_shared.models.jobs import ScrapeJobTarget
+
+    workspace_id = _uuid.uuid4()
+    scrape_job_id = _uuid.uuid4()
+    match_id = _uuid.uuid4()
+
+    target = ScrapeJobTarget(
+        workspace_id=workspace_id,
+        scrape_job_id=scrape_job_id,
+        match_id=match_id,
+        status=ScrapeTargetStatus.PENDING,
+        created_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+    )
+    target.id = _uuid.uuid4()
+    session = FakeOrmSession()
+    session.seed(target)
+
+    def _mark(status: ScrapeTargetStatus, error_code: ScrapeErrorCode | None = None) -> None:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=match_id,
+            status=status,
+            error_code=error_code,
+        )
+
+    _mark(ScrapeTargetStatus.STARTED)
+    assert target.status is ScrapeTargetStatus.STARTED
+
+    _mark(ScrapeTargetStatus.COMPLETED)
+    assert target.status is ScrapeTargetStatus.COMPLETED
+
+    # A stale spider's late defer must NOT re-open it.
+    _mark(ScrapeTargetStatus.DEFERRED, ScrapeErrorCode.RATE_LIMITED)
+    assert target.status is ScrapeTargetStatus.COMPLETED
+    assert target.error_code is None, "a blocked transition must not stamp an error code either"
+
+    # Nor may a late failure overwrite a success.
+    _mark(ScrapeTargetStatus.FAILED, ScrapeErrorCode.TIMEOUT)
+    assert target.status is ScrapeTargetStatus.COMPLETED
