@@ -115,6 +115,7 @@ from scrape_core.db import as_awaitable, await_in_thread, run_in_thread, workspa
 from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
 from scrape_core.observability import log_event
 from scrape_core.reactor import deferred_delay
+from scrape_core.defer_budget import consume_defer_budget
 from scrape_core.result_builder import build_scrape_result
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,27 @@ def _mark_target_deferred_rate_limited(
             scrape_job_id=scrape_job_id,
             match_id=match_id,
             status=ScrapeTargetStatus.DEFERRED,
+            error_code=ScrapeErrorCode.RATE_LIMITED,
+        )
+
+
+def _mark_target_rate_limited_failed(
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    match_id: uuid.UUID,
+) -> None:
+    """Terminal counterpart of :func:`_mark_target_deferred_rate_limited`
+    for a target whose defer budget is spent (2026-08-03,
+    `scrape_core.defer_budget`) -- **Blocking** (DB round trip), so only
+    ever called inside :func:`scrape_core.db.run_in_thread`. Reuses the
+    single ``mark_target`` writer; no new persistence path."""
+    with workspace_txn(workspace_id) as session:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=match_id,
+            status=ScrapeTargetStatus.FAILED,
             error_code=ScrapeErrorCode.RATE_LIMITED,
         )
 
@@ -1135,6 +1157,34 @@ async def defer_rate_limited_target(
             "targets: rate-limit defer with no scrape_job_id -- "
             "cannot mark DEFERRED or re-dispatch match_id=%s",
             target.match_id,
+        )
+        return
+
+    # 2026-08-03: bounded, same as the pipeline's defer path -- once this
+    # target has burned its defer cycles it is failed terminally instead,
+    # so a persistently blocked domain cannot keep the job alive forever
+    # (scrape_core.defer_budget).
+    from app_shared.config import get_settings
+
+    keep_deferring = consume_defer_budget(
+        get_redis_client(),
+        scrape_job_id=scrape_job_id,
+        match_id=target.match_id,
+        max_cycles=get_settings().SCRAPE_MAX_DEFER_CYCLES,
+    )
+    if not keep_deferring:
+        await await_in_thread(
+            _mark_target_rate_limited_failed,
+            ctx.workspace_id,
+            scrape_job_id,
+            target.match_id,
+        )
+        log_event(
+            logger,
+            "rate_limit.defer_budget_exhausted",
+            workspace_id=ctx.workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=target.match_id,
         )
         return
 

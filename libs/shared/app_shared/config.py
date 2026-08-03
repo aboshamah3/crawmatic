@@ -151,6 +151,12 @@ class Settings(BaseSettings):
     # Phase 1). Doubles as the pacing floor: a still-deferred batch can
     # actually re-POST at most once per TTL window.
     SCRAPYD_DISPATCH_GUARD_TTL_SECONDS: int = 900
+    # How many times one target may be handed back DEFERRED before it is
+    # called a terminal FAILED (2026-08-03; consumed by the scraping
+    # runtime's defer-budget helper). DEFERRED is non-terminal, so without
+    # a bound a persistently blocked domain cycles forever and its job
+    # never finalizes.
+    SCRAPE_MAX_DEFER_CYCLES: int = 3
 
     # --- Celery worker sizing (PLAN_AMAZON_NOON_PRICING Phase 4a) ---
     # Prefork pool size for the `worker` service. Celery's default is one

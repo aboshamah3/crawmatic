@@ -91,6 +91,8 @@ from app_shared.messaging import enqueue
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.redis_client import get_redis_client
 from app_shared.strategy.stats_buffer import record_attempt
+
+from scrape_core.defer_budget import consume_defer_budget
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE, SCRAPE_FINALIZE_JOBS
 
 from scrape_core.db import run_in_thread, workspace_txn
@@ -266,7 +268,12 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 continue
             if item.success:
                 target_status = ScrapeTargetStatus.COMPLETED
-            elif item.defer_target:
+            elif item.defer_target and consume_defer_budget(
+                get_redis_client(),
+                scrape_job_id=item.scrape_job_id,
+                match_id=item.match_id,
+                max_cycles=get_settings().SCRAPE_MAX_DEFER_CYCLES,
+            ):
                 # 2026-08-02: the next attempt was rate-ceiling-gated, so
                 # this failure is NOT terminal -- the target is handed back
                 # to `scrape_dispatch` (the spider enqueues the
@@ -274,6 +281,11 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 # that records the attempt, is what keeps the intent from
                 # racing a separate `mark_target` call (see
                 # `ScrapeResult.defer_target`).
+                #
+                # 2026-08-03: bounded by `consume_defer_budget` -- once a
+                # target has burned its defer cycles it falls through to
+                # FAILED below, so a persistently blocked domain can no
+                # longer keep its job non-terminal forever.
                 target_status = ScrapeTargetStatus.DEFERRED
             elif item.error_code == ScrapeErrorCode.LOCKED_ALREADY_RUNNING:
                 # SPEC-11 US2 (contracts/match-lock.md, data-model.md §5):

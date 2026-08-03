@@ -183,6 +183,20 @@ def classify_exception(
     if hostname and was_recently_rejected(hostname):
         return ScrapeErrorCode.BLOCKED
 
+    # 2026-08-03: Scrapy's HttpErrorMiddleware filters every non-2xx to the
+    # errback as `HttpError`, so a spider's `parse` never sees one and the
+    # `classify_http_status` branch there is unreachable in practice. Left
+    # unhandled these all landed as UNKNOWN_ERROR -- 717 S-Tech throttle
+    # responses in the 2026-08-03 run were indistinguishable from genuine
+    # crashes. Duck-typed on `.response.status` (never importing Scrapy
+    # here, per this module's stdlib-only contract) so the real status
+    # classifies exactly as it would have in `parse`.
+    status = getattr(getattr(exc, "response", None), "status", None)
+    if isinstance(status, int):
+        status_code = classify_http_status(status)
+        if status_code is not None:
+            return status_code
+
     name = type(exc).__name__.lower()
     if "timeout" in name:
         return ScrapeErrorCode.TIMEOUT

@@ -84,3 +84,26 @@ def test_blocked_error_classifies_as_blocked() -> None:
     surface as BLOCKED (a retryable transport failure) rather than
     UNKNOWN_ERROR."""
     assert classify_exception(BlockedResponseError("blocked")) is BLOCKED
+
+
+class _HttpErrorLike(Exception):
+    """Shape of Scrapy's `HttpError`: carries the filtered `.response`."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__("Ignoring non-200 response")
+        self.response = type("R", (), {"status": status})()
+
+
+@pytest.mark.parametrize(
+    "status,expected_name",
+    [(429, "HTTP_429"), (403, "HTTP_403"), (404, "HTTP_404"), (503, "UNKNOWN_ERROR")],
+)
+def test_http_error_classifies_by_real_status(status: int, expected_name: str) -> None:
+    """Scrapy filters every non-2xx to the errback as HttpError, so
+    `parse`'s classify_http_status branch never runs -- these used to all
+    land as UNKNOWN_ERROR (717 S-Tech throttle responses on 2026-08-03)."""
+    assert classify_exception(_HttpErrorLike(status)).name == expected_name
+
+
+def test_non_http_exception_still_unknown() -> None:
+    assert classify_exception(Exception("boom")).name == "UNKNOWN_ERROR"

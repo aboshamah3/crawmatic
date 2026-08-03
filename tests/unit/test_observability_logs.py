@@ -139,6 +139,7 @@ class _FakeSettings:
     REQUEUE_MAX_TOTAL_WAIT_SECONDS = 300
     RATE_LIMIT_JITTER_MIN_SECONDS = 0
     RATE_LIMIT_JITTER_MAX_SECONDS = 0.01
+    SCRAPE_MAX_DEFER_CYCLES = 3
 
 
 def _patch_get_settings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,6 +262,13 @@ def test_rate_limit_overflow_event_carries_documented_fields(
         return None
 
     monkeypatch.setattr(targets_mod, "await_in_thread", _fake_run_in_thread)
+    # 2026-08-03: the defer path now consults `SCRAPE_MAX_DEFER_CYCLES` and
+    # the Redis defer-cycle counter before deferring. The helper's stub
+    # client has no `incr`, which exercises `consume_defer_budget`'s
+    # documented fail-open branch -- an unreadable counter must still
+    # defer, so the `rate_limit.overflow` emission asserted below is
+    # exactly what a real (Redis-healthy, budget-remaining) run emits.
+    _patch_get_settings(monkeypatch)
 
     scrape_job_id = uuid.uuid4()
     spider = gps.GenericPriceSpider(
