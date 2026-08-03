@@ -49,6 +49,15 @@ so the SC-001 guarantee ("a scrape follows the configured sequence in
    `sticky_session` -> a session_seed-derived key stable across
    `attempt_number`; `rotate_per_request` -> a key that changes with
    `attempt_number`; neither -> `None`.
+
+   **The caller owns the grain.** This function only ever combines
+   `session_seed` with `attempt_number`, so how widely one upstream
+   session is shared is decided entirely by what the caller puts in the
+   seed. A per-domain seed makes `rotate_per_request` share one exit IP
+   across every attempt-1 fetch of that domain, which burns the exit
+   under sustained crawling (2026-08-03: Amazon CAPTCHA'd every request
+   after ~150 fetches). Callers pass a per-match seed so rotation is
+   genuinely per request.
 """
 
 from __future__ import annotations

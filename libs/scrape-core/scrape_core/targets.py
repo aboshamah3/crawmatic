@@ -870,7 +870,19 @@ def _prepare_dispatch(
             attempt_number=attempt_number,
             rotate_per_request=policy.rotate_per_request,
             sticky_session=policy.sticky_session,
-            session_seed=f"{target.competitor_id}:{target.domain}",
+            # Per-MATCH seed (2026-08-03). This was `competitor:domain`,
+            # i.e. per-domain -- and since `rotate_per_request` only varies
+            # the key by `attempt_number`, every attempt-1 fetch for a
+            # domain shared ONE upstream session, every retry a second.
+            # A whole Amazon crawl therefore funnelled through ~3 exit IPs
+            # at 10 rpm, which burns them: after ~150 fetches every exit
+            # answered with a CAPTCHA interstitial and all 6 targets of the
+            # next run failed BLOCKED, having priced 56/57 an hour earlier
+            # on fresh exits. Including the match makes "rotate per
+            # request" actually rotate per request, and leaves
+            # `sticky_session` meaning "one exit for this match's whole
+            # retry chain" -- the useful grain, since a match is one page.
+            session_seed=f"{target.competitor_id}:{target.domain}:{target.match_id}",
         )
         if proxy_assignment is None:
             # No eligible provider (disabled/absent) -- degrade per

@@ -84,3 +84,24 @@ def test_redis_failure_fails_open() -> None:
 
 def test_zero_budget_never_defers() -> None:
     assert _consume(_FakeRedis(), max_cycles=0) is False
+
+
+def test_proxy_session_seed_is_per_match() -> None:
+    """The spider's proxy session seed must include the match (2026-08-03).
+
+    `assign_proxy` only ever combines the seed with `attempt_number`, so a
+    per-domain seed makes `rotate_per_request` share ONE upstream session
+    across every attempt-1 fetch of that domain. That funnelled a whole
+    Amazon crawl through ~3 exit IPs at 10 rpm and burned them: after
+    ~150 fetches every exit returned a CAPTCHA interstitial, and a run
+    that had priced 56/57 an hour earlier failed every target BLOCKED.
+    """
+    import inspect
+
+    from scrape_core import targets as targets_mod
+
+    source = inspect.getsource(targets_mod._prepare_dispatch)
+    assert "session_seed=f\"{target.competitor_id}:{target.domain}:{target.match_id}\"" in source, (
+        "proxy session seed must be per-match, or 'rotate_per_request' does not "
+        "rotate per request"
+    )
