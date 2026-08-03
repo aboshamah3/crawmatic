@@ -89,6 +89,11 @@ ITEM_PIPELINES = {
 DOWNLOADER_MIDDLEWARES = {
     "scrape_core.safety.middleware.SsrfGuardMiddleware": 100,
     "scrape_core.robots.RobotsPolicyMiddleware": 110,
+    # 120 puts this *below* the built-in HttpCompressionMiddleware (590) in
+    # the response chain (responses walk middlewares in descending order),
+    # so it inspects the DECODED body. Turns a bot interstitial served with
+    # HTTP 200 into a retryable failure -- see scrape_core.blocking.
+    "scrape_core.blocking.BlockDetectionMiddleware": 120,
     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
 }
 

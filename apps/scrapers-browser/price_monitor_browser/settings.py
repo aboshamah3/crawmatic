@@ -107,6 +107,12 @@ ITEM_PIPELINES = {
 DOWNLOADER_MIDDLEWARES = {
     "scrape_core.safety.middleware.SsrfGuardMiddleware": 100,
     "scrape_core.robots.RobotsPolicyMiddleware": 110,
+    # See the HTTP project's settings for why 120: a bot interstitial
+    # served with HTTP 200 must become a retryable failure, not a
+    # PRICE_NOT_FOUND. The browser spider has no retry ladder of its own,
+    # so here it simply surfaces as BLOCKED instead of a bogus
+    # "no price on the page" (scrape_core.blocking).
+    "scrape_core.blocking.BlockDetectionMiddleware": 120,
 }
 
 # Config-driven (env/DB-tunable, Principle IV) -- never a hardcoded
