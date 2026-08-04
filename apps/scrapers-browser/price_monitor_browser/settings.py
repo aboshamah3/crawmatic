@@ -128,3 +128,15 @@ PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = _settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT
 # hardcoded literals here.
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS
 SCRAPE_FLUSH_INTERVAL_SECONDS = _settings.SCRAPE_FLUSH_INTERVAL_SECONDS
+
+# Per-spider-process memory ceiling (2026-08-03 memory-leak hardening,
+# parity with price_monitor/settings.py). Scrapy's `MemoryUsage`
+# extension measures only *this* process's RSS -- Chromium runs as a
+# separate process tree, so on this node the setting bounds the Scrapy
+# side and the container-wide backstop (`price_monitor_browser.scrapyd_app`,
+# WATCHDOG_MEMORY_LIMIT_MB) is what catches a leaking browser. Values
+# from `Settings` (env-tunable), never hardcoded literals here.
+MEMUSAGE_ENABLED = True
+MEMUSAGE_LIMIT_MB = _settings.SCRAPE_MEMUSAGE_LIMIT_MB
+MEMUSAGE_WARNING_MB = _settings.SCRAPE_MEMUSAGE_WARNING_MB
+MEMUSAGE_CHECK_INTERVAL_SECONDS = _settings.SCRAPE_MEMUSAGE_CHECK_INTERVAL_SECONDS

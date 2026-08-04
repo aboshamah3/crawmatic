@@ -28,10 +28,11 @@ actually touch the DB and therefore rely on it (FR-016).
 from __future__ import annotations
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import worker_init, worker_process_init
 
 from app_shared.config import get_settings
 from app_shared.database import dispose_engine
+from app_shared.memory_watchdog import start_memory_watchdog
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     MAINTENANCE_DAILY_ROLLUP,
@@ -115,6 +116,14 @@ app = Celery(
 # calls. Env-tunable via CELERY_WORKER_CONCURRENCY, no rebuild needed.
 app.conf.worker_concurrency = settings.CELERY_WORKER_CONCURRENCY
 
+# Prefork child recycling (2026-08-03 memory-leak hardening): retire each
+# child after N tasks and once its resident set passes N KB. Celery lets
+# the running task finish before replacing the process, so this bounds how
+# long a per-child leak can accumulate without ever interrupting or
+# throttling a legitimate heavy run. Both env-tunable, no rebuild needed.
+app.conf.worker_max_tasks_per_child = settings.CELERY_MAX_TASKS_PER_CHILD
+app.conf.worker_max_memory_per_child = settings.CELERY_MAX_MEMORY_PER_CHILD_KB
+
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
@@ -137,6 +146,19 @@ app.conf.task_routes = {
     MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
     CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},
 }
+
+
+@worker_init.connect
+def _start_memory_watchdog(**kwargs: object) -> None:
+    """Start the container memory watchdog in the worker's main process.
+
+    ``worker_init`` fires once in the long-lived parent (not per forked
+    child), which is exactly the process
+    ``worker_max_memory_per_child`` cannot protect — see
+    ``app_shared.memory_watchdog``. No-op unless
+    ``WATCHDOG_MEMORY_LIMIT_MB`` is set (Railway: 2048 for this service).
+    """
+    start_memory_watchdog("worker")
 
 
 @worker_process_init.connect

@@ -167,6 +167,33 @@ class Settings(BaseSettings):
     # backlog, not errors).
     CELERY_WORKER_CONCURRENCY: int = 4
 
+    # Prefork child recycling (2026-08-03 memory-leak hardening). A child
+    # is retired after this many tasks, and after its resident set passes
+    # CELERY_MAX_MEMORY_PER_CHILD_KB — Celery finishes the running task
+    # first, then replaces the process, so recycling never interrupts or
+    # throttles a legitimate heavy run; it only bounds how long a leak can
+    # accumulate. 300 MB is several times the steady-state footprint of
+    # this task mix (short DB/broker calls), so a healthy child is
+    # recycled by task count, not by memory.
+    CELERY_MAX_TASKS_PER_CHILD: int = 1000
+    CELERY_MAX_MEMORY_PER_CHILD_KB: int = 300000
+
+    # --- Scrapy MemoryUsage extension (2026-08-03 memory-leak hardening,
+    # Principle IV — env-tunable, never a hardcoded literal in the Scrapy
+    # settings modules). Bounds a single *spider* process on both Scrapyd
+    # nodes: at the warning mark it only logs, at the limit Scrapy closes
+    # the spider gracefully (finishing in-flight items through the
+    # persistence pipeline) instead of letting the process grow until the
+    # container OOMs. The container-wide backstop for the long-lived
+    # Scrapyd/Celery *parents* is app_shared.memory_watchdog, driven by
+    # WATCHDOG_MEMORY_LIMIT_MB (an ops/Railway env knob, not a Setting).
+    #
+    # 1024 MB is well above a real ~3k-product run's spider footprint, so
+    # legitimate heavy runs are never throttled by it. ---
+    SCRAPE_MEMUSAGE_LIMIT_MB: int = 1024
+    SCRAPE_MEMUSAGE_WARNING_MB: int = 512
+    SCRAPE_MEMUSAGE_CHECK_INTERVAL_SECONDS: int = 30
+
     # --- Price-analysis recompute dedup (SPEC-09 FR-012, FR-015, D4, D7 —
     # DB/env-tunable, never a hardcoded literal, Principle IV). TTL on the
     # emission-side Redis ``SET NX`` key (``analysis:enqueued:{job}:{variant}``)

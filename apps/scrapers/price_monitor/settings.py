@@ -109,3 +109,18 @@ REACTOR_THREADPOOL_MAXSIZE = 20
 _settings = get_settings()
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS
 SCRAPE_FLUSH_INTERVAL_SECONDS = _settings.SCRAPE_FLUSH_INTERVAL_SECONDS
+
+# Per-spider-process memory ceiling (2026-08-03 memory-leak hardening).
+# Scrapy's built-in `MemoryUsage` extension polls this process's RSS and,
+# at MEMUSAGE_LIMIT_MB, closes the spider gracefully — in-flight items
+# still drain through BatchedPersistencePipeline — instead of letting one
+# crawl grow until the container OOMs; MEMUSAGE_WARNING_MB only logs.
+# The limit is far above a real ~3k-product run's footprint, so it never
+# throttles legitimate work. It guards only the spider *subprocess*; the
+# long-lived Scrapyd parent (where the 2026-08-03 idle 7.65 GB plateau
+# lived) is covered by `price_monitor.scrapyd_app`. Values from
+# `Settings` (env-tunable), never hardcoded literals here.
+MEMUSAGE_ENABLED = True
+MEMUSAGE_LIMIT_MB = _settings.SCRAPE_MEMUSAGE_LIMIT_MB
+MEMUSAGE_WARNING_MB = _settings.SCRAPE_MEMUSAGE_WARNING_MB
+MEMUSAGE_CHECK_INTERVAL_SECONDS = _settings.SCRAPE_MEMUSAGE_CHECK_INTERVAL_SECONDS
