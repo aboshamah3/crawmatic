@@ -197,9 +197,49 @@ site.** It is no longer a cost variable in this plan.
 
 **Cohort B result** (`matching/PRICE_TEST_COHORT_B_2026-08-02.md`): 100/100 products
 priced, 239/449 links (53%), **unattended end-to-end**; 9 of 13 sites at 92–100%.
-Remaining gaps: stech retry-path ceiling failures, amazon PRICE_NOT_FOUND sampling,
-noon re-block. Measured all-in marginal ≈ **$0.17 per 100 products**; projected
-daily-cadence total ≈ **$33/mo** (better than §3's $50 estimate).
+Measured all-in marginal ≈ **$0.17 per 100 products**.
+
+## 5b. State after the 2026-08-03 amazon/S-Tech validation
+
+Abdul held the push because those two sites were unvalidated. Full detail in
+`matching/PRICE_TEST_COHORT_B_2026-08-02.md` §E. Headlines:
+
+| | Result |
+|---|---|
+| **S-Tech** | ✅ **96/96 = 100%** (was 18%). Needed all three: its own proxy-first policy (the old one had no provider), `domain_strategy_profiles` set DISABLED, and the retry-path defer fix |
+| **Amazon** | ✅ extraction solved — **56/57 = 98% on fresh exits**, zero PRICE_NOT_FOUND. ⚠️ access unfinished: it burned its proxy exits mid-run and then failed 37/37 with CAPTCHAs |
+| **Noon** | unchanged — still re-blocked since 2026-08-02 |
+
+Five more code defects were found and fixed (retry-path ceiling failure; bot
+interstitial served as HTTP 200; unbounded defer cycling; every non-2xx logged
+UNKNOWN_ERROR; terminal targets re-openable). 27 commits pushed; 1,861 tests green.
+
+**Two plan assumptions are now void:**
+
+- **§A3's single-browser ceiling.** Amazon never needed the browser — the price is in
+  server-rendered HTML, plain HTTP scores 28/30 at **240 KB/page vs ~910 KB**. Its
+  profile is now HTTP mode, and **no `BROWSER` profiles remain**, so `scrapers-browser`
+  is idle and reclaimable.
+- **§3's cost table.** It assumed Amazon dominates via browser bytes. Re-measure before
+  quoting a cadence price; the real number is below the $33/mo in §5.
+
+**The new gate on Phase 4 (cadence) is proxy exit burn, not cost.** `assign_proxy` only
+varies the session key by `attempt_number`, and the spider seeded it per *domain*, so a
+whole crawl funnelled through ~3 exit IPs; Amazon CAPTCHAs after ~150 such fetches and
+recovers only with time. Fixed to seed per match (rotation is now genuinely per
+request), but **unproven at sweep scale** — a full 606-link Amazon sweep must run clean
+before daily cadence is credible.
+
+### Next actions
+
+1. **Cold re-run Amazon's 37 remaining links** after the exits rest — the last
+   validation step.
+2. **Clean up 153 stale jobs.** They make the Phase-1 sweep enqueue ~220k pointless
+   tasks/day (SQL in the `scrape-deferred-deadlock` memory note).
+3. **Investigate the strategy optimizer**: it kept S-Tech on a preference carrying 996
+   recorded failures; rediscovery should have marked it DEGRADED after ~3. Any site
+   whose access method breaks will keep being retried the broken way.
+4. Then Phase 4b: two consecutive clean unattended runs before scheduling.
 
 ---
 
