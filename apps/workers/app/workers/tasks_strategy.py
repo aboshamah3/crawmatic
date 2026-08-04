@@ -32,13 +32,13 @@ here are safe and expected (Constitution V).
 
 from __future__ import annotations
 
-import base64
 import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from sqlalchemy import select
@@ -267,9 +267,20 @@ def _build_proxy_kwargs(session: Session, workspace_id: uuid.UUID) -> dict[str, 
     configured/visible for this workspace -- `PROXY_HTTP` is then simply
     not a discovery candidate (never an error).
 
-    Mirrors `generic_price_spider`'s existing provider -> proxy meta +
-    `Proxy-Authorization` header construction (`_parse_host_port` +
-    `decrypt_secret`), simplified to a one-off probe: no rotation/
+    Credentials go in the **proxy URL userinfo**, not a
+    `Proxy-Authorization` header (2026-08-03 fix). `requests` reaches an
+    https:// target through a CONNECT tunnel, and anything in `headers=`
+    is sent to the destination *inside* that tunnel — the proxy never
+    sees it, so every probe died `407 NO_USER`. Because a failed probe is
+    indistinguishable from "this method doesn't work for this domain",
+    discovery could never confirm a proxied method and kept promoting
+    DIRECT ones: that is why stech.ink held `DIRECT_HTTP` while
+    accumulating 996 recorded failures. The spider path was never
+    affected — Scrapy authenticates CONNECT from its own
+    `Proxy-Authorization` meta.
+
+    Otherwise mirrors `generic_price_spider`'s provider selection
+    (`decrypt_secret`), simplified to a one-off probe: no rotation/
     stickiness policy applies to a single discovery sample.
     """
     providers = session.execute(visible_providers_select(workspace_id)).scalars().all()
@@ -280,7 +291,6 @@ def _build_proxy_kwargs(session: Session, workspace_id: uuid.UUID) -> dict[str, 
     provider = active[0]
     proxy_url = provider.base_url if "://" in provider.base_url else f"http://{provider.base_url}"
 
-    headers: dict[str, str] = {}
     if provider.username and provider.password_encrypted and provider.password_key_version:
         try:
             password = decrypt_secret(provider.password_encrypted, provider.password_key_version)
@@ -291,10 +301,24 @@ def _build_proxy_kwargs(session: Session, workspace_id: uuid.UUID) -> dict[str, 
                 exc,
             )
             return {"proxies": {"http": proxy_url, "https": proxy_url}}
-        token = base64.b64encode(f"{provider.username}:{password}".encode()).decode()
-        headers["Proxy-Authorization"] = f"Basic {token}"
+        proxy_url = _proxy_url_with_credentials(proxy_url, provider.username, password)
 
-    return {"proxies": {"http": proxy_url, "https": proxy_url}, "headers": headers}
+    return {"proxies": {"http": proxy_url, "https": proxy_url}, "headers": {}}
+
+
+def _proxy_url_with_credentials(proxy_url: str, username: str, password: str) -> str:
+    """Embed `username`/`password` in `proxy_url`'s userinfo.
+
+    This is the only way `requests` authenticates a CONNECT tunnel — see
+    `_build_proxy_kwargs`. Both parts are percent-encoded (a DataImpulse
+    username carries `__cr.sa`/`;sessid.` and a password may contain any
+    byte), with `safe=""` so `:`/`@`/`/` can never split the URL.
+    """
+    scheme, _, rest = proxy_url.partition("://")
+    if not rest:
+        scheme, rest = "http", proxy_url
+    rest = rest.rpartition("@")[2]  # never double-embed credentials
+    return f"{scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{rest}"
 
 
 def _fetch_via_proxy(session: Session, workspace_id: uuid.UUID, url: str) -> str | None:
