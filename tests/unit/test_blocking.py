@@ -107,3 +107,47 @@ def test_http_error_classifies_by_real_status(status: int, expected_name: str) -
 
 def test_non_http_exception_still_unknown() -> None:
     assert classify_exception(Exception("boom")).name == "UNKNOWN_ERROR"
+
+
+# --- noon.com / Akamai Bot Manager (2026-08-05) ----------------------------
+
+#: Trimmed from a real noon.com challenge captured through the production SA
+#: proxy on 2026-08-05 (~2.5 KB, served at HTTP 200 on a product URL).
+_NOON_AKAMAI_CHALLENGE = """<!DOCTYPE html><html><head><title></title></head><body>
+<div class="sec-bc-button-parent">
+  <div class="behavioral-button progress-btn-disabled">
+    <div class="btn" id="progress-button" role="button" disabled></div>
+  </div>
+</div>
+<div class="scf-akamai-logo-sec-abc">
+  <p class="scf-akamai-protected-by">Powered and protected by</p>
+  <img src="https://www.akamai.com/site/ko/images/logo/akamai-logo1.svg" class="scf-akamai-logo">
+</div>
+</body></html>"""
+
+
+def test_noon_akamai_challenge_is_detected() -> None:
+    """noon serves this at HTTP 200 instead of the product page.
+
+    Undetected it reaches extraction, finds no price and dies terminal
+    PRICE_NOT_FOUND with no retry -- which is what every noon failure in
+    job 279b32fd actually was. Detected, it becomes a retryable BLOCKED
+    and the existing ladder re-fetches on a fresh exit.
+    """
+    assert looks_blocked(_NOON_AKAMAI_CHALLENGE.encode()) is True
+
+
+def test_real_noon_product_page_mentioning_akamai_is_not_blocked() -> None:
+    """The size guard is what makes the Akamai markers safe.
+
+    noon's real product pages are 430-540 KB and legitimately reference
+    Akamai (it is their CDN), so a marker alone must never condemn a page.
+    """
+    big_page = (
+        '<html><body><script src="https://cdn.akamai.com/x.js"></script>'
+        '<p>Powered and protected by Akamai</p>'
+        + "<div>product copy</div>" * 8000
+        + "</body></html>"
+    )
+    assert len(big_page.encode()) > 60_000
+    assert looks_blocked(big_page.encode()) is False

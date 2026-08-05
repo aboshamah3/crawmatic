@@ -61,12 +61,30 @@ def _text_nodes(html: str, *, exclude_tags: frozenset[str] = frozenset()) -> lis
         return []
     nodes: list[str] = []
     for text_node in selector.xpath("//text()"):
+        # Walk lxml directly instead of calling .xpath()/.get() on the
+        # child Selector. parsel re-infers a *per-node* type, and any text
+        # node that happens to be JSON-parseable comes back typed 'json' —
+        # on which .xpath() raises ValueError. The root-level guard above
+        # does not help, because the root really is 'html'.
+        #
+        # This is not hypothetical: a live amazon.sa product page has 6,932
+        # text nodes of which 91 (the embedded <script> JSON blobs) type as
+        # 'json'. Before this fix the ValueError escaped `parse` and killed
+        # the whole item — 73 of 82 amazon pages in job 279b32fd were
+        # fetched successfully and then lost right here.
+        #
+        # `.root` on a text-node Selector is lxml's _ElementUnicodeResult (a
+        # str subclass that knows its parent), so this is both type-agnostic
+        # and cheaper than round-tripping through XPath.
+        root = text_node.root
         if exclude_tags:
-            parent_tag = text_node.xpath("parent::*/name()").get()
-            if parent_tag and parent_tag.lower() in exclude_tags:
+            getparent = getattr(root, "getparent", None)
+            parent = getparent() if getparent is not None else None
+            parent_tag = getattr(parent, "tag", None)
+            if isinstance(parent_tag, str) and parent_tag.lower() in exclude_tags:
                 continue
-        text = text_node.get()
-        if text and text.strip():
+        text = str(root)
+        if text.strip():
             nodes.append(text.strip())
     return nodes
 

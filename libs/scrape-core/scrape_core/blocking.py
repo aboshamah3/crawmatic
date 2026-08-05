@@ -64,6 +64,22 @@ _BLOCK_MARKERS: tuple[str, ...] = (
     "sorry, we just need to make sure you're not a robot",
     "unusual traffic from your computer network",
     "checking your browser before accessing",
+    # noon.com fronts with **Akamai Bot Manager**, which answers a flagged
+    # fetch with a ~2.5 KB behavioural-challenge page at HTTP 200 (measured
+    # 2026-08-05: 2 of 12 fetches of one product URL, then 0 of 70 an hour
+    # later — bursty and reputation-driven, exactly like amazon's CAPTCHA).
+    # Without these markers the challenge reaches extraction, finds no
+    # price, and dies terminal PRICE_NOT_FOUND with no retry — which is
+    # what job 279b32fd's noon failures were.
+    #
+    # Matched on the challenge's own markup rather than its prose: the CSS
+    # class names are stable across Akamai's locales, whereas the visible
+    # text is not. The <60 KB size guard above is what keeps these safe —
+    # a real noon product page is 430-540 KB and can mention Akamai (it is
+    # their CDN) without ever being considered.
+    "sec-bc-button-parent",
+    "scf-akamai-logo",
+    "powered and protected by",
 )
 
 #: A bot interstitial is tiny (~5 KB) next to a real product page
