@@ -47,9 +47,32 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+# The `Sec-Fetch-*` set plus a richer Accept/Accept-Language mirrors what a
+# real Chrome sends for a top-level document navigation, which every
+# product-page fetch here is -- so this is correct realism, kept as hygiene.
+#
+# It is NOT a fix for anything, and the history matters so nobody re-tries
+# it: these were added 2026-08-04 believing they were why noon.com tarpits
+# us (0 prices in 2,508 production attempts, while a hand-run curl harness
+# scored 100/100 through the same proxy). That belief came from an isolation
+# matrix that varied headers on **curl only** and never ran Scrapy, so it
+# proved "curl needs Sec-Fetch-*", not "Scrapy works with them". Deployed
+# and verified live in the running egg -- and noon still timed out 12/12.
+#
+# The real cause is the Scrapy/Twisted **client** itself: with byte-identical
+# headers, same proxy, same minute, curl got HTTP 200 in 1.7 s while Scrapy
+# raised DownloadTimeoutError (`Sec-Fetch-Mode: navigate` confirmed on the
+# wire). amazon.sa rejects the same client with a 5 KB CAPTCHA at HTTP 200.
+# One cause, two symptoms; the fix is a Chrome-impersonating TLS transport
+# (curl_cffi) selected per domain, not header tuning.
 DEFAULT_REQUEST_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
