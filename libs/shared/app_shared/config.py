@@ -158,6 +158,20 @@ class Settings(BaseSettings):
     # never finalizes.
     SCRAPE_MAX_DEFER_CYCLES: int = 3
 
+    # Domains whose fetches go through the scraping runtime's
+    # Chrome-impersonating TLS transport (2026-08-05) instead of the
+    # Scrapy/Twisted HTTP client. amazon.sa and noon.com reject that
+    # client itself -- not our headers, not our IPs -- so header tuning
+    # cannot fix them and a per-domain transport swap can. Matched by
+    # host equality or dot-anchored suffix, which is why turning these
+    # two sites on needs no spider change. Everything not listed keeps
+    # the existing `HTTP11DownloadHandler` path exactly.
+    SCRAPE_IMPERSONATE_DOMAINS: str = "amazon.sa,noon.com"
+    # curl_cffi impersonation target. `chrome131` is the profile already
+    # verified 2/2 against noon through the production proxy
+    # (matching/NOON_PROXY_MATRIX_2026-08-02.md).
+    SCRAPE_IMPERSONATE_PROFILE: str = "chrome131"
+
     # --- Celery worker sizing (PLAN_AMAZON_NOON_PRICING Phase 4a) ---
     # Prefork pool size for the `worker` service. Celery's default is one
     # process per CPU core, which on Railway meant ~48 idle processes

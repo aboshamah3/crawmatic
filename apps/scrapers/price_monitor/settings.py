@@ -123,13 +123,32 @@ DOWNLOADER_MIDDLEWARES = {
 # Small per-process pool through PgBouncer (contracts/reactor-safe-db.md) —
 # a Scrapyd node runs many spiders per process; keep concurrency modest so
 # the pool never needs to be large.
+# Env/DB-tunable settings, read once for every knob sourced below.
+_settings = get_settings()
+
+# Chrome-impersonating TLS transport for amazon.sa/noon.com only
+# (`scrape_core.impersonate`, 2026-08-05). Both sites reject the
+# Scrapy/Twisted HTTP *client* -- see the DEFAULT_REQUEST_HEADERS note
+# above for why headers were never the lever -- so the fix is a
+# per-domain transport swap. The handler wraps `HTTP11DownloadHandler`
+# and delegates every non-matching request to it unchanged, so the eight
+# healthy sites keep their exact current path.
+DOWNLOAD_HANDLERS = {
+    "http": "scrape_core.impersonate.ImpersonatingDownloadHandler",
+    "https": "scrape_core.impersonate.ImpersonatingDownloadHandler",
+}
+# Which hosts take that path, and which browser to replay. Read from
+# `Settings` (env/DB-tunable) rather than hardcoded here, matching the
+# flush thresholds below.
+SCRAPE_IMPERSONATE_DOMAINS = _settings.SCRAPE_IMPERSONATE_DOMAINS
+SCRAPE_IMPERSONATE_PROFILE = _settings.SCRAPE_IMPERSONATE_PROFILE
+
 CONCURRENT_REQUESTS = 16
 CONCURRENT_REQUESTS_PER_DOMAIN = 4
 REACTOR_THREADPOOL_MAXSIZE = 20
 
 # Batched-flush thresholds (contracts/persistence-pipeline.md) — read from
 # `Settings`/config (env/DB-tunable), never hardcoded literals here.
-_settings = get_settings()
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS
 SCRAPE_FLUSH_INTERVAL_SECONDS = _settings.SCRAPE_FLUSH_INTERVAL_SECONDS
 
