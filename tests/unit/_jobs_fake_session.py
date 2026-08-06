@@ -2,7 +2,8 @@
 
 Not a ``test_*.py`` module (pytest's default collection pattern skips
 it) — a small shared support module for ``test_jobs_service.py``,
-``test_jobs_dispatch_task.py``, and ``test_jobs_router.py``.
+``test_jobs_dispatch_task.py``, ``test_jobs_router.py``, and
+``test_variants_rescrape_route.py``.
 
 Unlike ``tests/unit/test_seed_bootstrap.py``'s hand-rolled
 ``FakeSession`` (which deliberately does *not* evaluate ``WHERE``
@@ -19,6 +20,7 @@ running any real SQL engine.
 
 from __future__ import annotations
 
+import operator
 import uuid
 from typing import Any
 
@@ -51,6 +53,12 @@ def _eval_clause(clause: Any, obj: Any) -> bool:
         return actual in _resolve_bind_value(clause.right)
     if op is sa_operators.eq:
         return actual == _resolve_bind_value(clause.right)
+    # Scalar comparisons — the `created_at >= <cutoff>` time-window shape
+    # (`POST /v1/variants/{id}/rescrape`'s cooldown lookup). Not the
+    # `tuple_(...) > tuple_(...)` keyset predicate, which only the
+    # pagination-aware `_alerts_fake_session` double evaluates.
+    if op in (operator.ge, operator.gt, operator.le, operator.lt):
+        return bool(op(actual, _resolve_bind_value(clause.right)))
     if op is sa_operators.is_:
         if isinstance(clause.right, Null):
             return actual is None

@@ -1,7 +1,12 @@
 """Jobs API DTOs (`contracts/api-jobs.md`) — SPEC-08 US1 (run-match/get/results).
 
 Pydantic v2 request/response models for the `/v1/jobs` router
-(``apps/api/app/routers/jobs.py``). Kept in ``apps/api`` (never
+(``apps/api/app/routers/jobs.py``) — plus :class:`VariantRescrapeResponse`,
+the job-shaped reply of the plugin's on-demand
+``POST /v1/variants/{variant_id}/rescrape`` (which lives on the variants
+router but answers with a job id, so its DTO belongs here next to
+``JobResponse`` rather than in ``app.schemas.catalog``). Kept in
+``apps/api`` (never
 ``app_shared``) so the framework-agnostic core never depends on
 Pydantic — same discipline as ``app.schemas.matches``/``competitors``.
 """
@@ -29,6 +34,21 @@ class JobRunResponse(BaseModel):
 
     id: uuid.UUID
     status: ScrapeJobStatus
+
+
+class VariantRescrapeResponse(BaseModel):
+    """`POST /v1/variants/{variant_id}/rescrape` response (202).
+
+    Deliberately *not* `JobRunResponse`: the plugin's on-demand refresh
+    only ever produces a `PENDING` job (a zero-active-match variant is a
+    `409 NO_ACTIVE_MATCHES`, never a job), so `status` would be a
+    constant — what the caller actually needs back is the id to poll
+    (`GET /v1/jobs/{job_id}`) and how many competitor pages it is waiting
+    on.
+    """
+
+    job_id: uuid.UUID
+    match_count: int
 
 
 class JobResponse(BaseModel):

@@ -5,11 +5,16 @@ bulk-upsert (US2, later); this router exposes read + update only — no
 standalone create, no delete (a delete that could orphan a product down
 to zero variants is deliberately absent from this feature; see
 [analyze F2] note on `PATCH` below).
+
+The one `POST` on a single variant, `/{variant_id}/rescrape`, creates no
+variant: it is an *action* on an existing one (trigger a scrape of its
+competitor pages now), answering with a job id rather than a variant.
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import or_, select
@@ -21,10 +26,13 @@ from app_shared.catalog.consistency import (
     assert_refs_in_workspace,
 )
 from app_shared.catalog.upsert import plan_upsert
+from app_shared.enums import MatchPriority, ScrapeJobStatus, ScrapeScope
+from app_shared.jobs.service import create_scope_job
 from app_shared.messaging import enqueue
 from app_shared.models.alerts import VariantPriceState
 from app_shared.models.catalog import Product, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.jobs import ScrapeJob
 from app_shared.models.observations import MatchCurrentPrice
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
@@ -44,6 +52,7 @@ from app.schemas.catalog import (
     VariantsBulkUpsertRequest,
     VariantUpdate,
 )
+from app.schemas.jobs import VariantRescrapeResponse
 
 router = APIRouter(prefix="/v1/variants", tags=["variants"])
 
@@ -350,6 +359,154 @@ def list_competitor_prices(
             )
         )
     return CompetitorPriceListResponse(items=items, next_cursor=envelope["next_cursor"])
+
+
+#: Per-variant rescrape cooldown window. A second rescrape of the same
+#: variant inside this window, while the earlier job is still unfinished,
+#: is refused (429 `RESCRAPE_COOLDOWN`) instead of pointing a second set
+#: of targets at the very same competitor pages — the plugin's refresh
+#: button is one click away from being held down.
+RESCRAPE_COOLDOWN = timedelta(minutes=10)
+
+#: A job in one of these statuses has not finished yet. The cooldown only
+#: bites while an earlier rescrape is genuinely in flight: a job that
+#: already reached a terminal status (COMPLETED/PARTIAL_FAILED/FAILED/
+#: CANCELLED) inside the window never blocks a fresh one — the user has
+#: their prices and may legitimately ask again. Enumerated locally rather
+#: than imported from `apps/workers` (`tasks_jobs._NON_TERMINAL_JOB_STATUSES`),
+#: which the API must never import (Principle I).
+_UNFINISHED_JOB_STATUSES = (ScrapeJobStatus.PENDING, ScrapeJobStatus.RUNNING)
+
+
+@router.post("/{variant_id}/rescrape", response_model=VariantRescrapeResponse, status_code=202)
+def rescrape_variant(
+    variant_id: uuid.UUID,
+    principal_ctx: tuple = Depends(require_scopes("jobs:write")),
+) -> VariantRescrapeResponse:
+    """`POST /v1/variants/{variant_id}/rescrape` — refresh one variant's
+    competitor prices now, instead of waiting for the scheduled sweep.
+
+    The WooCommerce plugin's "refresh prices" action. Creates exactly the
+    same rows the scheduler's refresh pass creates — one `scrape_jobs`
+    header plus one `scrape_job_targets` row per ACTIVE match of the
+    variant — through the same seam
+    (`app_shared.jobs.service.create_scope_job`, scope `VARIANT`), which
+    enqueues the `scrape_dispatch` Celery task before returning. No new
+    queue, no new table: this endpoint is `create_scope_job` plus a
+    per-variant cooldown and a match count.
+
+    Scope `jobs:write` — the same gate the sibling
+    `POST /v1/jobs/run/variant/{variant_id}` declares, because this
+    *is* a job run; a key that may not run jobs may not run this one via
+    a different path. (A catalog scope like `variants:write` would let a
+    catalog-editing key spend scrape budget.)
+
+    Statuses:
+
+    * `202` — `{"job_id", "match_count"}`. Poll
+      `GET /v1/jobs/{job_id}` (scope `jobs:read`) for `status` /
+      counters, `GET /v1/jobs/{job_id}/results` for per-target detail,
+      then re-read `GET /v1/variants/{variant_id}/competitor-prices`.
+    * `404 NOT_FOUND` — unknown or cross-workspace variant.
+    * `409 NO_ACTIVE_MATCHES` — the variant has no ACTIVE
+      `competitor_product_matches`, so there is nothing to scrape. A
+      state conflict, not a malformed request, hence 409 (the
+      `CONFLICT` precedent on `PATCH /v1/variants/{variant_id}`) — and
+      deliberately *not* the immediately-`COMPLETED` empty job
+      `POST /v1/jobs/run/variant/{id}` returns, which would have the
+      plugin poll a job that was never going to produce a price.
+    * `429 RESCRAPE_COOLDOWN` — an unfinished rescrape of this variant is
+      younger than `RESCRAPE_COOLDOWN`; the error carries that job's
+      `job_id` (poll it — the answer is already on its way) and a
+      `Retry-After` header.
+
+    The cooldown is a plain scoped read over `scrape_jobs` (no Redis, no
+    new state): any unfinished `scope=VARIANT` job for this variant
+    counts, whichever endpoint created it, so a rescrape can't pile onto
+    an operator's in-flight `POST /v1/jobs/run/variant/{id}` either.
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    variant = scoped_get(session, ProductVariant, variant_id, ws)
+    if variant is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "NOT_FOUND", "message": "Variant not found."}},
+        )
+
+    now = datetime.now(timezone.utc)
+    in_flight = (
+        session.execute(
+            scoped_select(ScrapeJob, ws).where(
+                ScrapeJob.scope == ScrapeScope.VARIANT,
+                ScrapeJob.product_variant_id == variant_id,
+                ScrapeJob.status.in_(_UNFINISHED_JOB_STATUSES),
+                ScrapeJob.created_at >= now - RESCRAPE_COOLDOWN,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if in_flight:
+        # Bounded by the cooldown itself (only jobs created in the last
+        # `RESCRAPE_COOLDOWN` and still unfinished can appear here), so the
+        # newest is picked in Python rather than with an ORDER BY/LIMIT
+        # round trip.
+        existing = max(in_flight, key=lambda job: job.created_at)
+        retry_after = max(int((existing.created_at + RESCRAPE_COOLDOWN - now).total_seconds()), 1)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "code": "RESCRAPE_COOLDOWN",
+                    "message": (
+                        "A rescrape of this variant is already in progress. "
+                        "Poll GET /v1/jobs/{job_id} for its result."
+                    ),
+                    "job_id": str(existing.id),
+                }
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    job_id, _status = create_scope_job(
+        session,
+        workspace_id=ws,
+        scope=ScrapeScope.VARIANT,
+        target_id=variant_id,
+        requested_by=principal.id,
+    )
+    if job_id is None:
+        # `create_scope_job` creates no job at all when zero ACTIVE
+        # matches resolve (FR-015) — nothing to roll back.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "NO_ACTIVE_MATCHES",
+                    "message": (
+                        "This variant has no active competitor matches, so there "
+                        "are no competitor pages to scrape."
+                    ),
+                }
+            },
+        )
+
+    job = scoped_get(session, ScrapeJob, job_id, ws)
+    # Just inserted on this session in the same transaction — a miss is
+    # impossible and must fail loudly rather than serve a made-up count.
+    assert job is not None
+    # `scrape_jobs.priority` is the model's existing priority notion
+    # (`MatchPriority`), defaulted to NORMAL by `create_scope_job`. Marking
+    # a user-triggered rescrape HIGH records the intent on the row; note
+    # that no dispatcher currently *orders* by it — promptness comes from
+    # the dispatch task being enqueued immediately (same as any manual
+    # run), not from queue priority.
+    job.priority = MatchPriority.HIGH
+
+    return VariantRescrapeResponse(job_id=job_id, match_count=job.total_targets)
 
 
 @router.patch("/{variant_id}", response_model=VariantResponse)
