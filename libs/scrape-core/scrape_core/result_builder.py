@@ -15,7 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from app_shared.enums import AccessMethod
+from app_shared.enums import AccessMethod, StockStatus
 
 from scrape_core.items import ScrapeResult
 
@@ -41,6 +41,7 @@ def build_scrape_result(
     comparable: bool = True,
     price: Decimal | None = None,
     candidate_extras: Any = None,
+    stock_status: StockStatus | None = None,
     match_lock_key: str | None = None,
     match_lock_token: str | None = None,
     defer_target: bool = False,
@@ -80,6 +81,16 @@ def build_scrape_result(
     them via `_attempt_kwargs_from_meta` (read back from
     `request.meta`/`response.meta`, stamped by `_request_for`).
 
+    ``stock_status`` (2026-08-09, PLAN_AMAZON_PRICE_FIX) is the
+    **failure-path** availability signal: a candidate-bearing result
+    already carries its stock from ``candidate_extras.stock``, but a
+    result with no candidate at all (``PRICE_NOT_FOUND`` on a page that
+    says the product is unavailable) has no candidate to read it from,
+    and ``price_observations.stock_status`` is nullable — so callers may
+    pass it explicitly. Ignored when ``candidate_extras`` is given (the
+    candidate's own stock wins); ``None`` (the default) leaves the column
+    NULL exactly as before.
+
     ``domain_strategy_profile_id`` (SPEC-12 US2, T022, contracts/
     consumption.md step 4) is read straight off `target` -- every
     target this spider builds carries the profile id its
@@ -90,6 +101,8 @@ def build_scrape_result(
     ready for US5's off-reactor stats recorder.
     """
     kwargs: dict[str, Any] = {}
+    if stock_status is not None:
+        kwargs["stock_status"] = stock_status
     if candidate_extras is not None:
         kwargs.update(
             currency=candidate_extras.currency,

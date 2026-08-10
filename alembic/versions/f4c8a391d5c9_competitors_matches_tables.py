@@ -103,6 +103,9 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("id", name="pk_competitor_product_matches"),
         sa.UniqueConstraint(
+            "workspace_id", "id", name="uq_competitor_product_matches_workspace_id_id"
+        ),
+        sa.UniqueConstraint(
             "workspace_id",
             "product_variant_id",
             "competitor_id",

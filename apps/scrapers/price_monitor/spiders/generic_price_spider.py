@@ -101,7 +101,7 @@ import scrapy
 from scrapy.http import Response
 
 from app_shared.access.engine import AttemptPlan, ProxyAssignment
-from app_shared.enums import AccessMethod
+from app_shared.enums import AccessMethod, StockStatus
 from app_shared.models.access import ProxyProvider
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
@@ -143,6 +143,40 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODE = "HTTP"
 
+# 2026-08-09 (PLAN_AMAZON_PRICE_FIX §B, problem 4): markers that mean "this
+# page carries no price because the product is unavailable", not "extraction
+# missed a price that is there". Probed against all 21 PRICE_NOT_FOUND
+# amazon.sa matches: the 10 genuinely-unavailable pages all carry
+# `id="outOfStock"` + "غير متوفر حالي..." and zero `"priceAmount"`, while the
+# 11 deferred-buybox pages carry neither marker. Deliberately kept as plain
+# substrings and site-agnostic in spirit (the English/Arabic availability
+# wordings are shared across KSA storefronts) rather than a per-profile
+# selector — the sniff only ever runs on the failure path, where the
+# alternative is a bare NULL stock_status, so a false positive costs nothing
+# more than a wrong badge on an already-priceless row.
+_OUT_OF_STOCK_MARKERS: tuple[str, ...] = (
+    'id="outOfStock"',
+    "id='outOfStock'",
+    "غير متوفر حالي",
+    "currently unavailable",
+    "out of stock",
+)
+
+
+def _sniff_out_of_stock(html: str) -> StockStatus | None:
+    """``OUT_OF_STOCK`` if the page says the product is unavailable, else ``None``.
+
+    ``None`` (not ``UNKNOWN``) when nothing matches, so a page we cannot
+    read an availability signal off keeps writing NULL — the pre-2026-08-09
+    behaviour — and only a positive marker ever changes what is persisted.
+    """
+    haystack = html.casefold()
+    return (
+        StockStatus.OUT_OF_STOCK
+        if any(marker.casefold() in haystack for marker in _OUT_OF_STOCK_MARKERS)
+        else None
+    )
+
 # Re-exported so every pre-SPEC-14 import site (this module's own test
 # suite: `SpiderTarget`/`_RequeueState`/`_prepare_dispatch`/`load_targets`/
 # `_attempt_kwargs_from_meta`/`_mark_target_deferred_rate_limited`, and
@@ -163,6 +197,7 @@ __all__ = [
     "_parse_host_port",
     "_attempt_kwargs_from_meta",
     "_mark_target_deferred_rate_limited",
+    "_sniff_out_of_stock",
 ]
 
 
@@ -474,6 +509,13 @@ class GenericPriceSpider(scrapy.Spider):
             ),
         )
         if candidate is None:
+            # 2026-08-09: "no price on the page" has two very different
+            # causes -- extraction missed one that is there, or the product
+            # is genuinely unavailable and there is no price to find. Only
+            # the second one is a state worth showing a user, so sniff the
+            # HTML for an availability marker and let it ride on the
+            # PRICE_NOT_FOUND result (`stock_status` is a nullable column on
+            # `price_observations`; `None` keeps the old NULL behaviour).
             yield self._build_result(
                 target,
                 response.url,
@@ -482,6 +524,7 @@ class GenericPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=PRICE_NOT_FOUND,
                 error_message="no extraction strategy matched a price",
+                stock_status=_sniff_out_of_stock(response.text),
                 **attempt_kwargs,
             )
             return

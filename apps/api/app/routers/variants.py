@@ -356,6 +356,12 @@ def list_competitor_prices(
                 currency=current.currency if current is not None else None,
                 scraped_at=current.scraped_at if current is not None else None,
                 health_status=match.health_status,
+                # 2026-08-09 (problem 4): the availability/outcome pair the
+                # plugin needs to tell "unavailable on the competitor's
+                # site" apart from "we have no price for this yet" — both
+                # None when there is no current-price row at all.
+                stock_status=current.stock_status if current is not None else None,
+                success=current.success if current is not None else None,
             )
         )
     return CompetitorPriceListResponse(items=items, next_cursor=envelope["next_cursor"])

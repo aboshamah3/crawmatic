@@ -449,3 +449,159 @@ def test_flush_batch_all_failed_items_records_attempts_but_no_upsert(
     assert len(session.added[0]) == 3
     assert len(session.added[1]) == 3
     assert session.executed == []
+
+
+# --- out-of-stock failures DO upsert, but only the availability columns -------
+#
+# PLAN_AMAZON_PRICE_FIX_2026-08-09 problem 4: a page that says the product
+# is unavailable is a state worth showing, not a blank. It rides on the
+# failure path (there is no price to extract), so it needs its own upsert
+# with a deliberately narrowed update set -- the price columns must survive
+# untouched (FR-014 still holds literally).
+
+
+def _oos_result(*, match_id: uuid.UUID | None = None) -> ScrapeResult:
+    result = _make_result(success=False, match_id=match_id)
+    result.stock_status = StockStatus.OUT_OF_STOCK
+    return result
+
+
+def _spy_dedup(monkeypatch: Any) -> dict[str, Any]:
+    """Capture every row list handed to `dedup_last_wins`, in call order."""
+    captured: dict[str, Any] = {"calls": []}
+    original = pipelines_mod.dedup_last_wins
+
+    def _spy(rows: Any, *, key_fn: Any) -> Any:
+        rows = list(rows)
+        captured["calls"].append(rows)
+        return original(rows, key_fn=key_fn)
+
+    monkeypatch.setattr(pipelines_mod, "dedup_last_wins", _spy)
+    return captured
+
+
+def test_flush_batch_out_of_stock_failure_upserts_only_availability_columns(
+    monkeypatch: Any,
+) -> None:
+    session = _FakeSession()
+    monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session))
+    captured = _spy_dedup(monkeypatch)
+
+    match_id = uuid.uuid4()
+    _flush_batch(WORKSPACE_ID, [_oos_result(match_id=match_id)])
+
+    assert len(session.executed) == 1  # the out-of-stock upsert
+    assert len(captured["calls"]) == 1
+    row = captured["calls"][0][0]
+    assert row["match_id"] == match_id
+    assert row["stock_status"] == StockStatus.OUT_OF_STOCK
+    assert row["success"] is False
+    assert row["error_code"] == ScrapeErrorCode.PRICE_NOT_FOUND
+    # The row carries NO price/extraction data at all -- there is none to
+    # carry, and the ON CONFLICT set below never writes those columns.
+    assert "price" not in row
+    assert "old_price" not in row
+    assert "currency" not in row
+    assert "extraction_method" not in row
+    assert "extraction_confidence" not in row
+    assert "observation_id" not in row
+
+
+def test_out_of_stock_update_set_never_includes_a_price_column() -> None:
+    """The last known price is what the plugin renders beside the
+    "unavailable" badge, so no price/extraction column may appear in the
+    out-of-stock ON CONFLICT update set."""
+    forbidden = {
+        "price",
+        "old_price",
+        "currency",
+        "comparable",
+        "observation_id",
+        "extraction_method",
+        "extraction_confidence",
+        "product_id",
+        "product_variant_id",
+        "competitor_id",
+    }
+    oos_columns = set(pipelines_mod._CURRENT_PRICE_OUT_OF_STOCK_UPDATABLE_COLUMNS)
+
+    assert oos_columns & forbidden == set()
+    assert oos_columns == {"stock_status", "success", "error_code", "scraped_at"}
+    # ... and it stays a strict subset of the success-path set, so a column
+    # added there is never silently writable from a failure.
+    assert oos_columns < set(pipelines_mod._CURRENT_PRICE_UPDATABLE_COLUMNS)
+
+
+def test_flush_batch_other_failures_still_never_upsert(monkeypatch: Any) -> None:
+    """Only OUT_OF_STOCK earns the failure-path upsert -- an unknown-stock
+    failure (a block, a timeout, a plain extraction miss) is still
+    structurally absent from both statements."""
+    session = _FakeSession()
+    monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session))
+
+    in_stock_failure = _make_result(success=False)
+    in_stock_failure.stock_status = StockStatus.IN_STOCK
+    _flush_batch(WORKSPACE_ID, [_make_result(success=False), in_stock_failure])
+
+    assert session.executed == []
+
+
+def test_flush_batch_mixed_success_and_out_of_stock_run_two_statements(
+    monkeypatch: Any,
+) -> None:
+    session = _FakeSession()
+    monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session))
+    captured = _spy_dedup(monkeypatch)
+
+    success_match_id = uuid.uuid4()
+    oos_match_id = uuid.uuid4()
+    _flush_batch(
+        WORKSPACE_ID,
+        [
+            _make_result(success=True, match_id=success_match_id),
+            _oos_result(match_id=oos_match_id),
+        ],
+    )
+
+    assert len(session.executed) == 2  # success upsert, then out-of-stock upsert
+    assert [row["match_id"] for rows in captured["calls"] for row in rows] == [
+        success_match_id,
+        oos_match_id,
+    ]
+
+
+def test_flush_batch_same_match_both_ways_keeps_only_the_last_outcome(
+    monkeypatch: Any,
+) -> None:
+    """A retried match can produce both an out-of-stock and a successful
+    item inside one batch; the two statements must never both target the
+    same conflict arbiter -- the LAST item in the batch wins."""
+    session = _FakeSession()
+    monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session))
+    captured = _spy_dedup(monkeypatch)
+
+    match_id = uuid.uuid4()
+    _flush_batch(
+        WORKSPACE_ID,
+        [_oos_result(match_id=match_id), _make_result(success=True, match_id=match_id)],
+    )
+
+    # Only the success upsert runs -- the out-of-stock row was dropped.
+    assert len(session.executed) == 1
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0][0]["match_id"] == match_id
+    assert captured["calls"][0][0]["price"] == Decimal("9.99")
+
+    session_reversed = _FakeSession()
+    monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session_reversed))
+    captured_reversed = _spy_dedup(monkeypatch)
+
+    _flush_batch(
+        WORKSPACE_ID,
+        [_make_result(success=True, match_id=match_id), _oos_result(match_id=match_id)],
+    )
+
+    # ... and the other way round: only the out-of-stock upsert runs.
+    assert len(session_reversed.executed) == 1
+    assert len(captured_reversed["calls"]) == 1
+    assert captured_reversed["calls"][0][0]["stock_status"] == StockStatus.OUT_OF_STOCK

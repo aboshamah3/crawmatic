@@ -21,7 +21,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from app_shared.enums import AlertEventType, AlertSeverity, AlertStatus, AlertType, HealthStatus
+from app_shared.enums import (
+    AlertEventType,
+    AlertSeverity,
+    AlertStatus,
+    AlertType,
+    HealthStatus,
+    StockStatus,
+)
 
 
 class PriceComparisonResponse(BaseModel):
@@ -86,6 +93,15 @@ class CompetitorPriceResponse(BaseModel):
     currency: str | None
     scraped_at: datetime | None
     health_status: HealthStatus
+    # 2026-08-09 (PLAN_AMAZON_PRICE_FIX, problem 4): "no price" is not one
+    # state. `stock_status = OUT_OF_STOCK` with `success = False` means the
+    # competitor page says the product is unavailable — the plugin renders
+    # an "unavailable" badge (keeping `price`, the last known one, beside
+    # it) instead of the blank it used to show for every priceless row.
+    # Both are None when the match has no `match_current_prices` row at all
+    # (never scraped), which stays distinguishable from a scraped failure.
+    stock_status: StockStatus | None = None
+    success: bool | None = None
 
 
 class CompetitorPriceListResponse(BaseModel):

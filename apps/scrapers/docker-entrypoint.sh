@@ -17,4 +17,10 @@ sed \
   scrapyd.conf > scrapyd.conf.rendered
 mv scrapyd.conf.rendered scrapyd.conf
 
+# A scrapyd crash leaves twistd.pid behind, and Railway restarts reuse the
+# container's writable layer, so the stale pidfile blocks every subsequent
+# start ("Another twistd server is running, PID 1"). Safe to remove here:
+# this runs before scrapyd starts, and nothing else runs in this container.
+rm -f twistd.pid
+
 exec "$@"

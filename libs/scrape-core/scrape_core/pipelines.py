@@ -83,7 +83,7 @@ from twisted.python.failure import Failure
 
 from app_shared.catalog.upsert import dedup_last_wins
 from app_shared.config import get_settings
-from app_shared.enums import MethodType, ScrapeErrorCode, ScrapeTargetStatus
+from app_shared.enums import MethodType, ScrapeErrorCode, ScrapeTargetStatus, StockStatus
 from app_shared.ids import new_uuid7
 from app_shared.jobs.targets import mark_target
 from app_shared.limiter.locks import release_match_lock
@@ -123,6 +123,22 @@ _CURRENT_PRICE_UPDATABLE_COLUMNS: tuple[str, ...] = (
     "scraped_at",
 )
 
+# 2026-08-09 (PLAN_AMAZON_PRICE_FIX §B, problem 4): the columns an
+# out-of-stock FAILURE is allowed to overwrite on an existing
+# match_current_prices row. Deliberately a strict subset of
+# _CURRENT_PRICE_UPDATABLE_COLUMNS with every price/extraction column
+# removed (price, old_price, currency, comparable, observation_id,
+# extraction_method, extraction_confidence, and the identity columns) --
+# the row keeps its last known price, which the plugin renders next to the
+# "unavailable" badge, and FR-014 ("a failure observation never overwrites
+# the current price") still holds literally.
+_CURRENT_PRICE_OUT_OF_STOCK_UPDATABLE_COLUMNS: tuple[str, ...] = (
+    "stock_status",
+    "success",
+    "error_code",
+    "scraped_at",
+)
+
 
 def _current_price_key(row: dict[str, Any]) -> tuple[Any, Any]:
     return (row["workspace_id"], row["match_id"])
@@ -136,6 +152,17 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     **successful** items only — a failure/rejected item is simply absent
     from that insert, so ``ON CONFLICT`` never fires for it and the
     current price is never overwritten with a bad value (FR-014).
+
+    2026-08-09 (PLAN_AMAZON_PRICE_FIX §B, problem 4) — one narrow
+    exception: a **failure item carrying ``stock_status =
+    OUT_OF_STOCK``** (the spider sniffed an "unavailable" marker on a page
+    with no price) upserts its row too, through a second statement whose
+    ``ON CONFLICT`` update set is restricted to
+    ``stock_status``/``success``/``error_code``/``scraped_at``
+    (+``updated_at``). No price/currency/extraction column is ever
+    written, so the last known price survives beside the unavailable
+    badge and FR-014 still holds; every other failure remains absent from
+    both statements exactly as before.
 
     SPEC-08 T052: for every item that carries a non-null
     ``scrape_job_id``, also terminalizes its ``scrape_job_targets`` row
@@ -170,6 +197,10 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     observations: list[PriceObservation] = []
     attempts: list[RequestAttempt] = []
     current_price_rows: list[dict[str, Any]] = []
+    out_of_stock_rows: list[dict[str, Any]] = []
+    # Which of the two upserts a given (workspace_id, match_id) was last
+    # touched by, in batch order -- see the split just below the loop.
+    last_row_kind: dict[tuple[Any, Any], str] = {}
 
     for item in batch:
         observation_id = new_uuid7()
@@ -237,6 +268,48 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                     "scraped_at": moment,
                 }
             )
+            last_row_kind[(item.workspace_id, item.match_id)] = "success"
+        elif item.stock_status == StockStatus.OUT_OF_STOCK:
+            # 2026-08-09 (problem 4): a failure that knows *why* there was
+            # no price -- the product is unavailable on the competitor's
+            # site. Without this the OOS state never left price_observations
+            # and the plugin rendered an indistinguishable blank. The row
+            # carries only what an out-of-stock failure legitimately knows;
+            # the price/extraction columns are present solely so a
+            # first-ever INSERT satisfies the NOT NULL `comparable` and
+            # leaves the rest NULL -- ON CONFLICT updates none of them
+            # (_CURRENT_PRICE_OUT_OF_STOCK_UPDATABLE_COLUMNS).
+            out_of_stock_rows.append(
+                {
+                    "workspace_id": item.workspace_id,
+                    "match_id": item.match_id,
+                    "product_id": item.product_id,
+                    "product_variant_id": item.product_variant_id,
+                    "competitor_id": item.competitor_id,
+                    "comparable": item.comparable,
+                    "stock_status": item.stock_status,
+                    "success": item.success,
+                    "error_code": item.error_code,
+                    "scraped_at": moment,
+                }
+            )
+            last_row_kind[(item.workspace_id, item.match_id)] = "out_of_stock"
+
+    # One match can produce both kinds within a single batch (a retried
+    # attempt that finally found a price after an out-of-stock miss, or the
+    # reverse). `dedup_last_wins` only collapses *within* a list, so the
+    # loser kind is dropped here first -- otherwise the two INSERTs would
+    # both hit the same conflict arbiter and the second, possibly staler,
+    # one would win purely by statement order.
+    if current_price_rows and out_of_stock_rows:
+        current_price_rows = [
+            row for row in current_price_rows if last_row_kind[_current_price_key(row)] == "success"
+        ]
+        out_of_stock_rows = [
+            row
+            for row in out_of_stock_rows
+            if last_row_kind[_current_price_key(row)] == "out_of_stock"
+        ]
 
     affected_job_ids: dict[Any, None] = {}  # insertion-ordered de-dup set
 
@@ -258,6 +331,22 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 index_elements=["workspace_id", "match_id"], set_=set_
             )
             session.execute(stmt)
+
+        if out_of_stock_rows:
+            # Same upsert shape as above, narrowed update set: an existing
+            # row keeps its last known price and only learns that the
+            # product is now unavailable (2026-08-09, problem 4).
+            deduped_oos = dedup_last_wins(out_of_stock_rows, key_fn=_current_price_key)
+            oos_stmt = pg_insert(MatchCurrentPrice).values(list(deduped_oos))
+            oos_set = {
+                col: oos_stmt.excluded[col]
+                for col in _CURRENT_PRICE_OUT_OF_STOCK_UPDATABLE_COLUMNS
+            }
+            oos_set["updated_at"] = func.now()
+            oos_stmt = oos_stmt.on_conflict_do_update(
+                index_elements=["workspace_id", "match_id"], set_=oos_set
+            )
+            session.execute(oos_stmt)
 
         # T052: terminalize each item's target in this SAME transaction --
         # no second run_in_thread/reactor hop. An item with no

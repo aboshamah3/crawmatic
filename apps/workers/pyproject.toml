@@ -1,16 +1,18 @@
 [project]
 name = "workers"
 version = "0.1.0"
-description = "Celery worker service; no tasks registered in the skeleton. Must NOT depend on scrapy/twisted/playwright."
+description = "Celery worker service. Reuses scrape_core's extraction/validation helpers directly (never the Twisted reactor/Scrapy spider machinery) for STRATEGY_DISCOVERY_RUN's off-reactor probe sampling; see apps/workers/app/workers/tasks_strategy.py."
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "celery>=5.5,<6",
     "redis>=5.0,<6",
     "app_shared",
+    "scrape_core",
 ]
 
 [tool.uv.sources]
 app_shared = { workspace = true }
+scrape_core = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

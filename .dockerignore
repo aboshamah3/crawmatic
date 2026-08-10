@@ -24,3 +24,6 @@ specs
 .uv-cache
 tests
 README.md
+node_modules
+package.json
+package-lock.json

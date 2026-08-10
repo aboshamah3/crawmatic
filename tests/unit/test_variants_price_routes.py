@@ -208,6 +208,8 @@ def _make_current_price(
     price: Decimal,
     workspace_id: uuid.UUID = WORKSPACE_ID,
     scraped_at: datetime | None = None,
+    stock_status: StockStatus | None = StockStatus.IN_STOCK,
+    success: bool = True,
 ) -> MatchCurrentPrice:
     now = datetime.now(timezone.utc)
     current = MatchCurrentPrice(
@@ -218,9 +220,9 @@ def _make_current_price(
         competitor_id=match.competitor_id,
         price=price,
         currency="SAR",
-        stock_status=StockStatus.IN_STOCK,
+        stock_status=stock_status,
         comparable=True,
-        success=True,
+        success=success,
         scraped_at=scraped_at or now,
         created_at=now,
         updated_at=now,
@@ -484,6 +486,44 @@ def test_competitor_prices_returns_200_rows(
     assert row["currency"] == "SAR"
     assert row["scraped_at"] is not None
     assert row["health_status"] == "HEALTHY"
+    assert row["stock_status"] == "IN_STOCK"
+    assert row["success"] is True
+
+
+def test_competitor_prices_exposes_out_of_stock_with_last_known_price(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    """PLAN_AMAZON_PRICE_FIX problem 4: a match whose competitor page says
+    the product is unavailable comes back as an explicit
+    `OUT_OF_STOCK`/`success=False` pair — with the last known price still
+    on the row — so the plugin can render an "unavailable" badge instead of
+    the same blank it shows for a never-scraped match."""
+    variant = _make_variant()
+    competitor = _make_competitor(name="Out Of Stock Shop")
+    match = _make_match(variant_id=variant.id, competitor=competitor, url="https://oos.example/p")
+    session.seed(
+        variant,
+        competitor,
+        match,
+        _make_current_price(
+            match=match,
+            price=Decimal("59.0000"),
+            stock_status=StockStatus.OUT_OF_STOCK,
+            success=False,
+        ),
+    )
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    resp = client.get(f"/v1/variants/{variant.id}/competitor-prices")
+
+    assert resp.status_code == 200
+    row = resp.json()["items"][0]
+    assert row["stock_status"] == "OUT_OF_STOCK"
+    assert row["success"] is False
+    # The last known price survives beside the unavailable state.
+    assert Decimal(row["price"]) == Decimal("59.0000")
 
 
 def test_competitor_prices_includes_never_scraped_match_with_null_price(
@@ -528,6 +568,11 @@ def test_competitor_prices_includes_never_scraped_match_with_null_price(
     assert items[1]["currency"] is None
     assert items[1]["scraped_at"] is None
     assert items[1]["health_status"] == "UNKNOWN"
+    # No current-price row at all -> both availability fields are null,
+    # which is what keeps "never scraped" distinguishable from a scraped
+    # OUT_OF_STOCK failure.
+    assert items[1]["stock_status"] is None
+    assert items[1]["success"] is None
 
 
 def test_competitor_prices_no_matches_is_empty_200(

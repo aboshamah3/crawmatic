@@ -35,3 +35,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local Railway IaC tooling (not part of the app)
+node_modules/
+package.json
+package-lock.json
