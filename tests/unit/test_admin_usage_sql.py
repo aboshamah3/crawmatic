@@ -15,11 +15,13 @@ from sqlalchemy.dialects import postgresql
 from app.services.admin_usage import (
     MAX_WINDOW_DAYS,
     InvalidUsageCursor,
+    InvalidUsageWindow,
     UsageCursor,
     UsageWindowTooLarge,
     build_usage_query,
     decode_usage_cursor,
     encode_usage_cursor,
+    normalize_window,
     validate_window,
 )
 
@@ -60,8 +62,53 @@ def test_window_exactly_31_days_is_accepted() -> None:
 
 
 def test_inverted_window_is_rejected() -> None:
-    with pytest.raises(UsageWindowTooLarge):
+    """CHANGED (review finding I6b): an inverted window (`since >= until`)
+    used to raise `UsageWindowTooLarge`, which the router mapped to the
+    misleading `422 WINDOW_TOO_LARGE` -- an inverted window isn't "too
+    large", it's malformed. It now raises the distinct
+    `InvalidUsageWindow`, mapped to `422 INVALID_WINDOW`.
+    `WINDOW_TOO_LARGE` stays reserved for the real >31-day case (see
+    `test_window_over_31_days_is_rejected` above, unchanged)."""
+    with pytest.raises(InvalidUsageWindow):
         validate_window(UNTIL, SINCE)
+
+
+def test_equal_since_and_until_is_an_invalid_window_not_too_large() -> None:
+    """`since == until` is degenerate (empty window), not inverted, but
+    must be rejected the same way -- `until <= since` is the exact
+    condition, not `until < since`."""
+    with pytest.raises(InvalidUsageWindow):
+        validate_window(SINCE, SINCE)
+
+
+def test_naive_and_utc_windows_normalize_to_the_same_query() -> None:
+    """A naive `since`/`until` reaches Postgres as a bare `timestamp`,
+    interpreted in the session TimeZone -- silently shifting the window
+    (review finding I6c). `normalize_window` must treat a naive
+    datetime as UTC, so the compiled query is byte-identical to the one
+    built from the explicit-UTC equivalent."""
+    naive_since = datetime(2026, 8, 1)
+    naive_until = datetime(2026, 8, 8)
+    normalized_since, normalized_until = normalize_window(naive_since, naive_until)
+
+    assert normalized_since == SINCE
+    assert normalized_until == UNTIL
+    assert normalized_since.tzinfo is timezone.utc
+    assert normalized_until.tzinfo is timezone.utc
+
+    sql_naive = _sql_with_values(
+        build_usage_query(since=normalized_since, until=normalized_until, after=None, limit=10)
+    )
+    sql_aware = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert sql_naive == sql_aware
+
+
+def test_normalize_window_leaves_aware_datetimes_untouched() -> None:
+    since, until = normalize_window(SINCE, UNTIL)
+    assert since is SINCE
+    assert until is UNTIL
 
 
 def test_cursor_round_trips() -> None:

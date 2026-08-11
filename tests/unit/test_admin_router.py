@@ -112,6 +112,26 @@ def test_archive_sets_status_suspended(client, session):
     assert ws.status == WorkspaceStatus.SUSPENDED
 
 
+def test_archive_response_status_rejects_a_non_enum_value():
+    """`WorkspaceArchiveResponse.status` was typed as bare `str` -- any
+    string, including a mis-rendered `"WorkspaceStatus.SUSPENDED"` (what
+    a non-`StrEnum` `WorkspaceStatus` would produce from a bare
+    `str(...)` call), would validate silently. Typing it as
+    `WorkspaceStatus` makes Pydantic reject anything that isn't a real
+    member (review finding I6d)."""
+    import uuid as uuid_mod
+
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from app.schemas.admin import WorkspaceArchiveResponse
+
+    with _pytest.raises(ValidationError):
+        WorkspaceArchiveResponse(
+            workspace_id=uuid_mod.uuid4(), status="WorkspaceStatus.SUSPENDED"
+        )
+
+
 def test_archive_unknown_workspace_is_404(client, session):
     resp = client.post(
         f"/v1/admin/workspaces/{uuid.uuid4()}/archive", headers=SERVICE_HEADERS
@@ -220,6 +240,33 @@ def test_usage_window_over_31_days_is_422():
     assert resp.json()["detail"]["error"]["code"] == "WINDOW_TOO_LARGE"
 
 
+def test_usage_inverted_window_is_422_invalid_window_not_window_too_large():
+    """CHANGED (review finding I6b): `since >= until` used to map to the
+    misleading `422 WINDOW_TOO_LARGE`. It's now the distinct
+    `422 INVALID_WINDOW` -- `WINDOW_TOO_LARGE` stays reserved for the
+    real >31-day case (see `test_usage_window_over_31_days_is_422`,
+    unchanged)."""
+    client, _ = _usage_client([])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-08T00:00:00Z&until=2026-08-01T00:00:00Z",
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["code"] == "INVALID_WINDOW"
+
+
+def test_usage_accepts_naive_since_and_until():
+    """A naive `since`/`until` (no UTC offset in the query string) must be
+    treated as UTC, not rejected and not silently misinterpreted (review
+    finding I6c)."""
+    client, _ = _usage_client([_usage_row()])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00&until=2026-08-08T00:00:00",
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 200
+
+
 def test_usage_bad_cursor_is_422():
     client, _ = _usage_client([])
     resp = client.get(
@@ -234,6 +281,25 @@ def test_usage_requires_since_and_until():
     client, _ = _usage_client([])
     resp = client.get("/v1/admin/usage", headers=SERVICE_HEADERS)
     assert resp.status_code == 422
+
+
+def test_slugify_truncates_the_name_not_the_ref():
+    """`f"{base}-{ref}"[:200]` used to truncate from the END, which is
+    where `external_ref` lives -- since `name` is capped at 200 chars,
+    two different refs on a 200-char name collided into the same slug,
+    so customer B's provisioning call would 409 naming customer A's
+    workspace. Truncating `base` (never `ref`) fixes this."""
+    from app.routers.admin import _slugify
+
+    long_name = "A" * 200
+    slug_alpha = _slugify(long_name, "ref-alpha")
+    slug_beta = _slugify(long_name, "ref-beta")
+
+    assert slug_alpha != slug_beta
+    assert slug_alpha.endswith("ref-alpha")
+    assert slug_beta.endswith("ref-beta")
+    assert len(slug_alpha) <= 200
+    assert len(slug_beta) <= 200
 
 
 def test_provision_duplicate_external_ref_is_409(client, session):

@@ -16,6 +16,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app_shared.enums import WorkspaceStatus
+
 
 class WorkspaceProvisionRequest(BaseModel):
     """`POST /v1/admin/workspaces` body."""
@@ -35,8 +37,12 @@ class WorkspaceProvisionResponse(BaseModel):
 
 
 class WorkspaceArchiveResponse(BaseModel):
+    """`WorkspaceStatus`, not bare `str` (review finding I6d) -- a future
+    change away from `StrEnum` cannot silently start returning
+    `"WorkspaceStatus.SUSPENDED"` through this field undetected."""
+
     workspace_id: uuid.UUID
-    status: str
+    status: WorkspaceStatus
 
 
 class UsageRow(BaseModel):

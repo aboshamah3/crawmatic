@@ -58,12 +58,14 @@ from app.schemas.admin import (
 from app.service_auth import require_service_token
 from app.services.admin_usage import (
     InvalidUsageCursor,
+    InvalidUsageWindow,
     UsageCursor,
     UsageWindowTooLarge,
     build_usage_query,
     clamp_usage_limit,
     decode_usage_cursor,
     encode_usage_cursor,
+    normalize_window,
     validate_window,
 )
 
@@ -123,11 +125,21 @@ def _slugify(name: str, external_ref: str) -> str:
     `workspaces.slug` is UNIQUE; `external_ref` is unique per SaaS
     project, so appending it makes collisions between two customers
     named "Acme Store" impossible without a retry loop.
+
+    Truncate `base`, never `ref`: `f"{base}-{ref}"[:200]` used to
+    truncate from the END, which is where `external_ref` lives. Since
+    `name` (and therefore `base`) can itself be up to 200 chars, two
+    different refs on the same/similar long name collided into the
+    IDENTICAL slug -- `_slugify("A"*200, "ref-alpha") ==
+    _slugify("A"*200, "ref-beta")` -- so customer B's provisioning call
+    would 409 `DUPLICATE_EXTERNAL_REF` naming their own ref against a
+    workspace that actually belongs to customer A.
     """
     base = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-")
     base = "-".join(part for part in base.split("-") if part) or "workspace"
     ref = "".join(ch.lower() if ch.isalnum() else "-" for ch in external_ref).strip("-")
-    return f"{base}-{ref}"[:200]
+    base = base[: max(1, 200 - len(ref) - 1)]
+    return f"{base}-{ref}"
 
 
 @router.post("/workspaces", response_model=WorkspaceProvisionResponse, status_code=201)
@@ -230,8 +242,17 @@ def export_usage(
     Cursor-paginated, idempotent, window capped at 31 days. The response
     field names are a frozen contract — see `app.schemas.admin.UsageRow`.
     """
+    # A naive since/until reaches Postgres as a bare `timestamp`,
+    # interpreted in the session TimeZone -- normalize before validating
+    # and before it drives the query (review finding I6c).
+    since, until = normalize_window(since, until)
     try:
         validate_window(since, until)
+    except InvalidUsageWindow as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_WINDOW", "message": str(exc)}},
+        ) from exc
     except UsageWindowTooLarge as exc:
         raise HTTPException(
             status_code=422,

@@ -36,6 +36,15 @@ fallbacks the brief anticipated (`func.count().filter(...)` rejected;
 this repo's SQLAlchemy 2.0.51 — both compile cleanly, so the query shape
 is unchanged from the brief.
 
+This is the most deliberately cross-workspace query in the repo: the
+export aggregates over every workspace in one statement, so the
+`per_link`/`per_check` CTEs' leading `select(...)` calls carry an
+explicit `# noqa: workspace-scope` marker even though the CI guard
+(`scripts/check_workspace_scoping.py`) would not flag them anyway — it
+only matches `select(Model)`, not `select(Model.column, ...)` — so the
+markers exist purely to make the intent explicit to a human reader, not
+to satisfy the guard's AST pattern.
+
 Every value that reaches this query — the window bounds, the cursor
 position, and the protected-method set — is passed as a **bound
 parameter**, never interpolated into SQL text. `.in_()` on the fixed
@@ -80,7 +89,17 @@ class InvalidUsageCursor(ValueError):
 
 
 class UsageWindowTooLarge(ValueError):
-    """`until - since` exceeded `MAX_WINDOW_DAYS`, or the window is inverted."""
+    """`until - since` exceeded `MAX_WINDOW_DAYS`."""
+
+
+class InvalidUsageWindow(ValueError):
+    """`since`/`until` are inverted or equal (`until <= since`).
+
+    Distinct from `UsageWindowTooLarge` (review finding I6b): an
+    inverted window is malformed, not "too large" -- conflating the two
+    made the router return the misleading `422 WINDOW_TOO_LARGE` for a
+    caller that simply swapped its query params.
+    """
 
 
 class UsageCursor(NamedTuple):
@@ -98,13 +117,36 @@ def clamp_usage_limit(requested: int | None) -> int:
 
 
 def validate_window(since: datetime, until: datetime) -> None:
-    """Reject an inverted or over-long window (PLAN §7.2, risk P2)."""
+    """Reject an inverted or over-long window (PLAN §7.2, risk P2).
+
+    Raises `InvalidUsageWindow` for `until <= since` (malformed) and
+    `UsageWindowTooLarge` for `until - since > MAX_WINDOW_DAYS` (the
+    real over-long case) -- two distinct exceptions so the router can
+    map them to two distinct, honest error codes (review finding I6b).
+    """
     if until <= since:
-        raise UsageWindowTooLarge("`until` must be after `since`.")
+        raise InvalidUsageWindow("`until` must be after `since`.")
     if until - since > timedelta(days=MAX_WINDOW_DAYS):
         raise UsageWindowTooLarge(
             f"The usage window may not exceed {MAX_WINDOW_DAYS} days."
         )
+
+
+def normalize_window(since: datetime, until: datetime) -> tuple[datetime, datetime]:
+    """Treat a naive `since`/`until` as UTC (review finding I6c).
+
+    A naive `datetime` reaches Postgres as a bare `timestamp` and is
+    interpreted in the session TimeZone, silently shifting the window.
+    Every other timestamp boundary in this API is UTC; an absent
+    `tzinfo` here is treated the same way rather than trusting the
+    session's ambient TimeZone. Datetimes that already carry a tzinfo
+    are returned unchanged (same object, not a copy).
+    """
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return since, until
 
 
 def encode_usage_cursor(cursor: UsageCursor) -> str:
@@ -173,7 +215,7 @@ def build_usage_query(
 
     # --- inner: fold retries, one row per (cycle, workspace, product, match)
     per_link = (
-        select(
+        select(  # noqa: workspace-scope
             RequestAttempt.workspace_id.label("workspace_id"),
             CompetitorProductMatch.product_id.label("product_id"),
             attempt_cycle_ts.label("cycle_ts"),
@@ -213,7 +255,7 @@ def build_usage_query(
 
     # --- observations: did this product actually yield a price this cycle?
     per_check = (
-        select(
+        select(  # noqa: workspace-scope
             PriceObservation.workspace_id.label("workspace_id"),
             PriceObservation.product_id.label("product_id"),
             observation_cycle_ts.label("cycle_ts"),
