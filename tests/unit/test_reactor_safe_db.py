@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 import pytest
+from twisted.internet.defer import Deferred
 
 from scrape_core import db as db_mod
 
@@ -119,7 +120,7 @@ def test_run_in_thread_offloads_via_deferToThread_never_calls_fn_inline(
     monkeypatch: Any,
 ) -> None:
     dispatched: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
-    sentinel_deferred = object()
+    sentinel_deferred = Deferred()
 
     def _fake_defer_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
         dispatched.append((fn, args, kwargs))
@@ -135,7 +136,13 @@ def test_run_in_thread_offloads_via_deferToThread_never_calls_fn_inline(
 
     result = db_mod.run_in_thread(_work, 1, 2, kw="x")
 
-    assert result is sentinel_deferred
+    # The seam's Deferred is chained through the AsyncioSafeDeferred
+    # wrapper (awaitable from asyncio-driven coroutines too), so the
+    # sentinel's result must surface on the returned Deferred.
+    fired: list[Any] = []
+    result.addCallback(fired.append)
+    sentinel_deferred.callback("thread-result")
+    assert fired == ["thread-result"]
     assert dispatched == [(_work, (1, 2), {"kw": "x"})]
     # `run_in_thread` only ever hands the callable to the (mocked)
     # thread-pool seam -- it never executes it directly on the calling

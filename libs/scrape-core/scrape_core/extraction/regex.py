@@ -42,6 +42,14 @@ _BARE_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _OUT_OF_STOCK_PHRASES = ("out of stock", "sold out", "unavailable", "false")
 _IN_STOCK_PHRASES = ("in stock", "available", "true")
 
+# Compact status tokens a stock_regex may capture directly (e.g. a
+# `stockLevelStatus` code inside an app-state JSON blob). Mirrors
+# ``_OUT_OF_STOCK_TOKENS`` in extraction/jsonld.py, plus retailer codes.
+_OUT_OF_STOCK_TOKENS = frozenset(
+    {"outofstock", "soldout", "discontinued", "backorder", "preorder"}
+)
+_IN_STOCK_TOKENS = frozenset({"instock", "lowstock", "limitedavailability"})
+
 
 def _text_nodes(html: str, *, exclude_tags: frozenset[str] = frozenset()) -> list[str]:
     """Every non-empty, stripped text node in document order.
@@ -78,6 +86,24 @@ def _first_regex_match(nodes: list[str], pattern: str) -> tuple[str, str] | None
     return None
 
 
+def _stock_from_token(value: str | None) -> StockStatus | None:
+    """Classify a regex's *captured value* as a compact stock token, else ``None``.
+
+    A stock_regex reaching into a JSON blob captures the status code
+    itself ("outOfStock"); classifying the surrounding node text would be
+    meaningless there — blobs carry i18n labels like "Out Of Stock" on
+    every page regardless of actual status.
+    """
+    if not value:
+        return None
+    token = value.strip().lower()
+    if token in _OUT_OF_STOCK_TOKENS:
+        return StockStatus.OUT_OF_STOCK
+    if token in _IN_STOCK_TOKENS:
+        return StockStatus.IN_STOCK
+    return None
+
+
 def _stock_from_text(text: str | None) -> StockStatus | None:
     if not text:
         return None
@@ -109,7 +135,9 @@ def _extract_via_price_regex(
     if stock_regex:
         stock_match = _first_regex_match(nodes, stock_regex)
         if stock_match:
-            stock = _stock_from_text(stock_match[1])
+            # Captured value as a compact token first; node-text phrase
+            # classification only as the fallback for visible-text rules.
+            stock = _stock_from_token(stock_match[0]) or _stock_from_text(stock_match[1])
 
     old_price_regex = getattr(profile, "old_price_regex", None) if profile is not None else None
     if old_price_regex:

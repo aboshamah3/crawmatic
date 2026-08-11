@@ -216,3 +216,90 @@ def test_pipeline_prefers_jsonld_over_css_and_regex_when_all_are_configured() ->
     assert candidate is not None
     assert candidate.method == ExtractionMethod.JSON_LD
     assert candidate.confidence == 0.95
+
+
+# --- stock_regex captured-token classification (extra.com app-state blobs) -----
+
+
+class _AppStateProfile:
+    """Regex rules matching ``tests/fixtures/html/extra_appstate.html``."""
+
+    jsonld_enabled = False
+    price_selector: str | None = None
+    price_regex = r'"price":\{"currencyIso":"SAR","value":([0-9.]+),"priceType":"BUY"'
+    currency_regex = r'"currencyIso":"(SAR)"'
+    stock_regex = r'"stock":\{"stockLevelStatus":\{"code":"(\w+)"'
+    confidence_rules: dict[str, float] | None = None
+
+
+def _blob_html(code: str) -> str:
+    """A script blob whose i18n labels contradict the actual status code."""
+    return (
+        "<html><body><script>var s = {"
+        '"price":"12.00",'
+        f'"stockLevelStatus":{{"code":"{code}"}},'
+        '"label":"Out Of Stock","label2":"In Stock"};</script></body></html>'
+    )
+
+
+def test_regex_stock_classifies_captured_token_not_surrounding_blob_text() -> None:
+    class _Profile:
+        jsonld_enabled = False
+        price_regex = r'"price":"([0-9.]+)"'
+        stock_regex = r'"stockLevelStatus":\{"code":"(\w+)"'
+        confidence_rules: dict[str, float] | None = None
+
+    for code, expected in (
+        ("outOfStock", StockStatus.OUT_OF_STOCK),
+        ("inStock", StockStatus.IN_STOCK),
+        ("lowStock", StockStatus.IN_STOCK),
+    ):
+        candidate = extract_regex(_blob_html(code), profile=_Profile())
+
+        assert candidate is not None
+        assert candidate.method == ExtractionMethod.REGEX
+        assert candidate.stock == expected
+
+
+def test_regex_stock_falls_back_to_node_text_when_captured_value_is_no_token() -> None:
+    html = (
+        "<html><body><p>Price: 19.99</p>"
+        '<p class="stock">Currently sold out, sorry!</p></body></html>'
+    )
+
+    class _Profile:
+        jsonld_enabled = False
+        price_regex = r"Price: ([0-9.]+)"
+        stock_regex = r"Currently (\w+ \w+)"
+        confidence_rules: dict[str, float] | None = None
+
+    candidate = extract_regex(html, profile=_Profile())
+
+    assert candidate is not None
+    assert candidate.stock == StockStatus.OUT_OF_STOCK
+
+
+def test_pipeline_extra_appstate_regex_beats_stale_jsonld_when_disabled() -> None:
+    html = _read_fixture("extra_appstate.html")
+
+    candidate = extract(html, profile=_AppStateProfile())
+
+    assert candidate is not None
+    assert candidate.method == ExtractionMethod.REGEX
+    assert candidate.raw_price_text == "498"
+    assert candidate.currency == "SAR"
+    assert candidate.stock == StockStatus.OUT_OF_STOCK
+
+
+def test_pipeline_extra_appstate_stale_jsonld_wins_unless_disabled() -> None:
+    html = _read_fixture("extra_appstate.html")
+
+    class _JsonldOnProfile(_AppStateProfile):
+        jsonld_enabled = True
+
+    candidate = extract(html, profile=_JsonldOnProfile())
+
+    assert candidate is not None
+    assert candidate.method == ExtractionMethod.JSON_LD
+    assert candidate.raw_price_text == "149"
+    assert candidate.stock == StockStatus.IN_STOCK

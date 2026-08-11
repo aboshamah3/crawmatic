@@ -39,6 +39,12 @@ DNS_RESOLVER = "scrape_core.safety.resolver.SafeResolver"
 
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+# Scrapy >= 2.13 defaults `scrapy crawl` to AsyncCrawlerProcess, which runs
+# spider coroutines on asyncio where awaiting a raw Twisted Deferred is a
+# "Task got bad yield" error. This project's coroutines await Deferreds
+# natively (scrape_core.reactor.deferred_delay, the SPEC-10 seam), which is
+# only legal under the classic Twisted-managed CrawlerProcess.
+FORCE_CRAWLER_PROCESS = True
 FEED_EXPORT_ENCODING = "utf-8"
 
 ITEM_PIPELINES = {
