@@ -49,6 +49,19 @@ def test_admin_paths_are_absent():
     assert not [p for p in paths if p.startswith("/v1/admin")]
 
 
+def test_admin_workspace_api_key_paths_are_absent():
+    """phase4-connect Task 2: the SaaS-control-plane key-management routes
+    (`POST/GET /v1/admin/workspaces/{workspace_id}/api-keys`,
+    `DELETE .../{api_key_id}`) live on the `admin`-tagged router
+    precisely so they inherit this exclusion -- a router with the
+    `/v1/admin` prefix but no `admin` tag would silently publish itself
+    here instead. `test_admin_paths_are_absent` already covers this by
+    prefix; this asserts the exact new paths explicitly."""
+    paths = _spec()["paths"]
+    assert "/v1/admin/workspaces/{workspace_id}/api-keys" not in paths
+    assert "/v1/admin/workspaces/{workspace_id}/api-keys/{api_key_id}" not in paths
+
+
 def test_proxy_provider_paths_are_absent():
     paths = _spec()["paths"]
     assert not [p for p in paths if p.startswith("/v1/proxy-providers")]

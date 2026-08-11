@@ -11,6 +11,12 @@ chains on top of `03dec3037c8f`, moving the alembic head forward, so
 the head assertion below now targets `f87cf9a237cd` instead of
 `03dec3037c8f`. The `03dec3037c8f` down_revision assertion is untouched
 since that edge in the linear history is unaffected.
+
+Phase 4 Task 2 (`5b9a86717a66_normalise_api_key_status.py`,
+phase4-connect) chains on top of `f87cf9a237cd`, moving the alembic
+head forward again, so the head assertion below now targets
+`5b9a86717a66`. Same pattern as the Task 5 update above: only the head
+assertion changes, not the down_revision chain below.
 """
 
 from __future__ import annotations
@@ -42,10 +48,11 @@ def test_alembic_heads_reports_exactly_one_head_after_webhooks_migration() -> No
     head_lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(head_lines) == 1, f"expected exactly one head, got: {head_lines!r}"
     # Head moved forward from 03dec3037c8f to f87cf9a237cd (Task 5,
-    # usage_export_indexes) after this migration's own single-head guard
-    # was written; only the head assertion changes, not the down_revision
-    # chain below.
-    assert "f87cf9a237cd" in head_lines[0]
+    # usage_export_indexes), then to 5b9a86717a66 (phase4-connect Task 2,
+    # normalise_api_key_status) after this migration's own single-head
+    # guard was written; only the head assertion changes, not the
+    # down_revision chain below.
+    assert "5b9a86717a66" in head_lines[0]
     assert "(head)" in head_lines[0]
 
 

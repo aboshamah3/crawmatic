@@ -16,7 +16,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app_shared.enums import WorkspaceStatus
+from app_shared.enums import ApiKeyStatus, WorkspaceStatus
 
 
 class WorkspaceProvisionRequest(BaseModel):
@@ -65,3 +65,47 @@ class UsageListResponse(BaseModel):
 
     items: list[UsageRow]
     next_cursor: str | None
+
+
+class AdminApiKeyCreateRequest(BaseModel):
+    """`POST /v1/admin/workspaces/{workspace_id}/api-keys` body.
+
+    `scopes` omitted (or `null`) means "use the default set" --
+    `app.routers.admin.BOOTSTRAP_SCOPES`, the same tenant-scope set a
+    workspace's own bootstrap key gets at provisioning time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    scopes: list[str] | None = None
+
+
+class AdminApiKeyCreateResponse(BaseModel):
+    """The plaintext key is returned exactly once and never stored."""
+
+    id: uuid.UUID
+    name: str
+    key_prefix: str
+    scopes: list[str]
+    status: ApiKeyStatus
+    created_at: datetime
+    api_key: str  # the full secret — shown exactly once
+
+
+class AdminApiKeyListItem(BaseModel):
+    """One row of `GET /v1/admin/workspaces/{workspace_id}/api-keys` --
+    never `key_hash`, never plaintext."""
+
+    id: uuid.UUID
+    name: str
+    key_prefix: str
+    scopes: list[str]
+    status: ApiKeyStatus
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class AdminApiKeyListResponse(BaseModel):
+    items: list[AdminApiKeyListItem]

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -46,9 +46,15 @@ from sqlalchemy.orm import Session
 from app_shared.database import get_auth_session
 from app_shared.enums import ApiKeyStatus, WorkspaceStatus
 from app_shared.models.identity import ApiKey, Workspace
+from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.api_keys import generate_api_key
+from app_shared.security.scopes import validate_scopes
 
 from app.schemas.admin import (
+    AdminApiKeyCreateRequest,
+    AdminApiKeyCreateResponse,
+    AdminApiKeyListItem,
+    AdminApiKeyListResponse,
     UsageListResponse,
     UsageRow,
     WorkspaceArchiveResponse,
@@ -227,6 +233,149 @@ def archive_workspace(
     return WorkspaceArchiveResponse(
         workspace_id=workspace.id, status=str(workspace.status)
     )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/api-keys",
+    response_model=AdminApiKeyCreateResponse,
+    status_code=201,
+)
+def create_workspace_api_key(
+    workspace_id: uuid.UUID,
+    payload: AdminApiKeyCreateRequest,
+    session: Session = Depends(get_admin_session),
+) -> AdminApiKeyCreateResponse:
+    """`POST /v1/admin/workspaces/{workspace_id}/api-keys` -- mint a named,
+    workspace-scoped key on the SaaS's behalf (PLAN §7.4, phase4-connect
+    Task 2).
+
+    404s on an unknown `workspace_id` (mirrors `archive_workspace` just
+    above) rather than letting a bad id fall through to the `api_keys`
+    FK constraint as an opaque `IntegrityError` -> 500. This is safe to
+    do here (unlike the DELETE below): the caller is the trusted,
+    service-token-holding SaaS control plane, not an untrusted customer,
+    so confirming "that workspace id doesn't exist" leaks nothing a
+    customer could exploit and helps the SaaS catch a stale
+    `cmWorkspaceId` immediately instead of via a confusing 500.
+
+    The plaintext key is returned exactly once and never persisted --
+    same contract as `provision_workspace` above and
+    `POST /v1/api-keys` (api_keys.py).
+    """
+    workspace = session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)  # noqa: workspace-scope
+    ).scalar_one_or_none()
+    if workspace is None:
+        raise _not_found("Workspace not found.")
+
+    requested_scopes = (
+        payload.scopes if payload.scopes is not None else list(BOOTSTRAP_SCOPES)
+    )
+    try:
+        scopes = validate_scopes(requested_scopes)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_SCOPES", "message": str(exc)}},
+        ) from exc
+
+    full_secret, key_prefix, key_hash = generate_api_key()
+    api_key = ApiKey(
+        workspace_id=workspace_id,
+        name=payload.name,
+        key_prefix=key_prefix,
+        key_hash=key_hash,
+        scopes=scopes,
+        status=ApiKeyStatus.ACTIVE,
+    )
+    session.add(api_key)
+    session.flush()
+
+    return AdminApiKeyCreateResponse(
+        id=api_key.id,
+        name=api_key.name,
+        key_prefix=api_key.key_prefix,
+        scopes=list(api_key.scopes),
+        status=api_key.status,
+        created_at=api_key.created_at,
+        api_key=full_secret,  # returned exactly once; never persisted/re-shown
+    )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/api-keys",
+    response_model=AdminApiKeyListResponse,
+)
+def list_workspace_api_keys(
+    workspace_id: uuid.UUID,
+    session: Session = Depends(get_admin_session),
+) -> AdminApiKeyListResponse:
+    """`GET /v1/admin/workspaces/{workspace_id}/api-keys` -- never
+    `key_hash`, never plaintext. `scoped_select` (not a bare
+    `select(ApiKey)`) so one workspace's keys are never visible through
+    another workspace's path id."""
+    stmt = scoped_select(ApiKey, workspace_id).order_by(ApiKey.created_at, ApiKey.id)
+    rows = session.execute(stmt).scalars().all()
+    items = [
+        AdminApiKeyListItem(
+            id=row.id,
+            name=row.name,
+            key_prefix=row.key_prefix,
+            scopes=list(row.scopes),
+            status=row.status,
+            last_used_at=row.last_used_at,
+            revoked_at=row.revoked_at,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+    return AdminApiKeyListResponse(items=items)
+
+
+@router.delete("/workspaces/{workspace_id}/api-keys/{api_key_id}", status_code=204)
+def revoke_workspace_api_key(
+    workspace_id: uuid.UUID,
+    api_key_id: uuid.UUID,
+    session: Session = Depends(get_admin_session),
+) -> None:
+    """`DELETE /v1/admin/workspaces/{workspace_id}/api-keys/{api_key_id}` --
+    IDEMPOTENT, always 204. A missing key, an already-revoked key, and a
+    key belonging to another workspace all return 204 -- same contract
+    and rationale as `DELETE /v1/api-keys/{id}` (api_keys.py:149-171):
+    revoking is a "make sure this key can't authenticate" instruction,
+    not a "does this exact row exist under this exact workspace"
+    question, and answering the latter would leak cross-workspace
+    existence information to whichever caller guesses an id. Do NOT
+    turn this into a 404.
+
+    `scoped_get` (not `session.get`) filters by BOTH id and
+    `workspace_id` -- a workspace can never revoke another workspace's
+    key by guessing its id (the cross-workspace case above resolves to
+    "not found" -> 204 no-op, never touching the other workspace's row).
+
+    Mutates the ORM object directly (`existing.status = ...;
+    session.flush()`) rather than issuing a Core `update(...)` statement
+    (contrast `api_keys.py`'s `revoke_api_key`) -- both produce the same
+    UPDATE against a real `Session`, but only the ORM-attribute form is
+    observable by this router's own `get_admin_session` test double
+    (`FakeOrmSession`, which evaluates `select`/`WHERE` but not a bare
+    `update()` statement), and it mirrors `archive_workspace`'s existing
+    get-then-mutate style in this same file.
+
+    Only sets `revoked_at` on the first revocation (guarded by the
+    status check) so a redundant revoke of an already-revoked key is a
+    true no-op rather than clobbering the original revocation
+    timestamp.
+    """
+    existing = scoped_get(session, ApiKey, api_key_id, workspace_id)
+    if existing is None:
+        return None
+
+    if existing.status != ApiKeyStatus.REVOKED:
+        existing.status = ApiKeyStatus.REVOKED
+        existing.revoked_at = datetime.now(timezone.utc)
+        session.flush()
+    return None
 
 
 @router.get("/usage", response_model=UsageListResponse)
