@@ -49,7 +49,10 @@ def require_service_token(authorization: str | None = Header(default=None)) -> N
     if not presented:
         raise auth_failed_exception()
 
-    if not hmac.compare_digest(presented, configured):
+    if not hmac.compare_digest(
+        presented.encode("utf-8", "surrogateescape"),
+        configured.encode("utf-8", "surrogateescape"),
+    ):
         raise auth_failed_exception()
 
     return None
