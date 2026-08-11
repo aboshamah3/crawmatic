@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_TTL_SECONDS: int = 900
     REFRESH_TOKEN_TTL_SECONDS: int = 2592000
 
+    # --- SaaS control-plane service auth (PLAN §7.1) ---
+    # Static bearer token the SaaS control plane presents to
+    # `/v1/admin/*`. Machine analog of SUPER_ADMIN: it resolves no
+    # workspace context and is compared in constant time. Optional so an
+    # engine deployment that hosts no SaaS control plane still boots —
+    # when unset, every admin request is refused (fail-closed).
+    SAAS_SERVICE_TOKEN: str | None = None
+
     # --- Status cache (SPEC-03 FR-022) ---
     STATUS_CACHE_TTL_SECONDS: int = 30
 
