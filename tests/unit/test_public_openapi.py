@@ -2,12 +2,40 @@
 
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 from app.main import app
 from app.openapi_public import INTERNAL_TAGS, build_public_openapi
 
 
 def _spec() -> dict:
     return build_public_openapi(app)
+
+
+def test_default_openapi_json_is_disabled():
+    """The default `FastAPI(...)` spec route would publish the FULL spec
+    (admin, proxy-providers, access-policies included) unauthenticated --
+    it must not exist at all; only `/openapi-public.json` is served."""
+    client = TestClient(app)
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 404
+
+
+def test_openapi_public_json_excludes_internal_routes():
+    client = TestClient(app)
+    resp = client.get("/openapi-public.json")
+    assert resp.status_code == 200
+    paths = resp.json()["paths"]
+    assert not [p for p in paths if p.startswith("/v1/admin")]
+    assert not [p for p in paths if p.startswith("/v1/proxy-providers")]
+    assert not [p for p in paths if p.startswith("/v1/access-policies")]
+
+
+def test_docs_page_is_served_from_the_public_spec():
+    client = TestClient(app)
+    resp = client.get("/docs")
+    assert resp.status_code == 200
+    assert "openapi-public.json" in resp.text
 
 
 def test_internal_tags_are_the_documented_three():

@@ -104,6 +104,7 @@ in `app.deps`, and is excluded from the public OpenAPI spec.
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.openapi.docs import get_swagger_ui_html
 
 from app.error_envelope import register_error_handlers
 from app.openapi_public import build_public_openapi
@@ -128,7 +129,7 @@ from app.routers import (
     webhooks,
 )
 
-app = FastAPI(title="crawmatic-api")
+app = FastAPI(title="crawmatic-api", openapi_url=None, docs_url=None, redoc_url=None)
 
 register_error_handlers(app)
 
@@ -163,3 +164,11 @@ def health() -> dict[str, str]:
 def public_openapi() -> dict:
     """The customer-facing spec — internal routers excluded (PLAN §7.4)."""
     return build_public_openapi(app)
+
+
+@app.get("/docs", include_in_schema=False)
+def public_docs():
+    """Swagger UI over the PUBLIC spec only — the default `/docs` (which
+    would have rendered the full, internal-route-including spec) is
+    disabled via `docs_url=None` above."""
+    return get_swagger_ui_html(openapi_url="/openapi-public.json", title="Crawmatic API")
