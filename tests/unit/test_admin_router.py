@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.routers import admin
 from app.service_auth import require_service_token
+from unit._admin_fake_session import FakeUsageSession
 from unit._jobs_fake_session import FakeOrmSession
 
 SERVICE_HEADERS = {"Authorization": "Bearer test-service-token"}
@@ -141,3 +143,94 @@ def test_admin_routes_require_the_service_token(
             "/v1/admin/workspaces", json={"name": "x", "external_ref": "y"}
         )
     assert resp.status_code == 401
+
+
+def _usage_row(**over):
+    base = dict(
+        workspace_id=uuid.uuid4(),
+        product_id=uuid.uuid4(),
+        cycle_ts="2026-08-03T14:00:00+00:00",
+        links_total=7,
+        links_succeeded=6,
+        protected_links_attempted=1,
+        protected_links_succeeded=1,
+        check_successful=True,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _usage_client(rows):
+    session = FakeUsageSession(rows)
+    app.dependency_overrides[require_service_token] = lambda: None
+    app.dependency_overrides[admin.get_admin_session] = lambda: session
+    return TestClient(app), session
+
+
+def test_usage_returns_the_frozen_contract_fields():
+    client, _ = _usage_client([_usage_row()])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00Z&until=2026-08-08T00:00:00Z",
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert set(item) == {
+        "workspace_id",
+        "product_id",
+        "cycle_ts",
+        "links_total",
+        "links_succeeded",
+        "protected_links_attempted",
+        "protected_links_succeeded",
+        "check_successful",
+    }
+
+
+def test_usage_returns_the_items_next_cursor_envelope():
+    client, _ = _usage_client([_usage_row()])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00Z&until=2026-08-08T00:00:00Z",
+        headers=SERVICE_HEADERS,
+    )
+    body = resp.json()
+    assert set(body) == {"items", "next_cursor"}
+    assert body["next_cursor"] is None
+
+
+def test_usage_emits_a_cursor_when_more_rows_exist():
+    rows = [_usage_row() for _ in range(3)]
+    client, _ = _usage_client(rows)
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00Z&until=2026-08-08T00:00:00Z&limit=2",
+        headers=SERVICE_HEADERS,
+    )
+    body = resp.json()
+    assert len(body["items"]) == 2
+    assert body["next_cursor"] is not None
+
+
+def test_usage_window_over_31_days_is_422():
+    client, _ = _usage_client([])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-01-01T00:00:00Z&until=2026-06-01T00:00:00Z",
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["code"] == "WINDOW_TOO_LARGE"
+
+
+def test_usage_bad_cursor_is_422():
+    client, _ = _usage_client([])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00Z&until=2026-08-08T00:00:00Z&cursor=%21%21%21",
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
+
+
+def test_usage_requires_since_and_until():
+    client, _ = _usage_client([])
+    resp = client.get("/v1/admin/usage", headers=SERVICE_HEADERS)
+    assert resp.status_code == 422

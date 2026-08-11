@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -47,11 +48,23 @@ from app_shared.models.identity import ApiKey, Workspace
 from app_shared.security.api_keys import generate_api_key
 
 from app.schemas.admin import (
+    UsageListResponse,
+    UsageRow,
     WorkspaceArchiveResponse,
     WorkspaceProvisionRequest,
     WorkspaceProvisionResponse,
 )
 from app.service_auth import require_service_token
+from app.services.admin_usage import (
+    InvalidUsageCursor,
+    UsageCursor,
+    UsageWindowTooLarge,
+    build_usage_query,
+    clamp_usage_limit,
+    decode_usage_cursor,
+    encode_usage_cursor,
+    validate_window,
+)
 
 router = APIRouter(
     prefix="/v1/admin", tags=["admin"], dependencies=[Depends(require_service_token)]
@@ -178,3 +191,65 @@ def archive_workspace(
     return WorkspaceArchiveResponse(
         workspace_id=workspace.id, status=str(workspace.status)
     )
+
+
+@router.get("/usage", response_model=UsageListResponse)
+def export_usage(
+    since: datetime,
+    until: datetime,
+    cursor: str | None = None,
+    limit: int | None = None,
+    session: Session = Depends(get_admin_session),
+) -> UsageListResponse:
+    """`GET /v1/admin/usage` — the SaaS metering feed (PLAN §7.2).
+
+    Cursor-paginated, idempotent, window capped at 31 days. The response
+    field names are a frozen contract — see `app.schemas.admin.UsageRow`.
+    """
+    try:
+        validate_window(since, until)
+    except UsageWindowTooLarge as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "WINDOW_TOO_LARGE", "message": str(exc)}},
+        ) from exc
+
+    after: UsageCursor | None = None
+    if cursor is not None:
+        try:
+            after = decode_usage_cursor(cursor)
+        except InvalidUsageCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+
+    page_limit = clamp_usage_limit(limit)
+    rows = list(
+        session.execute(
+            build_usage_query(
+                since=since, until=until, after=after, limit=page_limit
+            )
+        ).all()
+    )
+
+    has_more = len(rows) > page_limit
+    page = rows[:page_limit]
+    # Build the validated items first and derive the cursor from those,
+    # not from the raw row: Pydantic has already coerced `cycle_ts` to a
+    # real `datetime` (rows can carry it as a string in tests), and
+    # `encode_usage_cursor` requires `.isoformat()` to exist.
+    items = [UsageRow.model_validate(row, from_attributes=True) for row in page]
+    next_cursor = (
+        encode_usage_cursor(
+            UsageCursor(
+                cycle_ts=items[-1].cycle_ts,
+                workspace_id=items[-1].workspace_id,
+                product_id=items[-1].product_id,
+            )
+        )
+        if has_more and items
+        else None
+    )
+
+    return UsageListResponse(items=items, next_cursor=next_cursor)

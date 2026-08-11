@@ -42,6 +42,8 @@ class WorkspaceArchiveResponse(BaseModel):
 class UsageRow(BaseModel):
     """One product-check cycle. **Field names are contractual.**"""
 
+    model_config = ConfigDict(from_attributes=True)
+
     workspace_id: uuid.UUID
     product_id: uuid.UUID
     cycle_ts: datetime
