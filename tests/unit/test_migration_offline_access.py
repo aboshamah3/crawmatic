@@ -127,7 +127,14 @@ def test_request_attempts_is_absent_from_this_migration() -> None:
     # full multi-migration history — request_attempts legitimately
     # appears earlier in history (SPEC-07) but must not reappear here.
     sql = _upgrade_sql()
-    upgrade_section = sql.split("-- Running upgrade e4a75b48360c -> ", 1)[-1]
+    after_marker = sql.split("-- Running upgrade e4a75b48360c -> ", 1)[-1]
+    # Bound the slice at the NEXT migration's marker. Without this the
+    # "section" runs to the end of the entire rendered history, so the
+    # assertion silently widens into "no later migration may ever touch
+    # request_attempts" — which the usage-export covering index
+    # legitimately does (PLAN §7.2, risk P2). This test is about what
+    # SPEC-10 emits, not about the rest of history.
+    upgrade_section = after_marker.split("-- Running upgrade ", 1)[0]
     assert "request_attempts" not in upgrade_section
     assert "ADD COLUMN" not in upgrade_section
 
