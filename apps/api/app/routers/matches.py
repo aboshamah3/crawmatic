@@ -69,6 +69,7 @@ from app_shared.url_pattern import derive_match_url_fields
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
 from app.deps import Principal, require_scopes
+from app.limits import enforce_batch_cap
 from app.schemas.matches import (
     DeleteOutcome,
     MatchBulkUpsertRequest,
@@ -364,6 +365,7 @@ def bulk_upsert_matches(
     `IN (...)` lookup + `assert_refs_in_workspace`) ->
     `build_matches_upsert` executed once. Never a per-row loop.
     """
+    enforce_batch_cap(payload.matches, what="matches")
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
     ws = principal.workspace_id
