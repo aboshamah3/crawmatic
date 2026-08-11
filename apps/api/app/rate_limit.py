@@ -26,9 +26,17 @@ no business turning a missing dev-config file into a 500 on every route
 in the shared `app` object, so an unconstructable `Settings` disables
 the limiter rather than raising through `dispatch`.
 
-Exempt paths: `/health` (liveness must never depend on Redis) and
+Exempt paths: `/health` (liveness must never depend on Redis),
 `/v1/auth/*` (already limited, per-account and per-IP, by
-`app_shared.security.rate_limit.check_and_increment_login`).
+`app_shared.security.rate_limit.check_and_increment_login`), and
+`/v1/admin` (the SaaS control plane, gated by the shared
+`SAAS_SERVICE_TOKEN` secret in `app.service_auth` rather than a
+per-tenant credential -- it is not a customer surface, so this
+tenant-cost limiter does not apply to it. Without this exemption the
+SaaS's own billing/metering export (`GET /v1/admin/usage`) and
+provisioning calls would be throttled at the same 60-read/10-write
+budget as a single customer, and a backfill or a busy month would 429
+the metering feed -- a silent revenue-loss path).
 """
 
 from __future__ import annotations
@@ -49,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 60
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_EXEMPT_PREFIXES = ("/health", "/v1/auth")
+_EXEMPT_PREFIXES = ("/health", "/v1/auth", "/v1/admin")
 _BEARER = "Bearer "
 
 

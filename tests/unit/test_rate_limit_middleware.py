@@ -98,6 +98,23 @@ def test_health_is_never_limited():
         assert client.get("/health").status_code == 200
 
 
+def test_admin_surface_is_never_limited():
+    """`/v1/admin/*` is gated by the shared service-token secret, not a
+    customer credential -- it must never be throttled by the tenant
+    limiter (PLAN §7.4). Otherwise a billing backfill or a busy month
+    429s the SaaS metering feed -- a silent revenue-loss path."""
+    application = _app(FakeRedis(), read=1)
+
+    @application.get("/v1/admin/usage")
+    def _admin_read():
+        return {"ok": True}
+
+    client = TestClient(application)
+    for _ in range(2):
+        resp = client.get("/v1/admin/usage", headers=HEADERS)
+        assert resp.status_code != 429
+
+
 def test_unauthenticated_requests_are_not_limited_here():
     """No credential means auth will 401 anyway; don't spend Redis on it."""
     client = TestClient(_app(FakeRedis(), read=1))
