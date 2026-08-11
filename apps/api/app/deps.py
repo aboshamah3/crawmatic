@@ -157,7 +157,15 @@ def _fire_last_used_throttle(api_key_id: uuid.UUID, workspace_id: uuid.UUID) -> 
 
 def _authenticate_api_key(credential: str) -> Principal:
     key_prefix = parse_prefix(credential)
-    candidates = _lookup_api_key_candidates(key_prefix)
+    try:
+        candidates = _lookup_api_key_candidates(key_prefix)
+    except ValueError:
+        # A row whose `status` (or any other app-validated enum column,
+        # see `_AppValidatedEnumString` in `app_shared.enums`) is outside
+        # its enum's value set raises `ValueError` while SQLAlchemy
+        # materialises the row — i.e. before it can be inspected at all.
+        # Authentication must fail closed on corrupt data, not 500.
+        raise auth_failed_exception() from None
 
     matched: ApiKey | None = None
     for candidate in candidates:
