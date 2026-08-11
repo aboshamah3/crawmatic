@@ -20,11 +20,27 @@ running any real SQL engine.
 from __future__ import annotations
 
 import uuid
+from collections import namedtuple
 from typing import Any
 
 from sqlalchemy import Select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.sql import operators as sa_operators
-from sqlalchemy.sql.elements import Null
+from sqlalchemy.sql.elements import False_, Null, True_
+
+
+def _eval_column_default(default: Any) -> Any:
+    """Evaluate a SQLAlchemy `ColumnDefault` the way a real `Session.flush()`
+    would -- a scalar value as-is, a callable with or without the (unused,
+    stdlib-only) execution-context arg every default in this codebase
+    ignores (`app_shared.models.base.new_uuid7`/`_utc_now`)."""
+    if default.is_scalar:
+        return default.arg
+    fn = default.arg
+    try:
+        return fn()
+    except TypeError:
+        return fn(None)
 
 
 def _resolve_bind_value(node: Any) -> Any:
@@ -52,8 +68,19 @@ def _eval_clause(clause: Any, obj: Any) -> bool:
     if op is sa_operators.eq:
         return actual == _resolve_bind_value(clause.right)
     if op is sa_operators.is_:
+        # `.is_(None)`/`.is_(True)`/`.is_(False)` each compile to a
+        # dedicated SQL-literal node (`Null`/`True_`/`False_`) rather than
+        # a plain `BindParameter` carrying a Python `.value` -- handle all
+        # three explicitly instead of falling through to
+        # `_resolve_bind_value` (which has no `.value` to read off a
+        # `True_`/`False_` literal and would otherwise always evaluate
+        # `False`, e.g. `DomainAccessRule.enabled.is_(True)`).
         if isinstance(clause.right, Null):
             return actual is None
+        if isinstance(clause.right, True_):
+            return actual is True
+        if isinstance(clause.right, False_):
+            return actual is False
         return actual is _resolve_bind_value(clause.right)
     raise NotImplementedError(f"unsupported operator {op!r}")
 
@@ -119,6 +146,19 @@ class FakeOrmSession:
     def flush(self) -> None:
         self.flush_count += 1
         for obj in self.added:
+            # Mirror a real `Session.flush()`'s Python-side column-default
+            # evaluation (`mapped_column(..., default=...)`, e.g. `Base.id`
+            # -> `new_uuid7`, `TimestampMixin.created_at`/`updated_at` ->
+            # `_utc_now`, or a plain scalar model default) -- every
+            # attribute the caller left unset (`None`) gets its declared
+            # default filled in, exactly as it would against a real
+            # Postgres-backed session, so `Model.model_validate(row)`
+            # (non-nullable response fields) sees a fully-populated row.
+            for column in sa_inspect(type(obj)).columns:
+                if column.default is None:
+                    continue
+                if getattr(obj, column.key, None) is None:
+                    setattr(obj, column.key, _eval_column_default(column.default))
             if getattr(obj, "id", None) is None:
                 obj.id = uuid.uuid4()
 
@@ -151,13 +191,21 @@ class FakeOrmSession:
         # Model.workspace_id)``, the ``_scan_job_refs`` maintenance-scan
         # shape) -- as opposed to a full-entity ``select(Model)`` -- is
         # distinguished by its column description ``expr`` no longer
-        # being the entity class itself. Project tuples of attribute
-        # values by column name instead of returning whole ORM rows.
+        # being the entity class itself. Project namedtuples of
+        # attribute values by column name instead of returning whole
+        # ORM rows -- a real SQLAlchemy ``Row`` supports both positional
+        # (``row[0]``) *and* attribute (``row.id``) access, so callers
+        # like ``routers/matches.py``'s ``_workspace_map`` (``{row.id:
+        # row.workspace_id for row in rows}``) work the same against
+        # this fake as against a real ``Session``.
         is_full_entity_select = len(descriptions) == 1 and (
             descriptions[0]["expr"] is descriptions[0]["entity"]
         )
         if not is_full_entity_select:
             column_names = [description["name"] for description in descriptions]
-            rows = [tuple(getattr(row, name) for name in column_names) for row in rows]
+            row_type = namedtuple("_FakeRow", column_names)  # noqa: PYI024
+            rows = [
+                row_type(*(getattr(row, name) for name in column_names)) for row in rows
+            ]
 
         return _FakeExecResult(rows)
