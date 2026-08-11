@@ -158,14 +158,25 @@ def build_usage_query(
     """
     is_protected = RequestAttempt.access_method.in_(PROTECTED_ACCESS_METHODS)
 
+    # Build each `cycle_ts` expression ONCE and reuse the same object in
+    # both the SELECT list and the GROUP BY. Calling `_cycle_ts_expr`
+    # twice yields two equal-looking but distinct expression trees, each
+    # with its own bind parameter for the `'hour'` literal — so Postgres
+    # renders `date_trunc($1, ...)` in the SELECT and `date_trunc($5, ...)`
+    # in the GROUP BY, fails to match them, and rejects the query with
+    # "column scrape_jobs.created_at must appear in the GROUP BY clause".
+    # Compile-only tests cannot see this; the live gate did.
+    attempt_cycle_ts = _cycle_ts_expr(RequestAttempt.created_at, ScrapeJob.created_at)
+    observation_cycle_ts = _cycle_ts_expr(
+        PriceObservation.scraped_at, ScrapeJob.created_at
+    )
+
     # --- inner: fold retries, one row per (cycle, workspace, product, match)
     per_link = (
         select(
             RequestAttempt.workspace_id.label("workspace_id"),
             CompetitorProductMatch.product_id.label("product_id"),
-            _cycle_ts_expr(RequestAttempt.created_at, ScrapeJob.created_at).label(
-                "cycle_ts"
-            ),
+            attempt_cycle_ts.label("cycle_ts"),
             RequestAttempt.match_id.label("match_id"),
             func.bool_or(RequestAttempt.success).label("link_ok"),
             func.bool_or(is_protected).label("protected"),
@@ -194,7 +205,7 @@ def build_usage_query(
         .group_by(
             RequestAttempt.workspace_id,
             CompetitorProductMatch.product_id,
-            _cycle_ts_expr(RequestAttempt.created_at, ScrapeJob.created_at),
+            attempt_cycle_ts,
             RequestAttempt.match_id,
         )
         .cte("per_link")
@@ -205,9 +216,7 @@ def build_usage_query(
         select(
             PriceObservation.workspace_id.label("workspace_id"),
             PriceObservation.product_id.label("product_id"),
-            _cycle_ts_expr(PriceObservation.scraped_at, ScrapeJob.created_at).label(
-                "cycle_ts"
-            ),
+            observation_cycle_ts.label("cycle_ts"),
             func.bool_or(PriceObservation.success).label("observed"),
         )
         .outerjoin(
@@ -224,7 +233,7 @@ def build_usage_query(
         .group_by(
             PriceObservation.workspace_id,
             PriceObservation.product_id,
-            _cycle_ts_expr(PriceObservation.scraped_at, ScrapeJob.created_at),
+            observation_cycle_ts,
         )
         .cte("per_check")
     )

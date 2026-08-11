@@ -137,3 +137,40 @@ def test_cursor_predicate_is_a_keyset_tuple_comparison() -> None:
     )
     sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=after, limit=10))
     assert ">" in sql.split("HAVING")[-1] or "(cycle_ts, workspace_id, product_id) >" in sql.replace('"', "")
+
+
+def test_cycle_ts_expression_is_identical_in_select_and_group_by() -> None:
+    """Regression: the GROUP BY must reuse the SELECT's `cycle_ts` object.
+
+    Building the expression twice yields two distinct trees, each with
+    its own bind parameter for `'hour'`. Postgres then sees
+    `date_trunc($1, ...)` in the SELECT and `date_trunc($5, ...)` in the
+    GROUP BY, refuses to match them, and rejects the whole query with
+    "column scrape_jobs.created_at must appear in the GROUP BY clause".
+    A live gate run caught this; compile-only assertions did not.
+    """
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    lowered = sql.lower()
+    # Every date_trunc rendering in the statement must be byte-identical,
+    # which is what proves a single shared expression object per CTE.
+    renderings = set()
+    index = lowered.find("date_trunc(")
+    while index != -1:
+        depth, cursor = 0, index + len("date_trunc")
+        while cursor < len(lowered):
+            if lowered[cursor] == "(":
+                depth += 1
+            elif lowered[cursor] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        renderings.add(lowered[index : cursor + 1])
+        index = lowered.find("date_trunc(", cursor)
+    assert renderings, "no date_trunc found in the compiled query"
+    # Two CTEs => at most two distinct renderings (attempts, observations).
+    assert len(renderings) <= 2, sorted(renderings)
+    for rendering in renderings:
+        assert "'hour'" in rendering, rendering

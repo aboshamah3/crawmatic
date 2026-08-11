@@ -40,6 +40,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app_shared.database import get_auth_session
@@ -139,6 +140,14 @@ def provision_workspace(
     The plaintext key is returned exactly once and never stored; only
     its prefix and sha256 hash are persisted (same contract as
     `POST /v1/api-keys`).
+
+    Re-provisioning an `external_ref` that already has a workspace is a
+    `409 DUPLICATE_EXTERNAL_REF`, not a 500. The SaaS retries this call
+    (network blip, job redelivery), and a retry must get a clear,
+    actionable answer instead of an opaque server error. It is
+    deliberately NOT idempotent-success: silently returning the existing
+    workspace would have to either mint a second bootstrap key or return
+    none, and both are worse than making the caller decide.
     """
     workspace = Workspace(
         name=payload.name,
@@ -146,7 +155,22 @@ def provision_workspace(
         status=WorkspaceStatus.ACTIVE,
     )
     session.add(workspace)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "DUPLICATE_EXTERNAL_REF",
+                    "message": (
+                        "A workspace already exists for external_ref "
+                        f"{payload.external_ref!r}."
+                    ),
+                }
+            },
+        ) from exc
 
     full_secret, key_prefix, key_hash = generate_api_key()
     session.add(

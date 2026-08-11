@@ -234,3 +234,28 @@ def test_usage_requires_since_and_until():
     client, _ = _usage_client([])
     resp = client.get("/v1/admin/usage", headers=SERVICE_HEADERS)
     assert resp.status_code == 422
+
+
+def test_provision_duplicate_external_ref_is_409(client, session):
+    """The SaaS retries provisioning; a retry must not surface a 500."""
+    from sqlalchemy.exc import IntegrityError
+
+    original_flush = session.flush
+    calls = {"n": 0}
+
+    def _flush_raising_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+        return original_flush(*args, **kwargs)
+
+    session.flush = _flush_raising_once
+    session.rollback = lambda *a, **k: None
+
+    resp = client.post(
+        "/v1/admin/workspaces",
+        json={"name": "Acme Store", "external_ref": "proj_dupe"},
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "DUPLICATE_EXTERNAL_REF"
