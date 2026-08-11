@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from decimal import Decimal
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app_shared.enums import AccessStrategy, ProductStatus, VariantStatus
@@ -280,6 +281,89 @@ def test_direct_http_domain_is_unaffected_by_the_protected_cap(
         },
     )
     assert resp.status_code == 201
+
+
+# --- control B, bulk path: POST /v1/matches/bulk-upsert must not bypass -----
+# the per-product protected-link cap (review finding I3): `create_match`
+# calls `_check_protected_link_cap`, but `bulk_upsert_matches` used to call
+# only `enforce_batch_cap` -- the bulk path is the one a plugin actually
+# uses, so a customer could push an unbounded number of proxy-eligible
+# matches for one product in a single request and never touch the cap.
+
+
+def test_bulk_upsert_protected_link_cap_is_enforced(
+    client: TestClient, session: FakeOrmSession
+) -> None:
+    """5 matches on a protected domain for one, brand-new product -> 422
+    `PROTECTED_LINK_CAP_REACHED`. This request never reaches the actual
+    `INSERT ... ON CONFLICT` (the cap check runs before it), so the full
+    HTTP round-trip is exercisable even against `FakeOrmSession`."""
+    product_id = uuid.uuid4()
+    variant = _seed_product_and_variant(session, product_id=product_id)
+
+    rows = []
+    for index in range(MAX_PROTECTED_LINKS_PER_PRODUCT + 1):
+        competitor, _policy = _seed_protected_competitor(session, index=index)
+        rows.append(
+            {
+                "variant_external_id": variant.external_id,
+                "competitor_id": str(competitor.id),
+                "competitor_url": f"https://{competitor.domain}/p/{index}",
+            }
+        )
+
+    resp = client.post("/v1/matches/bulk-upsert", json={"matches": rows})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "PROTECTED_LINK_CAP_REACHED"
+
+
+def test_bulk_protected_cap_check_allows_exactly_the_cap(
+    session: FakeOrmSession,
+) -> None:
+    """Helper-level check for the "4 is fine" side: `FakeOrmSession` cannot
+    execute the `pg_insert(...).on_conflict_do_update(...)` the bulk path
+    issues once past this guard (it only interprets `Select` statements),
+    so a full 200-response HTTP round-trip for the accepted case isn't
+    exercisable without a much larger fake-session rewrite. Per the
+    review brief, testing the pure grouping/decision helper directly
+    instead -- `_bulk_protected_cap_check` is the exact function
+    `bulk_upsert_matches` calls, so this is not a weaker guarantee for
+    the logic under test, only for the surrounding HTTP plumbing."""
+    from app.routers.matches import _bulk_protected_cap_check
+
+    product_id = uuid.uuid4()
+    _seed_product_and_variant(session, product_id=product_id)
+
+    rows_at_cap = []
+    for index in range(MAX_PROTECTED_LINKS_PER_PRODUCT):
+        competitor, _policy = _seed_protected_competitor(session, index=index)
+        rows_at_cap.append(
+            {
+                "product_id": product_id,
+                "competitor_id": competitor.id,
+                "competitor_url": f"https://{competitor.domain}/p/{index}",
+                "url_pattern": None,
+            }
+        )
+
+    # Exactly at the cap: must NOT raise.
+    _bulk_protected_cap_check(session, WORKSPACE_ID, rows_at_cap)
+
+    overflow_competitor, _policy = _seed_protected_competitor(
+        session, index=MAX_PROTECTED_LINKS_PER_PRODUCT
+    )
+    rows_over_cap = rows_at_cap + [
+        {
+            "product_id": product_id,
+            "competitor_id": overflow_competitor.id,
+            "competitor_url": f"https://{overflow_competitor.domain}/p/overflow",
+            "url_pattern": None,
+        }
+    ]
+    with pytest.raises(HTTPException) as exc:
+        _bulk_protected_cap_check(session, WORKSPACE_ID, rows_over_cap)
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error"]["code"] == "PROTECTED_LINK_CAP_REACHED"
 
 
 # --- control C: unknown domain inherits the direct-HTTP default -------------
