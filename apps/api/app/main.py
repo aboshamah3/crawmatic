@@ -106,6 +106,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.error_envelope import register_error_handlers
+from app.rate_limit import RateLimitMiddleware
 from app.routers import (
     access_policies,
     admin,
@@ -129,6 +130,8 @@ from app.routers import (
 app = FastAPI(title="crawmatic-api")
 
 register_error_handlers(app)
+
+app.add_middleware(RateLimitMiddleware)
 
 app.include_router(auth.router)
 app.include_router(api_keys.router)

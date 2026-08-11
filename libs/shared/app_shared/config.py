@@ -246,6 +246,15 @@ class Settings(BaseSettings):
     RETENTION_INTERVAL_SECONDS: int = 86400
     PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 1
 
+    # --- Public API rate limits (PLAN §7.4, risk P5) ---
+    # Per-credential fixed-window budgets. Reads are cheap and get the
+    # generous budget; writes touch the catalog and get a tenth of it.
+    # Tunable per deployment because a plugin doing a bulk catalog sync
+    # has a legitimately different shape from a dashboard.
+    API_RATE_LIMIT_ENABLED: bool = True
+    API_RATE_LIMIT_READ_PER_MINUTE: int = 60
+    API_RATE_LIMIT_WRITE_PER_MINUTE: int = 10
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
