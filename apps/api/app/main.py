@@ -106,6 +106,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.error_envelope import register_error_handlers
+from app.openapi_public import build_public_openapi
 from app.rate_limit import RateLimitMiddleware
 from app.routers import (
     access_policies,
@@ -156,3 +157,9 @@ app.include_router(admin.router)
 def health() -> dict[str, str]:
     """Liveness probe. Returns 200 whenever the process is serving."""
     return {"status": "ok"}
+
+
+@app.get("/openapi-public.json", include_in_schema=False)
+def public_openapi() -> dict:
+    """The customer-facing spec — internal routers excluded (PLAN §7.4)."""
+    return build_public_openapi(app)
