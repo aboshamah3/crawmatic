@@ -28,7 +28,22 @@ UNTIL = datetime(2026, 8, 8, tzinfo=timezone.utc)
 
 
 def _sql(stmt) -> str:
+    """Compiled SQL with values still bound — the production shape."""
     return str(stmt.compile(dialect=postgresql.dialect()))
+
+
+def _sql_with_values(stmt) -> str:
+    """Compiled SQL with bind params rendered inline.
+
+    Values reach the query as bound parameters (correct), so they are
+    invisible in the plain compilation. Assertions *about the values*
+    render them here rather than asking production code to inline them.
+    """
+    return str(
+        stmt.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
 
 
 def test_window_within_limit_is_accepted() -> None:
@@ -94,7 +109,9 @@ def test_query_reads_success_from_price_observations() -> None:
 
 
 def test_query_classifies_protected_by_access_method() -> None:
-    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
     assert "PROXY_HTTP" in sql
     assert "PLAYWRIGHT_PROXY" in sql
 
@@ -107,8 +124,9 @@ def test_query_orders_by_the_cursor_key() -> None:
 
 
 def test_query_fetches_one_extra_row_to_detect_a_next_page() -> None:
-    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
-    assert "LIMIT 11" in sql or "LIMIT %(param_1)s" in sql
+    assert "LIMIT 11" in _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
 
 
 def test_cursor_predicate_is_a_keyset_tuple_comparison() -> None:

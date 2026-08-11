@@ -33,22 +33,18 @@ at 31 days by `validate_window`.
 Deviation from the brief's reference implementation: neither of the two
 fallbacks the brief anticipated (`func.count().filter(...)` rejected;
 `.having()` on a tuple comparison compiling badly) actually triggers on
-this repo's SQLAlchemy 2.0.51 — both compile cleanly, so the query
-shape is unchanged from the brief. The one real deviation is unrelated
-to those two: `RequestAttempt.access_method.in_(PROTECTED_ACCESS_METHODS)`
-compiles to an *expanding* bind parameter
-(`IN (__[POSTCOMPILE_access_method_1])`), so the two protected-method
-values never appear as text in the compiled SQL — failing the test that
-asserts `"PROXY_HTTP"`/`"PLAYWRIGHT_PROXY"` are literally present. Since
-`PROTECTED_ACCESS_METHODS` is a fixed, code-controlled tuple (never
-user input), the membership check is built with `literal_column` instead
-of `.in_()` on Python literals, so the values render inline as ordinary
-SQL text — no injection surface, because nothing external ever reaches
-this expression. The same reasoning applies to the `check_successful`
-default: `literal_column("false")` renders inline for the same test's
-neighboring assumption that `LIMIT n+1` lands on the query's first
-anonymous bind parameter (`param_1`) — an ordinary `literal(False)`
-would consume that slot first and push `LIMIT` to `param_2`.
+this repo's SQLAlchemy 2.0.51 — both compile cleanly, so the query shape
+is unchanged from the brief.
+
+Every value that reaches this query — the window bounds, the cursor
+position, and the protected-method set — is passed as a **bound
+parameter**, never interpolated into SQL text. `.in_()` on the fixed
+`PROTECTED_ACCESS_METHODS` tuple compiles to an expanding bind param
+(`IN (__[POSTCOMPILE_access_method_1])`), which is correct and is what
+we want; the tests that need to see the two method names assert against
+a `literal_binds=True` compilation rather than asking this module to
+inline them. Production SQL is not shaped to make a string assertion
+convenient.
 """
 
 from __future__ import annotations
@@ -60,7 +56,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from sqlalchemy import Select, and_, func, literal_column, select, tuple_, literal
+from sqlalchemy import Select, and_, func, literal, select, tuple_
 
 from app_shared.enums import AccessMethod
 from app_shared.models.competitors_matches import CompetitorProductMatch
@@ -160,9 +156,7 @@ def build_usage_query(
     protected_links_attempted, protected_links_succeeded,
     check_successful` — the frozen §7.2 contract, positionally stable.
     """
-    is_protected = RequestAttempt.access_method.in_(
-        literal_column(repr(v)) for v in PROTECTED_ACCESS_METHODS
-    )
+    is_protected = RequestAttempt.access_method.in_(PROTECTED_ACCESS_METHODS)
 
     # --- inner: fold retries, one row per (cycle, workspace, product, match)
     per_link = (
@@ -249,7 +243,7 @@ def build_usage_query(
                 "protected_links_succeeded"
             ),
             func.coalesce(
-                func.bool_or(per_check.c.observed), literal_column("false")
+                func.bool_or(per_check.c.observed), literal(False)
             ).label("check_successful"),
         )
         .select_from(per_link)
