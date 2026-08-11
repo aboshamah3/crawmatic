@@ -59,7 +59,11 @@ def client() -> TestClient:
 
 
 def test_scrape_profiles_routes_are_registered(client: TestClient) -> None:
-    openapi = client.get("/openapi.json").json()
+    # The default `/openapi.json` route is deliberately disabled (the full
+    # spec documents internal routers; only the filtered
+    # `/openapi-public.json` is served). Route *registration* is still
+    # asserted against the app's own generated schema.
+    openapi = app.openapi()
     paths = openapi["paths"]
 
     assert "/v1/scrape-profiles" in paths
