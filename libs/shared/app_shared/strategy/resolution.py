@@ -29,8 +29,11 @@ from dataclasses import dataclass
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from sqlalchemy import select
+
 from app_shared.enums import AccessMethod, ExtractionMethod, StrategyStatus
 from app_shared.messaging import enqueue
+from app_shared.models.domain_playbooks import DomainPlaybook
 from app_shared.models.strategy import DomainStrategyProfile
 from app_shared.strategy.repository import resolve_profile
 from app_shared.task_names import STRATEGY_DISCOVERY_RUN
@@ -180,14 +183,38 @@ def resolve_or_create_strategy_profile(
     if profile is not None:
         return profile
 
-    candidate = DomainStrategyProfile(
-        workspace_id=workspace_id,
-        competitor_id=competitor_id,
-        domain=domain,
-        url_pattern=url_pattern,
-        url_pattern_version=URL_PATTERN_ALGORITHM_VERSION,
-        status=StrategyStatus.DISCOVERY_REQUIRED,
-    )
+    # 2026-08-11 proxy-cost Fix 4 (PLAN_PROXY_COST_REDUCTION.md): a
+    # brand-new key whose domain is in the curated global playbook seeds
+    # LEARNING with the playbook's transport start instead of running the
+    # discovery probe ladder (up to ~20 paid fetches per key). LEARNING —
+    # not ACTIVE — so `resolve_strategy_start` applies it immediately
+    # (LEARNING + preference set) while the normal 3-confirmation
+    # promotion still has to earn ACTIVE from live successes, and the
+    # rediscovery machinery can degrade it exactly like any learned
+    # value. The playbook is a starting hint, never an override.
+    playbook = session.execute(
+        select(DomainPlaybook).where(DomainPlaybook.domain == domain)
+    ).scalar_one_or_none()
+
+    if playbook is not None:
+        candidate = DomainStrategyProfile(
+            workspace_id=workspace_id,
+            competitor_id=competitor_id,
+            domain=domain,
+            url_pattern=url_pattern,
+            url_pattern_version=URL_PATTERN_ALGORITHM_VERSION,
+            status=StrategyStatus.LEARNING,
+            preferred_access_method=playbook.preferred_access_method,
+        )
+    else:
+        candidate = DomainStrategyProfile(
+            workspace_id=workspace_id,
+            competitor_id=competitor_id,
+            domain=domain,
+            url_pattern=url_pattern,
+            url_pattern_version=URL_PATTERN_ALGORITHM_VERSION,
+            status=StrategyStatus.DISCOVERY_REQUIRED,
+        )
     try:
         with session.begin_nested():
             session.add(candidate)
@@ -200,6 +227,18 @@ def resolve_or_create_strategy_profile(
             # real error.
             raise
         return existing
+
+    if playbook is not None:
+        logger.info(
+            "app_shared.strategy.resolution: strategy_profile_seeded workspace_id=%s "
+            "competitor_id=%s domain=%s url_pattern=%s source=PLAYBOOK access_method=%s",
+            workspace_id,
+            competitor_id,
+            domain,
+            url_pattern,
+            playbook.preferred_access_method.value,
+        )
+        return candidate
 
     enqueue(
         STRATEGY_DISCOVERY_RUN,

@@ -392,6 +392,28 @@ def _probe_sample(
             tally.confidence_sum += Decimal(str(candidate.confidence))
             tally.confidence_count += 1
 
+        # 2026-08-11 proxy-cost Fix 4b (PLAN_PROXY_COST_REDUCTION.md):
+        # once an access method qualifies on the ENTIRE sample, no later
+        # ladder leg can beat it -- `select_discovery_winner` ranks by
+        # most qualifying URLs first and breaks ties by CHEAPEST access,
+        # and the ladder is walked cheapest-first. Probing the remaining
+        # (more expensive, possibly proxied) legs could only ever tie and
+        # then lose the tie-break, so the outcome is provably identical
+        # and the paid fetches are pure waste (up to 2 legs x 10 URLs per
+        # new discovery key).
+        sample = set(urls)
+        if any(
+            method is access_method and tally.qualifying_urls >= sample
+            for (method, _extraction), tally in tallies.items()
+        ):
+            logger.info(
+                "strategy_discovery: access_method=%s qualified on the full "
+                "sample (%d urls) -- skipping the remaining ladder legs",
+                access_method.value,
+                len(sample),
+            )
+            break
+
     return tallies
 
 

@@ -115,7 +115,7 @@ from scrape_core.errors import (
 )
 from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import LockGrant, Permission, release_lock, release_slot
+from scrape_core.limiter import LockGrant, Permission, acquire_lock, release_lock, release_slot
 from scrape_core.result_builder import build_scrape_result
 from scrape_core.targets import (
     AdmissionContext,
@@ -131,6 +131,7 @@ from scrape_core.targets import (
     SpiderTarget,
     acquire_fetch_permission,
     dispatch_admission,
+    group_targets_for_dedup,
     load_targets,
     overflow_to_dispatch,
     prepare_dispatch_with_backoff,
@@ -234,6 +235,15 @@ class GenericPriceSpider(scrapy.Spider):
         # rate-limit backoff bookkeeping, reset only when a fresh target
         # is first seen in `start()` -- see `_RequeueState`.
         self._requeue_state_by_match_id: dict[uuid.UUID, _RequeueState] = {}
+        # 2026-08-11 proxy-cost Fix 1 (`SCRAPE_URL_DEDUP`): the match lock
+        # held for each *sibling* riding a shared fetch, acquired in
+        # `start()` right after the fetcher's own admission built a
+        # request. Sibling result rows carry these key/tokens whenever the
+        # fetcher's row carries its own, so the persistence pipeline
+        # releases them on the same commit; while a retry is pending both
+        # the fetcher's and the siblings' locks are withheld from the
+        # failed row (Issue-3 reuse semantics, applied group-wide).
+        self._sibling_locks: dict[uuid.UUID, LockGrant] = {}
         # Populated by `start()` from `load_targets`'s bounded-load result
         # (SPEC-10 US2) -- shared workspace-wide provider state consulted
         # by `_prepare_dispatch`/`_request_for`, not duplicated per target.
@@ -256,13 +266,35 @@ class GenericPriceSpider(scrapy.Spider):
         )
 
     async def start(self) -> AsyncIterator[scrapy.Request]:
+        from app_shared.config import get_settings
+
         loaded = await await_in_thread(load_targets, self.workspace_id, self.match_ids)
         self._visible_providers = loaded.visible_providers
         self._provider_rows = loaded.provider_rows
         self._provider_passwords = loaded.provider_passwords
 
-        for target in loaded.targets:
+        # 2026-08-11 proxy-cost Fix 1: fold same-fetch targets onto one
+        # fetcher each; every result the fetcher produces is cloned onto
+        # its siblings by `_results_with_siblings`, so per-match rows stay
+        # 1:1 while the fetch count drops to one per distinct URL.
+        # Siblings a lock-collision ejects below re-enter this queue as
+        # ordinary standalone targets.
+        pending: list[SpiderTarget] = list(loaded.targets)
+        if get_settings().SCRAPE_URL_DEDUP:
+            pending = group_targets_for_dedup(pending)
+            dedup_saved = sum(len(t.sibling_targets) for t in pending)
+            if dedup_saved:
+                logger.info(
+                    "generic_price_spider: url dedup folded %d of %d targets onto shared fetches",
+                    dedup_saved,
+                    dedup_saved + len(pending),
+                )
+
+        while pending:
+            target = pending.pop(0)
             self._targets_by_match_id[target.match_id] = target
+            for sibling in target.sibling_targets:
+                self._targets_by_match_id[sibling.match_id] = sibling
             # SPEC-11 US1: fresh per-target backoff bookkeeping (reset
             # only here, on first sight of this target -- see
             # `_RequeueState`).
@@ -272,7 +304,8 @@ class GenericPriceSpider(scrapy.Spider):
             # requeue caps are exceeded, handed back DEFERRED -- it never
             # reaches the terminal skip-result branch below. `None` means
             # exactly that (already deferred + re-dispatched): dispatch
-            # nothing for this target.
+            # nothing for this target. (Its siblings stay PENDING and are
+            # re-grouped by the re-dispatched run -- never lost.)
             decision = await prepare_dispatch_with_backoff(
                 self._admission_context(), target, 1, self._visible_providers, self._provider_rows
             )
@@ -280,7 +313,7 @@ class GenericPriceSpider(scrapy.Spider):
                 continue
             if decision.plan is None:
                 if decision.skip_error_code is not None:
-                    yield self._build_result(
+                    for result in self._results_with_siblings(
                         target,
                         target.url,
                         datetime.now(UTC),
@@ -294,16 +327,52 @@ class GenericPriceSpider(scrapy.Spider):
                             decision.attempted_proxy.provider_id if decision.attempted_proxy else None
                         ),
                         proxy_country=(decision.attempted_proxy.country if decision.attempted_proxy else None),
-                    )
+                    ):
+                        yield result
                 # else: NONE_RESOLVED access policy -- skip silently, see
-                # `_DispatchDecision` docstring.
+                # `_DispatchDecision` docstring. (Siblings resolved the
+                # same chain -- same silent skip, exactly as standalone.)
                 continue
             result = await self._dispatch(target, 1, decision.plan, decision.proxy)
-            if result is not None:
+            if result is None:
                 # SPEC-11 US3 (T027): `None` means the requeue cap
                 # overflowed and the target was already marked `DEFERRED`
                 # + re-dispatched -- nothing to yield for this attempt.
+                # Siblings stay PENDING for the re-dispatched run.
+                continue
+            if isinstance(result, ScrapeResult):
+                # LOCKED_ALREADY_RUNNING skip for the fetcher: its
+                # siblings' matches are (very likely) not the locked one
+                # -- eject them to run standalone, exactly as they would
+                # have without dedup.
+                pending = target.sibling_targets + pending
+                target.sibling_targets = []
                 yield result
+                continue
+            # A real request was built: take each sibling's match lock now,
+            # before the fetch flies, mirroring `dispatch_admission`'s
+            # fetch-side lock. A sibling whose lock is already held (a
+            # concurrent run is scraping that match) is ejected to run
+            # standalone -- its own admission then reports
+            # LOCKED_ALREADY_RUNNING exactly as today.
+            if target.sibling_targets:
+                redis = get_redis_client()
+                kept: list[SpiderTarget] = []
+                for sibling in target.sibling_targets:
+                    lock = await acquire_lock(
+                        redis,
+                        workspace_id=self.workspace_id,
+                        match_id=sibling.match_id,
+                        mode=decision.plan.access_method,
+                        settings=get_settings(),
+                    )
+                    if lock is None:
+                        pending.insert(0, sibling)
+                        continue
+                    self._sibling_locks[sibling.match_id] = lock
+                    kept.append(sibling)
+                target.sibling_targets = kept
+            yield result
 
     async def _acquire_fetch_permission(
         self, target: SpiderTarget, access_method: AccessMethod
@@ -348,6 +417,43 @@ class GenericPriceSpider(scrapy.Spider):
             build_request=self._request_for,
             reuse_lock=reuse_lock,
         )
+
+    def _results_with_siblings(
+        self,
+        target: SpiderTarget,
+        url: str,
+        scraped_at: datetime,
+        **kwargs: Any,
+    ) -> list[ScrapeResult]:
+        """The fetcher's own `ScrapeResult` plus one clone per sibling
+        riding its shared fetch (2026-08-11 proxy-cost Fix 1) -- identical
+        outcome fields, each sibling's own identity via `_build_result`'s
+        target parameter, so the persistence pipeline writes the exact
+        per-match rows N standalone fetches would have written.
+
+        Lock mirroring: a sibling row carries its own held match lock
+        key/token exactly when the fetcher's row carries its own (a
+        terminal write -- pipeline releases all of them on the same
+        commit); when the fetcher's lock was withheld because a retry is
+        pending (Issue-3 `reuse_lock`), the siblings' locks are withheld
+        too and survive for the retry's fan-out.
+
+        A target with no siblings degrades to exactly the old single
+        `_build_result` call.
+        """
+        results = [self._build_result(target, url, scraped_at, **kwargs)]
+        fetcher_carries_lock = kwargs.get("match_lock_key") is not None
+        for sibling in target.sibling_targets:
+            sib_kwargs = dict(kwargs)
+            sib_kwargs.pop("match_lock_key", None)
+            sib_kwargs.pop("match_lock_token", None)
+            if fetcher_carries_lock:
+                lock = self._sibling_locks.pop(sibling.match_id, None)
+                if lock is not None:
+                    sib_kwargs["match_lock_key"] = lock.key
+                    sib_kwargs["match_lock_token"] = lock.token
+            results.append(self._build_result(sibling, url, scraped_at, **sib_kwargs))
+        return results
 
     def _request_for(
         self,
@@ -486,7 +592,7 @@ class GenericPriceSpider(scrapy.Spider):
 
         status_error_code = classify_http_status(response.status)
         if status_error_code is not None:
-            yield self._build_result(
+            for result in self._results_with_siblings(
                 target,
                 response.url,
                 now,
@@ -495,7 +601,8 @@ class GenericPriceSpider(scrapy.Spider):
                 error_code=status_error_code,
                 error_message=f"HTTP {response.status}",
                 **attempt_kwargs,
-            )
+            ):
+                yield result
             return
 
         # SPEC-12 US2 (contracts/consumption.md step 3, D6): a learned
@@ -516,7 +623,7 @@ class GenericPriceSpider(scrapy.Spider):
             # HTML for an availability marker and let it ride on the
             # PRICE_NOT_FOUND result (`stock_status` is a nullable column on
             # `price_observations`; `None` keeps the old NULL behaviour).
-            yield self._build_result(
+            for result in self._results_with_siblings(
                 target,
                 response.url,
                 now,
@@ -526,7 +633,8 @@ class GenericPriceSpider(scrapy.Spider):
                 error_message="no extraction strategy matched a price",
                 stock_status=_sniff_out_of_stock(response.text),
                 **attempt_kwargs,
-            )
+            ):
+                yield result
             return
 
         profile_confidence_rules = target.profile.confidence_rules if target.profile else None
@@ -535,7 +643,7 @@ class GenericPriceSpider(scrapy.Spider):
         outcome = validate_candidate(candidate, validation_rules, confidence_cfg)
 
         if isinstance(outcome, Rejected):
-            yield self._build_result(
+            for result in self._results_with_siblings(
                 target,
                 response.url,
                 now,
@@ -545,11 +653,12 @@ class GenericPriceSpider(scrapy.Spider):
                 error_message=outcome.message,
                 candidate_extras=candidate,
                 **attempt_kwargs,
-            )
+            ):
+                yield result
             return
 
         assert isinstance(outcome, Accepted)
-        yield self._build_result(
+        for result in self._results_with_siblings(
             target,
             response.url,
             now,
@@ -559,7 +668,8 @@ class GenericPriceSpider(scrapy.Spider):
             price=outcome.price,
             candidate_extras=candidate,
             **attempt_kwargs,
-        )
+        ):
+            yield result
 
     async def errback(self, failure: Any) -> Any:
         """Record the attempt that just failed, then retry or stop.
@@ -617,6 +727,17 @@ class GenericPriceSpider(scrapy.Spider):
         decision = await await_in_thread(
             _prepare_dispatch, target, next_attempt_number, self._visible_providers, self._provider_rows
         )
+        if decision.plan is not None and decision.plan.access_method is AccessMethod.PLAYWRIGHT_PROXY:
+            # 2026-08-11 proxy-cost Fix 2a: the ladder's terminal
+            # browser-fallback intent cannot be executed by this HTTP
+            # spider -- `dispatch_admission` would send it as one more
+            # plain HTTP download of the very page that just failed
+            # (measured Aug-10: a paid, byte-duplicate 4th attempt on
+            # every exhausted amazon target). Treat it as STOP: the
+            # failed attempt's own row below is the terminal outcome,
+            # exactly as if `allow_browser_fallback` were off. The
+            # browser spider (which *can* execute it) is unaffected.
+            decision = _DispatchDecision(plan=None, proxy=None)
         prior_lock_key = failure.request.meta.get("match_lock_key")
         prior_lock_token = failure.request.meta.get("match_lock_token")
         reuse_lock: LockGrant | None = None
@@ -627,7 +748,7 @@ class GenericPriceSpider(scrapy.Spider):
         if reuse_lock is not None:
             failed_attempt_kwargs["match_lock_key"] = None
             failed_attempt_kwargs["match_lock_token"] = None
-        yield self._build_result(
+        for result in self._results_with_siblings(
             target,
             failure.request.url,
             now,
@@ -636,7 +757,8 @@ class GenericPriceSpider(scrapy.Spider):
             error_code=failed_error_code,
             error_message=str(failure.value),
             **failed_attempt_kwargs,
-        )
+        ):
+            yield result
 
         if decision.plan is not None:
             result = await self._dispatch(
@@ -649,8 +771,15 @@ class GenericPriceSpider(scrapy.Spider):
                 # An inherited lock must be released here (its normal
                 # release path -- the retry's result row -- never
                 # happens), or the re-dispatched run would be locked out.
+                # Sibling locks are in the same boat: their release path
+                # is the retry's fan-out rows, which now never happen.
+                redis = get_redis_client()
                 if reuse_lock is not None:
-                    await release_lock(get_redis_client(), key=reuse_lock.key, token=reuse_lock.token)
+                    await release_lock(redis, key=reuse_lock.key, token=reuse_lock.token)
+                for sibling in target.sibling_targets:
+                    sib_lock = self._sibling_locks.pop(sibling.match_id, None)
+                    if sib_lock is not None:
+                        await release_lock(redis, key=sib_lock.key, token=sib_lock.token)
             else:
                 yield result
             return
@@ -678,7 +807,7 @@ class GenericPriceSpider(scrapy.Spider):
         # may still hold the match lock, whose TTL is shorter than the
         # requeue wait cap.
         defer = decision.skip_error_code is RATE_LIMITED
-        yield self._build_result(
+        for result in self._results_with_siblings(
             target,
             failure.request.url,
             now,
@@ -691,7 +820,8 @@ class GenericPriceSpider(scrapy.Spider):
             proxy_provider_id=(decision.attempted_proxy.provider_id if decision.attempted_proxy else None),
             proxy_country=(decision.attempted_proxy.country if decision.attempted_proxy else None),
             defer_target=defer,
-        )
+        ):
+            yield result
         if defer:
             await redispatch_job(self._admission_context(), target)
 

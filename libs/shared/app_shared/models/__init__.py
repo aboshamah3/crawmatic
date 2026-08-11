@@ -125,6 +125,11 @@ from app_shared.models.rollups import VariantPriceDailyRollup
 # `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 
+# 2026-08-11 proxy-cost Fix 4: fully-global curated per-domain scraping
+# playbook (no workspace column at all — operator-seeded reference data;
+# see the model's module docstring). Not workspace-owned, no RLS.
+from app_shared.models.domain_playbooks import DomainPlaybook
+
 __all__ = [
     "Base",
     "metadata",
@@ -164,4 +169,5 @@ __all__ = [
     "VariantPriceDailyRollup",
     "WebhookEndpoint",
     "WebhookEvent",
+    "DomainPlaybook",
 ]

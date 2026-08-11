@@ -35,7 +35,9 @@ def test_alembic_heads_reports_exactly_one_head_after_webhooks_migration() -> No
 
     head_lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(head_lines) == 1, f"expected exactly one head, got: {head_lines!r}"
-    assert "03dec3037c8f" in head_lines[0]
+    # 2026-08-11: domain_playbooks (proxy-cost Fix 4) extended the linear
+    # chain past the webhooks migration -- the single head moved with it.
+    assert "b7d02a41c9e3" in head_lines[0]
     assert "(head)" in head_lines[0]
 
 

@@ -80,6 +80,7 @@ from app_shared.enums import (
     RobotsPolicy,
     ScrapeErrorCode,
     ScrapeTargetStatus,
+    VariantStrategy,
 )
 from app_shared.jobs.targets import mark_target
 from app_shared.limiter.limits import resolve_limits
@@ -209,6 +210,16 @@ class SpiderTarget:
     # `variant_selector_config` off-reactor, or `None` when resolution
     # succeeded (or there was nothing to resolve).
     variant_config_error: str | None = None
+    # 2026-08-11 proxy-cost Fix 1 (`SCRAPE_URL_DEDUP`): sibling targets
+    # whose fetch this target performs on their behalf -- same competitor,
+    # byte-identical URL, identical resolved profile + access policy, so
+    # one response is valid for all of them. Populated only by
+    # `group_targets_for_dedup`; siblings never dispatch their own
+    # request -- the spider clones every result it emits for this target
+    # onto each sibling (per-match observation/attempt/target rows stay
+    # 1:1, only the fetch count changes). Defaults empty so every
+    # existing constructor call site keeps working unchanged.
+    sibling_targets: list["SpiderTarget"] = field(default_factory=list)
 
 
 @dataclass
@@ -732,6 +743,70 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
             provider_rows=provider_rows_by_id,
             provider_passwords=provider_passwords,
         )
+
+
+# --- 2026-08-11 proxy-cost Fix 1: same-URL fetch dedup ----------------------
+
+
+def _dedup_group_key(target: SpiderTarget) -> tuple | None:
+    """The fetch-identity key for `group_targets_for_dedup`, or ``None``
+    when this target must never share a fetch.
+
+    Two targets may share one fetch only when the *request that would be
+    built for them is byte-identical* and the *interpretation of the
+    response is match-independent*:
+
+    - same competitor + same exact URL (the request line);
+    - same resolved profile row (extraction/validation/confidence all
+      come from it) and same resolved access policy row (transport
+      ladder, proxy, timeouts);
+    - the profile is not variant-aware: extraction today is page-level
+      (`variant_strategy` is stored but consumed nowhere in scrape-core),
+      but a profile that declares a non-default strategy or carries a
+      `variant_selector_config` (per-match `value_from` resolution,
+      SPEC-14) could legally produce *different* values per match from
+      one page -- those targets are excluded so a future variant-aware
+      extractor can never be silently fed a shared fetch.
+    """
+    profile = target.profile
+    if profile is not None and profile.variant_strategy is not VariantStrategy.PAGE_SINGLE_PRICE:
+        return None
+    if target.variant_selector_config is not None or target.variant_config_error is not None:
+        return None
+    return (
+        target.competitor_id,
+        target.url,
+        profile.id if profile is not None else None,
+        target.access_policy.id if target.access_policy is not None else None,
+    )
+
+
+def group_targets_for_dedup(targets: list[SpiderTarget]) -> list[SpiderTarget]:
+    """Fold same-fetch targets onto one fetcher each (`SCRAPE_URL_DEDUP`).
+
+    Returns the fetcher list: the first target of every group, with the
+    rest of its group attached as ``sibling_targets``; ungroupable
+    targets (see `_dedup_group_key`) pass through untouched, alone.
+    Order-preserving and pure -- no I/O, safe on any thread. The caller
+    (the HTTP spider's ``start()``) is responsible for cloning every
+    result it emits for a fetcher onto each sibling so per-match
+    persistence stays exactly 1:1 (measured Aug-10 duplicate fetch
+    ratios: amazon 2.5x, stech 2.4x -- PLAN_PROXY_COST_REDUCTION.md).
+    """
+    fetchers: list[SpiderTarget] = []
+    by_key: dict[tuple, SpiderTarget] = {}
+    for target in targets:
+        key = _dedup_group_key(target)
+        if key is None:
+            fetchers.append(target)
+            continue
+        fetcher = by_key.get(key)
+        if fetcher is None:
+            by_key[key] = target
+            fetchers.append(target)
+        else:
+            fetcher.sibling_targets.append(target)
+    return fetchers
 
 
 # --- SPEC-10 US2: per-attempt dispatch decision (blocking; run_in_thread only) --

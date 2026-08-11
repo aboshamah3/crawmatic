@@ -244,6 +244,18 @@ class Settings(BaseSettings):
     RATE_LIMIT_JITTER_MIN_SECONDS: int = 2
     RATE_LIMIT_JITTER_MAX_SECONDS: int = 20
 
+    # --- Same-URL fetch dedup (2026-08-11 proxy-cost reduction, Fix 1) ---
+    # When enabled, the HTTP spider folds same-job targets that resolve to
+    # the identical (competitor, exact URL, profile, policy) fetch into one
+    # request and fans the fetched result out to every sibling match --
+    # measured Aug-10: amazon fetched 2,716 times for 1,097 distinct URLs.
+    # Off by default: flipped per-environment after the A/B verification
+    # run (PLAN_PROXY_COST_REDUCTION.md). Grouping is refused for targets
+    # whose profile is variant-aware (non-PAGE_SINGLE_PRICE or a
+    # variant_selector_config) -- see `group_targets_for_dedup` in the
+    # scraper-side targets module.
+    SCRAPE_URL_DEDUP: bool = False
+
     # --- Domain strategy optimizer tuning (SPEC-12, data-model §7 /
     # research D11, Principle IV — env-tunable, never a hardcoded
     # literal). Promotion/rediscovery/discovery thresholds are global

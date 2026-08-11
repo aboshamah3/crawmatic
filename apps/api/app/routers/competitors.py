@@ -21,8 +21,12 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 
+from sqlalchemy import select
+
 from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
 from app_shared.models.competitors_matches import Competitor
+from app_shared.models.domain_playbooks import DomainPlaybook
+from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.profiles.repository import assert_profile_assignable
 from app_shared.repository import scoped_get, scoped_select
@@ -85,6 +89,26 @@ def create_competitor(
         session, principal.workspace_id, payload.default_scrape_profile_id
     )
 
+    # 2026-08-11 proxy-cost Fix 4 (PLAN_PROXY_COST_REDUCTION.md): a new
+    # competitor for a domain in the curated global playbook inherits the
+    # playbook's GLOBAL extraction profile when the caller didn't choose
+    # one — every workspace extracts a well-known domain identically,
+    # with zero discovery cost. A caller-supplied profile id always wins;
+    # an unknown domain (or a playbook row naming a missing global
+    # profile) changes nothing.
+    default_scrape_profile_id = payload.default_scrape_profile_id
+    if default_scrape_profile_id is None:
+        playbook_profile_id = session.execute(
+            select(ScrapeProfile.id)
+            .join(DomainPlaybook, DomainPlaybook.scrape_profile_name == ScrapeProfile.name)
+            .where(
+                DomainPlaybook.domain == payload.domain,
+                ScrapeProfile.workspace_id.is_(None),
+            )
+        ).scalar_one_or_none()
+        if playbook_profile_id is not None:
+            default_scrape_profile_id = playbook_profile_id
+
     competitor = Competitor(
         workspace_id=principal.workspace_id,
         name=payload.name,
@@ -92,7 +116,7 @@ def create_competitor(
         status=payload.status,
         legal_status=payload.legal_status,
         robots_policy=payload.robots_policy,
-        default_scrape_profile_id=payload.default_scrape_profile_id,
+        default_scrape_profile_id=default_scrape_profile_id,
         default_access_policy_id=payload.default_access_policy_id,
         max_concurrent_requests=payload.max_concurrent_requests,
         max_requests_per_minute=payload.max_requests_per_minute,
