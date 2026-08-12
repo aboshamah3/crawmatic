@@ -33,23 +33,41 @@ that never touches the health fields on re-push.
 -> `422 WORKSPACE_MISMATCH`; a dangling id -> `404 NOT_FOUND`. The bulk
 path collects the batch's distinct `scrape_profile_id`s and runs **one**
 `profile_visibility_map` lookup, never one query per row.
+
+User-supplied competitor URLs (PLAN §7.4) are a cost surface, not just a
+safety one. A domain with no `DomainAccessRule` inherits the workspace
+default policy, which is direct-HTTP — a customer therefore cannot make
+us spend residential-proxy budget on an arbitrary host simply by pasting
+its URL. A domain only becomes proxy-eligible when an operator
+classifies it. Both `POST /v1/matches` (`_check_protected_link_cap`) and
+`POST /v1/matches/bulk-upsert` (`_bulk_protected_cap_check`) enforce this
+at the product level: `app.limits.MAX_PROTECTED_LINKS_PER_PRODUCT` caps
+how many of a product's matches may resolve to a proxy/browser-capable
+`AccessPolicy` (`strategy != DIRECT_ONLY`), keeping the worst-case
+per-product scrape cost bounded regardless of which endpoint a plugin
+uses. "Protected" is decided by reusing the existing
+`app.services.access_resolution.resolve_access_policies_for_matches`
+resolver (SPEC-10) — never a second, independently-drifting classifier.
 """
 
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app_shared.access.repository import visible_policies_select
+from app_shared.access.resolution import ResolvedPolicy
 from app_shared.catalog.consistency import (
     CrossWorkspaceReference,
     MissingReference,
     assert_refs_in_workspace,
 )
-from app_shared.enums import MatchStatus
+from app_shared.enums import AccessStrategy, MatchStatus
 from app_shared.matches.upsert import (
     build_matches_upsert,
     dedup_last_wins,
@@ -59,6 +77,7 @@ from app_shared.matches.upsert import (
     variant_lookup_keys,
 )
 from app_shared.messaging import enqueue
+from app_shared.models.access import AccessPolicy
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
@@ -69,6 +88,7 @@ from app_shared.url_pattern import derive_match_url_fields
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
 from app.deps import Principal, require_scopes
+from app.limits import MAX_PROTECTED_LINKS_PER_PRODUCT, enforce_batch_cap
 from app.schemas.matches import (
     DeleteOutcome,
     MatchBulkUpsertRequest,
@@ -78,6 +98,7 @@ from app.schemas.matches import (
     MatchResponse,
     MatchUpdate,
 )
+from app.services.access_resolution import resolve_access_policies_for_matches
 
 router = APIRouter(prefix="/v1/matches", tags=["matches"])
 
@@ -109,6 +130,138 @@ def _duplicate_match(message: str) -> HTTPException:
     return HTTPException(
         status_code=409, detail={"error": {"code": "DUPLICATE_MATCH", "message": message}}
     )
+
+
+def _protected_link_cap_reached() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "code": "PROTECTED_LINK_CAP_REACHED",
+                "message": (
+                    "This product may have at most "
+                    f"{MAX_PROTECTED_LINKS_PER_PRODUCT} matches whose access "
+                    "policy is proxy/browser-capable. Contact support to "
+                    "raise the limit, or point this match at a domain with a "
+                    "direct-HTTP access policy."
+                ),
+            }
+        },
+    )
+
+
+# --- protected-link cap (PLAN §7.4) -----------------------------------------
+
+
+@dataclass(frozen=True)
+class _ResolutionStub:
+    """Not-yet-persisted match, shaped for
+    `resolve_access_policies_for_matches` (`.id`/`.competitor_id`/
+    `.url_pattern`/`.competitor_url`) -- lets the about-to-be-created
+    match be resolved in the same batch as the product's existing
+    matches without an early `session.add()`/`flush()`."""
+
+    id: uuid.UUID
+    competitor_id: uuid.UUID
+    url_pattern: str | None
+    competitor_url: str
+
+
+def _strategy_is_protected(strategy: AccessStrategy) -> bool:
+    """A resolved `AccessPolicy` is proxy/browser-capable iff its
+    `strategy` is anything other than `DIRECT_ONLY` (`contracts/
+    access-engine.md`: `DIRECT_ONLY` never proxies, every other strategy
+    reaches `PROXY_HTTP`/`PLAYWRIGHT_PROXY` at some attempt)."""
+    return strategy != AccessStrategy.DIRECT_ONLY
+
+
+def _resolve_protected_status(
+    session: Session, workspace_id: uuid.UUID, matches: list[object]
+) -> dict[uuid.UUID, bool]:
+    """`{match.id: is_protected}` for `matches`, reusing the existing
+    SPEC-10 resolver (`app.services.access_resolution`) -- never a
+    second, independently-drifting URL/domain classifier.
+
+    `redis=None`: this check runs at match-creation time (low
+    frequency, a small bounded per-product match set), so skipping the
+    Redis resolution cache here is a deliberate simplification, not a
+    correctness gap -- `resolve_access_policies_for_matches`'s cache
+    helpers already fail open on any cache error (including a `None`
+    client), always falling back to a fresh DB-backed resolve.
+    """
+    if not matches:
+        return {}
+
+    resolved = resolve_access_policies_for_matches(session, None, workspace_id, matches)
+
+    policy_ids = {
+        result.policy_id for result in resolved.values() if isinstance(result, ResolvedPolicy)
+    }
+    protected_policy_ids: set[uuid.UUID] = set()
+    if policy_ids:
+        policies = (
+            session.execute(visible_policies_select(workspace_id).where(AccessPolicy.id.in_(policy_ids)))
+            .scalars()
+            .all()
+        )
+        protected_policy_ids = {
+            policy.id for policy in policies if _strategy_is_protected(policy.strategy)
+        }
+
+    return {
+        match_id: isinstance(result, ResolvedPolicy) and result.policy_id in protected_policy_ids
+        for match_id, result in resolved.items()
+    }
+
+
+def _protected_cap_exceeded(
+    existing_protected_count: int, new_match_is_protected: bool, max_protected: int
+) -> bool:
+    """Pure decision logic for the per-product protected-link cap
+    (PLAN §7.4). A match on a non-protected (direct-HTTP) domain is
+    never blocked by this rule, regardless of how many protected
+    matches the product already has."""
+    return new_match_is_protected and existing_protected_count >= max_protected
+
+
+def _check_protected_link_cap(
+    session: Session,
+    workspace_id: uuid.UUID,
+    *,
+    product_id: uuid.UUID,
+    competitor_id: uuid.UUID,
+    url_pattern: str | None,
+    competitor_url: str,
+) -> None:
+    existing_matches = (
+        session.execute(
+            scoped_select(CompetitorProductMatch, workspace_id).where(
+                CompetitorProductMatch.product_id == product_id
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    pending = _ResolutionStub(
+        id=uuid.uuid4(),
+        competitor_id=competitor_id,
+        url_pattern=url_pattern,
+        competitor_url=competitor_url,
+    )
+    protected_by_id = _resolve_protected_status(
+        session, workspace_id, [*existing_matches, pending]
+    )
+
+    existing_protected_count = sum(
+        1 for match in existing_matches if protected_by_id.get(match.id, False)
+    )
+    new_match_is_protected = protected_by_id.get(pending.id, False)
+
+    if _protected_cap_exceeded(
+        existing_protected_count, new_match_is_protected, MAX_PROTECTED_LINKS_PER_PRODUCT
+    ):
+        raise _protected_link_cap_reached()
 
 
 def _enqueue_price_analysis_recompute(
@@ -264,6 +417,14 @@ def create_match(
     variant = _resolve_variant(session, ws, payload)
     _resolve_competitor(session, ws, payload.competitor_id)
     _check_scrape_profile_assignable(session, ws, payload.scrape_profile_id)
+    _check_protected_link_cap(
+        session,
+        ws,
+        product_id=variant.product_id,
+        competitor_id=payload.competitor_id,
+        url_pattern=url_pattern,
+        competitor_url=payload.competitor_url,
+    )
 
     match = CompetitorProductMatch(
         workspace_id=ws,
@@ -296,6 +457,82 @@ def create_match(
         ) from exc
 
     return MatchResponse.model_validate(match)
+
+
+def _protected_link_cap_reached_bulk(product_id: uuid.UUID) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "code": "PROTECTED_LINK_CAP_REACHED",
+                "message": (
+                    f"Product {product_id} would exceed the limit of "
+                    f"{MAX_PROTECTED_LINKS_PER_PRODUCT} matches whose access "
+                    "policy is proxy/browser-capable. Contact support to "
+                    "raise the limit, or point these matches at a domain "
+                    "with a direct-HTTP access policy."
+                ),
+            }
+        },
+    )
+
+
+def _bulk_protected_cap_check(
+    session: Session, workspace_id: uuid.UUID, rows: list[dict]
+) -> None:
+    """`POST /v1/matches/bulk-upsert`'s own protected-link cap gate
+    (PLAN §7.4, final-review finding I3). `create_match` calls
+    `_check_protected_link_cap`; the bulk path used to call only
+    `enforce_batch_cap`, so a customer could push an unbounded number of
+    proxy-eligible matches for one product in a single request and never
+    touch `MAX_PROTECTED_LINKS_PER_PRODUCT` -- the bulk path is the one a
+    plugin actually uses.
+
+    Groups the post-resolution `rows` (each already carrying
+    `product_id`/`competitor_id`/`competitor_url`/`url_pattern` from
+    `resolve_match_variants`) by `product_id`, and for each distinct
+    product resolves `existing_matches ∪ pending_rows`'s protected
+    status via the SAME `_resolve_protected_status` helper
+    `_check_protected_link_cap` uses -- never a second,
+    independently-drifting classifier -- one resolver call per product,
+    not per row. Raises `422 PROTECTED_LINK_CAP_REACHED` naming the
+    first offending product if any product's post-upsert protected
+    count would exceed the cap.
+    """
+    by_product: dict[uuid.UUID, list[dict]] = {}
+    for row in rows:
+        by_product.setdefault(row["product_id"], []).append(row)
+
+    for product_id, product_rows in by_product.items():
+        existing_matches = (
+            session.execute(
+                scoped_select(CompetitorProductMatch, workspace_id).where(
+                    CompetitorProductMatch.product_id == product_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pending = [
+            _ResolutionStub(
+                id=uuid.uuid4(),
+                competitor_id=row["competitor_id"],
+                url_pattern=row.get("url_pattern"),
+                competitor_url=row["competitor_url"],
+            )
+            for row in product_rows
+        ]
+        protected_by_id = _resolve_protected_status(
+            session, workspace_id, [*existing_matches, *pending]
+        )
+        existing_protected_count = sum(
+            1 for match in existing_matches if protected_by_id.get(match.id, False)
+        )
+        new_protected_count = sum(
+            1 for stub in pending if protected_by_id.get(stub.id, False)
+        )
+        if existing_protected_count + new_protected_count > MAX_PROTECTED_LINKS_PER_PRODUCT:
+            raise _protected_link_cap_reached_bulk(product_id)
 
 
 # --- bulk-upsert (US3, contracts/matches-bulk-upsert.md) --------------------
@@ -364,6 +601,7 @@ def bulk_upsert_matches(
     `IN (...)` lookup + `assert_refs_in_workspace`) ->
     `build_matches_upsert` executed once. Never a per-row loop.
     """
+    enforce_batch_cap(payload.matches, what="matches")
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
     ws = principal.workspace_id
@@ -417,6 +655,8 @@ def bulk_upsert_matches(
     _check_scrape_profile_ids_assignable_bulk(
         session, ws, {row.get("scrape_profile_id") for row in resolved}
     )
+
+    _bulk_protected_cap_check(session, ws, resolved)
 
     final_rows = [
         {

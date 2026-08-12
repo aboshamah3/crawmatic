@@ -21,6 +21,13 @@ from app_shared.jobs.service import create_match_job, create_variant_job
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+from app_shared.pagination import (
+    InvalidCursor,
+    clamp_limit,
+    decode_cursor,
+    keyset_predicate,
+    paginate,
+)
 from app_shared.repository import scoped_get, scoped_select
 
 from app.deps import Principal, require_scopes
@@ -93,6 +100,8 @@ def get_job(
 @router.get("/{job_id}/results", response_model=JobResultsResponse)
 def get_job_results(
     job_id: uuid.UUID,
+    limit: int | None = None,
+    cursor: str | None = None,
     principal_ctx: tuple = Depends(require_scopes("jobs:read")),
 ) -> JobResultsResponse:
     session, principal = principal_ctx
@@ -103,14 +112,23 @@ def get_job_results(
     if job is None:
         raise _not_found("Job not found.")
 
-    targets = (
-        session.execute(
-            scoped_select(ScrapeJobTarget, ws).where(ScrapeJobTarget.scrape_job_id == job.id)
-        )
-        .scalars()
-        .all()
-    )
+    page_limit = clamp_limit(limit)
+    stmt = scoped_select(ScrapeJobTarget, ws).where(ScrapeJobTarget.scrape_job_id == job.id)
+    if cursor is not None:
+        try:
+            after = decode_cursor(cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+        stmt = stmt.where(keyset_predicate(ScrapeJobTarget, after))
+    stmt = stmt.order_by(ScrapeJobTarget.created_at, ScrapeJobTarget.id).limit(page_limit + 1)
+
+    targets = session.execute(stmt).scalars().all()
+    envelope = paginate(targets, page_limit)
 
     return JobResultsResponse(
-        items=[JobTargetResponse.model_validate(target) for target in targets]
+        items=[JobTargetResponse.model_validate(target) for target in envelope["items"]],
+        next_cursor=envelope["next_cursor"],
     )

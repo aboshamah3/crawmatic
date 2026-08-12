@@ -25,6 +25,8 @@ from typing import Any, Callable, TypeVar
 from twisted.internet.defer import Deferred
 from twisted.internet.threads import deferToThread
 
+from scrape_core.reactor import AsyncioSafeDeferred
+
 from app_shared.database import get_session, set_workspace_context
 from sqlalchemy.orm import Session
 
@@ -42,8 +44,13 @@ def run_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Deferr
     ``Deferred`` that fires with ``fn``'s return value (or its
     exception, wrapped in a ``Failure``); never blocks the calling
     (reactor) thread itself.
+
+    Returned as an :class:`~scrape_core.reactor.AsyncioSafeDeferred` so
+    ``await run_in_thread(...)`` also works from coroutines driven as
+    asyncio tasks (Scrapy >= 2.13 spider coroutines) — the callback API
+    for synchronous callers is unchanged.
     """
-    return deferToThread(fn, *args, **kwargs)
+    return AsyncioSafeDeferred.from_deferred(deferToThread(fn, *args, **kwargs))
 
 
 def as_awaitable(d: Deferred) -> Any:

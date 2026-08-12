@@ -1,7 +1,7 @@
 """domain_playbooks_table
 
 Revision ID: b7d02a41c9e3
-Revises: 03dec3037c8f
+Revises: 5b9a86717a66
 Create Date: 2026-08-11 00:00:00.000000
 
 2026-08-11 proxy-cost Fix 4 (PLAN_PROXY_COST_REDUCTION.md): the curated
@@ -23,7 +23,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "b7d02a41c9e3"
-down_revision: Union[str, Sequence[str], None] = "03dec3037c8f"
+down_revision: Union[str, Sequence[str], None] = "5b9a86717a66"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

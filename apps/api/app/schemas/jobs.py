@@ -90,3 +90,4 @@ class JobResultsResponse(BaseModel):
     """`GET /v1/jobs/{job_id}/results` response envelope."""
 
     items: list[JobTargetResponse]
+    next_cursor: str | None = None

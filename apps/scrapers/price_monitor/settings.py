@@ -76,15 +76,18 @@ DEFAULT_REQUEST_HEADERS = {
 }
 
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
-# Scrapyd's daemon process installs the classic epoll reactor before
-# spawning each crawl subprocess, and a Twisted reactor can never be
-# swapped once installed. Scrapy's own default_settings.py requests the
-# asyncio reactor unconditionally (even with no project-level override),
-# which crashed every crawl with "The installed reactor ... does not
-# match the requested one" before it could send a single request — so
-# this must explicitly match Scrapyd's already-installed reactor, not
-# simply omit the setting.
-TWISTED_REACTOR = "twisted.internet.epollreactor.EPollReactor"
+# 2026-08-11: the scrapy 2.16 configuration (commit 25608c0) supersedes the
+# earlier EPollReactor pin -- `scrape_core.reactor`'s lazy import +
+# AsyncioSafeDeferred make the asyncio reactor the working combination, and
+# this is what production has been running since. Do not revert to
+# EPollReactor: import-time reactor install broke every crawl on scrapy 2.16.
+TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+# Scrapy >= 2.13 defaults `scrapy crawl` to AsyncCrawlerProcess, which runs
+# spider coroutines on asyncio where awaiting a raw Twisted Deferred is a
+# "Task got bad yield" error. This project's coroutines await Deferreds
+# natively (scrape_core.reactor.deferred_delay, the SPEC-10 seam), which is
+# only legal under the classic Twisted-managed CrawlerProcess.
+FORCE_CRAWLER_PROCESS = True
 FEED_EXPORT_ENCODING = "utf-8"
 
 ITEM_PIPELINES = {

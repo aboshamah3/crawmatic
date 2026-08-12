@@ -93,14 +93,25 @@ the existing `webhooks:read` scope (no new scope). `/v1/webhook-endpoints*`
 CRUD (US2) lands in the same router module in a later phase. Never imports
 `apps/workers` — the `create_webhook_event` task that populates this table
 is enqueued by name elsewhere.
+
+PLAN §7.1 adds the `/v1/admin` router (`docs/superpowers/plans/
+2026-08-10-phase2-engine.md`) — SaaS control-plane workspace
+provisioning, archive, and the usage export. It is guarded by the static
+`SAAS_SERVICE_TOKEN` seam in `app.service_auth`, not the workspace seam
+in `app.deps`, and is excluded from the public OpenAPI spec.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.openapi.docs import get_swagger_ui_html
 
+from app.error_envelope import register_error_handlers
+from app.openapi_public import build_public_openapi
+from app.rate_limit import RateLimitMiddleware
 from app.routers import (
     access_policies,
+    admin,
     alerts,
     api_keys,
     auth,
@@ -118,7 +129,11 @@ from app.routers import (
     webhooks,
 )
 
-app = FastAPI(title="crawmatic-api")
+app = FastAPI(title="crawmatic-api", openapi_url=None, docs_url=None, redoc_url=None)
+
+register_error_handlers(app)
+
+app.add_middleware(RateLimitMiddleware)
 
 app.include_router(auth.router)
 app.include_router(api_keys.router)
@@ -136,9 +151,24 @@ app.include_router(domain_access_rules.router)
 app.include_router(strategy.router)
 app.include_router(refresh_rules.router)
 app.include_router(webhooks.router)
+app.include_router(admin.router)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe. Returns 200 whenever the process is serving."""
     return {"status": "ok"}
+
+
+@app.get("/openapi-public.json", include_in_schema=False)
+def public_openapi() -> dict:
+    """The customer-facing spec — internal routers excluded (PLAN §7.4)."""
+    return build_public_openapi(app)
+
+
+@app.get("/docs", include_in_schema=False)
+def public_docs():
+    """Swagger UI over the PUBLIC spec only — the default `/docs` (which
+    would have rendered the full, internal-route-including spec) is
+    disabled via `docs_url=None` above."""
+    return get_swagger_ui_html(openapi_url="/openapi-public.json", title="Crawmatic API")

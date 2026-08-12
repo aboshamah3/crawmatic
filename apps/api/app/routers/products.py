@@ -26,6 +26,7 @@ from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, key
 from app_shared.repository import scoped_get, scoped_select
 
 from app.deps import Principal, require_scopes
+from app.limits import enforce_batch_cap
 from app.schemas.catalog import (
     DeleteOutcome,
     ProductBulkUpsertRequest,
@@ -173,6 +174,7 @@ def bulk_upsert_products(
     least one of those two fields on every product they intend to keep
     in sync (see ``app.schemas.catalog.ProductBulkUpsertItem``).
     """
+    enforce_batch_cap(payload.products, what="products")
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
     ws = principal.workspace_id

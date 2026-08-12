@@ -12,16 +12,26 @@ them as the second isolation layer (FR-002/FR-015), same discipline as
 (`contracts/assignment-enforcement.md`, SPEC-06 US2 T032): visible
 (own-workspace or global) or `None` -> OK; a cross-workspace reference
 -> `422 WORKSPACE_MISMATCH`; a dangling id -> `404 NOT_FOUND`.
+
+`POST /v1/competitors` also enforces `app.limits.MAX_DOMAINS_PER_WORKSPACE`
+(PLAN §7.4, task-9-brief.md): a workspace may register at most that many
+DISTINCT domains -- a cost control, since every registered domain is a
+future scrape target. The check counts DISTINCT domains with a bounded,
+SQL-side `DISTINCT` projection of just the `domain` column (never a
+Python scan of every `Competitor` row); re-registering a domain the
+workspace already has is never blocked by this rule (only *new* domains
+count against the cap) -- that case is still guarded by the pre-existing
+`unique(workspace_id, domain)` -> `409 DUPLICATE_DOMAIN` path below.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.exc import IntegrityError
-
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
 from app_shared.models.competitors_matches import Competitor
@@ -32,6 +42,7 @@ from app_shared.profiles.repository import assert_profile_assignable
 from app_shared.repository import scoped_get, scoped_select
 
 from app.deps import Principal, require_scopes
+from app.limits import MAX_DOMAINS_PER_WORKSPACE
 from app.schemas.competitors import (
     CompetitorCreate,
     CompetitorListResponse,
@@ -62,6 +73,34 @@ def _workspace_mismatch(message: str) -> HTTPException:
     )
 
 
+def _domain_limit_reached() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "code": "DOMAIN_LIMIT_REACHED",
+                "message": (
+                    f"This workspace may track at most {MAX_DOMAINS_PER_WORKSPACE} "
+                    "competitor domains. Contact support to raise the limit."
+                ),
+            }
+        },
+    )
+
+
+def _domain_limit_exceeded(
+    existing_domains: Sequence[str], new_domain: str, max_domains: int
+) -> bool:
+    """Pure decision logic for the per-workspace domain cap (PLAN §7.4).
+
+    A domain the workspace already has never counts against the cap
+    (re-registration is a no-op for this rule, guarded separately by the
+    `unique(workspace_id, domain)` constraint) -- only a genuinely *new*
+    domain can push the workspace over `max_domains`.
+    """
+    return new_domain not in existing_domains and len(existing_domains) >= max_domains
+
+
 def _check_scrape_profile_assignable(
     session: object, workspace_id: uuid.UUID, profile_id: uuid.UUID | None
 ) -> None:
@@ -88,6 +127,19 @@ def create_competitor(
     _check_scrape_profile_assignable(
         session, principal.workspace_id, payload.default_scrape_profile_id
     )
+
+    # Bounded, SQL-side DISTINCT projection of just `domain` -- never a
+    # Python scan of every Competitor row (PLAN §7.4). Checked BEFORE the
+    # playbook lookup below: a workspace over its domain cap is rejected
+    # outright, so there is no point resolving a profile for it.
+    existing_domain_rows = session.execute(
+        select(Competitor.domain)
+        .where(Competitor.workspace_id == principal.workspace_id)
+        .distinct()
+    ).all()
+    existing_domains = [row[0] for row in existing_domain_rows]
+    if _domain_limit_exceeded(existing_domains, payload.domain, MAX_DOMAINS_PER_WORKSPACE):
+        raise _domain_limit_reached()
 
     # 2026-08-11 proxy-cost Fix 4 (PLAN_PROXY_COST_REDUCTION.md): a new
     # competitor for a domain in the curated global playbook inherits the

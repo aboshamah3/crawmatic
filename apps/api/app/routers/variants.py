@@ -39,6 +39,7 @@ from app_shared.repository import scoped_get, scoped_select
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 
 from app.deps import Principal, require_scopes
+from app.limits import enforce_batch_cap
 from app.schemas.alerts import (
     CompetitorPriceListResponse,
     CompetitorPriceResponse,
@@ -635,6 +636,7 @@ def bulk_upsert_variants(
     parent reference is rejected (422) via the workspace-consistency
     pre-check (FR-009) before any upsert statement runs.
     """
+    enforce_batch_cap(payload.variants, what="variants")
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
     ws = principal.workspace_id

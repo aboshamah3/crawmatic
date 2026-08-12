@@ -19,6 +19,13 @@ from sqlalchemy import update
 
 from app_shared.enums import ApiKeyStatus, UserRole
 from app_shared.models import ApiKey
+from app_shared.pagination import (
+    InvalidCursor,
+    clamp_limit,
+    decode_cursor,
+    keyset_predicate,
+    paginate,
+)
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.api_keys import generate_api_key
 from app_shared.security.scopes import validate_scopes
@@ -58,6 +65,7 @@ class ApiKeyListItem(BaseModel):
 
 class ApiKeyListResponse(BaseModel):
     items: list[ApiKeyListItem]
+    next_cursor: str | None = None
 
 
 @router.post("", response_model=CreateApiKeyResponse, status_code=201)
@@ -100,12 +108,28 @@ def create_api_key(
 
 @router.get("", response_model=ApiKeyListResponse)
 def list_api_keys(
+    limit: int | None = None,
+    cursor: str | None = None,
     principal_ctx: tuple = Depends(require_role(*_MANAGER_ROLES)),
 ) -> ApiKeyListResponse:
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
 
-    rows = session.execute(scoped_select(ApiKey, principal.workspace_id)).scalars().all()
+    page_limit = clamp_limit(limit)
+    stmt = scoped_select(ApiKey, principal.workspace_id)
+    if cursor is not None:
+        try:
+            after = decode_cursor(cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+        stmt = stmt.where(keyset_predicate(ApiKey, after))
+    stmt = stmt.order_by(ApiKey.created_at, ApiKey.id).limit(page_limit + 1)
+
+    rows = session.execute(stmt).scalars().all()
+    envelope = paginate(rows, page_limit)
     items = [
         ApiKeyListItem(
             id=row.id,
@@ -117,9 +141,9 @@ def list_api_keys(
             created_at=row.created_at,
             revoked_at=row.revoked_at,
         )
-        for row in rows
+        for row in envelope["items"]
     ]
-    return ApiKeyListResponse(items=items)
+    return ApiKeyListResponse(items=items, next_cursor=envelope["next_cursor"])
 
 
 @router.delete("/{api_key_id}", status_code=204)

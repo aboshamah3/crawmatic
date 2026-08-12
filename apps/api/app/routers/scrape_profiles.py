@@ -35,6 +35,7 @@ from app_shared.profiles.upsert import build_profiles_upsert, prepare_profiles
 from app_shared.profiles.validation import ProfileValidationError, validate_profile
 
 from app.deps import Principal, require_scopes
+from app.limits import enforce_batch_cap
 from app.schemas.scrape_profiles import (
     DeleteOutcome,
     ScrapeProfileBulkUpsertRequest,
@@ -236,6 +237,7 @@ def bulk_upsert_scrape_profiles(
     reject-and-report + last-wins dedup) -> `build_profiles_upsert`
     executed once under the caller's workspace context. Tenant-only —
     never writes a global row."""
+    enforce_batch_cap(payload.profiles, what="scrape profiles")
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
     ws = principal.workspace_id

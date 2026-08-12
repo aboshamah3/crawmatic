@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_TTL_SECONDS: int = 900
     REFRESH_TOKEN_TTL_SECONDS: int = 2592000
 
+    # --- SaaS control-plane service auth (PLAN §7.1) ---
+    # Static bearer token the SaaS control plane presents to
+    # `/v1/admin/*`. Machine analog of SUPER_ADMIN: it resolves no
+    # workspace context and is compared in constant time. Optional so an
+    # engine deployment that hosts no SaaS control plane still boots —
+    # when unset, every admin request is refused (fail-closed).
+    SAAS_SERVICE_TOKEN: str | None = None
+
     # --- Status cache (SPEC-03 FR-022) ---
     STATUS_CACHE_TTL_SECONDS: int = 30
 
@@ -322,6 +330,15 @@ class Settings(BaseSettings):
     DAILY_ROLLUP_INTERVAL_SECONDS: int = 86400
     RETENTION_INTERVAL_SECONDS: int = 86400
     PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 1
+
+    # --- Public API rate limits (PLAN §7.4, risk P5) ---
+    # Per-credential fixed-window budgets. Reads are cheap and get the
+    # generous budget; writes touch the catalog and get a tenth of it.
+    # Tunable per deployment because a plugin doing a bulk catalog sync
+    # has a legitimately different shape from a dashboard.
+    API_RATE_LIMIT_ENABLED: bool = True
+    API_RATE_LIMIT_READ_PER_MINUTE: int = 60
+    API_RATE_LIMIT_WRITE_PER_MINUTE: int = 10
 
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod

@@ -165,11 +165,29 @@ def get_auth_session() -> Iterator[Session]:
     (configuration) cause. Raising here instead surfaces the
     misconfiguration immediately and loudly, via :func:`get_auth_engine`.
 
-    Scope: this session is for credential resolution ONLY (finding the
-    row by unique email / key prefix). Once a principal is resolved, all
-    further workspace-owned access goes through the ordinary
-    :func:`get_session` engine with :func:`set_workspace_context` +
-    RLS — never through this BYPASSRLS session.
+    Scope: two sanctioned users.
+
+    1. Credential resolution (the original, narrower purpose): finding a
+       row by unique email / key prefix, pre-auth. Once a principal is
+       resolved this way, all further workspace-owned access goes
+       through the ordinary :func:`get_session` engine with
+       :func:`set_workspace_context` + RLS — never through this
+       BYPASSRLS session.
+    2. The SaaS admin control plane (`apps/api/app/routers/admin.py`,
+       PLAN §7.1–§7.2, guarded by `app.service_auth.require_service_token`
+       rather than the workspace seam): provisioning, archiving, and the
+       usage export are all *legitimately* cross-workspace by
+       construction (provisioning creates a workspace before any
+       `app.workspace_id` GUC could apply to it; the usage export
+       aggregates over every workspace in one statement), so this
+       surface performs INSERT/UPDATE/aggregate reads on this same
+       BYPASSRLS session rather than treating it as select-only. Every
+       statement the admin router issues here is deliberately unscoped
+       and carries its own `# noqa: workspace-scope` marker.
+
+    No other caller may use this session — every other tenant-owned
+    read/write still goes through :func:`get_session` +
+    :func:`set_workspace_context` + RLS.
     """
     session_factory = get_auth_sessionmaker()
     session = session_factory()
