@@ -189,6 +189,29 @@ class RediscoveryDecision:
     reason: str | None
 
 
+def _bare_host(host: str) -> str:
+    """Lowercase host with any leading ``www.`` stripped.
+
+    2026-08-12 runaway-rediscovery fix. Condition 8 compares an attempt's
+    observed hostname against the profile's ``domain`` key, but
+    ``competitors.domain`` is stored bare (``extra.com``) while the
+    scraped URLs are ``https://www.extra.com/...`` -- so the raw
+    comparison was permanently unequal for EVERY www-hosted competitor
+    (amazon.sa, noon.com, jarir.com, stech.ink, extra.com), marking them
+    "template changed" forever: rediscovery re-triggered on every light
+    recheck, each run re-created the profile it had just degraded, and
+    extra.com alone burned ~6.5k discovery runs/day (~$325/mo of proxy
+    before the discovery early-exit landed).
+
+    Mirrors the existing ``www.``-stripping in
+    :func:`app_shared.url_pattern.normalize_url` /
+    :func:`~app_shared.url_pattern.derive_url_pattern` -- this was the one
+    host comparison in the codebase that skipped it.
+    """
+    host = host.lower()
+    return host[len("www.") :] if host.startswith("www.") else host
+
+
 def _consecutive(
     attempts: Sequence[RecentAttemptSignal], predicate: Callable[[RecentAttemptSignal], bool]
 ) -> int:
@@ -319,7 +342,7 @@ def evaluate_rediscovery(
     if scope == "domain":
         template_changed_predicate: Callable[[RecentAttemptSignal], bool] = (
             lambda a: a.url is not None
-            and (urlsplit(a.url).hostname or "").lower() != profile.domain.lower()
+            and _bare_host(urlsplit(a.url).hostname or "") != _bare_host(profile.domain)
         )
     else:
         template_changed_predicate = (

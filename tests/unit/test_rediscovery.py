@@ -409,3 +409,33 @@ def test_condition_8_domain_scope_default_matches_explicit_domain_kwarg() -> Non
         _domain_profile(), _healthy_combined_stats(), RecentSignals(attempts=attempts), _THRESHOLDS
     )
     assert decision.trigger is True
+
+
+def test_condition_8_domain_scope_www_host_never_triggers() -> None:
+    # 2026-08-12 runaway-rediscovery regression. `competitors.domain` is
+    # stored bare ("example.com") while the scraped URLs carry the `www.`
+    # prefix, so the raw hostname comparison was permanently unequal for
+    # EVERY www-hosted competitor (amazon.sa, noon.com, jarir.com,
+    # stech.ink, extra.com) -- "template changed" fired forever, and each
+    # rediscovery re-created the profile it had just degraded. extra.com
+    # alone reached ~6.5k discovery runs/day. The host comparison now
+    # strips `www.` exactly as `normalize_url`/`derive_url_pattern` do.
+    attempts = tuple(
+        RecentAttemptSignal(
+            error_code=None,
+            status_code=200,
+            price=Decimal("19.99"),
+            currency_present=True,
+            confidence=Decimal("0.90"),
+            url=_HEALTHY_URL,  # https://www.example.com/products/red-shoe-123
+        )
+        for _ in range(3)
+    )
+    decision = evaluate_rediscovery(
+        _domain_profile(),  # domain == "example.com", no www
+        _healthy_combined_stats(),
+        RecentSignals(attempts=attempts),
+        _THRESHOLDS,
+        scope="domain",
+    )
+    assert decision.trigger is False, decision.reason
