@@ -33,6 +33,7 @@ from app.workers.celery_app import app
 from app_shared.config import get_settings
 from app_shared.database import get_session, set_workspace_context
 from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetStatus
+from app_shared.ids import new_uuid7
 from app_shared.jobs.batching import ResolvedTarget, plan_batches
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.nodes import select_node
@@ -42,6 +43,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.models.strategy import DomainStrategyProfile
+from app_shared.outbox import write_outbox_message
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.scrapyd import ScrapydDispatchClient
 from app_shared.task_names import (
@@ -356,24 +358,31 @@ def finalize_jobs() -> None:
     this task against an already-finalized job is a no-op (FR-019).
 
     SPEC-12 US5 (T036, contracts/stats-buffer.md §Flush, FR-023): once a
-    job actually finalizes, also enqueue `STRATEGY_STATS_FLUSH` for the
+    job actually finalizes, also request `STRATEGY_STATS_FLUSH` for the
     distinct `domain_strategy_profiles` its targets' matches map to — so a
     job's buffered stats flush promptly at job end rather than waiting up
     to a full `STRATEGY_STATS_FLUSH_INTERVAL_SECONDS` for the periodic
     sweep. A job whose targets resolve no strategy profile at all (e.g.
-    every match predates SPEC-12 discovery) enqueues nothing -- `flush_stats`
+    every match predates SPEC-12 discovery) requests nothing -- `flush_stats`
     is never called with an empty `profile_ids` list.
 
     SPEC-16 US3 (T034, contracts/events.md #2): once a job actually
-    finalizes, its `(job_id, status, counts)` is collected here and, AFTER
-    the single `session.commit()` below, one `create_webhook_event` is
-    enqueued per finalized job via `build_job_event` — `CANCELLED` (never
-    produced by this path) and any non-terminal status enqueue nothing. A
-    broker error at this seam is caught and logged, never allowed to fail
-    the already-committed finalize above (FR-009/SC-005).
-    """
-    finalized: list[tuple[uuid.UUID, uuid.UUID, ScrapeJobStatus, Counts]] = []
+    finalizes, one `create_webhook_event` is requested per finalized job
+    via `build_job_event` — `CANCELLED` (never produced by this path) and
+    any non-terminal status emit nothing.
 
+    2026-08-15 audit risk H1: BOTH follow-ups above are now written to the
+    transactional outbox (`app_shared.outbox.write_outbox_message`) inside
+    the same transaction as the finalize, instead of being sent to the
+    broker around it. That fixes two distinct defects at once: the stats
+    flush used to be enqueued *before* `session.commit()` (a rollback left
+    a flush chasing a job that never finalized), and the webhook event was
+    enqueued *after* it with the broker error swallowed (a Redis outage
+    silently dropped the terminal-status event of a genuinely finished
+    job). Neither can happen now — the messages commit with the finalize
+    or not at all, and the outbox dispatcher publishes them with
+    at-least-once delivery and bounded retries.
+    """
     with get_session() as session:
         for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
             set_workspace_context(session, workspace_id)
@@ -402,52 +411,68 @@ def finalize_jobs() -> None:
                 counts.success, counts.failure, counts.skipped, counts.total
             )
             job.completed_at = datetime.now(timezone.utc)
-            finalized.append((job.id, workspace_id, job.status, counts))
 
+            # Audit H1: this was a *pre-commit* `enqueue` — it fired the
+            # stats flush before the finalize it depends on had
+            # committed, so a rollback below left a flush racing (or
+            # preceding) a job that never finalized. Written to the
+            # outbox instead, it now commits atomically with the
+            # finalize and is published afterwards.
             profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
             if profile_ids:
-                enqueue(
-                    STRATEGY_STATS_FLUSH,
+                write_outbox_message(
+                    session,
+                    workspace_id=workspace_id,
+                    task_name=STRATEGY_STATS_FLUSH,
                     queue="maintenance",
                     kwargs={
                         "workspace_id": str(workspace_id),
                         "profile_ids": [str(profile_id) for profile_id in profile_ids],
                     },
+                    dedup_key=f"statsflush:{job.id}",
+                    now=job.completed_at,
                 )
 
-        session.commit()
-
-        for job_id, workspace_id, status, counts in finalized:
+            # SPEC-16 US3 (T034, contracts/events.md #2), reworked for
+            # audit H1: the job event was a post-commit fire-and-forget
+            # enqueue whose failure was swallowed, so a broker outage
+            # silently dropped the terminal-status event of a job that
+            # had genuinely finished. It is now an outbox row written in
+            # the same transaction as the finalize. `CANCELLED` (never
+            # produced by this path) and any non-terminal status still
+            # emit nothing (`build_job_event` returns `None`).
             built = build_job_event(
-                scrape_job_id=job_id,
-                status=status,
+                scrape_job_id=job.id,
+                status=job.status,
                 success_count=counts.success,
                 failure_count=counts.failure,
                 skipped_count=counts.skipped,
                 total=counts.total,
             )
-            if built is None:
-                continue
-            webhook_event_type, webhook_payload, dedup_key = built
-            try:
-                enqueue(
-                    CREATE_WEBHOOK_EVENT,
+            if built is not None:
+                webhook_event_type, webhook_payload, dedup_key = built
+                # The message id doubles as the consumer's idempotency
+                # key -- see `create_webhook_event`.
+                message_id = new_uuid7()
+                write_outbox_message(
+                    session,
+                    workspace_id=workspace_id,
+                    task_name=CREATE_WEBHOOK_EVENT,
                     queue="webhook_events",
                     kwargs={
                         "workspace_id": str(workspace_id),
                         "event_type": webhook_event_type,
                         "payload": webhook_payload,
                         "dedup_key": dedup_key,
+                        "event_id": str(message_id),
+                        "occurred_at": job.completed_at.isoformat(),
                     },
+                    dedup_key=dedup_key,
+                    now=job.completed_at,
+                    message_id=message_id,
                 )
-            except Exception:
-                logger.warning(
-                    "webhook_enqueue_failed source=finalize_jobs "
-                    "scrape_job_id=%s event_type=%s",
-                    job_id,
-                    webhook_event_type,
-                    exc_info=True,
-                )
+
+        session.commit()
 
 
 @app.task(name=SCRAPE_REDISPATCH_JOBS)

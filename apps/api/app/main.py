@@ -99,12 +99,33 @@ PLAN §7.1 adds the `/v1/admin` router (`docs/superpowers/plans/
 provisioning, archive, and the usage export. It is guarded by the static
 `SAAS_SERVICE_TOKEN` seam in `app.service_auth`, not the workspace seam
 in `app.deps`, and is excluded from the public OpenAPI spec.
+
+Production-readiness audit (`CORE_PRODUCT_PRODUCTION_READINESS_AUDIT_
+2026-08-15.md` §C2) adds the `GET /version` route
+(`apps/api/app/routers/version.py`) — deployed git SHA + build time +
+code/live-database Alembic migration heads, unauthenticated like
+`/health` but (unlike `/health`) reads the database's `alembic_version`
+table on purpose, so a stale or mismatched deploy is visible without
+shelling into a container.
+
+The same audit's §H5 adds `GET /ops/metrics`
+(`apps/api/app/routers/ops_metrics.py`) — the fleet-wide operational
+snapshot (queue age, per-domain success and requests/link, proxy spend
+velocity and month-end forecast, discovery volume, partition/rollup
+health, outbox backlog, circuit-breaker posture, Redis posture) plus the
+alert rules evaluated against it. Unlike `/version` it is a
+*cross-workspace* surface, so it is guarded by the same
+`SAAS_SERVICE_TOKEN` seam as `/v1/admin/*` and excluded from the public
+spec. Rules and thresholds live in `app_shared.opsmetrics.rules`;
+operator documents are under `docs/ops/`.
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
+
+from app_shared.config_validation import assert_production_safe
 
 from app.error_envelope import register_error_handlers
 from app.openapi_public import build_public_openapi
@@ -119,6 +140,7 @@ from app.routers import (
     domain_access_rules,
     jobs,
     matches,
+    ops_metrics,
     product_groups,
     products,
     proxy_providers,
@@ -126,8 +148,16 @@ from app.routers import (
     scrape_profiles,
     strategy,
     variants,
+    version,
     webhooks,
 )
+
+# Audit §L1: refuses to start (raises `ProductionConfigError`) when
+# `ENVIRONMENT`/`RAILWAY_ENVIRONMENT_NAME` says "production" and the
+# resolved config still looks local-dev-shaped (weak/default secrets,
+# PGBOUNCER_AUTH_TYPE=trust, the DB bootstrap/owner role as DATABASE_URL).
+# No-op otherwise — never affects local dev, CI, or `docker compose up`.
+assert_production_safe()
 
 app = FastAPI(title="crawmatic-api", openapi_url=None, docs_url=None, redoc_url=None)
 
@@ -152,6 +182,8 @@ app.include_router(strategy.router)
 app.include_router(refresh_rules.router)
 app.include_router(webhooks.router)
 app.include_router(admin.router)
+app.include_router(version.router)
+app.include_router(ops_metrics.router)
 
 
 @app.get("/health")

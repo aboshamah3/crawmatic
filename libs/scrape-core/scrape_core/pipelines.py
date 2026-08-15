@@ -15,26 +15,31 @@ that carries a non-null ``scrape_job_id`` also terminalizes its
 ``error_code`` otherwise) via ``app_shared.jobs.targets.mark_target``,
 in the SAME ``workspace_txn`` transaction as the observation/attempt
 writes — no extra reactor hop, no second ``run_in_thread``. Once that
-transaction commits, ``_flush_batch`` enqueues ``SCRAPE_FINALIZE_JOBS``
-(``app_shared.messaging.enqueue``, queue ``maintenance``) once per
-distinct affected ``scrape_job_id`` so ``finalize_jobs`` resolves
-counters/status event-driven, without depending on the SPEC-13 beat.
-This keeps ``scrape-core`` import-clean: only ``app_shared.jobs.targets``
-+ ``app_shared.messaging`` are added, neither of which imports fastapi/
-apps.workers/scrapy/twisted/playwright.
+transaction commits, ``finalize_jobs`` resolves counters/status
+event-driven, without depending on the SPEC-13 beat.
 
-SPEC-09 US3 T029 (FR-012/015, SC-007, ``contracts/recompute-triggers.md``
-trigger (a)) adds, after that same commit, one ``PRICE_ANALYSIS_RECOMPUTE``
-enqueue per distinct affected ``(workspace_id, scrape_job_id,
-product_variant_id)`` in the batch. For items carrying a non-null
-``scrape_job_id`` a Redis ``SET NX`` key
+2026-08-15 (audit risk H1): the two follow-ups this flush produces —
+``SCRAPE_FINALIZE_JOBS`` once per distinct affected ``scrape_job_id``,
+and ``PRICE_ANALYSIS_RECOMPUTE`` once per distinct affected
+``(workspace_id, scrape_job_id, product_variant_id)`` (SPEC-09 US3 T029,
+FR-012/015, SC-007, ``contracts/recompute-triggers.md`` trigger (a)) —
+are no longer post-commit ``app_shared.messaging.enqueue`` calls. They
+are ``outbox_messages`` rows written **inside the same
+``workspace_txn`` transaction** as the observations/attempts/target
+terminalisation, and published to Celery afterwards by the outbox
+dispatcher. The broker therefore still never sits on the persistence
+path (this is a plain INSERT), but a Redis blip or a spider process
+dying right after ``COMMIT`` can no longer strand committed
+observations with no analysis and a job that never finalizes.
+
+The Redis ``SET NX`` key
 (``analysis:enqueued:{scrape_job_id}:{product_variant_id}``, TTL
-``Settings.PRICE_ANALYSIS_DEDUP_TTL_SECONDS``) is claimed first so many
-completed matches of one variant within one job collapse to a single
-recompute; ad-hoc items with no ``scrape_job_id`` enqueue directly, no
-dedup key. This adds only ``app_shared.redis_client`` (already used
-elsewhere in ``app_shared``) to the import closure — still no fastapi/
-apps.workers.
+``Settings.PRICE_ANALYSIS_DEDUP_TTL_SECONDS``) is retained as a pure
+contention reducer so many completed matches of one variant within one
+job collapse to a single recompute; it now fails **open** on a Redis
+error, because durability no longer depends on it. Import closure is
+unchanged apart from ``app_shared.outbox`` (plain SQLAlchemy) — still no
+fastapi/apps.workers/scrapy in ``app_shared``.
 
 US5 hardening (T041) — this module has exactly **one** call site for
 ``run_in_thread`` (:func:`BatchedPersistencePipeline._flush`), and all
@@ -57,8 +62,8 @@ call on the reactor thread:
 There is no ``time.sleep`` and no direct/synchronous ``session.commit()``
 anywhere on the reactor thread — the batch build in :func:`_flush_batch`
 is pure Python + SQLAlchemy object construction that only touches the
-database (and, post-commit, Redis/the Celery producer for the
-``SCRAPE_FINALIZE_JOBS``/``PRICE_ANALYSIS_RECOMPUTE`` enqueues) once it is
+database (and Redis, for the lock releases and the best-effort analysis
+dedup claim) once it is
 already running inside the ``run_in_thread`` thread-pool thread, never on
 the reactor thread itself. ``_flush`` also swaps
 ``self._buffer`` for a fresh list *before* dispatching the batch, so
@@ -87,8 +92,8 @@ from app_shared.enums import MethodType, ScrapeErrorCode, ScrapeTargetStatus, St
 from app_shared.ids import new_uuid7
 from app_shared.jobs.targets import mark_target
 from app_shared.limiter.locks import release_match_lock
-from app_shared.messaging import enqueue
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.outbox import write_outbox_message
 from app_shared.redis_client import get_redis_client
 from app_shared.strategy.stats_buffer import record_attempt
 
@@ -169,10 +174,12 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     (COMPLETED on ``item.success``, FAILED with ``item.error_code``, or
     — SPEC-11 US2 — SKIPPED for a ``LOCKED_ALREADY_RUNNING`` lock
     collision) via ``mark_target`` — in this SAME transaction, no second
-    ``run_in_thread``/reactor hop. Once the transaction commits, enqueues
-    ``SCRAPE_FINALIZE_JOBS`` (``maintenance`` queue) exactly once per
-    distinct affected ``scrape_job_id`` in the batch, so counters/status
-    finalize event-driven (FR-017/018/019, SC-007).
+    ``run_in_thread``/reactor hop. In that SAME transaction it also
+    records one outbox message for ``SCRAPE_FINALIZE_JOBS``
+    (``maintenance`` queue) per distinct affected ``scrape_job_id`` in
+    the batch, so counters/status finalize event-driven
+    (FR-017/018/019, SC-007) and can no longer be lost between COMMIT and
+    the broker (audit H1).
 
     SPEC-11 US2 (T023, ``contracts/match-lock.md`` "Ownership lifecycle"
     step 3): once that same transaction has committed, releases each
@@ -398,6 +405,84 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             )
             affected_job_ids[item.scrape_job_id] = None
 
+        # --- post-commit follow-ups, recorded IN this transaction --------
+        #
+        # 2026-08-15 audit risk H1. These two follow-ups used to be
+        # fire-and-forget `enqueue` calls placed *after* the `with
+        # workspace_txn(...)` block, on the reasoning that a broker error
+        # must not roll back persisted observations. The cost of that
+        # choice was silent loss: this is the highest-volume producer in
+        # the system, and a Redis blip (or a spider process dying between
+        # COMMIT and send_task) left committed observations whose price
+        # analysis never ran and whose job never finalized — the exact
+        # "valid observations, no analysis" shape the audit flags.
+        #
+        # Writing them to the outbox instead keeps the original property
+        # (the broker is never on the persistence path — this is a plain
+        # INSERT into the same transaction) while removing the loss
+        # window entirely.
+        #
+        # One `SCRAPE_FINALIZE_JOBS` per distinct affected job, deduped by
+        # job id: the task is a global no-arg sweep, so N identical
+        # messages were always wasteful; the outbox's PENDING dedup index
+        # collapses them to one.
+        for affected_job_id in affected_job_ids:
+            write_outbox_message(
+                session,
+                workspace_id=workspace_id,
+                task_name=SCRAPE_FINALIZE_JOBS,
+                queue="maintenance",
+                kwargs={},
+                dedup_key=f"finalize:{affected_job_id}",
+            )
+
+        # SPEC-09 US3 T029 (contracts/recompute-triggers.md trigger (a)):
+        # one `PRICE_ANALYSIS_RECOMPUTE` per distinct affected
+        # (workspace_id, scrape_job_id, product_variant_id). The Redis
+        # `SET NX` claim is kept as a *contention reducer* only — it
+        # collapses many completed matches of one variant within one job
+        # into a single recompute (SC-007). It is explicitly not a
+        # correctness guard (`recompute_variant` is idempotent), and it
+        # is no longer the only thing standing between a committed
+        # observation and its analysis: even if Redis is down and the
+        # claim fails open, the message is durably recorded here.
+        dedup_ttl = get_settings().PRICE_ANALYSIS_DEDUP_TTL_SECONDS
+        seen_variant_jobs: set[tuple[Any, Any, Any]] = set()
+        for item in batch:
+            key = (item.workspace_id, item.scrape_job_id, item.product_variant_id)
+            if key in seen_variant_jobs:
+                continue
+            seen_variant_jobs.add(key)
+
+            if item.scrape_job_id is not None:
+                redis_key = f"analysis:enqueued:{item.scrape_job_id}:{item.product_variant_id}"
+                try:
+                    claimed = get_redis_client().set(redis_key, "1", nx=True, ex=dedup_ttl)
+                except Exception:  # noqa: BLE001 - contention reducer only, fail open
+                    claimed = True
+                if not claimed:
+                    continue  # another completed match of this variant already claimed it
+
+            write_outbox_message(
+                session,
+                workspace_id=item.workspace_id,
+                task_name=PRICE_ANALYSIS_RECOMPUTE,
+                queue="price_analysis",
+                kwargs={
+                    "workspace_id": str(item.workspace_id),
+                    "product_variant_id": str(item.product_variant_id),
+                    "product_id": str(item.product_id),
+                    "scrape_job_id": (
+                        None if item.scrape_job_id is None else str(item.scrape_job_id)
+                    ),
+                },
+                dedup_key=(
+                    None
+                    if item.scrape_job_id is None
+                    else f"analysis:{item.scrape_job_id}:{item.product_variant_id}"
+                ),
+            )
+
     # SPEC-11 US2 (T023): release each item's match lock only AFTER the
     # transaction above has committed -- still inside this same
     # off-reactor flush (no second run_in_thread/reactor hop). An item
@@ -478,44 +563,6 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 qualifying=qualifying,
                 ttl_seconds=stats_ttl_seconds,
             )
-
-    # Only after the transaction above has committed cleanly -- enqueue one
-    # SCRAPE_FINALIZE_JOBS per distinct affected job so finalize_jobs()
-    # never races the target rows it is about to aggregate.
-    for job_id in affected_job_ids:
-        enqueue(SCRAPE_FINALIZE_JOBS, queue="maintenance")
-
-    # SPEC-09 US3 T029 (contracts/recompute-triggers.md trigger (a)): also
-    # after the same commit, enqueue one PRICE_ANALYSIS_RECOMPUTE per
-    # distinct affected (workspace_id, scrape_job_id, product_variant_id)
-    # in the batch. For items that belong to a job, claim a Redis SET NX
-    # dedup key first so many completed matches of one variant within one
-    # job collapse to a single recompute (SC-007) -- a contention reducer,
-    # not a correctness guard, since recompute_variant is idempotent.
-    # Ad-hoc items with no scrape_job_id enqueue directly, no dedup key.
-    dedup_ttl = get_settings().PRICE_ANALYSIS_DEDUP_TTL_SECONDS
-    seen_variant_jobs: set[tuple[Any, Any, Any]] = set()
-    for item in batch:
-        key = (item.workspace_id, item.scrape_job_id, item.product_variant_id)
-        if key in seen_variant_jobs:
-            continue
-        seen_variant_jobs.add(key)
-
-        if item.scrape_job_id is not None:
-            redis_key = f"analysis:enqueued:{item.scrape_job_id}:{item.product_variant_id}"
-            if not get_redis_client().set(redis_key, "1", nx=True, ex=dedup_ttl):
-                continue  # another completed match of this variant already enqueued this job
-
-        enqueue(
-            PRICE_ANALYSIS_RECOMPUTE,
-            queue="price_analysis",
-            kwargs={
-                "workspace_id": str(item.workspace_id),
-                "product_variant_id": str(item.product_variant_id),
-                "product_id": str(item.product_id),
-                "scrape_job_id": None if item.scrape_job_id is None else str(item.scrape_job_id),
-            },
-        )
 
 
 class BatchedPersistencePipeline:

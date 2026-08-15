@@ -49,6 +49,36 @@ partition-create/daily-rollup accumulators above (no arguments; the
 task re-checks partition-drop eligibility + rollup coverage on every
 pass, so a not-yet-verified partition is simply retained until a later
 run, self-healing).
+
+2026-08-15 readiness cycle — **the three daily cadences above are no
+longer driven by in-process accumulators.** A float that starts at
+``0.0`` on every process start, compared against ``86400``, only ever
+fires on a container that survives a full day; Railway restarts
+containers on every deploy, so those three tasks could go — and did go —
+arbitrarily long without firing. The production symptom was no
+``2026_09`` partition on any of the four partitioned tables (a total
+write outage on a known date) and zero rows ever written to
+``variant_price_daily_rollups``. Their deadlines now live in the
+``maintenance_cadences`` table and are claimed atomically
+(``app_shared.maintenance.cadence``), so a restart cannot reset the
+countdown, an overdue cadence fires on the next poll, and multiple
+scheduler replicas (or a crash-loop) still enqueue exactly once.
+
+The 60s-class cadences (refresh poll, strategy flush/finalize/recover/
+redispatch, outbox drain/reconcile) deliberately stay in-process: a
+restart costs at most one interval of *seconds*, every one of them is an
+idempotent sweep whose work is durably recorded elsewhere, and making
+them durable would add a write per tick to protect against a bounded
+loss. See ``app_shared.maintenance.cadence``'s module docstring.
+
+A separate, slower **health tick** runs the outcome assertions in
+``app_shared.maintenance.health`` — "does the partition the calendar
+needs in N months exist?" and "has the daily rollup produced a row
+recently?" — at ERROR level. These assert on *results read from the
+database*, not on the scheduler's own bookkeeping, because the second,
+independent root cause of the same incident was the ``worker`` service
+missing ``SYSTEM_DATABASE_URL``/``AUTH_DATABASE_URL``: the scheduler was
+enqueueing correctly the whole time and every task died on arrival.
 """
 
 from __future__ import annotations
@@ -59,13 +89,27 @@ import time
 from datetime import datetime, timezone
 from types import FrameType
 
-from app_shared.config import get_settings
+from app_shared.config import Settings, get_settings
 from app_shared.database import get_system_sessionmaker
+from app_shared.maintenance.cadence import (
+    claim_cadence,
+    ensure_cadence_rows,
+    log_overdue_cadences,
+    read_cadence_statuses,
+)
+from app_shared.maintenance.health import check_maintenance_health, log_health_report
 from app_shared.messaging import enqueue
+from app_shared.models.maintenance_cadence import (
+    CADENCE_DAILY_ROLLUP,
+    CADENCE_PARTITION_CREATE,
+    CADENCE_RETENTION_DROP,
+)
 from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RETENTION_DROP,
+    OUTBOX_DRAIN,
+    OUTBOX_RECONCILE,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
     SCRAPE_REDISPATCH_JOBS,
@@ -217,6 +261,40 @@ def _enqueue_retention_drop() -> None:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_RETENTION_DROP)
 
 
+def _enqueue_outbox_drain() -> None:
+    """Fire-and-forget `OUTBOX_DRAIN` on the `maintenance` queue (audit
+    risk H1). This is the pass that turns durably-recorded
+    `outbox_messages` rows into real Celery deliveries, so it runs on its
+    own, much tighter accumulator (`OUTBOX_DRAIN_INTERVAL_SECONDS`) than
+    the 60s maintenance tick — that interval is the worst-case added
+    latency between a producer's COMMIT and its follow-up task reaching
+    the broker.
+
+    Errors are logged and swallowed like every other maintenance enqueue,
+    and here that is *safe by construction* rather than merely tolerable:
+    a missed tick cannot lose anything, because the messages are already
+    committed in Postgres. The next tick (or the next scheduler process)
+    publishes them.
+    """
+    try:
+        enqueue(OUTBOX_DRAIN, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", OUTBOX_DRAIN)
+
+
+def _enqueue_outbox_reconcile() -> None:
+    """Fire-and-forget `OUTBOX_RECONCILE` on the `maintenance` queue
+    (audit risk H1) — backlog/dead-letter reporting plus retention on the
+    outbox table. Slower cadence than the drain
+    (`OUTBOX_RECONCILE_INTERVAL_SECONDS`); idempotent and no-arg. Errors
+    are logged and swallowed like every other maintenance enqueue.
+    """
+    try:
+        enqueue(OUTBOX_RECONCILE, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", OUTBOX_RECONCILE)
+
+
 def _run_refresh_pass_tick(batch_limit: int) -> None:
     """Run one SPEC-13 refresh pass (`app.scheduler.refresh.run_refresh_pass`)
     on the BYPASSRLS system sessionmaker, claiming/firing up to
@@ -239,6 +317,104 @@ def _run_refresh_pass_tick(batch_limit: int) -> None:
         logger.exception("scheduler: refresh pass failed")
 
 
+#: The durable daily cadences: ``(cadence_key, settings attribute holding
+#: the interval, enqueue callable)``. Driven by ``maintenance_cadences``
+#: deadlines, NOT by in-process accumulators — see the module docstring.
+_DURABLE_CADENCES = (
+    (CADENCE_PARTITION_CREATE, "PARTITION_CREATE_INTERVAL_SECONDS", _enqueue_partition_create),
+    (CADENCE_DAILY_ROLLUP, "DAILY_ROLLUP_INTERVAL_SECONDS", _enqueue_daily_rollup),
+    (CADENCE_RETENTION_DROP, "RETENTION_INTERVAL_SECONDS", _enqueue_retention_drop),
+)
+
+
+def _run_durable_cadence_tick(settings: Settings) -> list[str]:
+    """Claim every *due* daily cadence and enqueue its task.
+
+    One system session, one transaction per cadence claim. The claim is
+    the atomic ``UPDATE ... WHERE next_due_at <= now RETURNING id`` in
+    ``app_shared.maintenance.cadence`` — so with N scheduler replicas
+    exactly one enqueues, and a scheduler that crash-loops enqueues once
+    rather than once per boot (the winning claim advances the deadline a
+    full interval before the enqueue happens).
+
+    Enqueue-then-commit, deliberately: this mirrors
+    ``run_refresh_pass``'s "enqueue already happened; commit last"
+    ordering and the codebase-wide duplicate-over-miss posture. All three
+    maintenance tasks are idempotent no-arg sweeps, so a duplicate is
+    free while a miss costs a full day.
+
+    Returns the cadence keys actually claimed (for tests/diagnostics).
+    Any exception — an unreachable database, a missing
+    ``SYSTEM_DATABASE_URL`` — is logged and swallowed: a failed tick is
+    retried on the next poll and must never crash-loop the scheduler
+    (same posture as every other seam here). Crucially, a failure here no
+    longer *loses* the cadence: the deadline is still in Postgres,
+    unclaimed.
+    """
+    claimed: list[str] = []
+    try:
+        session_factory = get_system_sessionmaker()
+        with session_factory() as session:
+            ensure_cadence_rows(session)
+            session.commit()
+
+            now = datetime.now(timezone.utc)
+            for cadence_key, interval_attr, enqueue_task in _DURABLE_CADENCES:
+                interval = getattr(settings, interval_attr)
+                if not claim_cadence(session, cadence_key, interval_seconds=interval, now=now):
+                    session.rollback()
+                    continue
+                enqueue_task()
+                session.commit()
+                claimed.append(cadence_key)
+                logger.info(
+                    "scheduler: claimed durable cadence %s (interval %ss)",
+                    cadence_key,
+                    interval,
+                )
+    except Exception:
+        logger.exception("scheduler: durable cadence tick failed")
+    return claimed
+
+
+def _run_health_tick(settings: Settings) -> None:
+    """Assert on maintenance **outcomes** and emit ERROR signals.
+
+    Answers "does the partition the calendar needs actually exist?" and
+    "has the daily rollup produced a row recently?" by reading the
+    database, plus "is any durable cadence sitting past its deadline?".
+    Deliberately independent of whether the scheduler *thinks* it
+    enqueued anything: in the 2026-08-15 incident the scheduler was
+    enqueueing correctly and every task died on arrival in the worker for
+    want of ``SYSTEM_DATABASE_URL``, so only an outcome check could have
+    caught it. Errors are logged and swallowed — an observability probe
+    must never be able to take down the process it observes.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        session_factory = get_system_sessionmaker()
+        with session_factory() as session:
+            report = check_maintenance_health(
+                session,
+                now_utc=now,
+                months_ahead=settings.PARTITION_CREATE_LOOKAHEAD_MONTHS,
+                rollup_stale_after_days=settings.MAINTENANCE_ROLLUP_STALE_AFTER_DAYS,
+            )
+            log_health_report(
+                report,
+                now_utc=now,
+                threshold_days=settings.MAINTENANCE_ROLLUP_STALE_AFTER_DAYS,
+            )
+            log_overdue_cadences(
+                read_cadence_statuses(session),
+                now=now,
+                grace_seconds=settings.MAINTENANCE_CADENCE_OVERDUE_GRACE_SECONDS,
+            )
+            session.rollback()
+    except Exception:
+        logger.exception("scheduler: maintenance health tick failed")
+
+
 def main() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
@@ -250,30 +426,51 @@ def main() -> None:
     partition_create_interval = settings.PARTITION_CREATE_INTERVAL_SECONDS
     daily_rollup_interval = settings.DAILY_ROLLUP_INTERVAL_SECONDS
     retention_interval = settings.RETENTION_INTERVAL_SECONDS
+    outbox_drain_interval = settings.OUTBOX_DRAIN_INTERVAL_SECONDS
+    outbox_reconcile_interval = settings.OUTBOX_RECONCILE_INTERVAL_SECONDS
+    cadence_poll_interval = settings.MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS
+    health_interval = settings.MAINTENANCE_HEALTH_INTERVAL_SECONDS
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush + "
         "finalize_jobs + recover_stalled_batches every %ss; "
-        "refresh pass every %ss; partition_create every %ss; daily_rollup every %ss; "
-        "retention_drop every %ss)",
+        "refresh pass every %ss; DURABLE cadences partition_create every %ss / "
+        "daily_rollup every %ss / retention_drop every %ss polled every %ss from "
+        "maintenance_cadences; outbox_drain every %ss; outbox_reconcile every %ss; "
+        "maintenance health assertions every %ss)",
         interval,
         refresh_interval,
         partition_create_interval,
         daily_rollup_interval,
         retention_interval,
+        cadence_poll_interval,
+        outbox_drain_interval,
+        outbox_reconcile_interval,
+        health_interval,
     )
+
+    # Run both DB-backed passes once at boot, before the loop: a cadence
+    # that is overdue (or has never run) must fire promptly rather than
+    # wait a poll interval, and a partition gap must be reported at the
+    # first opportunity. Neither can thunder: the cadence claim is atomic
+    # and the health pass is read-only.
+    _run_durable_cadence_tick(settings)
+    _run_health_tick(settings)
+
     elapsed = 0.0
     refresh_elapsed = 0.0
-    partition_create_elapsed = 0.0
-    daily_rollup_elapsed = 0.0
-    retention_elapsed = 0.0
+    cadence_poll_elapsed = 0.0
+    health_elapsed = 0.0
+    outbox_drain_elapsed = 0.0
+    outbox_reconcile_elapsed = 0.0
     while not _shutdown_requested:
         time.sleep(_TICK_SECONDS)
         elapsed += _TICK_SECONDS
         refresh_elapsed += _TICK_SECONDS
-        partition_create_elapsed += _TICK_SECONDS
-        daily_rollup_elapsed += _TICK_SECONDS
-        retention_elapsed += _TICK_SECONDS
+        cadence_poll_elapsed += _TICK_SECONDS
+        health_elapsed += _TICK_SECONDS
+        outbox_drain_elapsed += _TICK_SECONDS
+        outbox_reconcile_elapsed += _TICK_SECONDS
         if elapsed >= interval:
             elapsed = 0.0
             _enqueue_light_recheck()
@@ -286,15 +483,22 @@ def main() -> None:
         if refresh_elapsed >= refresh_interval:
             refresh_elapsed = 0.0
             _run_refresh_pass_tick(refresh_batch_limit)
-        if partition_create_elapsed >= partition_create_interval:
-            partition_create_elapsed = 0.0
-            _enqueue_partition_create()
-        if daily_rollup_elapsed >= daily_rollup_interval:
-            daily_rollup_elapsed = 0.0
-            _enqueue_daily_rollup()
-        if retention_elapsed >= retention_interval:
-            retention_elapsed = 0.0
-            _enqueue_retention_drop()
+        # NOTE: this accumulator only decides how often we ASK the
+        # database; the daily deadlines themselves live in
+        # `maintenance_cadences`, so resetting it on restart costs at most
+        # one poll interval of detection latency, never a cadence.
+        if cadence_poll_elapsed >= cadence_poll_interval:
+            cadence_poll_elapsed = 0.0
+            _run_durable_cadence_tick(settings)
+        if health_elapsed >= health_interval:
+            health_elapsed = 0.0
+            _run_health_tick(settings)
+        if outbox_drain_elapsed >= outbox_drain_interval:
+            outbox_drain_elapsed = 0.0
+            _enqueue_outbox_drain()
+        if outbox_reconcile_elapsed >= outbox_reconcile_interval:
+            outbox_reconcile_elapsed = 0.0
+            _enqueue_outbox_reconcile()
 
     logger.info("scheduler stopped")
 

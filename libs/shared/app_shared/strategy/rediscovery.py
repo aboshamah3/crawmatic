@@ -48,13 +48,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
+from app_shared.config import get_settings
 from app_shared.enums import ScrapeErrorCode, StrategyStatus
 from app_shared.messaging import enqueue
 from app_shared.models.competitors_matches import CompetitorProductMatch
@@ -497,21 +498,64 @@ def apply_rediscovery(
     Returns `True` iff this call's UPDATE actually changed a row — so two
     concurrent evaluations of the same profile (inline flush + periodic
     re-check racing) enqueue at most one discovery run.
+
+    ## Cooldown (2026-08-15 runaway backstop)
+
+    The `WHERE` clause also carries a per-profile **minimum re-discovery
+    interval** (`Settings.STRATEGY_REDISCOVERY_MIN_INTERVAL_SECONDS`,
+    default 6h): a profile whose `last_discovery_at` is inside the window
+    is not degraded and enqueues nothing. This is a structural bound, not
+    a tuning knob — it exists so that a trigger condition which its own
+    remedy cannot clear degrades to a handful of runs/day instead of one
+    per `STRATEGY_LIGHT_RECHECK` tick (1,440/day; measured live on
+    fqtoners.com, 13,151 runs over ten days). It lives *inside* the same
+    guarded UPDATE as the `status='ACTIVE'` predicate so it is evaluated
+    by the database against the committed row — two concurrent
+    evaluations cannot both pass it.
+
+    The profile is deliberately left `ACTIVE` (not degraded) when the
+    cooldown blocks: degrading without enqueuing a discovery run would
+    park the profile out of service with nothing scheduled to bring it
+    back, which is strictly worse than continuing to serve the (possibly
+    imperfect) learned start until the window elapses.
     """
     if not decision.trigger:
         return False
 
     now = datetime.now(timezone.utc)
+    min_interval = max(0, int(get_settings().STRATEGY_REDISCOVERY_MIN_INTERVAL_SECONDS))
+    cooldown_cutoff = now - timedelta(seconds=min_interval)
     stmt = (
         update(DomainStrategyProfile)
         .where(
             DomainStrategyProfile.id == profile.id,
             DomainStrategyProfile.status == _DEGRADABLE_STATUS,
+            or_(
+                DomainStrategyProfile.last_discovery_at.is_(None),
+                DomainStrategyProfile.last_discovery_at < cooldown_cutoff,
+            ),
         )
         .values(status=StrategyStatus.DEGRADED, last_failed_at=now)
     )
     result = session.execute(stmt)
     if not (result.rowcount and result.rowcount > 0):
+        if (
+            min_interval > 0
+            and profile.status == _DEGRADABLE_STATUS
+            and profile.last_discovery_at is not None
+            and profile.last_discovery_at >= cooldown_cutoff
+        ):
+            logger.info(
+                "app_shared.strategy.rediscovery: strategy_rediscovery_rate_limited "
+                "profile_id=%s workspace_id=%s domain=%s last_discovery_at=%s "
+                "min_interval_seconds=%d reason=%s",
+                profile.id,
+                profile.workspace_id,
+                profile.domain,
+                profile.last_discovery_at.isoformat(),
+                min_interval,
+                decision.reason,
+            )
         return False
 
     enqueue(

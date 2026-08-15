@@ -84,6 +84,62 @@ class Settings(BaseSettings):
     # --- Redis (required) ---
     REDIS_URL: str
 
+    # --- Redis server-policy assertion (audit 2026-08-15 risk H2) ---
+    # This Redis holds correctness/cost-critical keys (match locks,
+    # dispatch sentinels, `proxybudget:*` spend counters) alongside the
+    # Celery broker, so an eviction-capable `maxmemory-policy` can
+    # silently duplicate paid work and erase the spend ledger at once.
+    # When true (default), a process that CONFIRMS a non-`noeviction`
+    # policy refuses to start. A server that cannot answer `CONFIG GET`
+    # (managed/ACL-blocked/fakeredis) is only warned about -- never
+    # fatal -- which is why defaulting this on is safe for local dev and
+    # the test suite. Set false to override during an incident.
+    # See `app_shared.redis_policy`.
+    PROXY_REDIS_REQUIRE_NOEVICTION: bool = True
+
+    # --- Paid-proxy fail-closed posture (audit 2026-08-15 risk H3) ---
+    # EMERGENCY OVERRIDE, default OFF. When the cost ledger (Redis) is
+    # unavailable, NEW PROXIED (paid) requests are denied while DIRECT
+    # (unpaid) requests continue -- a Redis incident must not remove the
+    # cost brake (the 2026-08-12 hostname-normalisation loop would have
+    # spent ~$325/month unattended). Setting this true restores the old
+    # fail-OPEN behaviour so an operator can keep proxied scraping alive
+    # during a Redis outage at knowing financial risk. API request rate
+    # limiting is unaffected and remains fail-open by design.
+    # See `app_shared.access.budget`.
+    PROXY_LEDGER_FAIL_OPEN: bool = False
+
+    # --- Independent spend circuit breaker (audit 2026-08-15 risk H3) ---
+    # Authoritative state lives in Postgres (`proxy_circuit_breakers`),
+    # NOT Redis -- a Redis-backed counter cannot protect against Redis
+    # failure. Thresholds are evaluated against the durable
+    # `request_attempts` / `strategy_discovery_runs` audit tables. Set
+    # any limit to None to disable that single trip condition; set
+    # PROXY_BREAKER_ENABLED=false to disable the breaker entirely.
+    PROXY_BREAKER_ENABLED: bool = True
+    #: Hard ceiling on month-to-date proxied requests (absolute spend).
+    PROXY_BREAKER_MONTHLY_PROXIED_REQUESTS: int | None = 250_000
+    #: Month-end forecast from 1h/24h velocity may not exceed the
+    #: absolute monthly ceiling by more than this factor.
+    PROXY_BREAKER_VELOCITY_FACTOR: float = 1.5
+    #: Minimum samples before a velocity window is trusted (a 3-request
+    #: hour must not extrapolate into a trip).
+    PROXY_BREAKER_VELOCITY_MIN_SAMPLE: int = 200
+    #: Max proxied requests per DISTINCT url in the trailing 24h. The
+    #: 2026-08-10 measurement was amazon 2,716 fetches / 1,097 urls =
+    #: 2.48, so 8 is comfortably above healthy retry behaviour and well
+    #: below a rediscovery loop.
+    PROXY_BREAKER_MAX_REQUESTS_PER_URL: float | None = 8.0
+    PROXY_BREAKER_REQUESTS_PER_URL_MIN_SAMPLE: int = 500
+    #: Max strategy discovery runs per domain per day.
+    PROXY_BREAKER_MAX_DISCOVERY_RUNS_PER_DOMAIN_PER_DAY: int | None = 50
+    #: How often any one process re-evaluates the durable breaker.
+    PROXY_BREAKER_EVAL_INTERVAL_SECONDS: int = 300
+    #: How long a process may reuse its cached breaker verdict before
+    #: re-reading the durable row. Bounds how long a trip takes to stop
+    #: paid work fleet-wide.
+    PROXY_BREAKER_STATE_CACHE_SECONDS: int = 30
+
     # --- Scrapyd pools & auth (required) ---
     # NoDecode: env values are plain comma-separated strings, not JSON —
     # skip pydantic-settings' default JSON decoding for complex types and
@@ -200,6 +256,69 @@ class Settings(BaseSettings):
     CELERY_MAX_TASKS_PER_CHILD: int = 1000
     CELERY_MAX_MEMORY_PER_CHILD_KB: int = 300000
 
+    # --- Celery delivery reliability (2026-08-15 audit risk H1) ---------
+    #
+    # Redis broker visibility timeout, in seconds: how long a delivered-
+    # but-unacknowledged message stays invisible before the broker hands
+    # it to another worker. It MUST exceed the longest task runtime, or a
+    # still-running task is redelivered and executed twice.
+    #
+    # Measured worst case in this codebase is `STRATEGY_DISCOVERY_RUN`
+    # (`apps/workers/app/workers/tasks_strategy.py`): its probe loop walks
+    # `_ACCESS_LADDER` (DIRECT_HTTP, DIRECT_HTTP_RETRY = 2 requests,
+    # PROXY_HTTP) over up to `STRATEGY_DISCOVERY_MAX_SAMPLE` = 10 URLs at
+    # `_PROBE_TIMEOUT_SECONDS` = 15s each => (1 + 2 + 1) * 10 * 15s = 600s
+    # of pure network wait, plus extraction. Every other task is a bounded
+    # DB sweep or a single Scrapyd POST. 3600s is 6x that worst case, and
+    # also covers a slow `MAINTENANCE_RETENTION_DROP`/`DAILY_ROLLUP` on a
+    # large month. The cost of the generous margin is bounded: a hard
+    # SIGKILL of a whole worker delays redelivery by up to an hour, but
+    # `task_reject_on_worker_lost` already re-queues the common
+    # child-death case immediately, and the scheduler's finalize /
+    # recover-stalled / redispatch / outbox-drain passes re-drive anything
+    # important on their own cadence.
+    CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS: int = 3600
+
+    # Messages a worker reserves per child process beyond the one it is
+    # executing. 1 (Celery's "fair" setting) is chosen deliberately over
+    # the default 4: with `task_acks_late` a prefetched message is held
+    # unacknowledged, so a worker that dies strands everything it
+    # prefetched for a full visibility timeout. At concurrency 4 that is
+    # 4 stranded messages instead of 16. Prefetch batching buys nothing
+    # here anyway — every task in this system runs for seconds to minutes
+    # while a broker round-trip is ~1ms — and it actively hurts the
+    # `scrape_dispatch` queue, where a hoarded message is a scrape that
+    # is not running.
+    CELERY_WORKER_PREFETCH_MULTIPLIER: int = 1
+
+    # --- Transactional outbox (2026-08-15 audit risk H1) ---------------
+    #
+    # `OUTBOX_DRAIN_INTERVAL_SECONDS` is the scheduler cadence for the
+    # drain pass; it is also the worst-case added latency between a
+    # producer's COMMIT and its follow-up task reaching the broker, so it
+    # is deliberately much tighter than the 60s maintenance tick.
+    OUTBOX_DRAIN_INTERVAL_SECONDS: int = 5
+    # Messages published per drain pass. Bounded so one pass cannot hold a
+    # worker for an unbounded time; the next tick continues the backlog.
+    OUTBOX_DRAIN_BATCH_LIMIT: int = 200
+    # Publish attempts before a message becomes DEAD (alertable dead
+    # letter). With the capped exponential backoff in
+    # `app_shared.outbox.dispatcher` this spans well over an hour of
+    # broker unavailability before anything is given up on.
+    OUTBOX_MAX_ATTEMPTS: int = 8
+    # First-retry delay after a failed publish; doubles per attempt up to
+    # `dispatcher.MAX_BACKOFF_SECONDS`.
+    OUTBOX_RETRY_BACKOFF_BASE_SECONDS: int = 10
+    # Reconciliation/retention cadence + the age at which a still-PENDING
+    # message counts as "stuck" for alerting.
+    OUTBOX_RECONCILE_INTERVAL_SECONDS: int = 300
+    OUTBOX_STUCK_AFTER_SECONDS: int = 900
+    # How long a PUBLISHED row is kept before deletion (DEAD rows are kept
+    # `DEAD_RETENTION_MULTIPLIER` times longer — they are incident
+    # evidence). The table is a drain-to-empty queue, not a history table,
+    # so this is short by design.
+    RETENTION_OUTBOX_MESSAGES_DAYS: int = 7
+
     # --- Scrapy MemoryUsage extension (2026-08-03 memory-leak hardening,
     # Principle IV — env-tunable, never a hardcoded literal in the Scrapy
     # settings modules). Bounds a single *spider* process on both Scrapyd
@@ -280,6 +399,31 @@ class Settings(BaseSettings):
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
     STRATEGY_STATS_KEY_TTL_SECONDS: int = 3600
 
+    # --- Rediscovery/discovery local rate bounds (2026-08-15 runaway
+    # backstop). These are NOT tuning knobs for how eagerly the optimizer
+    # re-learns; they are the structural ceiling that keeps ANY future
+    # correctness bug in the trigger conditions from authorising unbounded
+    # discovery. `STRATEGY_LIGHT_RECHECK` fires every 60s, so a trigger
+    # condition that its own remedy cannot clear costs 1,440 discovery
+    # runs/profile/day (measured: fqtoners.com, 13,151 runs over 10 days).
+    #
+    # `STRATEGY_REDISCOVERY_MIN_INTERVAL_SECONDS` is the per-profile
+    # cooldown enforced inside `apply_rediscovery`'s guarded UPDATE (so it
+    # is a database predicate, not an app-side check that two concurrent
+    # evaluations could both pass). `STRATEGY_DISCOVERY_MAX_RUNS_PER_KEY_PER_DAY`
+    # is the independent per-(competitor, url_pattern) ceiling enforced in
+    # `run_discovery` itself, so it bounds EVERY enqueue path -- including
+    # any future one that never goes through `apply_rediscovery`.
+    #
+    # These complement `proxy_circuit_breakers` rather than duplicating
+    # it: the breaker is a fleet-wide, manually-reset kill switch that
+    # trips AFTER a domain has already burned its daily allowance
+    # (`DISCOVERY_RUNS_PER_DOMAIN`); these are local, self-releasing
+    # bounds that stop the burn at a handful of runs per key per day and
+    # need no operator intervention. 0 disables either bound.
+    STRATEGY_REDISCOVERY_MIN_INTERVAL_SECONDS: int = 21600  # 6h -> <=4 runs/profile/day
+    STRATEGY_DISCOVERY_MAX_RUNS_PER_KEY_PER_DAY: int = 6
+
     # --- Strategy profile lookup-key scope (2026-07-11 domain-scope fix) ---
     # "domain": the profile/discovery lookup key is the bare competitor
     # domain (caps discovery cost at O(#competitors), fixes the discovery
@@ -329,7 +473,37 @@ class Settings(BaseSettings):
     PARTITION_CREATE_INTERVAL_SECONDS: int = 86400
     DAILY_ROLLUP_INTERVAL_SECONDS: int = 86400
     RETENTION_INTERVAL_SECONDS: int = 86400
-    PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 1
+    # Raised 1 -> 3 in the 2026-08-15 readiness cycle. With a lookahead of
+    # 1 the entire safety margin between "maintenance stops working" and
+    # "every INSERT into four partitioned tables fails" is however many
+    # days are left in the current month -- which is exactly how a silent
+    # failure became a dated outage 17 days out. 3 months means the whole
+    # maintenance path can be dead for ~90 days without a write outage,
+    # which comfortably exceeds any plausible detect-and-fix window, at a
+    # cost of at most 8 extra empty partitions across the registry (an
+    # empty partition is a catalog entry and an empty heap -- no rows, no
+    # measurable planning cost at this table count).
+    PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 3
+
+    # --- Maintenance cadence durability + health assertions (2026-08-15
+    # readiness cycle). `MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS` is how
+    # often the scheduler ASKS the database whether a daily cadence is due
+    # -- the deadline itself lives in `maintenance_cadences`, so this knob
+    # only bounds detection latency after a restart, never the cadence.
+    # `MAINTENANCE_HEALTH_*` drive the outcome assertions in
+    # `app_shared.maintenance.health` (partition present? rollup fresh?),
+    # which are what actually catches a maintenance task that is being
+    # enqueued but failing downstream. ---
+    MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS: int = 60
+    MAINTENANCE_HEALTH_INTERVAL_SECONDS: int = 3600
+    #: How far past its deadline a cadence may sit before
+    #: `maintenance_cadence_overdue` fires. Two poll intervals of slack so
+    #: a momentarily unreachable database does not page anyone.
+    MAINTENANCE_CADENCE_OVERDUE_GRACE_SECONDS: int = 7200
+    #: The daily rollup targets *yesterday*, so a healthy system is always
+    #: ~1 day behind; 3 days tolerates a missed run plus a retry without
+    #: masking a real stall.
+    MAINTENANCE_ROLLUP_STALE_AFTER_DAYS: int = 3
 
     # --- Public API rate limits (PLAN §7.4, risk P5) ---
     # Per-credential fixed-window budgets. Reads are cheap and get the

@@ -35,20 +35,22 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
+from app_shared.access.breaker import log_denied, paid_requests_allowed
 from app_shared.access.repository import visible_providers_select
 from app_shared.config import Settings, get_settings
 from app_shared.database import get_session, set_workspace_context
+from app_shared.ids import new_uuid7
 from app_shared.enums import (
     AccessMethod,
     DiscoveryRunStatus,
@@ -63,7 +65,11 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.encryption import SecretDecryptionError, decrypt_secret
-from app_shared.strategy.flush import StrategyTransition, flush_profile
+from app_shared.strategy.flush import (
+    StrategyTransition,
+    flush_profile,
+    rebase_stats_after_discovery,
+)
 from app_shared.strategy.promotion import PromotionThresholds
 from app_shared.strategy.rediscovery import (
     CombinedStats,
@@ -72,9 +78,9 @@ from app_shared.strategy.rediscovery import (
     build_recent_signals,
     evaluate_rediscovery,
 )
+from app_shared.outbox import write_outbox_message
 from app_shared.strategy.repository import resolve_profile, stats_for_profile
 from app_shared.strategy.seed import DiscoverySeedConfidences, seed_from_discovery, validate_sample_size
-from app_shared.messaging import enqueue
 from app_shared.strategy.stats_buffer import dirty_key, read_pending
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
@@ -323,7 +329,34 @@ def _proxy_url_with_credentials(proxy_url: str, username: str, password: str) ->
 
 def _fetch_via_proxy(session: Session, workspace_id: uuid.UUID, url: str) -> str | None:
     """One `PROXY_HTTP` fetch attempt; `None` when no provider is
-    configured or the request fails -- never raises."""
+    configured, the circuit breaker is OPEN, or the request fails --
+    never raises.
+
+    ## Breaker gate (2026-08-15)
+
+    This is the only leg of the discovery probe ladder that spends money,
+    and it was the single largest source of paid requests in the system
+    (measured: 87,082 DataImpulse requests for www.extra.com against 646
+    recorded `request_attempts` rows -- discovery probes are not written
+    to the audit table at all, so every Redis/Postgres accounting path
+    was blind to them). It also never consulted
+    `access.breaker.paid_requests_allowed`, so an OPEN circuit breaker
+    stopped the spider's paid work while discovery kept probing through
+    the same proxy. An OPEN breaker now skips this leg exactly as it
+    degrades a proxied spider plan: `PROXY_HTTP` simply stops being a
+    discovery candidate, which is the same outcome as "no provider
+    configured" and is already handled everywhere downstream.
+    """
+    allowed, reason = paid_requests_allowed(get_session)
+    if not allowed:
+        log_denied(domain=urlsplit(url).hostname or "", reason=reason)
+        logger.warning(
+            "strategy_discovery: proxy probe denied by circuit breaker url=%s reason=%s",
+            url,
+            reason,
+        )
+        return None
+
     proxy_kwargs = _build_proxy_kwargs(session, workspace_id)
     if proxy_kwargs is None:
         return None
@@ -469,6 +502,77 @@ def _promotion_thresholds(settings: Settings) -> PromotionThresholds:
     )
 
 
+#: How long a `RUNNING` discovery run suppresses a duplicate AUTO
+#: delivery for the same `(competitor, url_pattern)` key. Comfortably
+#: above the probe loop's ~600s worst case (3 ladder legs x 10 sample
+#: URLs x 15s) yet bounded, so a run wedged `RUNNING` by a hard kill
+#: cannot block that key's discovery forever.
+_AUTO_RUN_DEDUP_SECONDS = 3600
+
+
+def _auto_run_in_flight(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    competitor_id: uuid.UUID,
+    url_pattern: str,
+    now: datetime,
+) -> bool:
+    """`True` if a recent `RUNNING` run already covers this discovery key.
+
+    The AUTO trigger carries no `run_id`, so this is its replay guard
+    (audit H1) — see `run_discovery`. Scoped to the workspace like every
+    other read in this module.
+    """
+    cutoff = now - timedelta(seconds=_AUTO_RUN_DEDUP_SECONDS)
+    existing = (
+        session.execute(
+            scoped_select(StrategyDiscoveryRun, workspace_id)
+            .where(
+                StrategyDiscoveryRun.competitor_id == competitor_id,
+                StrategyDiscoveryRun.url_pattern == url_pattern,
+                StrategyDiscoveryRun.status == DiscoveryRunStatus.RUNNING,
+                StrategyDiscoveryRun.created_at >= cutoff,
+            )
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    return existing is not None
+
+
+def _runs_in_trailing_day(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    competitor_id: uuid.UUID,
+    url_pattern: str,
+    now: datetime,
+) -> int:
+    """How many discovery runs this exact key already recorded in the
+    trailing 24h — the ledger the per-key ceiling reads.
+
+    `strategy_discovery_runs` is the durable, append-only record of what
+    actually happened (the same table `access/breaker.py`'s
+    `DISCOVERY_RUNS_PER_DOMAIN` condition reads), indexed by
+    `ix_sdr_ws_competitor_domain_pattern`, so no new table or counter is
+    needed for the bound.
+    """
+    cutoff = now - timedelta(hours=24)
+    stmt = (
+        scoped_select(StrategyDiscoveryRun, workspace_id)
+        .where(
+            StrategyDiscoveryRun.competitor_id == competitor_id,
+            StrategyDiscoveryRun.url_pattern == url_pattern,
+            StrategyDiscoveryRun.created_at >= cutoff,
+        )
+        .with_only_columns(func.count())
+        .order_by(None)
+    )
+    return int(session.execute(stmt).scalar_one() or 0)
+
+
 def _fail_run(session: Session, run: StrategyDiscoveryRun) -> None:
     run.status = DiscoveryRunStatus.FAILED
     run.completed_at = datetime.now(timezone.utc)
@@ -507,6 +611,87 @@ def run_discovery(
         run: StrategyDiscoveryRun | None = None
         if run_id is not None:
             run = scoped_get(session, StrategyDiscoveryRun, uuid.UUID(str(run_id)), ws)
+            # Idempotency guard (2026-08-15 audit risk H1). Under
+            # `task_acks_late` a worker killed mid-probe has its message
+            # redelivered, and the outbox publishes at-least-once — so
+            # this task MUST be replay-safe. It is the most expensive
+            # task in the system to replay: the probe loop below walks
+            # the access ladder over the whole sample and its
+            # `PROXY_HTTP` leg spends real money per request. A run that
+            # is no longer PENDING has already been claimed (RUNNING) or
+            # finished, so the replay is a no-op instead of a second
+            # paid sample.
+            if run is not None and run.status is not DiscoveryRunStatus.PENDING:
+                logger.info(
+                    "strategy_discovery: skipping replay of non-PENDING run_id=%s status=%s",
+                    run.id,
+                    run.status.value,
+                )
+                return
+        elif _auto_run_in_flight(
+            session,
+            workspace_id=ws,
+            competitor_id=comp_id,
+            url_pattern=url_pattern,
+            now=datetime.now(timezone.utc),
+        ):
+            # Same guard for the AUTO path, which has no caller-supplied
+            # run id to key on: another delivery of this same logical
+            # discovery is already probing (or crashed mid-probe less
+            # than `_AUTO_RUN_DEDUP_SECONDS` ago). Bounded by that window
+            # so a run wedged in RUNNING by a hard kill can never block
+            # genuine later discovery for this key forever.
+            logger.info(
+                "strategy_discovery: skipping replay, run already in flight "
+                "competitor_id=%s url_pattern=%s",
+                comp_id,
+                url_pattern,
+            )
+            return
+
+        # --- Per-key daily ceiling (2026-08-15 runaway backstop) --------
+        # The structural bound that a correctness bug cannot talk its way
+        # past. `apply_rediscovery`'s cooldown bounds the one enqueue path
+        # it owns; this bounds EVERY path into this task, including any
+        # future one, because it is enforced here at the point of spend.
+        #
+        # Deliberately scoped to machine-triggered runs (`run_id is
+        # None`, i.e. AUTO and REDISCOVERY). An operator run
+        # (`POST /v1/strategy/discovery-runs`) has already created its
+        # PENDING row and is waiting on it; silently refusing to execute
+        # it would strand the run and hide the refusal from the human who
+        # asked. Machine triggers are the ones that can loop.
+        #
+        # No row is written when the ceiling refuses, so the ledger this
+        # reads never inflates itself and the bound releases on its own
+        # 24h after the last real run — unlike `proxy_circuit_breakers`,
+        # which is a fleet-wide kill switch with deliberately manual
+        # recovery. The two are complementary: this keeps one key from
+        # burning the fleet's allowance; the breaker is what stops the
+        # fleet if something still does.
+        max_runs_per_day = int(settings.STRATEGY_DISCOVERY_MAX_RUNS_PER_KEY_PER_DAY)
+        if run_id is None and max_runs_per_day > 0:
+            recent_runs = _runs_in_trailing_day(
+                session,
+                workspace_id=ws,
+                competitor_id=comp_id,
+                url_pattern=url_pattern,
+                now=datetime.now(timezone.utc),
+            )
+            if recent_runs >= max_runs_per_day:
+                logger.warning(
+                    "strategy_discovery: strategy_discovery_rate_limited "
+                    "workspace_id=%s competitor_id=%s domain=%s url_pattern=%s "
+                    "runs_24h=%d max_runs_per_day=%d triggered_by=%s",
+                    ws,
+                    comp_id,
+                    domain,
+                    url_pattern,
+                    recent_runs,
+                    max_runs_per_day,
+                    triggered_by,
+                )
+                return
 
         urls = list(sample_urls or [])
         if not urls:
@@ -606,6 +791,23 @@ def run_discovery(
             winning_extraction=extraction_method,
             confidences=confidences,
             thresholds=thresholds,
+        )
+        session.flush()
+        # 2026-08-15 runaway-rediscovery root fix, second half. Seeding
+        # alone left rediscovery condition 2 reading the *lifetime*
+        # success ratio that had just triggered this very run, so the
+        # next 60s light-recheck tick re-triggered on identical inputs.
+        # Re-base the winning methods' counters onto this run's own
+        # result -- see `rebase_stats_after_discovery`'s docstring for
+        # the measured loop (fqtoners.com, 13,151 runs / 1,439 per day).
+        rebase_stats_after_discovery(
+            session,
+            profile.id,
+            winning_access=access_method,
+            winning_extraction=extraction_method,
+            confidence=confidences.access_confidence,
+            qualifying_count=confidences.access_qualifying_count,
+            now=now,
         )
         session.commit()
         logger.info(
@@ -778,10 +980,10 @@ def light_recheck() -> None:
                     )
                 )
 
-        session.commit()
+        for transition in transitions:
+            _outbox_strategy_transition(session, transition)
 
-    for transition in transitions:
-        _enqueue_strategy_transition(transition)
+        session.commit()
 
 
 # --- STRATEGY_STATS_FLUSH (US5, contracts/stats-buffer.md §Flush, FR-023) --
@@ -800,13 +1002,22 @@ def _scan_workspace_refs_with_profiles(session: Session) -> list[uuid.UUID]:
     return [row[0] for row in session.execute(stmt).all()]
 
 
-def _enqueue_strategy_transition(transition: StrategyTransition) -> None:
-    """SPEC-16 US3 (T035, contracts/events.md #3): fire-and-forget,
-    post-commit webhook enqueue for one genuine strategy-status transition
+def _outbox_strategy_transition(session: Session, transition: StrategyTransition) -> None:
+    """SPEC-16 US3 (T035, contracts/events.md #3), reworked for audit H1.
+
+    Records the webhook event for one genuine strategy-status transition
     (`flush_stats`'s surfaced `flush_profile` transitions, or
-    `light_recheck`'s own `triggered` rediscoveries). A broker error here
-    is caught and logged, never allowed to fail/roll back the
-    already-committed strategy change above (FR-009/SC-005)."""
+    `light_recheck`'s own `triggered` rediscoveries) as an
+    `outbox_messages` row in the **caller's still-open transaction** —
+    the same transaction that carries the status change itself.
+
+    It replaces a post-commit `enqueue` whose broker error was caught and
+    logged. That seam was silently lossy in exactly the situation it
+    mattered: a Redis interruption during a degradation storm dropped the
+    very events that would have told an operator the strategies were
+    degrading. Now the event either commits with the transition or
+    disappears with it, and the outbox dispatcher publishes it later.
+    """
     event_type, payload, dedup_key = build_strategy_event(
         strategy_profile_id=transition.profile_id,
         domain=transition.domain,
@@ -814,24 +1025,27 @@ def _enqueue_strategy_transition(transition: StrategyTransition) -> None:
         change=transition.change,
         method=transition.method,
     )
-    try:
-        enqueue(
-            CREATE_WEBHOOK_EVENT,
-            queue="webhook_events",
-            kwargs={
-                "workspace_id": str(transition.workspace_id),
-                "event_type": event_type,
-                "payload": payload,
-                "dedup_key": dedup_key,
-            },
-        )
-    except Exception:
-        logger.warning(
-            "webhook_enqueue_failed source=strategy profile_id=%s change=%s",
-            transition.profile_id,
-            transition.change,
-            exc_info=True,
-        )
+    # The message id doubles as the consumer's idempotency key -- see
+    # `create_webhook_event`.
+    message_id = new_uuid7()
+    now = datetime.now(timezone.utc)
+    write_outbox_message(
+        session,
+        workspace_id=transition.workspace_id,
+        task_name=CREATE_WEBHOOK_EVENT,
+        queue="webhook_events",
+        kwargs={
+            "workspace_id": str(transition.workspace_id),
+            "event_type": event_type,
+            "payload": payload,
+            "dedup_key": dedup_key,
+            "event_id": str(message_id),
+            "occurred_at": now.isoformat(),
+        },
+        dedup_key=dedup_key,
+        now=now,
+        message_id=message_id,
+    )
 
 
 @app.task(name=STRATEGY_STATS_FLUSH)
@@ -900,10 +1114,10 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
                 keys_flushed += result.keys_flushed
                 transitions.extend(result.transitions)
 
-        session.commit()
+        for transition in transitions:
+            _outbox_strategy_transition(session, transition)
 
-    for transition in transitions:
-        _enqueue_strategy_transition(transition)
+        session.commit()
 
     logger.info(
         "strategy_stats_flushed dirty_profiles=%d keys_flushed=%d",
@@ -995,8 +1209,18 @@ def pattern_backfill() -> None:
             profile.url_pattern_version = URL_PATTERN_ALGORITHM_VERSION
             if requeue:
                 profile.status = StrategyStatus.DISCOVERY_REQUIRED
-                enqueue(
-                    STRATEGY_DISCOVERY_RUN,
+                # Audit H1: this was a *pre-commit* `enqueue` of PAID
+                # work — if the backfill transaction rolled back, the
+                # profile kept its old pattern/status while a discovery
+                # run (whose PROXY_HTTP leg costs money per request)
+                # still fired against the abandoned decision. Recorded in
+                # the outbox instead, it commits with the decision or not
+                # at all. `dedup_key` collapses repeat backfill passes
+                # over the same profile into one pending run.
+                write_outbox_message(
+                    session,
+                    workspace_id=workspace_id,
+                    task_name=STRATEGY_DISCOVERY_RUN,
                     queue=_DISCOVERY_QUEUE,
                     kwargs={
                         "workspace_id": str(workspace_id),
@@ -1006,6 +1230,7 @@ def pattern_backfill() -> None:
                         "sample_urls": [],
                         "triggered_by": "AUTO",
                     },
+                    dedup_key=f"discovery:backfill:{profile.id}",
                 )
                 rediscovered += 1
             else:

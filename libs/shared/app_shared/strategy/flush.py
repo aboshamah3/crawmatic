@@ -47,7 +47,12 @@ from app_shared.strategy.rediscovery import (
 )
 from app_shared.strategy.repository import stats_for_profile
 
-__all__ = ["flush_profile", "FlushResult", "StrategyTransition"]
+__all__ = [
+    "flush_profile",
+    "rebase_stats_after_discovery",
+    "FlushResult",
+    "StrategyTransition",
+]
 
 
 @dataclass(frozen=True)
@@ -192,6 +197,95 @@ def _upsert_stats(
     )
 
     return session.execute(stmt).one()
+
+
+def rebase_stats_after_discovery(
+    session: Session,
+    profile_id: uuid.UUID | str,
+    *,
+    winning_access: AccessMethod,
+    winning_extraction: ExtractionMethod | None,
+    confidence: Decimal | None,
+    qualifying_count: int,
+    now: datetime | None = None,
+) -> None:
+    """Re-base the winning methods' `strategy_attempt_stats` to the outcome
+    of the discovery run that just seeded them (2026-08-15 runaway fix).
+
+    ## Why this exists
+
+    Rediscovery condition 2 compares the preferred method's **lifetime**
+    `success_count / attempt_count` against
+    `STRATEGY_REDISCOVERY_SUCCESS_RATE_FLOOR`. A discovery run changes
+    neither counter — `_probe_sample` writes no stats at all — so a
+    profile that tripped condition 2 came back `ACTIVE` with the *exact
+    same* ratio that had just tripped it. The next
+    `STRATEGY_LIGHT_RECHECK` tick (60s) re-evaluated identical inputs and
+    re-triggered, forever. Measured live on fqtoners.com: `DIRECT_HTTP`
+    sat at 3 successes / 6 attempts = 0.500 against a 0.80 floor and ran
+    13,151 discovery runs — a flat 1,439/day, one per maintenance tick,
+    for ten consecutive days.
+
+    The honest post-discovery state of knowledge for a method that just
+    qualified on a fresh sample of N distinct URLs is "N/N", not a
+    lifetime aggregate dominated by pre-discovery failures of a
+    configuration that no longer applies. This mirrors what
+    `seed_from_discovery` already does with the confidence columns (it
+    overwrites them outright from the probe) and with `status` (it may
+    jump straight to `ACTIVE`) — the counters were simply the one piece
+    of learned evidence discovery forgot to refresh.
+
+    Only the two **winning** methods are re-based. Every other method's
+    row is left untouched, so the operator-visible history of e.g.
+    "PROXY_HTTP: 2,051 attempts, 0 successes" survives; those rows are
+    not what condition 2 reads.
+
+    Idempotent (absolute `SET`, not `count + delta` — unlike
+    `_upsert_stats`), and a no-op when `qualifying_count <= 0` (a
+    `NO_WINNER` run never reaches here anyway).
+    """
+    if qualifying_count <= 0:
+        return
+
+    moment = now or datetime.now(timezone.utc)
+    table = StrategyAttemptStats
+
+    targets: list[tuple[MethodType, str]] = [(MethodType.ACCESS, winning_access.value)]
+    if winning_extraction is not None:
+        targets.append((MethodType.EXTRACTION, winning_extraction.value))
+
+    for method_type, method_name in targets:
+        stmt = pg_insert(table).values(
+            id=new_uuid7(),
+            domain_strategy_profile_id=profile_id,
+            method_type=method_type,
+            method_name=method_name,
+            attempt_count=qualifying_count,
+            success_count=qualifying_count,
+            failure_count=0,
+            success_rate=Decimal("1"),
+            avg_response_time_ms=None,
+            avg_confidence=confidence,
+            last_success_at=moment,
+            last_failed_at=None,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["domain_strategy_profile_id", "method_type", "method_name"],
+            set_={
+                "attempt_count": stmt.excluded.attempt_count,
+                "success_count": stmt.excluded.success_count,
+                "failure_count": stmt.excluded.failure_count,
+                "success_rate": stmt.excluded.success_rate,
+                # `avg_response_time_ms` is a timing statistic, not
+                # rediscovery evidence -- the probe measures nothing
+                # comparable to a spider fetch, so the existing value is
+                # kept rather than blanked.
+                "avg_confidence": stmt.excluded.avg_confidence,
+                "last_success_at": stmt.excluded.last_success_at,
+                "updated_at": func.now(),
+            },
+        )
+        session.execute(stmt)
 
 
 def _combined_stats(session: Session, profile: DomainStrategyProfile) -> CombinedStats:

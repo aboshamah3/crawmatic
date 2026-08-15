@@ -88,7 +88,10 @@ def _stub_target_terminalization(monkeypatch: Any) -> None:
     (SPEC-09 T032).
     """
     monkeypatch.setattr(pipelines_mod, "mark_target", lambda *a, **k: None)
-    monkeypatch.setattr(pipelines_mod, "enqueue", lambda *a, **k: None)
+    # 2026-08-15 (audit H1): the post-commit `enqueue` seam is now an
+    # in-transaction `write_outbox_message` — stubbed here for the same
+    # reason (this file tests persistence, not the follow-up seam).
+    monkeypatch.setattr(pipelines_mod, "write_outbox_message", lambda *a, **k: None)
     monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: _FakeRedis())
 

@@ -142,13 +142,40 @@ class _RecordingMarkTarget:
 
 
 class _RecordingEnqueue:
-    """Stand-in for `app_shared.messaging.enqueue`."""
+    """Stand-in for `app_shared.outbox.write_outbox_message`.
+
+    2026-08-15 (audit H1): `_flush_batch` no longer calls
+    `app_shared.messaging.enqueue` after the transaction — it writes an
+    `outbox_messages` row *inside* it. The recorder keeps the historical
+    `{"name", "queue", "kwargs"}` record shape so every assertion below
+    still reads the same, and additionally records the `session` it was
+    handed, which is what proves the write joined the domain transaction.
+    """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def __call__(self, name: str, *, queue: str, kwargs: dict[str, Any] | None = None) -> None:
-        self.calls.append({"name": name, "queue": queue, "kwargs": kwargs})
+    def __call__(
+        self,
+        session: Any,
+        *,
+        workspace_id: Any,
+        task_name: str,
+        queue: str,
+        kwargs: dict[str, Any] | None = None,
+        dedup_key: str | None = None,
+        now: Any = None,
+    ) -> None:
+        self.calls.append(
+            {
+                "name": task_name,
+                "queue": queue,
+                "kwargs": kwargs,
+                "session": session,
+                "workspace_id": workspace_id,
+                "dedup_key": dedup_key,
+            }
+        )
 
 
 class _FakeSettings:
@@ -189,7 +216,7 @@ def _install_fakes(
     fake_redis = _FakeRedis()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", txn)
     monkeypatch.setattr(pipelines_mod, "mark_target", mark_target)
-    monkeypatch.setattr(pipelines_mod, "enqueue", enqueue)
+    monkeypatch.setattr(pipelines_mod, "write_outbox_message", enqueue)
     monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: fake_redis)
     return session, txn, mark_target, enqueue, fake_redis

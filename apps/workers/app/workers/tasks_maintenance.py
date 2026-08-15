@@ -32,11 +32,19 @@ workspace-scope`` at its source in ``app_shared.maintenance.rollups``).
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+
+from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
 from app_shared.config import get_settings
 from app_shared.database import get_system_session
+from app_shared.maintenance.health import (
+    EVENT_PARTITION_MISSING,
+    find_missing_partitions,
+)
 from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
 from app_shared.maintenance.rollups import run_daily_rollup
@@ -48,6 +56,42 @@ from app_shared.task_names import (
 )
 
 logger = logging.getLogger("workers.maintenance")
+
+#: ERROR-level structured event emitted when the BYPASSRLS system session
+#: cannot be opened at all. 2026-08-15: the `worker` Railway service had
+#: neither `SYSTEM_DATABASE_URL` nor `AUTH_DATABASE_URL`, so all three
+#: maintenance tasks raised `RuntimeError` in `get_system_session()` on
+#: every single run for a month. That *was* logged — as an anonymous
+#: Celery traceback among thousands of INFO lines, mentioning only the
+#: scheduler's "refresh-rule claim", which is not this task and not
+#: greppable as a maintenance outage. This event name makes it one.
+EVENT_SYSTEM_SESSION_UNAVAILABLE = "maintenance_system_session_unavailable"
+
+
+@contextmanager
+def _system_session(task_name: str) -> Iterator[Session]:
+    """Open the BYPASSRLS system session, shouting first if it cannot be.
+
+    The configuration is checked *before* entering
+    :func:`get_system_session`, so the ERROR line is emitted and the
+    original ``RuntimeError`` still propagates unchanged — the task must
+    keep failing loudly (Celery records it), but the operator now gets a
+    greppable line naming this task, the missing variable and the fix,
+    instead of an unrelated traceback about the scheduler's refresh-rule
+    claim.
+    """
+    settings = get_settings()
+    if not (settings.SYSTEM_DATABASE_URL or settings.AUTH_DATABASE_URL):
+        logger.error(
+            "%s task=%s remedy=%s",
+            EVENT_SYSTEM_SESSION_UNAVAILABLE,
+            task_name,
+            "set SYSTEM_DATABASE_URL (or AUTH_DATABASE_URL) on the worker service; "
+            "without it EVERY maintenance task fails before doing any work, which "
+            "silently stops partition creation, daily rollups and retention",
+        )
+    with get_system_session() as session:
+        yield session
 
 
 @app.task(name=MAINTENANCE_PARTITION_CREATE)
@@ -63,18 +107,45 @@ def partition_create() -> None:
     and `partitions_created` (empty on a no-op re-run, FR-006).
     """
     settings = get_settings()
-    with get_system_session() as session:
+    now_utc = datetime.now(timezone.utc)
+    lookahead = settings.PARTITION_CREATE_LOOKAHEAD_MONTHS
+    with _system_session("partition_create") as session:
         report = create_missing_partitions(
             session,
-            now_utc=datetime.now(timezone.utc),
-            lookahead_months=settings.PARTITION_CREATE_LOOKAHEAD_MONTHS,
+            now_utc=now_utc,
+            lookahead_months=lookahead,
         )
         session.commit()
 
+        # Verify-after-create (2026-08-15 readiness cycle). Creation is
+        # idempotent and best-effort per table, so a run can "succeed"
+        # while a required partition is still absent (a table locked by
+        # another session, a permission problem, a registry entry whose
+        # parent was recreated). Re-reading the catalog after the commit
+        # is the only statement that can honestly say the calendar is
+        # safe, and it costs one cheap `to_regclass` probe per partition.
+        still_missing, _skipped = find_missing_partitions(
+            session, now_utc=now_utc, months_ahead=lookahead
+        )
+
+    for missing in still_missing:
+        logger.error(
+            "%s table=%s partition=%s month_start=%s days_until_writes_fail=%d "
+            "source=partition_create_verify",
+            EVENT_PARTITION_MISSING,
+            missing.table,
+            missing.partition,
+            missing.month_start.date().isoformat(),
+            missing.days_until_writes_fail(now_utc),
+        )
+
     logger.info(
-        "maintenance_partition_create tables_skipped_absent=%s partitions_created=%s",
+        "maintenance_partition_create tables_skipped_absent=%s partitions_created=%s "
+        "lookahead_months=%d partitions_still_missing=%s",
         report.tables_skipped_absent,
         report.partitions_created,
+        lookahead,
+        [m.partition for m in still_missing],
     )
 
 
@@ -92,7 +163,7 @@ def daily_rollup(target_date: str | None = None) -> None:
     no SPEC-09 `variant_price_states` row yet).
     """
     parsed_date = date.fromisoformat(target_date) if target_date is not None else None
-    with get_system_session() as session:
+    with _system_session("daily_rollup") as session:
         report = run_daily_rollup(session, target_date=parsed_date)
         session.commit()
 
@@ -126,7 +197,7 @@ def retention_drop() -> None:
     create/rollup/drop guarantees above it (FR-024's non-blocking
     principle, applied here).
     """
-    with get_system_session() as session:
+    with _system_session("retention_drop") as session:
         report = run_retention(session, now_utc=datetime.now(timezone.utc))
 
         dangling_soft_refs_tolerated: int | None

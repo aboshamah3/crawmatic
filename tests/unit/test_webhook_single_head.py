@@ -47,14 +47,18 @@ def test_alembic_heads_reports_exactly_one_head_after_webhooks_migration() -> No
 
     head_lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(head_lines) == 1, f"expected exactly one head, got: {head_lines!r}"
-    # Head moved forward from 03dec3037c8f to f87cf9a237cd (Task 5,
-    # usage_export_indexes), then to 5b9a86717a66 (phase4-connect Task 2,
-    # normalise_api_key_status), then to b7d02a41c9e3 (2026-08-11
-    # domain_playbooks, proxy-cost Fix 4) after this migration's own
-    # single-head guard was written; only the head assertion changes, not
-    # the down_revision chain below.
-    assert "b7d02a41c9e3" in head_lines[0]
     assert "(head)" in head_lines[0]
+
+    # Deliberately head-agnostic. This assertion used to pin the current
+    # revision as a literal, which meant every migration — from any
+    # workstream — broke this test and had to hand-edit the literal plus a
+    # running commentary of the chain. That churn taught contributors to
+    # treat a red single-head test as routine, which is the opposite of
+    # what a guard is for. The invariant worth protecting is "exactly one
+    # head", asserted above; the identity of that head is the migration
+    # graph's business, and `alembic heads` is already its source of truth.
+    head_revision = head_lines[0].split()[0]
+    assert head_revision, f"could not parse a revision from: {head_lines[0]!r}"
 
 
 def test_webhooks_migration_down_revision_is_spec15_head() -> None:

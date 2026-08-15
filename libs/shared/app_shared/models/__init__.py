@@ -130,6 +130,29 @@ from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 # see the model's module docstring). Not workspace-owned, no RLS.
 from app_shared.models.domain_playbooks import DomainPlaybook
 
+# 2026-08-15 audit risk H3: durable (non-Redis) proxy-spend circuit
+# breaker state. Also fully global, no workspace column, no RLS — a
+# platform-wide financial kill switch over one shared proxy account
+# (see the model's module docstring).
+from app_shared.models.proxy_breaker import (
+    ProxyBreakerState,
+    ProxyBreakerTrip,
+    ProxyCircuitBreaker,
+)
+
+# 2026-08-15 audit risk H1: the transactional outbox. Workspace-owned
+# (registered in `app_shared.repository.WORKSPACE_OWNED_MODELS`, RLS in
+# its own migration); deliberately NOT partitioned — see the model's
+# module docstring for the drain-to-empty-queue rationale.
+from app_shared.models.outbox import OutboxMessage
+
+# 2026-08-15 readiness cycle: durable deadlines for the scheduler's daily
+# maintenance cadences (the in-process float accumulators they replace
+# reset to 0.0 on every container restart, so on Railway the 86400s
+# cadences could — and did — never fire). Global, no RLS, same shape as
+# `domain_playbooks`/`proxy_circuit_breakers`.
+from app_shared.models.maintenance_cadence import MaintenanceCadence
+
 __all__ = [
     "Base",
     "metadata",
@@ -170,4 +193,9 @@ __all__ = [
     "WebhookEndpoint",
     "WebhookEvent",
     "DomainPlaybook",
+    "ProxyBreakerState",
+    "ProxyBreakerTrip",
+    "ProxyCircuitBreaker",
+    "OutboxMessage",
+    "MaintenanceCadence",
 ]

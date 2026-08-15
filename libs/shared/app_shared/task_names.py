@@ -53,3 +53,13 @@ MAINTENANCE_RETENTION_DROP = "maintenance.retention_drop"
 # ``apps/workers/app/workers/tasks_webhooks.py`` on the new
 # ``webhook_events`` queue.
 CREATE_WEBHOOK_EVENT = "webhook_events.create_webhook_event"
+
+# --- Transactional outbox (audit H1) ---
+# Enqueued by the scheduler's own fixed-cadence accumulators (never by a
+# domain producer — a producer writes an ``outbox_messages`` row instead);
+# consumed by ``apps/workers/app/workers/tasks_outbox.py`` on the existing
+# ``maintenance`` queue. ``OUTBOX_DRAIN`` publishes durably-recorded
+# messages to Celery; ``OUTBOX_RECONCILE`` reports backlog/dead-letter
+# health and ages out terminal rows.
+OUTBOX_DRAIN = "maintenance.outbox_drain"
+OUTBOX_RECONCILE = "maintenance.outbox_reconcile"

@@ -38,6 +38,8 @@ from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RETENTION_DROP,
+    OUTBOX_DRAIN,
+    OUTBOX_RECONCILE,
     PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
@@ -63,6 +65,7 @@ app = Celery(
         "app.workers.tasks_strategy",
         "app.workers.tasks_maintenance",
         "app.workers.tasks_webhooks",
+        "app.workers.tasks_outbox",
     ],
 )
 
@@ -124,6 +127,61 @@ app.conf.worker_concurrency = settings.CELERY_WORKER_CONCURRENCY
 app.conf.worker_max_tasks_per_child = settings.CELERY_MAX_TASKS_PER_CHILD
 app.conf.worker_max_memory_per_child = settings.CELERY_MAX_MEMORY_PER_CHILD_KB
 
+# --- Delivery reliability (2026-08-15 audit risk H1) -----------------------
+#
+# Before this block Celery ran on its defaults: early acknowledgement,
+# no worker-loss rejection, no explicit Redis visibility timeout, and
+# prefetch 4. A worker killed mid-task (OOM, container eviction, deploy)
+# therefore lost the task outright — the message was acked the moment it
+# was delivered, so nothing ever redelivered it.
+#
+# `task_acks_late`: acknowledge AFTER the task returns, so a task that
+# dies with its worker is redelivered instead of vanishing. This is only
+# safe because every registered task is idempotent under redelivery —
+# audited task-by-task, and where a task was not idempotent it was made
+# so in this same change (see each task module's docstring; the
+# non-trivial ones were `create_webhook_event`, which now inserts under a
+# deterministic primary key with ON CONFLICT DO NOTHING, and
+# `run_discovery`, which now refuses to re-probe a run that is no longer
+# PENDING — that one costs real proxy money per replay).
+app.conf.task_acks_late = True
+
+# `task_reject_on_worker_lost`: when a prefork child is killed (SIGKILL /
+# OOM killer / `worker_max_memory_per_child` overshoot), requeue the task
+# rather than marking it failed and dropping it. Only meaningful together
+# with `task_acks_late` above.
+app.conf.task_reject_on_worker_lost = True
+
+# A task that raises is still acknowledged (Celery's default). Redelivery
+# is for *lost workers*, not for application errors — an exception that
+# reproduces would otherwise become an infinite poison-pill loop, and
+# every task here already has its own retry/backoff or is re-driven by a
+# periodic sweep.
+app.conf.task_acks_on_failure_or_timeout = True
+
+# Redis visibility timeout: how long a delivered-but-unacked message
+# stays invisible before redelivery. MUST exceed the longest task
+# runtime, otherwise a healthy long task is redelivered and runs twice.
+# Sized from the measured worst case (STRATEGY_DISCOVERY_RUN's ~600s
+# probe loop) with a 6x margin — see the settings knob's comment in
+# `app_shared.config` for the arithmetic.
+app.conf.broker_transport_options = {
+    "visibility_timeout": settings.CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
+}
+
+# Reserve at most one extra message per child. With late acks a
+# prefetched message is held unacknowledged, so hoarding multiplies what
+# a dead worker strands for a full visibility timeout — and this task mix
+# (seconds-to-minutes tasks vs ~1ms broker round-trips) gains nothing
+# from batching. See the settings knob for the full reasoning.
+app.conf.worker_prefetch_multiplier = settings.CELERY_WORKER_PREFETCH_MULTIPLIER
+
+# Keep retrying the broker connection during startup instead of crashing
+# the container when Redis is momentarily unavailable (Celery 6 makes
+# this False by default; a crash-loop here would defeat the whole point
+# of the durability work).
+app.conf.broker_connection_retry_on_startup = True
+
 app.conf.task_queues = {
     "scrape_dispatch": {},
     "maintenance": {},
@@ -145,6 +203,10 @@ app.conf.task_routes = {
     MAINTENANCE_DAILY_ROLLUP: {"queue": "maintenance"},
     MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
     CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},
+    # Audit H1: both outbox passes are ordinary `maintenance` sweeps —
+    # bounded DB work on the BYPASSRLS system session, no blocking fetch.
+    OUTBOX_DRAIN: {"queue": "maintenance"},
+    OUTBOX_RECONCILE: {"queue": "maintenance"},
 }
 
 

@@ -517,6 +517,24 @@ class DiscoveryRunStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class OutboxStatus(StrEnum):
+    """Lifecycle of an ``outbox_messages`` row (H1 transactional outbox).
+
+    ``PENDING`` — written in the producer's own transaction, not yet
+    handed to the broker. ``PUBLISHED`` — the dispatcher's
+    ``send_task`` returned without raising; the row is retained only
+    until the outbox retention window so it stays visible for
+    reconciliation/debugging. ``DEAD`` — publication failed
+    ``Settings.OUTBOX_MAX_ATTEMPTS`` times; the row is a dead letter,
+    never retried automatically, and is what operators alert on (a
+    non-zero DEAD count means real domain work never reached a worker).
+    """
+
+    PENDING = "PENDING"
+    PUBLISHED = "PUBLISHED"
+    DEAD = "DEAD"
+
+
 class WebhookEventStatus(StrEnum):
     """Delivery status of a ``webhook_events`` row (SPEC-16 §22, FR-011).
 

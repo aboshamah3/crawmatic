@@ -56,7 +56,12 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
-from app_shared.access.budget import check_domain_cooldown, check_rate_ceilings, incr_and_check_monthly_budget
+from app_shared.access.breaker import log_denied as breaker_log_denied
+from app_shared.access.budget import (
+    check_domain_cooldown_gate,
+    check_rate_ceilings,
+    incr_and_check_monthly_budget,
+)
 from app_shared.access.engine import STOP, AttemptPlan, ProxyAssignment, assign_proxy, next_attempt
 from app_shared.access.repository import (
     GLOBAL_DEFAULT_POLICY_NAME,
@@ -848,6 +853,67 @@ class _DispatchDecision:
     retry_after_seconds: int = 0
 
 
+def _settings() -> Any:
+    """The process ``Settings`` (lazy import, matching this module's
+    existing local-import convention for config access)."""
+    from app_shared.config import get_settings
+
+    return get_settings()
+
+
+def _breaker_allows_paid_work() -> tuple[bool, str | None]:
+    """``(allowed, reason)`` from the durable spend circuit breaker.
+
+    Wraps :func:`app_shared.access.breaker.paid_requests_allowed` with
+    this codebase's session factory and the configured cache window, and
+    opportunistically runs a leased evaluation so the breaker is
+    self-driving -- no external scheduler has to be wired up for it to
+    trip (at most one process per ``PROXY_BREAKER_EVAL_INTERVAL_SECONDS``
+    actually recomputes the aggregates; see the breaker module docstring).
+
+    Disabled entirely by ``PROXY_BREAKER_ENABLED=false``. Called only
+    from the ``plan.use_proxy`` branch -- never for a direct attempt.
+    Already off-reactor (`_prepare_dispatch` is `run_in_thread`-only).
+    """
+    settings = _settings()
+    if not settings.PROXY_BREAKER_ENABLED:
+        return True, None
+
+    from app_shared.access.breaker import (
+        evaluate_and_persist,
+        paid_requests_allowed,
+        thresholds_from_settings,
+    )
+    from app_shared.database import get_sessionmaker
+
+    session_factory = get_sessionmaker()
+    allowed, reason = paid_requests_allowed(
+        session_factory, cache_seconds=settings.PROXY_BREAKER_STATE_CACHE_SECONDS
+    )
+
+    # Only bother re-evaluating while the breaker is closed -- once open
+    # it stays open until an operator clears it (breaker docstring,
+    # "Recovery"), so there is nothing for an evaluation to decide.
+    if allowed:
+        try:
+            with session_factory() as session:
+                evaluate_and_persist(
+                    session,
+                    thresholds=thresholds_from_settings(settings),
+                    min_interval_seconds=settings.PROXY_BREAKER_EVAL_INTERVAL_SECONDS,
+                )
+                session.commit()
+        except Exception:  # noqa: BLE001 - evaluation is best-effort
+            # A failed evaluation must not deny paid work on its own:
+            # `paid_requests_allowed` above already read the durable
+            # state successfully, and that read is the authority.
+            logger.warning(
+                "scrape_core.targets: proxy breaker evaluation failed", exc_info=True
+            )
+
+    return allowed, reason
+
+
 def _prepare_dispatch(
     target: SpiderTarget,
     attempt_number: int,
@@ -887,6 +953,12 @@ def _prepare_dispatch(
         per_hour=policy.max_requests_per_hour,
         per_day=policy.max_requests_per_day,
     )
+    # H3: `degraded` means the ledger was unreachable, NOT denied. These
+    # two gates run before the transport decision exists, so they cannot
+    # fail closed without also stopping free DIRECT traffic; the
+    # impairment is carried forward and applied below to the paid half
+    # only. See `app_shared.access.budget`'s fail-posture docstring.
+    ledger_degraded = rate_decision.degraded
     if not rate_decision.allowed:
         # Gated before any transport decision is even made -- there is no
         # real "attempted method" to report, so this leaves
@@ -899,7 +971,11 @@ def _prepare_dispatch(
         )
 
     cooldown_seconds = target.domain_rule.cooldown_seconds if target.domain_rule is not None else 0
-    if not check_domain_cooldown(redis, domain=target.domain, cooldown_seconds=cooldown_seconds):
+    cooldown_decision = check_domain_cooldown_gate(
+        redis, domain=target.domain, cooldown_seconds=cooldown_seconds
+    )
+    ledger_degraded = ledger_degraded or cooldown_decision.degraded
+    if not cooldown_decision.allowed:
         return _DispatchDecision(
             plan=None,
             proxy=None,
@@ -931,6 +1007,47 @@ def _prepare_dispatch(
     plan = _decide()
     if plan is STOP:
         return _DispatchDecision(plan=None, proxy=None, skip_error_code=None)
+
+    # --- H3 paid/unpaid split (audit 2026-08-15) -------------------------
+    # `plan.use_proxy` is the ONLY precise discriminator between a paid
+    # and an unpaid attempt in this codebase -- it is what decides whether
+    # `assign_proxy` runs, whether the monthly budget counter is
+    # incremented, and whether the request is actually routed through
+    # DataImpulse. Everything below is therefore gated on it, and a
+    # DIRECT plan reaches dispatch completely untouched by either the
+    # degraded-ledger check or the circuit breaker. Getting this
+    # backwards would either stop all scraping (if applied to direct
+    # plans) or leave the cost hole open (if applied to neither).
+    #
+    # Both new denials reuse the pre-existing `proxy_budget_exhausted`
+    # degrade path rather than inventing a new outcome: it already means
+    # exactly "wanted a proxy, cannot have one", already falls back to
+    # the strategy's direct step where one exists, and already maps to a
+    # clean terminal `LIMIT_REACHED` where one does not. Nothing
+    # in-flight is affected -- this runs before any request is built.
+    if plan.use_proxy:
+        deny_paid_reason: str | None = None
+
+        if ledger_degraded and not _settings().PROXY_LEDGER_FAIL_OPEN:
+            deny_paid_reason = "cost ledger unavailable (Redis)"
+        else:
+            breaker_ok, breaker_reason = _breaker_allows_paid_work()
+            if not breaker_ok:
+                deny_paid_reason = breaker_reason or "spend circuit breaker open"
+
+        if deny_paid_reason is not None:
+            breaker_log_denied(
+                domain=target.domain, reason=deny_paid_reason, match_id=target.match_id
+            )
+            intended_method = plan.access_method
+            plan = _decide(proxy_budget_exhausted=True)
+            if plan is STOP:
+                return _DispatchDecision(
+                    plan=None,
+                    proxy=None,
+                    skip_error_code=ScrapeErrorCode.LIMIT_REACHED,
+                    attempted_method=intended_method,
+                )
 
     proxy_assignment: ProxyAssignment | None = None
     if plan.use_proxy:
@@ -980,7 +1097,14 @@ def _prepare_dispatch(
             provider = provider_rows.get(proxy_assignment.provider_id)
             limit = provider.monthly_budget_limit if provider is not None else None
             budget_result = incr_and_check_monthly_budget(
-                redis, provider_id=proxy_assignment.provider_id, limit=limit, now=datetime.now(UTC)
+                redis,
+                provider_id=proxy_assignment.provider_id,
+                limit=limit,
+                now=datetime.now(UTC),
+                # H3: no ledger -> no new PAID request. This call is on
+                # the paid path by construction, so failing it closed
+                # denies exactly the requests that cost money.
+                fail_open_on_error=_settings().PROXY_LEDGER_FAIL_OPEN,
             )
             if not budget_result.allowed:
                 # `proxy_assignment` (the provider that hit its budget)

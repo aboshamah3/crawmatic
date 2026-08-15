@@ -100,6 +100,19 @@ def seed_from_discovery(
     profile.preferred_access_method = winning_access
     profile.access_confidence = confidences.access_confidence
     profile.last_discovery_at = datetime.now(timezone.utc)
+    # 2026-08-15 runaway-rediscovery root fix. `recent_failure_count` is
+    # rediscovery condition 1's entire input, and nothing on the discovery
+    # path used to clear it: a profile degraded because the counter had
+    # reached the threshold came back `ACTIVE` still carrying it, so the
+    # very next `STRATEGY_LIGHT_RECHECK` (every 60s) re-evaluated an
+    # identical input and re-triggered — a discovery run per profile per
+    # minute, forever. The counter is a *pre-discovery* failure streak;
+    # once discovery has re-established a working method it is stale
+    # evidence by definition. `flush_profile` re-increments it from live
+    # attempts the moment the newly seeded method actually fails again,
+    # so a genuinely broken domain still degrades — once, not 1,440 times
+    # a day.
+    profile.recent_failure_count = 0
 
     access_decision = evaluate_promotion(
         MethodStats(

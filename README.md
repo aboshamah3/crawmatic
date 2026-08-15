@@ -79,3 +79,34 @@ docker compose down -v
 For the full validation walkthrough (including dependency-boundary and
 health-endpoint tests), see
 `specs/001-monorepo-skeleton/quickstart.md`.
+
+## Running tests
+
+Install every workspace member before running anything — a plain `uv
+sync` at the repo root leaves `apps/*`/`libs/*` uninstalled (this uv
+workspace has no root package) and produces import/collection errors:
+
+```bash
+uv sync --locked --all-packages
+```
+
+Then, from the repo root:
+
+```bash
+# Migration-graph and workspace-scoping guards (fast, DB-independent):
+bash scripts/check_single_head.sh
+uv run python scripts/check_workspace_scoping.py
+
+# Unit suite:
+uv run pytest tests/unit -q
+
+# Compose smoke (needs a reachable Docker daemon + Compose v2; skips
+# cleanly otherwise) — brings up all 8 components and asserts they reach
+# running/healthy:
+cp .env.example .env   # required: docker-compose.yml's `env_file: .env`
+                        # is a literal path, not resolved by --env-file
+uv run pytest tests/integration/test_compose_smoke.py -v
+```
+
+`.github/workflows/ci.yml` runs exactly this sequence (as separate
+`checks`/`images`/`compose-smoke` jobs) on every push and pull request.

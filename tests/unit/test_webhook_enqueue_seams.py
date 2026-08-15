@@ -1,10 +1,19 @@
-"""Unit tests for the SPEC-16 US3 webhook enqueue seams (T036,
-contracts/events.md).
+"""Unit tests for the SPEC-16 US3 webhook event seams (T036,
+contracts/events.md), reworked for the 2026-08-15 audit risk H1.
 
-With `enqueue`/`get_session` monkeypatched/mocked (no live Celery/DB),
-asserts each of the FOUR seam paths calls
-`enqueue(CREATE_WEBHOOK_EVENT, queue="webhook_events", kwargs=...)` exactly
-once per genuine transition, with the expected `event_type`/payload:
+With the outbox writer / `get_session` monkeypatched/mocked (no live
+Celery/DB), asserts each of the FOUR seam paths records
+`CREATE_WEBHOOK_EVENT` on the `webhook_events` queue exactly once per
+genuine transition, with the expected `event_type`/payload.
+
+What changed in H1: these seams used to call
+`app_shared.messaging.enqueue` around their own `session.commit()` and
+swallow any broker error. They now call
+`app_shared.outbox.write_outbox_message(session, ...)` *inside* the same
+transaction as the domain change, so the message commits with the change
+or not at all. The four ex-`broker_error_is_swallowed` tests are
+therefore inverted into `..._commit_together` tests below — a failure to
+record the message must NOT leave a committed transition behind:
 
 1. alert transitions -- `tasks_analysis.py::recompute_variant`
 2. job finalization -- `tasks_jobs.py::finalize_jobs`
@@ -14,8 +23,7 @@ once per genuine transition, with the expected `event_type`/payload:
 
 Plus the negative cases (alert `event_type is None`, job
 `UNCHANGED`/`CANCELLED`, strategy `apply_promotion`/`apply_rediscovery`
-returning `False`) enqueue nothing, and a raised broker error inside any
-seam is swallowed (the source path completes, its commit stands).
+returning `False`) record nothing.
 
 Loaded in a fresh subprocess per scenario (mirrors
 `test_price_analysis_task.py`/`test_jobs_dispatch_task.py`'s
@@ -58,12 +66,42 @@ def _run(script_body: str) -> subprocess.CompletedProcess:
 
 _RECORDING_ENQUEUE_HELPER = """
 class _RecordingEnqueue:
+    \"\"\"Records every follow-up message a seam produces.
+
+    2026-08-15 (audit H1): these seams no longer call
+    `app_shared.messaging.enqueue` around their commit — they call
+    `app_shared.outbox.write_outbox_message(session, ..., task_name=...)`
+    *inside* it. This double accepts BOTH shapes and normalises them to
+    the same `{"name", "queue", "kwargs"}` record, so every behavioural
+    assertion in this file (one message per genuine transition, correct
+    event_type/payload/dedup_key, nothing on a non-transition) still
+    reads exactly as before and keeps testing the same guarantee.
+    \"\"\"
+
     def __init__(self, raise_on=None):
         self.calls = []
         self.raise_on = raise_on or set()
 
-    def __call__(self, name, *, queue, kwargs=None):
-        self.calls.append({"name": name, "queue": queue, "kwargs": kwargs})
+    def __call__(self, *args, **kwargs):
+        if args and hasattr(args[0], "commit"):
+            # outbox form: (session, *, workspace_id, task_name, queue, kwargs, ...)
+            session = args[0]
+            name = kwargs["task_name"]
+            record = {
+                "name": name,
+                "queue": kwargs.get("queue"),
+                "kwargs": kwargs.get("kwargs"),
+                "session": session,
+                "committed_at_write_time": getattr(session, "committed", None),
+            }
+        else:
+            name = args[0] if args else kwargs["name"]
+            record = {
+                "name": name,
+                "queue": kwargs.get("queue"),
+                "kwargs": kwargs.get("kwargs"),
+            }
+        self.calls.append(record)
         if name in self.raise_on:
             raise RuntimeError("simulated broker outage")
 """
@@ -146,7 +184,7 @@ def test_alert_seam_enqueues_once_on_genuine_transition() -> None:
         _ALERT_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_analysis.enqueue = enqueue
+tasks_analysis.write_outbox_message = enqueue
 
 scrape_job_id = uuid.uuid4()
 fake_session.seed(make_match("90"), make_match("100"), make_match("110"))
@@ -208,7 +246,7 @@ def test_alert_seam_no_event_type_enqueues_nothing() -> None:
         _ALERT_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_analysis.enqueue = enqueue
+tasks_analysis.write_outbox_message = enqueue
 
 # No competitor rows at all -> NO_COMPETITOR_DATA, but with no prior
 # history and outcome.type staying at its very first value the engine's
@@ -247,25 +285,50 @@ sys.exit(0)
     assert result.stdout.strip() == "OK"
 
 
-def test_alert_seam_broker_error_is_swallowed() -> None:
+def test_alert_seam_message_and_analysis_commit_together() -> None:
+    """2026-08-15 audit H1 — replaces `..._broker_error_is_swallowed`.
+
+    The old contract was "the broker error is swallowed and the analysis
+    commit stands", which is precisely how an alert transition could be
+    persisted with its event lost forever. The new contract is
+    all-or-nothing: the message is written to the outbox BEFORE the
+    commit (so it commits with the transition), and if that write fails
+    the transition does not commit either — there is no half-state to
+    reconcile, and the next run recomputes it cleanly.
+    """
     script = (
         _ALERT_SETUP
         + """
 from app_shared.task_names import CREATE_WEBHOOK_EVENT
 
 enqueue = _RecordingEnqueue(raise_on={CREATE_WEBHOOK_EVENT})
-tasks_analysis.enqueue = enqueue
+tasks_analysis.write_outbox_message = enqueue
 
 fake_session.seed(make_match("90"), make_match("100"), make_match("110"))
 
-# Must not raise even though enqueue() throws.
-tasks_analysis.recompute_variant(
-    workspace_id=str(workspace_id),
-    product_variant_id=str(variant_id),
-)
+raised = False
+try:
+    tasks_analysis.recompute_variant(
+        workspace_id=str(workspace_id),
+        product_variant_id=str(variant_id),
+    )
+except RuntimeError:
+    raised = True
 
-if not fake_session.committed:
-    print("SOURCE_COMMIT_DID_NOT_STAND")
+if not raised:
+    print("OUTBOX_FAILURE_WAS_SWALLOWED")
+    sys.exit(1)
+if fake_session.committed:
+    print("COMMITTED_DESPITE_FAILED_OUTBOX_WRITE")
+    sys.exit(1)
+
+# And the write really was attempted pre-commit.
+calls = [c for c in enqueue.calls if c["name"] == CREATE_WEBHOOK_EVENT]
+if len(calls) != 1:
+    print("EXPECTED_ONE_ATTEMPT:" + str(len(calls)))
+    sys.exit(1)
+if calls[0]["committed_at_write_time"]:
+    print("WROTE_AFTER_COMMIT")
     sys.exit(1)
 
 print("OK")
@@ -361,7 +424,7 @@ def test_job_seam_enqueues_once_per_finalized_terminal_job() -> None:
         _JOB_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_jobs.enqueue = enqueue
+tasks_jobs.write_outbox_message = enqueue
 
 completed_job = _make_job(workspace_id, ScrapeJobStatus.RUNNING)
 fake_session.seed(completed_job)
@@ -405,7 +468,7 @@ def test_job_seam_already_cancelled_job_enqueues_nothing() -> None:
         _JOB_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_jobs.enqueue = enqueue
+tasks_jobs.write_outbox_message = enqueue
 
 # Already-terminal CANCELLED job is skipped outright by finalize_jobs'
 # own scan (_NON_TERMINAL_JOB_STATUSES excludes it) -- never finalized,
@@ -436,7 +499,7 @@ def test_job_seam_not_yet_finalized_job_enqueues_nothing() -> None:
         _JOB_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_jobs.enqueue = enqueue
+tasks_jobs.write_outbox_message = enqueue
 
 # One target still PENDING -> job never finalizes this cycle ("unchanged").
 running_job = _make_job(workspace_id, ScrapeJobStatus.RUNNING)
@@ -465,26 +528,45 @@ sys.exit(0)
     assert result.stdout.strip() == "OK"
 
 
-def test_job_seam_broker_error_is_swallowed() -> None:
+def test_job_seam_message_and_finalize_commit_together() -> None:
+    """2026-08-15 audit H1 — replaces `..._broker_error_is_swallowed`.
+
+    Same inversion as the alert seam: the job event is written to the
+    outbox inside the finalize transaction, so a failure to record it
+    aborts the finalize rather than leaving a terminal job whose event
+    nobody will ever emit.
+    """
     script = (
         _JOB_SETUP
         + """
 from app_shared.task_names import CREATE_WEBHOOK_EVENT
 
 enqueue = _RecordingEnqueue(raise_on={CREATE_WEBHOOK_EVENT})
-tasks_jobs.enqueue = enqueue
+tasks_jobs.write_outbox_message = enqueue
 
 completed_job = _make_job(workspace_id, ScrapeJobStatus.RUNNING)
 fake_session.seed(completed_job)
 fake_session.seed(_make_target(workspace_id, completed_job.id, ScrapeTargetStatus.COMPLETED))
 
-tasks_jobs.finalize_jobs()
+raised = False
+try:
+    tasks_jobs.finalize_jobs()
+except RuntimeError:
+    raised = True
 
-if not fake_session.committed:
-    print("SOURCE_COMMIT_DID_NOT_STAND")
+if not raised:
+    print("OUTBOX_FAILURE_WAS_SWALLOWED")
     sys.exit(1)
-if completed_job.status != ScrapeJobStatus.COMPLETED:
-    print("JOB_NOT_FINALIZED:" + str(completed_job.status))
+if fake_session.committed:
+    print("COMMITTED_DESPITE_FAILED_OUTBOX_WRITE")
+    sys.exit(1)
+
+calls = [c for c in enqueue.calls if c["name"] == CREATE_WEBHOOK_EVENT]
+if len(calls) != 1:
+    print("EXPECTED_ONE_ATTEMPT:" + str(len(calls)))
+    sys.exit(1)
+if calls[0]["committed_at_write_time"]:
+    print("WROTE_AFTER_COMMIT")
     sys.exit(1)
 
 print("OK")
@@ -561,7 +643,7 @@ def test_flush_stats_seam_enqueues_once_per_surfaced_transition() -> None:
         _FLUSH_STATS_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_strategy.enqueue = enqueue
+tasks_strategy.write_outbox_message = enqueue
 
 
 def fake_flush_profile(session, redis, profile_id):
@@ -658,14 +740,21 @@ sys.exit(0)
     assert result.stdout.strip() == "OK"
 
 
-def test_flush_stats_seam_broker_error_is_swallowed() -> None:
+def test_flush_stats_seam_message_and_flush_commit_together() -> None:
+    """2026-08-15 audit H1 — replaces `..._broker_error_is_swallowed`.
+
+    A strategy transition and the event announcing it now commit
+    together or not at all (the old seam swallowed the broker error and
+    kept the transition, which is how a degradation storm could go
+    entirely unannounced).
+    """
     script = (
         _FLUSH_STATS_SETUP
         + """
 from app_shared.task_names import CREATE_WEBHOOK_EVENT
 
 enqueue = _RecordingEnqueue(raise_on={CREATE_WEBHOOK_EVENT})
-tasks_strategy.enqueue = enqueue
+tasks_strategy.write_outbox_message = enqueue
 
 
 def fake_flush_profile(session, redis, profile_id):
@@ -686,11 +775,27 @@ def fake_flush_profile(session, redis, profile_id):
 
 tasks_strategy.flush_profile = fake_flush_profile
 
-# Must not raise even though enqueue() throws for every transition.
-tasks_strategy.flush_stats(workspace_id=str(workspace_id), profile_ids=[str(profile_promote)])
+raised = False
+try:
+    tasks_strategy.flush_stats(
+        workspace_id=str(workspace_id), profile_ids=[str(profile_promote)]
+    )
+except RuntimeError:
+    raised = True
 
-if not fake_session.committed:
-    print("SOURCE_COMMIT_DID_NOT_STAND")
+if not raised:
+    print("OUTBOX_FAILURE_WAS_SWALLOWED")
+    sys.exit(1)
+if fake_session.committed:
+    print("COMMITTED_DESPITE_FAILED_OUTBOX_WRITE")
+    sys.exit(1)
+
+calls = [c for c in enqueue.calls if c["name"] == CREATE_WEBHOOK_EVENT]
+if not calls:
+    print("NO_ATTEMPT_RECORDED")
+    sys.exit(1)
+if calls[0]["committed_at_write_time"]:
+    print("WROTE_AFTER_COMMIT")
     sys.exit(1)
 
 print("OK")
@@ -823,7 +928,7 @@ def test_light_recheck_seam_enqueues_once_per_triggered_profile() -> None:
         _LIGHT_RECHECK_SETUP
         + """
 enqueue = _RecordingEnqueue()
-tasks_strategy.enqueue = enqueue
+tasks_strategy.write_outbox_message = enqueue
 
 tasks_strategy.light_recheck()
 
@@ -864,20 +969,41 @@ sys.exit(0)
     assert result.stdout.strip() == "OK"
 
 
-def test_light_recheck_seam_broker_error_is_swallowed() -> None:
+def test_light_recheck_seam_message_and_rediscovery_commit_together() -> None:
+    """2026-08-15 audit H1 — replaces `..._broker_error_is_swallowed`.
+
+    `light_recheck` is the one rediscovery path `flush_stats` never
+    sees, so losing its event lost the only signal that patrol had
+    degraded a profile. Now the event and the ACTIVE -> DEGRADED
+    transition share one transaction.
+    """
     script = (
         _LIGHT_RECHECK_SETUP
         + """
 from app_shared.task_names import CREATE_WEBHOOK_EVENT
 
 enqueue = _RecordingEnqueue(raise_on={CREATE_WEBHOOK_EVENT})
-tasks_strategy.enqueue = enqueue
+tasks_strategy.write_outbox_message = enqueue
 
-# Must not raise even though enqueue() throws.
-tasks_strategy.light_recheck()
+raised = False
+try:
+    tasks_strategy.light_recheck()
+except RuntimeError:
+    raised = True
 
-if not fake_session.committed:
-    print("SOURCE_COMMIT_DID_NOT_STAND")
+if not raised:
+    print("OUTBOX_FAILURE_WAS_SWALLOWED")
+    sys.exit(1)
+if fake_session.committed:
+    print("COMMITTED_DESPITE_FAILED_OUTBOX_WRITE")
+    sys.exit(1)
+
+calls = [c for c in enqueue.calls if c["name"] == CREATE_WEBHOOK_EVENT]
+if not calls:
+    print("NO_ATTEMPT_RECORDED")
+    sys.exit(1)
+if calls[0]["committed_at_write_time"]:
+    print("WROTE_AFTER_COMMIT")
     sys.exit(1)
 
 print("OK")

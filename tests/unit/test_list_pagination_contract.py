@@ -12,6 +12,9 @@ from app.openapi_public import build_public_openapi
 #: Collection GETs that legitimately return a single object, not a list.
 _SINGLETON_PATHS = {
     "/health",
+    # Build/release provenance (audit §C2) -- a single point-in-time
+    # snapshot (git SHA, migration heads), never a list.
+    "/version",
     "/openapi-public.json",
     # One computed price-comparison snapshot for the given variant (SPEC-09
     # US1) -- the path's last segment ("price-comparison") isn't a

@@ -153,7 +153,9 @@ def test_rollups_cover_query_is_an_except_over_scraped_at_date() -> None:
     sql = _compiled(stmt)
     assert "EXCEPT" in sql
     assert "price_observations_2026_01" in sql
-    assert "scraped_at::date" in sql
+    # UTC-pinned, not the session-TimeZone-dependent bare `scraped_at::date`
+    # — the rollup rows this is compared against are keyed on the UTC day.
+    assert "(scraped_at AT TIME ZONE 'UTC')::date" in sql
     assert "variant_price_daily_rollups" in sql
     assert "'2026-01-01'" in sql
     assert "'2026-02-01'" in sql

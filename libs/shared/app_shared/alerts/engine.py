@@ -263,7 +263,16 @@ def analyze(
     if count > 0:
         cheapest = min(split.included_prices)
         highest = max(split.included_prices)
-        average = sum(split.included_prices, Decimal(0)) / count
+        # The mean is a *derived statistic*, not an external monetary input.
+        # Exact division by a count that is not a power of two (three
+        # competitors, say) yields a repeating decimal such as
+        # ``1312.333...``, which `decide`'s over-scale guard would reject
+        # outright — dropping a perfectly valid observation. Quantize to the
+        # money scale here so that guard keeps its full strictness for the
+        # prices we did *not* compute ourselves.
+        average = (sum(split.included_prices, Decimal(0)) / count).quantize(
+            QUANT, rounding=ROUND_HALF_UP
+        )
 
     alert_type, discount = decide(client_price, cheapest, average, highest, count)
     severity = severity_for(alert_type)

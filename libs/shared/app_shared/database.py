@@ -63,6 +63,21 @@ def get_engine() -> Engine:
                 "prepare_threshold": None,
             },
         )
+        # Audit C3: this is the ONE ordinary, RLS-confined connection.
+        # Assert once, here, at engine construction (i.e. once per
+        # process on first use — never per request) that the role behind
+        # it cannot step over FORCE ROW LEVEL SECURITY. No-op outside
+        # production unless RLS_ROLE_ASSERTION=on; see
+        # app_shared.db.rls_guard. Deliberately NOT applied to the auth
+        # or system engines below, which are BYPASSRLS by design.
+        from app_shared.db.rls_guard import enforce_rls_role_on_startup
+
+        try:
+            enforce_rls_role_on_startup(_engine)
+        except BaseException:
+            _engine.dispose()
+            _engine = None
+            raise
     return _engine
 
 
@@ -294,6 +309,9 @@ def dispose_engine() -> None:
     """
     global _engine, _sessionmaker, _auth_engine, _auth_sessionmaker
     global _system_engine, _system_sessionmaker
+    from app_shared.db.rls_guard import reset_rls_guard_cache
+
+    reset_rls_guard_cache()
     if _engine is not None:
         _engine.dispose()
     _engine = None

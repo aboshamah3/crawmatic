@@ -35,7 +35,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import date as date_type
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, NamedTuple
 
@@ -134,6 +134,42 @@ def aggregate_competitor_prices(
     )
 
 
+def utc_day_bounds(target_date: date_type) -> tuple[datetime, datetime]:
+    """Return the half-open UTC instant range ``[start, end)`` covering
+    ``target_date`` — i.e. ``[D 00:00:00+00, D+1 00:00:00+00)``.
+
+    Every ``price_observations`` predicate in this module is expressed
+    against these two **tz-aware UTC** bounds rather than as
+    ``scraped_at::date = D`` (SARGABILITY, and timezone determinism):
+
+    * *Sargability* — wrapping the partition key ``scraped_at`` in a
+      cast makes the predicate opaque to the planner: it defeats BOTH
+      partition pruning (every monthly partition is scanned, including
+      months that cannot possibly contain ``D``) and the
+      ``(workspace_id, scraped_at)`` index, forcing a seq scan of the
+      whole table per (workspace, variant) probe — quadratic in
+      (variants x observations). A plain range comparison against the
+      partition key prunes to the one partition and drives the index.
+    * *Timezone determinism* — ``timestamptz::date`` resolves in the
+      **session** ``TimeZone``, so what "day D" means would silently
+      follow a server/role/connection setting. Production runs
+      ``TimeZone = Etc/UTC`` and the partitions are cut on UTC month
+      boundaries, so the previous cast happened to mean "UTC day", which
+      is what this job documents and what
+      :func:`default_target_date`/``variant_price_daily_rollups.date``
+      mean. These bounds pin that UTC meaning explicitly in the
+      *parameters* rather than inheriting it from session state, so the
+      behaviour is unchanged today and can no longer be shifted by
+      hours by a ``SET TimeZone``.
+
+    The range is half-open: ``D 00:00:00.000000+00`` is included,
+    ``D+1 00:00:00+00`` is not — exactly the set of instants
+    ``scraped_at::date = D`` selected under UTC.
+    """
+    start = datetime.combine(target_date, time.min, tzinfo=timezone.utc)
+    return start, start + timedelta(days=1)
+
+
 def _driver_pairs_stmt(target_date: date_type):
     """Build the (unexecuted) cross-tenant driver-scan statement.
 
@@ -144,14 +180,19 @@ def _driver_pairs_stmt(target_date: date_type):
     workspace-scope`, research R9). Split out so its rendered SQL can be
     asserted in a pure unit test without a live DB (mirrors
     `app_shared.maintenance.partitions._to_regclass_stmt`).
+
+    The day predicate is a half-open range on the raw partition key
+    (:func:`utc_day_bounds`) so the scan prunes to the target day's
+    partition instead of seq-scanning every month.
     """
+    day_start, day_end = utc_day_bounds(target_date)
     return text(
         """
         SELECT DISTINCT workspace_id, product_variant_id, product_id
         FROM price_observations
-        WHERE scraped_at::date = :target_date
+        WHERE scraped_at >= :day_start AND scraped_at < :day_end
         """
-    ).bindparams(target_date=target_date)
+    ).bindparams(day_start=day_start, day_end=day_end)
 
 
 def _day_observations_stmt(
@@ -161,17 +202,25 @@ def _day_observations_stmt(
     raw observation rows (price/currency/success/comparable) — the
     unfiltered input to :func:`aggregate_competitor_prices`. Explicitly
     scoped by ``workspace_id`` (FR-014) in addition to the day + variant.
+
+    This statement executes once per (workspace, variant) pair returned
+    by :func:`_driver_pairs_stmt`, so its per-call cost is multiplied by
+    the driver's row count — the half-open range on the raw partition
+    key (:func:`utc_day_bounds`) is what keeps it an index scan of one
+    partition rather than a full-table seq scan per pair.
     """
+    day_start, day_end = utc_day_bounds(target_date)
     return text(
         """
         SELECT price, currency, success, comparable
         FROM price_observations
-        WHERE scraped_at::date = :target_date
+        WHERE scraped_at >= :day_start AND scraped_at < :day_end
           AND workspace_id = :workspace_id
           AND product_variant_id = :product_variant_id
         """
     ).bindparams(
-        target_date=target_date,
+        day_start=day_start,
+        day_end=day_end,
         workspace_id=workspace_id,
         product_variant_id=product_variant_id,
     )

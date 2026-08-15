@@ -334,3 +334,69 @@ def test_analyze_mismatched_ids_surfaced_and_excluded_from_benchmarks() -> None:
     assert outcome.comparable_count == 3
     assert outcome.mismatched_match_ids == [mismatched.match_id]
     assert outcome.highest == Decimal("110")
+
+
+# --- repeating-decimal averages (C1 regression) -----------------------------
+#
+# ``analyze`` divides the price sum by the competitor count. For any count
+# that is not a power of two the exact quotient can repeat forever, and the
+# over-scale guard in ``decide`` used to reject it outright — discarding a
+# perfectly valid observation. The guard must stay strict for prices supplied
+# by a caller; only the mean we compute ourselves is quantized.
+
+
+def test_repeating_average_three_competitors_does_not_raise() -> None:
+    """The exact production repro: 1000 + 1001 + 1936 over 3 -> 1312.333..."""
+    rows = [_row("1000.0000"), _row("1001.0000"), _row("1936.0000")]
+    outcome = analyze(Decimal("900.0000"), CUR, rows)
+    assert outcome.average == Decimal("1312.3333")
+    assert outcome.type is AlertType.CHANCE_TO_INCREASE_PRICE
+
+
+@pytest.mark.parametrize("count", [3, 6, 7, 9, 11, 13])
+def test_repeating_average_non_power_of_two_counts_are_quantized(count: int) -> None:
+    """A repeating quotient must never escape as an over-scale Decimal."""
+    rows = [_row("100.0000") for _ in range(count - 1)] + [_row("101.0000")]
+    outcome = analyze(Decimal("50.0000"), CUR, rows)
+    assert outcome.average is not None
+    exponent = outcome.average.as_tuple().exponent
+    assert isinstance(exponent, int) and -exponent <= 4
+
+
+def test_repeating_average_uses_half_up_not_truncation() -> None:
+    """2/3 -> 0.6666... rounds the 5th decimal up, matching QUANT policy."""
+    rows = [_row("2.0000"), _row("2.0000"), _row("2.0001")]
+    outcome = analyze(Decimal("1.0000"), CUR, rows)
+    assert outcome.average == Decimal("2.0000")
+
+    rows = [_row("1.0000"), _row("1.0000"), _row("1.0002")]
+    outcome = analyze(Decimal("0.5000"), CUR, rows)
+    # 3.0002 / 3 = 1.00006666... -> 1.0001 half-up
+    assert outcome.average == Decimal("1.0001")
+
+
+def test_repeating_average_benchmark_price_matches_quantized_average() -> None:
+    """The stored benchmark must be the same 4dp value, not the raw quotient."""
+    rows = [_row("1000.0000"), _row("1001.0000"), _row("1936.0000")]
+    outcome = analyze(Decimal("900.0000"), CUR, rows)
+    assert outcome.benchmark_price == outcome.average == Decimal("1312.3333")
+
+
+def test_repeating_average_still_deterministic_across_runs() -> None:
+    rows = [
+        _row("1000.0000", match_id=uuid.UUID(int=1)),
+        _row("1001.0000", match_id=uuid.UUID(int=2)),
+        _row("1936.0000", match_id=uuid.UUID(int=3)),
+    ]
+    assert analyze(Decimal("900.0000"), CUR, rows) == analyze(Decimal("900.0000"), CUR, rows)
+
+
+def test_caller_supplied_over_scale_average_is_still_rejected() -> None:
+    """Quantizing the computed mean must not weaken the boundary guard."""
+    with pytest.raises(ValueError, match="over-scale"):
+        decide(Decimal("900"), Decimal("1000"), Decimal("1312.33333"), Decimal("1936"), 3)
+
+
+def test_caller_supplied_over_scale_competitor_price_is_still_rejected() -> None:
+    with pytest.raises(ValueError, match="over-scale"):
+        analyze(Decimal("900"), CUR, [_row("1000.00001")])

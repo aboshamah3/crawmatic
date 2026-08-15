@@ -36,6 +36,7 @@ from app.workers.celery_app import app
 from app_shared.alerts import engine
 from app_shared.alerts.engine import AlertOutcome, CompetitorPrice
 from app_shared.database import get_session, set_workspace_context
+from app_shared.ids import new_uuid7
 from app_shared.enums import (
     AlertEventType,
     AlertSeverity,
@@ -43,10 +44,10 @@ from app_shared.enums import (
     AlertType,
     ScrapeErrorCode,
 )
-from app_shared.messaging import enqueue
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.observations import MatchCurrentPrice
+from app_shared.outbox import write_outbox_message
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.task_names import CREATE_WEBHOOK_EVENT, PRICE_ANALYSIS_RECOMPUTE
 from app_shared.webhooks.payloads import build_alert_event
@@ -383,44 +384,70 @@ def recompute_variant(
                 now=now,
             )
 
-        session.commit()
-
-        # SPEC-16 US3 (T033, contracts/events.md #1): fire-and-forget,
-        # strictly post-commit webhook event -- only on a genuine alert
-        # transition (`event_type is not None`; UNCHANGED never reaches
-        # here). A broker error here must never fail/roll back the
-        # already-committed analysis above (FR-009/SC-005), so it is
-        # caught and logged, never re-raised.
+        # SPEC-16 US3 (T033, contracts/events.md #1), reworked for audit
+        # risk H1: the webhook event is no longer a post-commit,
+        # fire-and-forget `enqueue` — it is an `outbox_messages` row
+        # written HERE, inside the same transaction as the alert state /
+        # price state / alert event above, and published to Celery
+        # afterwards by the outbox dispatcher.
+        #
+        # Why this is strictly better than what it replaces: the old seam
+        # committed the analysis, then tried the broker, then swallowed
+        # any error. A Redis outage (or a crash in that gap) therefore
+        # produced a persisted alert transition with no event ever
+        # recorded, and nothing anywhere could reconstruct it. Now the
+        # intent commits atomically with the transition that caused it,
+        # so it cannot be lost; and if the transition rolls back, the
+        # message rolls back with it, so it can never be spurious either.
+        #
+        # Only a genuine transition emits (`event_type is not None`;
+        # UNCHANGED never reaches here). `build_alert_event` is pure and
+        # may reject an oversized payload — that must not fail an
+        # otherwise-good analysis, so only the build is guarded.
         if event_type is not None:
-            built = build_alert_event(
-                product_variant_id=variant_id,
-                product_id=resolved_product_id,
-                alert_state_id=alert_state.id,
-                transition=event_type,
-                previous_type=prev_type,
-                new_type=outcome.type,
-                previous_severity=prev_severity,
-                new_severity=outcome.severity,
-                scrape_job_id=scrape_job_id,
-            )
+            built = None
+            try:
+                built = build_alert_event(
+                    product_variant_id=variant_id,
+                    product_id=resolved_product_id,
+                    alert_state_id=alert_state.id,
+                    transition=event_type,
+                    previous_type=prev_type,
+                    new_type=outcome.type,
+                    previous_severity=prev_severity,
+                    new_severity=outcome.severity,
+                    scrape_job_id=scrape_job_id,
+                )
+            except Exception:
+                logger.warning(
+                    "webhook_payload_build_failed source=recompute_variant "
+                    "product_variant_id=%s",
+                    variant_id,
+                    exc_info=True,
+                )
             if built is not None:
                 webhook_event_type, webhook_payload, dedup_key = built
-                try:
-                    enqueue(
-                        CREATE_WEBHOOK_EVENT,
-                        queue="webhook_events",
-                        kwargs={
-                            "workspace_id": str(ws),
-                            "event_type": webhook_event_type,
-                            "payload": webhook_payload,
-                            "dedup_key": dedup_key,
-                        },
-                    )
-                except Exception:
-                    logger.warning(
-                        "webhook_enqueue_failed source=recompute_variant "
-                        "product_variant_id=%s event_type=%s",
-                        variant_id,
-                        webhook_event_type,
-                        exc_info=True,
-                    )
+                # The message id doubles as the consumer's idempotency
+                # key: `create_webhook_event` inserts under it with ON
+                # CONFLICT DO NOTHING, so an at-least-once redelivery
+                # produces exactly one `webhook_events` row.
+                message_id = new_uuid7()
+                write_outbox_message(
+                    session,
+                    workspace_id=ws,
+                    task_name=CREATE_WEBHOOK_EVENT,
+                    queue="webhook_events",
+                    kwargs={
+                        "workspace_id": str(ws),
+                        "event_type": webhook_event_type,
+                        "payload": webhook_payload,
+                        "dedup_key": dedup_key,
+                        "event_id": str(message_id),
+                        "occurred_at": now.isoformat(),
+                    },
+                    dedup_key=dedup_key,
+                    now=now,
+                    message_id=message_id,
+                )
+
+        session.commit()

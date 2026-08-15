@@ -18,16 +18,32 @@ from __future__ import annotations
 import redis
 
 from app_shared.config import get_settings
+from app_shared.redis_policy import enforce_redis_memory_policy
 
 _redis_client: redis.Redis | None = None
 
 
 def get_redis_client() -> redis.Redis:
-    """Return the per-process Redis client, creating it on first use."""
+    """Return the per-process Redis client, creating it on first use.
+
+    On the **first** creation in a process the connected server's
+    ``maxmemory-policy`` is asserted (audit 2026-08-15 risk H2, see
+    ``app_shared.redis_policy``): this instance holds correctness- and
+    cost-critical keys (match locks, dispatch sentinels, ``proxybudget:*``
+    spend counters), so an eviction-capable policy is a confirmed
+    misconfiguration and the process refuses to start. A server that
+    cannot answer ``CONFIG GET`` is only warned about, never fatal, and
+    ``PROXY_REDIS_REQUIRE_NOEVICTION=false`` disables enforcement
+    entirely -- see that module's docstring for the full rationale.
+    """
     global _redis_client
     if _redis_client is None:
         settings = get_settings()
-        _redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        enforce_redis_memory_policy(
+            client, require=settings.PROXY_REDIS_REQUIRE_NOEVICTION
+        )
+        _redis_client = client
     return _redis_client
 
 

@@ -47,11 +47,44 @@ services:
         condition: service_healthy
     expose:
       - "6432"
+    # Production-readiness audit §11 ("meaningful healthchecks" — only
+    # postgres/api had one). No Postgres client tooling is guaranteed in
+    # this Alpine-based image, so this is a bare TCP-accept probe via
+    # busybox ash's `/dev/tcp` (enabled by default on Alpine's busybox
+    # build) rather than a real `SELECT 1` — it proves the listener is up
+    # and accepting connections, not that auth/pooling is healthy.
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   redis:
     image: redis:7.4.2-bookworm
+    # Audit §6/§11/§12 (Redis is broker + correctness-critical
+    # locks/counters/budget state, with no enforced eviction policy or
+    # persistence): `noeviction` so a full Redis returns OOM errors to
+    # callers instead of silently discarding rate-limit/budget/dedup
+    # keys under memory pressure (an eviction would look like every
+    # brake releasing at once, not like an error). `--appendonly yes` +
+    # a named volume so broker/lock/counter state survives a container
+    # restart instead of resetting to empty. This is the compose-level
+    # piece only — the *application* fail-closed behavior when Redis is
+    # unavailable/full (H2/H3 workstream) is separate and not touched
+    # here.
+    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     expose:
       - "6379"
+    # Real semantic check (redis-cli PING -> PONG), not just TCP accept.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   api:
     build:
@@ -108,6 +141,21 @@ services:
         condition: service_started
       redis:
         condition: service_started
+    # Best-effort liveness only: the scheduler exposes no port and no
+    # CLI/heartbeat hook, so this can only confirm the app module still
+    # imports cleanly inside the running container (catches a
+    # crash-looping/broken deploy) — it does NOT confirm the poll loop
+    # (SCHEDULER_POLL_INTERVAL_SECONDS) is still actually ticking. A real
+    # liveness probe needs an application-level heartbeat (e.g. a
+    # periodically-touched file or a tiny status endpoint) — that's an
+    # apps/scheduler code change, out of this change's scope; see the
+    # handoff note in the accompanying report.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import app.scheduler.scheduler_app"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   worker:
     build:
@@ -119,6 +167,15 @@ services:
         condition: service_started
       redis:
         condition: service_started
+    # Real semantic check: `celery inspect ping` round-trips through the
+    # broker to the running worker process and back, not just "the
+    # container is up."
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping", "-t", "5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   scrapers:
     build:
@@ -130,6 +187,19 @@ services:
       SCRAPYD_PASSWORD: ${SCRAPYD_PASSWORD}
     expose:
       - "6800"
+    # Real semantic check against Scrapyd's own status endpoint (the
+    # same one README's manual "Authenticated request succeeds" curl
+    # exercises), not just TCP accept.
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import base64, os, urllib.request; req = urllib.request.Request('http://localhost:6800/daemonstatus.json', headers={'Authorization': 'Basic ' + base64.b64encode((os.environ['SCRAPYD_USERNAME'] + ':' + os.environ['SCRAPYD_PASSWORD']).encode()).decode()}); urllib.request.urlopen(req, timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   scrapers-browser:
     build:
@@ -141,6 +211,17 @@ services:
       SCRAPYD_PASSWORD: ${SCRAPYD_PASSWORD}
     expose:
       - "6800"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import base64, os, urllib.request; req = urllib.request.Request('http://localhost:6800/daemonstatus.json', headers={'Authorization': 'Basic ' + base64.b64encode((os.environ['SCRAPYD_USERNAME'] + ':' + os.environ['SCRAPYD_PASSWORD']).encode()).decode()}); urllib.request.urlopen(req, timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   postgres_data:
+  redis_data:

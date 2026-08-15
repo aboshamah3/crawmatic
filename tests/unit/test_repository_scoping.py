@@ -19,6 +19,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.outbox import OutboxMessage
 from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.rollups import VariantPriceDailyRollup
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
@@ -73,6 +74,11 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             VariantPriceDailyRollup,
             WebhookEndpoint,
             WebhookEvent,
+            # 2026-08-15 audit H1: the transactional outbox is
+            # workspace-owned (tenant-only) — a producer writes it under
+            # its own scoped session, in the same transaction as the
+            # domain data it accompanies.
+            OutboxMessage,
         }
     )
 

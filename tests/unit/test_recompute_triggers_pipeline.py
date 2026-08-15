@@ -91,12 +91,38 @@ class _FakeWorkspaceTxn:
 
 
 class _RecordingEnqueue:
+    """Stand-in for `app_shared.outbox.write_outbox_message` (audit H1).
+
+    Keeps the historical `{"name", "queue", "kwargs"}` record shape so the
+    behavioural assertions below are unchanged, and appends to `order` so
+    the ordering test can prove the write lands INSIDE the transaction.
+    """
+
     def __init__(self, order: list[str] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self._order = order
 
-    def __call__(self, name: str, *, queue: str, kwargs: dict[str, Any] | None = None) -> None:
-        self.calls.append({"name": name, "queue": queue, "kwargs": kwargs})
+    def __call__(
+        self,
+        session: Any,
+        *,
+        workspace_id: Any,
+        task_name: str,
+        queue: str,
+        kwargs: dict[str, Any] | None = None,
+        dedup_key: str | None = None,
+        now: Any = None,
+    ) -> None:
+        self.calls.append(
+            {
+                "name": task_name,
+                "queue": queue,
+                "kwargs": kwargs,
+                "session": session,
+                "workspace_id": workspace_id,
+                "dedup_key": dedup_key,
+            }
+        )
         if self._order is not None:
             self._order.append("enqueue")
 
@@ -136,7 +162,7 @@ def _install_fakes(
     fake_redis = _FakeRedis()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", txn)
     monkeypatch.setattr(pipelines_mod, "mark_target", lambda *a, **k: None)
-    monkeypatch.setattr(pipelines_mod, "enqueue", enqueue)
+    monkeypatch.setattr(pipelines_mod, "write_outbox_message", enqueue)
     monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: fake_redis)
     return txn, enqueue, fake_redis, order
@@ -273,17 +299,28 @@ def test_mixed_batch_job_and_ad_hoc_each_enqueue(monkeypatch: Any) -> None:
 # --- emission happens after commit ------------------------------------------
 
 
-def test_recompute_enqueue_happens_after_the_transaction_commits(monkeypatch: Any) -> None:
-    _txn, enqueue, _redis, order = _install_fakes(monkeypatch)
+def test_recompute_message_is_written_inside_the_transaction(monkeypatch: Any) -> None:
+    """2026-08-15 audit H1 — this assertion is deliberately INVERTED.
+
+    It previously asserted the recompute was enqueued strictly *after*
+    the transaction's commit boundary. That ordering was the bug: a
+    Redis blip or a spider death in the gap left committed observations
+    whose analysis never ran. The recompute intent is now an
+    `outbox_messages` row written before `__exit__`, so it commits
+    atomically with the observations that justify it (and rolls back with
+    them), and the outbox dispatcher publishes it afterwards.
+    """
+    txn, enqueue, _redis, order = _install_fakes(monkeypatch)
     item = _make_result(scrape_job_id=uuid.uuid4())
 
     _flush_batch(WORKSPACE_ID, [item])
 
     assert "txn_exit" in order
     assert "enqueue" in order
-    # The transaction's __exit__ (commit boundary) always precedes every
-    # enqueue call in this flush -- never emitted mid-transaction.
     txn_exit_index = order.index("txn_exit")
-    assert all(
-        idx > txn_exit_index for idx, event in enumerate(order) if event == "enqueue"
-    )
+    assert all(idx < txn_exit_index for idx, event in enumerate(order) if event == "enqueue")
+
+    # ...and it is the transaction's OWN session that received the write,
+    # which is what makes "same transaction" true rather than merely
+    # "before the boundary".
+    assert all(call["session"] is txn._session for call in enqueue.calls)

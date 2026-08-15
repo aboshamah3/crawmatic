@@ -377,7 +377,9 @@ def test_dedup_release_event_carries_documented_fields(
     # convention -- no real DB/Redis/Celery anywhere in this test.
     monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn())
     monkeypatch.setattr(pipelines_mod, "mark_target", lambda *a, **k: None)
-    monkeypatch.setattr(pipelines_mod, "enqueue", lambda *a, **k: None)
+    # 2026-08-15 (audit H1): the post-commit `enqueue` seam is now an
+    # in-transaction `write_outbox_message` — stubbed for the same reason.
+    monkeypatch.setattr(pipelines_mod, "write_outbox_message", lambda *a, **k: None)
     monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakePipelineSettings())
     monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: object())
 

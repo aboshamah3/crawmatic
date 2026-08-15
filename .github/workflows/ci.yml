@@ -1,0 +1,149 @@
+# Crawmatic core CI (production-readiness audit §M5, §C2 —
+# CORE_PRODUCT_PRODUCTION_READINESS_AUDIT_2026-08-15.md).
+#
+# Before this workflow existed the tree had no `.github/workflows` at
+# all: thousands of unit tests and the two migration/scoping guard
+# scripts had no visible enforcement on the canonical branch (M5), and a
+# green local run could silently apply to a different SHA than whatever
+# was deployed (C2). This is the first CI definition in the repo.
+#
+# `uv sync --locked --all-packages` is mandatory everywhere, not plain
+# `uv sync`: the audit found a plain `uv sync` at the repo root leaves
+# every workspace member (apps/*, libs/*) uninstalled, producing 136
+# import/collection errors. `--all-packages` is the only reproducible
+# bootstrap for this uv workspace.
+#
+# No lint/type-check job: as of this workflow, no `[tool.ruff]`,
+# `[tool.mypy]`, or `[tool.black]` config exists anywhere in the repo
+# (checked every `pyproject.toml`) — nothing to run, and the task that
+# added this workflow was explicitly told not to introduce a new
+# linter. Add a lint job here the day one is actually configured.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # uv 0.7.13+ is the version this repo's contributor docs assume
+  # (README "Prerequisites"); pin CI to the same line.
+  UV_VERSION: "0.7.13"
+
+jobs:
+  checks:
+    name: checks (locked sync, guards, unit suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      # requires-python = ">=3.13,<3.14" (root pyproject.toml) — uv
+      # manages/downloads the interpreter itself, no actions/setup-python
+      # needed.
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      # `.env` backs `Settings(env_file=".env")` construction (e.g.
+      # `DATABASE_URL`/`ENCRYPTION_KEYS` field validation) that some unit
+      # tests exercise even though no live Postgres/Redis is reachable
+      # here — the placeholders in `.env.example` are local-dev-only and
+      # never point at a real service in this job.
+      - name: Seed local env from .env.example
+        run: cp .env.example .env
+
+      - name: Single-head migration guard
+        run: bash scripts/check_single_head.sh
+
+      - name: Workspace-scoping guard
+        run: uv run python scripts/check_workspace_scoping.py
+
+      - name: Unit test suite
+        run: uv run pytest tests/unit -q
+
+  images:
+    name: images (build every Dockerfile docker-compose.yml references)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api
+            dockerfile: apps/api/Dockerfile
+          - service: migrate
+            dockerfile: apps/migrate/Dockerfile
+          - service: scheduler
+            dockerfile: apps/scheduler/Dockerfile
+          - service: worker
+            dockerfile: apps/workers/Dockerfile
+          - service: scrapers
+            dockerfile: apps/scrapers/Dockerfile
+          - service: scrapers-browser
+            dockerfile: apps/scrapers-browser/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.9.0
+
+      # Build context is the repo root for every service (each Dockerfile
+      # needs the whole uv workspace to resolve — see apps/api/Dockerfile's
+      # header comment) — matches `docker-compose.yml`'s `build.context: .`
+      # for every service.
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v6.13.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: crawmatic-${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  compose-smoke:
+    name: compose-smoke (all 8 components reach running/healthy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: checks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      # Required before ANY `docker compose` invocation against this
+      # repo's compose file, CI or local: every service sets
+      # `env_file: .env` (a literal relative path baked into
+      # docker-compose.yml, not resolved by `docker compose`'s
+      # `--env-file` flag, which only affects `${VAR}` interpolation).
+      # Skipping this step fails compose config validation on a clean
+      # checkout — this is the exact trap the production-readiness audit
+      # flagged in §4/§M5.
+      - name: Seed .env from .env.example
+        run: cp .env.example .env
+
+      - name: Validate compose config
+        run: docker compose -f docker-compose.yml config --quiet
+
+      # tests/integration/test_compose_smoke.py drives the full
+      # `docker compose up --build -d` / `ps` / teardown lifecycle itself
+      # (its own throwaway `--env-file`, separate from the `.env` seeded
+      # above) and asserts all 8 components reach running/healthy.
+      - name: Compose smoke test
+        run: uv run pytest tests/integration/test_compose_smoke.py -v

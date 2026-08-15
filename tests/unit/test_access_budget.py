@@ -17,6 +17,7 @@ from app_shared.access.budget import (
     BudgetResult,
     RateDecision,
     check_domain_cooldown,
+    check_domain_cooldown_gate,
     check_rate_ceilings,
     incr_and_check_monthly_budget,
 )
@@ -135,11 +136,38 @@ def test_monthly_budget_none_limit_always_allowed_and_not_incremented() -> None:
     assert redis.counters == {}
 
 
-def test_monthly_budget_fail_open_on_redis_error() -> None:
+def test_monthly_budget_fails_CLOSED_on_redis_error() -> None:
+    """REVISED 2026-08-15 (audit H3): this used to assert fail-OPEN.
+
+    The monthly budget counter is only ever incremented for a PROXIED
+    (paid) request, so denying here denies exactly the requests that
+    cost money. An unreachable ledger must not authorise new paid work
+    -- that is the cost hole H3 describes.
+    """
     redis = _BrokenRedis()
     result = incr_and_check_monthly_budget(redis, provider_id=uuid.uuid4(), limit=5, now=_NOW)
 
+    assert result.allowed is False
+    assert result.degraded is True
+
+
+def test_monthly_budget_emergency_override_restores_fail_open() -> None:
+    """`PROXY_LEDGER_FAIL_OPEN` escape hatch (default OFF)."""
+    redis = _BrokenRedis()
+    result = incr_and_check_monthly_budget(
+        redis, provider_id=uuid.uuid4(), limit=5, now=_NOW, fail_open_on_error=True
+    )
+
     assert result.allowed is True
+    assert result.degraded is True
+
+
+def test_monthly_budget_healthy_result_is_not_degraded() -> None:
+    redis = _FakeRedis()
+    result = incr_and_check_monthly_budget(redis, provider_id=uuid.uuid4(), limit=5, now=_NOW)
+
+    assert result.allowed is True
+    assert result.degraded is False
 
 
 # --- check_rate_ceilings -----------------------------------------------------
@@ -211,8 +239,26 @@ def test_rate_ceilings_fail_open_on_redis_error() -> None:
     decision = check_rate_ceilings(
         redis, policy_id=uuid.uuid4(), domain="shop.example.com", per_minute=1, per_hour=1, per_day=1
     )
+    # Still fails OPEN by design: this gate runs BEFORE the proxied/direct
+    # transport decision exists, so failing it closed would also stop free
+    # direct scraping. `degraded` is what carries the impairment forward
+    # to the caller, which applies the paid-only denial (audit H3).
     assert decision.allowed is True
     assert decision.retry_after_seconds == 0
+    assert decision.degraded is True
+
+
+def test_rate_ceilings_healthy_result_is_not_degraded() -> None:
+    decision = check_rate_ceilings(
+        _FakeRedis(),
+        policy_id=uuid.uuid4(),
+        domain="shop.example.com",
+        per_minute=10,
+        per_hour=None,
+        per_day=None,
+    )
+    assert decision.allowed is True
+    assert decision.degraded is False
 
 
 # --- check_domain_cooldown ----------------------------------------------------
@@ -251,6 +297,23 @@ def test_domain_cooldown_non_positive_seconds_always_allows() -> None:
 def test_domain_cooldown_fail_open_on_redis_error() -> None:
     redis = _BrokenRedis()
     assert check_domain_cooldown(redis, domain="shop.example.com", cooldown_seconds=30) is True
+
+
+def test_domain_cooldown_gate_reports_degraded_on_redis_error() -> None:
+    """Same fail-OPEN posture as the ceilings gate, but now observable."""
+    decision = check_domain_cooldown_gate(
+        _BrokenRedis(), domain="shop.example.com", cooldown_seconds=30
+    )
+    assert decision.allowed is True
+    assert decision.degraded is True
+
+
+def test_domain_cooldown_gate_healthy_result_is_not_degraded() -> None:
+    decision = check_domain_cooldown_gate(
+        _FakeRedis(), domain="shop.example.com", cooldown_seconds=30
+    )
+    assert decision.allowed is True
+    assert decision.degraded is False
 
 
 # --- FR-010/§22: budget.py must never query request_attempts ----------------

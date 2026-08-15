@@ -85,10 +85,24 @@ def _rollups_cover_stmt(partition_name: str, d0: date_type, d_n: date_type):
     distinct observation date in the partition minus every date already
     covered by a rollup row in ``[d0, d_n)`` — non-empty means at least
     one date is missing its rollup.
+
+    ``(scraped_at AT TIME ZONE 'UTC')::date`` and not the bare
+    ``scraped_at::date``: a plain cast of a ``timestamptz`` resolves in
+    the **session** ``TimeZone``, whereas the rollup rows this is
+    compared against are keyed on the **UTC** day
+    (``app_shared.maintenance.rollups.utc_day_bounds`` /
+    ``default_target_date``). Production runs ``TimeZone = Etc/UTC`` so
+    the two agree today; pinning UTC here makes that agreement a
+    property of the SQL rather than of a session setting — a mismatch
+    would manufacture "uncovered" edge dates and wedge the
+    verify-before-drop gate permanently (partitions never dropped).
+    This scan is deliberately NOT sargable-rewritten: it must visit every
+    row of the partition it is validating, and the partition is already
+    named directly (no pruning to gain).
     """
     return text(
         f"""
-        SELECT DISTINCT scraped_at::date FROM {partition_name}
+        SELECT DISTINCT (scraped_at AT TIME ZONE 'UTC')::date FROM {partition_name}
         EXCEPT
         SELECT DISTINCT date FROM variant_price_daily_rollups
           WHERE date >= :d0 AND date < :d_n
