@@ -505,6 +505,20 @@ class Settings(BaseSettings):
     #: masking a real stall.
     MAINTENANCE_ROLLUP_STALE_AFTER_DAYS: int = 3
 
+    # --- Ops snapshot cadence (audit §H5) ---
+    # How often the scheduler collects `app_shared.opsmetrics.snapshot`
+    # and emits it plus every firing alert rule
+    # (`app_shared.opsmetrics.emit`). Until this existed the rules were
+    # only ever evaluated when a human happened to curl `GET /ops/metrics`,
+    # so "alerting" meant "someone was already looking" -- which is not
+    # alerting. 15 minutes is the compromise between detection latency on
+    # the slow-moving conditions the rules actually cover (queue age,
+    # spend velocity, partition/rollup health, outbox backlog, breaker
+    # posture) and the cost of the collector, which is the heaviest read
+    # pass in the scheduler: 24h and 7d aggregates across
+    # `request_attempts`/`price_observations`.
+    OPS_SNAPSHOT_INTERVAL_SECONDS: int = 900
+
     # --- Public API rate limits (PLAN §7.4, risk P5) ---
     # Per-credential fixed-window budgets. Reads are cheap and get the
     # generous budget; writes touch the catalog and get a tenth of it.
