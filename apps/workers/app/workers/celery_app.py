@@ -23,14 +23,24 @@ builds its own engine/pool on first use. This hook already existed
 (SPEC-01) and is asserted here (``test_jobs_fork_safety.py``), not
 re-implemented — SPEC-08 is simply the first feature whose tasks
 actually touch the DB and therefore rely on it (FR-016).
+
+Production-config gate (audit §L1): ``_assert_production_safe_on_worker_start``
+runs `app_shared.config_validation.assert_production_safe` on
+``worker_init`` — see that function's docstring for why it is a signal
+rather than an import-time call (this module is imported by every task
+module, and by the test suite), and why it converts the failure into
+``SystemExit`` (Celery's signal dispatcher swallows plain ``Exception``s).
 """
 
 from __future__ import annotations
+
+import logging
 
 from celery import Celery
 from celery.signals import worker_init, worker_process_init
 
 from app_shared.config import get_settings
+from app_shared.config_validation import ProductionConfigError, assert_production_safe
 from app_shared.database import dispose_engine
 from app_shared.memory_watchdog import start_memory_watchdog
 from app_shared.task_names import (
@@ -50,6 +60,8 @@ from app_shared.task_names import (
     STRATEGY_PATTERN_BACKFILL,
     STRATEGY_STATS_FLUSH,
 )
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -208,6 +220,43 @@ app.conf.task_routes = {
     OUTBOX_DRAIN: {"queue": "maintenance"},
     OUTBOX_RECONCILE: {"queue": "maintenance"},
 }
+
+
+@worker_init.connect
+def _assert_production_safe_on_worker_start(**kwargs: object) -> None:
+    """Audit §L1: refuse to start a worker on local-dev-shaped production config.
+
+    **Why a signal and not module import time.** `apps/api` calls
+    `assert_production_safe()` at import, which is right for it: importing
+    `app.main` *is* starting the API. This module is different — every
+    `app.workers.tasks_*` module imports it to get the `app` object, and
+    those modules are imported by the unit suite, by `celery inspect`-style
+    tooling, and by anything that merely wants a task's name. An
+    import-time assertion would therefore fire in contexts that are not
+    starting a worker at all. ``worker_init`` fires exactly once, in the
+    long-lived worker parent process, before the pool is created and
+    before any task is consumed — the same lifecycle point
+    `_start_memory_watchdog` (below) already uses for "runs once per
+    worker boot, in the parent". Registered *first* so an unsafe deploy
+    dies before it spawns a watchdog thread or forks any child.
+
+    **Why `SystemExit` and not just letting the error propagate.** Celery's
+    `Signal.send` wraps every receiver in `except Exception` and returns
+    the exception as that receiver's *response* rather than re-raising
+    (`celery/utils/dispatch/signal.py` — its own docstring notes `send`
+    and `send_robust` do the same thing). A raised
+    `ProductionConfigError` (a `RuntimeError`) would therefore be
+    swallowed and the worker would boot anyway, which is the opposite of
+    fail-fast. `SystemExit` derives from `BaseException`, so it slips past
+    that `except Exception` and aborts `WorkController.__init__`. The
+    findings are logged at CRITICAL first, because `SystemExit`'s message
+    is the only thing the operator would otherwise see.
+    """
+    try:
+        assert_production_safe()
+    except ProductionConfigError as exc:
+        logger.critical("worker refusing to start: %s", exc)
+        raise SystemExit(1) from exc
 
 
 @worker_init.connect

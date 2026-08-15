@@ -79,6 +79,15 @@ database*, not on the scheduler's own bookkeeping, because the second,
 independent root cause of the same incident was the ``worker`` service
 missing ``SYSTEM_DATABASE_URL``/``AUTH_DATABASE_URL``: the scheduler was
 enqueueing correctly the whole time and every task died on arrival.
+
+``main()`` opens with
+`app_shared.config_validation.assert_production_safe` (audit §L1), the
+scheduler's equivalent of the API's import-time call in
+``apps/api/app/main.py``: a production deploy still carrying
+``.env.example``-shaped secrets, ``PGBOUNCER_AUTH_TYPE=trust`` or the DB
+owner role as ``DATABASE_URL`` refuses to boot rather than starting to
+drive fleet-wide maintenance under it. A no-op outside production, so
+local runs and CI are untouched.
 """
 
 from __future__ import annotations
@@ -90,6 +99,7 @@ from datetime import datetime, timezone
 from types import FrameType
 
 from app_shared.config import Settings, get_settings
+from app_shared.config_validation import assert_production_safe
 from app_shared.database import get_system_sessionmaker
 from app_shared.maintenance.cadence import (
     claim_cadence,
@@ -416,6 +426,20 @@ def _run_health_tick(settings: Settings) -> None:
 
 
 def main() -> None:
+    # Audit §L1: refuse to boot when `ENVIRONMENT`/`RAILWAY_ENVIRONMENT_NAME`
+    # says "production" and the resolved config still looks local-dev-shaped
+    # (placeholder secrets, PGBOUNCER_AUTH_TYPE=trust, the DB bootstrap/owner
+    # role as DATABASE_URL). A **no-op** whenever `is_production()` is false,
+    # so local runs, `docker compose up` and CI are unaffected.
+    #
+    # First statement of `main()`, deliberately — the equivalent of the API's
+    # import-time call in `apps/api/app/main.py`. The scheduler holds no
+    # import-time state worth guarding, but `main()` is the only way this
+    # process starts, and failing before the signal handlers/settings/loop
+    # means an unsafe production deploy crash-loops visibly instead of
+    # quietly enqueueing fleet-wide maintenance work under bad config.
+    assert_production_safe()
+
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
