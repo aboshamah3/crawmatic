@@ -144,6 +144,28 @@ def test_browser_scraping_knobs_honor_env_override(monkeypatch: pytest.MonkeyPat
     assert settings.BROWSER_MAX_CONTEXTS == 2
 
 
+def test_scrape_batch_browser_max_defaults_to_fifteen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SCRAPE_BATCH_BROWSER_MAX defaults to 15 when unset (M1, audit 5-25 range)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("SCRAPE_BATCH_BROWSER_MAX", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.SCRAPE_BATCH_BROWSER_MAX == 15
+
+
+def test_scrape_batch_browser_max_honors_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SCRAPE_BATCH_BROWSER_MAX is env-tunable, never hardcoded (M1)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SCRAPE_BATCH_BROWSER_MAX", "20")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.SCRAPE_BATCH_BROWSER_MAX == 20
+
+
 def test_strategy_profile_scope_defaults_to_domain(monkeypatch: pytest.MonkeyPatch) -> None:
     """STRATEGY_PROFILE_SCOPE defaults to "domain" (the discovery-gate fix, 2026-07-11)."""
     for key, value in REQUIRED_ENV.items():

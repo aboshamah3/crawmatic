@@ -207,6 +207,13 @@ class Settings(BaseSettings):
     # Principle IV — DB/env-tunable, never hardcoded literals) ---
     SCRAPE_DISPATCH_HTTP_BATCH_MIN: int = 50
     SCRAPE_DISPATCH_HTTP_BATCH_MAX: int = 200
+    # Browser-mode batches need a much smaller ceiling than HTTP (audit
+    # item M1, 5-25 guidance range) -- a browser Scrapyd run pays a
+    # per-target headless-render cost HTTP does not, so the same 200-wide
+    # chunk that's fine for HTTP makes one browser batch's wall time
+    # enormous. plan_batches() branches on the group's mode to apply this
+    # instead of SCRAPE_DISPATCH_HTTP_BATCH_MAX.
+    SCRAPE_BATCH_BROWSER_MAX: int = 15
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
     # TTL on the dispatch client's Redis idempotency guard
     # (``dispatched:{job}:{batch_index}``). Without an expiry the guard

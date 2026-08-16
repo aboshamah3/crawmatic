@@ -140,7 +140,11 @@ def test_multi_domain_multi_mode_targets_group_by_domain_and_mode_pair() -> None
         + _targets(250, domain="b.example.com", mode=ScrapeProfileMode.HTTP)
     )
 
-    batches = plan_batches(targets, http_min=50, http_max=200)
+    # browser_max=200 pins the BROWSER group's ceiling to the same value as
+    # http_max here -- this test is about (domain, mode) grouping, not
+    # sizing ceilings (those are covered separately below), so it stays
+    # unaffected by the browser_max default (M1).
+    batches = plan_batches(targets, http_min=50, http_max=200, browser_max=200)
 
     # a/HTTP -> 1 batch, a/BROWSER -> 1 batch, b/HTTP (250) -> 2 chunks (200 + 50).
     assert len(batches) == 4
@@ -155,7 +159,91 @@ def test_multi_domain_multi_mode_targets_group_by_domain_and_mode_pair() -> None
 
     # batch_index tracks the canonical (domain, mode) sort, then chunk
     # order within the group -- stable across a repeated call.
-    again = plan_batches(targets, http_min=50, http_max=200)
+    again = plan_batches(targets, http_min=50, http_max=200, browser_max=200)
     assert [b.batch_index for b in batches] == [b.batch_index for b in again]
     assert [b.domain for b in batches] == [b.domain for b in again]
     assert [b.mode for b in batches] == [b.mode for b in again]
+
+
+# --- browser-specific batch ceiling (M1, audit 5-25 range) --------------------
+
+
+def test_browser_group_over_browser_max_splits_into_bounded_chunks() -> None:
+    """60 BROWSER targets with browser_max=15 -> 4 batches of 15 (RED case)."""
+    targets = _targets(60, mode=ScrapeProfileMode.BROWSER)
+
+    batches = plan_batches(targets, browser_max=15)
+
+    assert len(batches) == 4
+    sizes = [len(batch.match_ids) for batch in batches]
+    assert sizes == [15, 15, 15, 15]
+    for size in sizes:
+        assert 1 <= size <= 15
+
+
+def test_http_group_unaffected_by_browser_max() -> None:
+    """An HTTP group is chunked by http_max, never by browser_max."""
+    targets = _targets(60, mode=ScrapeProfileMode.HTTP)
+
+    batches = plan_batches(targets, browser_max=15, http_max=200)
+
+    assert len(batches) == 1
+    assert len(batches[0].match_ids) == 60
+
+
+def test_browser_group_default_browser_max_is_fifteen() -> None:
+    """Exactly the default ceiling (15) forms a single batch."""
+    targets = _targets(15, mode=ScrapeProfileMode.BROWSER)
+
+    batches = plan_batches(targets)
+
+    assert len(batches) == 1
+    assert len(batches[0].match_ids) == 15
+
+
+def test_browser_group_under_browser_max_forms_single_batch() -> None:
+    targets = _targets(10, mode=ScrapeProfileMode.BROWSER)
+
+    batches = plan_batches(targets)
+
+    assert len(batches) == 1
+    assert len(batches[0].match_ids) == 10
+
+
+def test_browser_group_one_over_default_splits_into_two_batches() -> None:
+    """16 targets (default ceiling + 1) -> [15, 1]."""
+    targets = _targets(16, mode=ScrapeProfileMode.BROWSER)
+
+    batches = plan_batches(targets)
+
+    assert len(batches) == 2
+    sizes = [len(batch.match_ids) for batch in batches]
+    assert sizes == [15, 1]
+
+
+def test_browser_group_exact_multiple_of_browser_max_splits_evenly() -> None:
+    """45 targets (3x the default ceiling) -> [15, 15, 15]."""
+    targets = _targets(45, mode=ScrapeProfileMode.BROWSER)
+
+    batches = plan_batches(targets)
+
+    assert len(batches) == 3
+    sizes = [len(batch.match_ids) for batch in batches]
+    assert sizes == [15, 15, 15]
+
+
+def test_mixed_http_and_browser_groups_use_independent_ceilings() -> None:
+    """Same domain, both modes present -- each mode chunked by its own ceiling."""
+    targets = _targets(
+        60, domain="a.example.com", mode=ScrapeProfileMode.BROWSER
+    ) + _targets(60, domain="a.example.com", mode=ScrapeProfileMode.HTTP)
+
+    batches = plan_batches(targets, browser_max=15, http_max=200)
+
+    browser_batches = [b for b in batches if b.mode == ScrapeProfileMode.BROWSER]
+    http_batches = [b for b in batches if b.mode == ScrapeProfileMode.HTTP]
+
+    assert len(browser_batches) == 4
+    assert all(len(b.match_ids) <= 15 for b in browser_batches)
+    assert len(http_batches) == 1
+    assert len(http_batches[0].match_ids) == 60
