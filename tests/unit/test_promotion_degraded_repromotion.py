@@ -37,6 +37,31 @@ to `ACTIVE` -- the profile was parked `DEGRADED` forever. Measured live:
    `stub_rediscovery_settings` style), since `flush_profile`'s other
    collaborators (`_upsert_stats`, `rebase`) use Postgres-only
    `INSERT ... ON CONFLICT` and cannot run against SQLite.
+
+## Fix round 1 (review finding 1): fresh, not lifetime-blended, confidence
+
+The first version of this rebase passed `confidence=row.avg_confidence`
+(`_upsert_stats`'s `RETURNING` row) into `_rebase_method_stats` -- a
+*lifetime* weighted average blending every success since the
+`strategy_attempt_stats` row's first insert, including pre-degradation
+ones, not fresh evidence. Rediscovery condition 4
+(`combined_stats.avg_confidence`, `EXTRACTION` rows only,
+`rediscovery.py` lines ~304-314) reads exactly that column via
+`_combined_stats`, immediately after the rebase, in the *same* flush
+cycle -- so an `EXTRACTION`-method profile degraded via condition 4
+(stale low lifetime confidence) that re-promotes same-method through
+this path could re-trip condition 4 on the very data the rebase was
+supposed to clear, the identical bug class as condition 2's
+`success_rate` (`flush._batch_confidence`'s docstring). Fixed by
+computing a fresh, this-cycle-only confidence aggregate
+(`flush._batch_confidence`, `conf_sum`/`success` off the just-drained
+delta) instead of reading the lifetime-blended row -- the same "this
+batch's own result, not a stale aggregate" shape the discovery-seed
+path already uses (`confidences.access_confidence`/
+`extraction_confidence`). `test_flush_profile_rebases_extraction_
+stats_with_fresh_confidence_not_lifetime_average` and
+`test_fresh_confidence_avoids_condition_4_retrip_that_stale_average_
+would_cause` cover this.
 """
 
 from __future__ import annotations
@@ -54,7 +79,12 @@ from app_shared.enums import AccessMethod, ExtractionMethod, MethodType, Strateg
 from app_shared.models.strategy import DomainStrategyProfile
 from app_shared.strategy import flush as flush_mod
 from app_shared.strategy.promotion import PromotionDecision, apply_promotion
-from app_shared.strategy.rediscovery import RecentSignals
+from app_shared.strategy.rediscovery import (
+    CombinedStats,
+    RecentSignals,
+    RediscoveryThresholds,
+    evaluate_rediscovery,
+)
 
 # ---------------------------------------------------------------------------
 # 1. apply_promotion against a real (SQLite) guarded UPDATE.
@@ -493,3 +523,93 @@ def test_flush_profile_does_not_rebase_when_promotion_does_not_apply(
 
     assert result.transitions == ()
     assert flush_seams == []
+
+
+# ---------------------------------------------------------------------------
+# 3. Fix round 1, Finding 1: the rebase confidence must be fresh, not the
+#    lifetime-blended `strategy_attempt_stats.avg_confidence` row.
+# ---------------------------------------------------------------------------
+
+
+def test_flush_profile_rebases_extraction_stats_with_fresh_confidence_not_lifetime_average(
+    monkeypatch: pytest.MonkeyPatch, flush_seams: list[dict]
+) -> None:
+    """Finding 1: a same-method `DEGRADED` re-promotion of an `EXTRACTION`
+    method must rebase `strategy_attempt_stats.avg_confidence` to THIS
+    CYCLE's own batch average, not `_upsert_stats`'s `RETURNING` row's
+    lifetime-blended average -- rediscovery condition 4 reads exactly
+    that column, for `EXTRACTION` rows only, and `flush_seams`'s default
+    `_upsert_stats` stub deliberately returns a stale low value (0.5000,
+    below the 0.75 floor -- the value that plausibly tripped condition 4
+    in the first place) to prove the rebase does NOT pass it through."""
+    profile = _degraded_profile(preferred=AccessMethod.DIRECT_HTTP)
+    profile.preferred_extraction_method = ExtractionMethod.JSON_LD
+    monkeypatch.setattr(
+        flush_mod.stats_buffer,
+        "drain",
+        _drain_only_for(
+            MethodType.EXTRACTION,
+            ExtractionMethod.JSON_LD.value,
+            drained=_FakeDrained(
+                attempt=3, success=3, failure=0, rt_ms_sum=300,
+                conf_sum=28500,  # this cycle's own batch average: 0.9500
+                qualifying_success=3, distinct_urls=3,
+            ),
+        ),
+    )
+    monkeypatch.setattr(flush_mod, "apply_promotion", lambda *a, **k: True)
+    # flush_seams's default _upsert_stats stub already returns
+    # avg_confidence=Decimal("0.5") -- the stale lifetime value this test
+    # proves must NOT reach _rebase_method_stats.
+
+    result = flush_mod.flush_profile(_FakeSession(profile), _FakeRedis(), profile.id)
+
+    assert len(result.transitions) == 1
+    assert len(flush_seams) == 1
+    call = flush_seams[0]
+    assert call["method_type"] is MethodType.EXTRACTION
+    assert call["method_name"] == ExtractionMethod.JSON_LD.value
+    assert call["confidence"] == Decimal("0.9500"), (
+        "must be this cycle's fresh batch average (conf_sum/success), not "
+        "the stale lifetime row.avg_confidence (0.5000) that plausibly "
+        "tripped rediscovery condition 4 in the first place"
+    )
+
+
+_REDISCOVERY_THRESHOLDS = RediscoveryThresholds(
+    consecutive_failures=3,
+    success_rate_floor=Decimal("0.80"),
+    low_confidence=Decimal("0.75"),
+)
+
+
+def test_fresh_confidence_avoids_condition_4_retrip_that_stale_average_would_cause() -> None:
+    """Finding 1's actual consequence, proven directly against the real
+    `evaluate_rediscovery` (not mocked): feeding rediscovery condition 4
+    the stale lifetime average that plausibly tripped it re-trips
+    immediately in the same evaluation; feeding it this cycle's fresh
+    batch average (what the fixed rebase now persists) does not."""
+    profile = _degraded_profile(preferred=AccessMethod.DIRECT_HTTP)
+    profile.preferred_extraction_method = ExtractionMethod.JSON_LD
+    profile.status = StrategyStatus.ACTIVE  # evaluate_rediscovery only degrades ACTIVE
+
+    stale = CombinedStats(
+        recent_failure_count=0, success_rate=None, avg_confidence=Decimal("0.5000")
+    )
+    fresh = CombinedStats(
+        recent_failure_count=0, success_rate=None, avg_confidence=Decimal("0.9500")
+    )
+
+    stale_decision = evaluate_rediscovery(
+        profile, stale, RecentSignals(attempts=()), _REDISCOVERY_THRESHOLDS, scope="domain"
+    )
+    fresh_decision = evaluate_rediscovery(
+        profile, fresh, RecentSignals(attempts=()), _REDISCOVERY_THRESHOLDS, scope="domain"
+    )
+
+    assert stale_decision.trigger is True, (
+        "sanity check: the stale lifetime average must be the kind of "
+        "value that trips condition 4 -- otherwise this test proves nothing"
+    )
+    assert "avg_confidence" in (stale_decision.reason or "")
+    assert fresh_decision.trigger is False, fresh_decision.reason
