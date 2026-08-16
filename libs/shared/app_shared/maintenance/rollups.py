@@ -251,7 +251,9 @@ class RunReport:
     variants_skipped_no_state: list[str] = field(default_factory=list)
 
 
-def run_daily_rollup(session: Session, *, target_date: date_type | None = None) -> RunReport:
+def run_daily_rollup(
+    session: Session, *, target_date: date_type | None = None, dry_run: bool = False
+) -> RunReport:
     """Upsert one ``variant_price_daily_rollups`` row per (workspace,
     variant) that had >=1 observation on ``target_date`` (contracts/
     daily-rollup.md). ``target_date`` defaults to yesterday UTC
@@ -263,6 +265,24 @@ def run_daily_rollup(session: Session, *, target_date: date_type | None = None) 
     ``variants_skipped_no_state`` and skipped rather than erroring or
     writing a placeholder; this is distinct from the *zero-comparable*
     case (FR-013), which still gets a row.
+
+    ``dry_run=True`` (SPEC-15 Task 1.4, `scripts/backfill_daily_rollups.py`):
+    runs every read and the full aggregation exactly as normal — the same
+    driver scan, client-state read, day-observations read, and
+    :func:`aggregate_competitor_prices` call — and still counts the
+    result in ``report.rollups_upserted``, but the ``INSERT ... ON
+    CONFLICT`` statement is never built or executed. This makes the
+    caller's session genuinely, Postgres-enforceable read-only for the
+    whole call (no write statement is EVER sent), which a real upsert +
+    app-level ``session.rollback()`` cannot guarantee on its own — a
+    transaction-level ``SET TRANSACTION READ ONLY`` only holds if no
+    write statement is subsequently attempted in that same transaction;
+    ``session.execute(stmt)``ing the real upsert first and rolling back
+    after is NOT compatible with that guard (Postgres raises `cannot
+    execute INSERT in a read-only transaction` the instant the write is
+    attempted). ``dry_run=False`` (the default) is byte-for-byte the
+    original behaviour — every existing caller (the `MAINTENANCE_DAILY_
+    ROLLUP` Celery task, live/unit tests) is unaffected.
     """
     if target_date is None:
         target_date = default_target_date(datetime.now(timezone.utc))
@@ -314,22 +334,26 @@ def run_daily_rollup(session: Session, *, target_date: date_type | None = None) 
             "comparable_competitor_count": aggregate.comparable_count,
             "latest_alert_type": state_row.latest_alert_type,
         }
-        stmt = pg_insert(VariantPriceDailyRollup).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["workspace_id", "product_variant_id", "date"],
-            set_={
-                "product_id": stmt.excluded.product_id,
-                "currency": stmt.excluded.currency,
-                "client_price": stmt.excluded.client_price,
-                "cheapest_competitor_price": stmt.excluded.cheapest_competitor_price,
-                "average_competitor_price": stmt.excluded.average_competitor_price,
-                "highest_competitor_price": stmt.excluded.highest_competitor_price,
-                "comparable_competitor_count": stmt.excluded.comparable_competitor_count,
-                "latest_alert_type": stmt.excluded.latest_alert_type,
-                "updated_at": func.now(),
-            },
-        )
-        session.execute(stmt)
+        if not dry_run:
+            stmt = pg_insert(VariantPriceDailyRollup).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["workspace_id", "product_variant_id", "date"],
+                set_={
+                    "product_id": stmt.excluded.product_id,
+                    "currency": stmt.excluded.currency,
+                    "client_price": stmt.excluded.client_price,
+                    "cheapest_competitor_price": stmt.excluded.cheapest_competitor_price,
+                    "average_competitor_price": stmt.excluded.average_competitor_price,
+                    "highest_competitor_price": stmt.excluded.highest_competitor_price,
+                    "comparable_competitor_count": stmt.excluded.comparable_competitor_count,
+                    "latest_alert_type": stmt.excluded.latest_alert_type,
+                    "updated_at": func.now(),
+                },
+            )
+            session.execute(stmt)
+        # dry_run=True: `values` was fully computed (proves what WOULD be
+        # written) but no statement is ever sent -- the count below is
+        # the only side effect.
         report.rollups_upserted += 1
 
     return report

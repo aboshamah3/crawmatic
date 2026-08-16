@@ -474,3 +474,66 @@ def test_run_daily_rollup_driver_scan_ignores_out_of_day_variants() -> None:
     assert report.rollups_upserted == 1
     (upsert,) = session.upserts
     assert upsert["product_variant_id"] == in_day_variant
+
+
+# --- dry_run=True: SPEC-15 Task 1.4 -- counts computed, no write sent -------
+#
+# `scripts/backfill_daily_rollups.py`'s dry-run needs a caller-session
+# that genuinely never sends a write statement (so a transaction-level
+# `SET TRANSACTION READ ONLY` guard holds for the whole call) while still
+# reporting accurate would-be counts. This proves that contract directly
+# against `run_daily_rollup`, independent of the backfill script.
+
+
+def test_run_daily_rollup_dry_run_counts_without_ever_executing_upsert() -> None:
+    workspace_id = uuid.uuid4()
+    variant_id = uuid.uuid4()
+    product_id = uuid.uuid4()
+    target = date(2026, 7, 5)
+
+    observations = [
+        _observation(
+            workspace_id, variant_id, product_id,
+            datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc), "10.0000",
+        ),
+    ]
+    states = {
+        (workspace_id, variant_id): SimpleNamespace(
+            client_price=Decimal("15.0000"), currency="SAR", latest_alert_type=None
+        )
+    }
+    session = _FakeSession(observations, states)
+
+    report = run_daily_rollup(session, target_date=target, dry_run=True)
+
+    # The count reflects the real aggregation (same as dry_run=False would
+    # report for identical input)...
+    assert report.rollups_upserted == 1
+    assert report.variants_skipped_no_state == []
+    # ...but NO upsert statement was ever sent to the session -- the only
+    # statements executed are the three reads (driver scan, client
+    # state, day observations).
+    assert session.upserts == []
+
+
+def test_run_daily_rollup_dry_run_still_skips_variants_with_no_state() -> None:
+    """`variants_skipped_no_state` bookkeeping is unaffected by `dry_run`
+    -- it happens before the write branch is ever reached."""
+    workspace_id = uuid.uuid4()
+    variant_id = uuid.uuid4()
+    product_id = uuid.uuid4()
+    target = date(2026, 7, 5)
+
+    observations = [
+        _observation(
+            workspace_id, variant_id, product_id,
+            datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc), "10.0000",
+        ),
+    ]
+    session = _FakeSession(observations, states={})  # no variant_price_states row
+
+    report = run_daily_rollup(session, target_date=target, dry_run=True)
+
+    assert report.rollups_upserted == 0
+    assert report.variants_skipped_no_state == [str(variant_id)]
+    assert session.upserts == []

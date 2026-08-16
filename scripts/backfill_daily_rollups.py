@@ -31,19 +31,35 @@ including a day the normal daily cadence already rolled up, or a day this
 script itself already backfilled — overwrites that day's row in place
 rather than duplicating it.
 
-``--dry-run`` (the default — no flag needed): runs the full read +
-aggregate + upsert-statement path for every day in range and reports what
-WOULD be written, then rolls back each day's transaction. No row is ever
-persisted. This is backstopped at the DATABASE level, not just the app
-level: before any statement runs for a dry-run day, the session issues
-``SET default_transaction_read_only = on`` — the same hard guard
-``scripts/analyze_hot_query_plans.py`` pins before any production
-``SELECT`` (its module docstring / line 187) — so a future refactor that
-accidentally skips the ``session.rollback()`` call still cannot commit a
-write; Postgres itself rejects it.
-``--apply``: commits each day's transaction as it completes (session
-stays writable), so a mid-range failure leaves every already-processed
-day durably written rather than losing the whole run.
+``--dry-run`` (the default — no flag needed) is genuinely, DATABASE-level
+read-only, not merely app-level: each day's session issues ``SET
+TRANSACTION READ ONLY`` as its first statement (applies to the CURRENT
+transaction per Postgres semantics — unlike ``SET
+default_transaction_read_only = on``, which only affects transactions
+that begin AFTER it runs and does nothing for a transaction already
+opened by an earlier statement on the same session; see
+`scripts/analyze_hot_query_plans.py`'s ``SET
+default_transaction_read_only = on`` precedent, which is safe there only
+because it is issued on a fresh connection before any other statement).
+`run_daily_rollup` is then called with ``dry_run=True``
+(`app_shared.maintenance.rollups.run_daily_rollup`): every read and the
+full aggregation run exactly as normal (so the reported per-day counts
+are real, not simulated), but the ``INSERT ... ON CONFLICT`` statement is
+never built or executed — no write statement is EVER sent in a dry-run
+transaction, which is what makes the ``READ ONLY`` guard both real and
+compatible (a transaction truly marked read-only rejects any write the
+instant one is attempted, so genuine read-only enforcement and "execute
+the real write, then roll back" are mutually exclusive — this script
+resolves that by never attempting the write at all in dry-run mode,
+computing the same true counts via the read-only aggregation path
+instead). ``session.rollback()`` still runs afterward for hygiene/
+transaction cleanliness, but it is no longer the only thing standing
+between a dry-run and a write — a future refactor that accidentally
+skipped it would find nothing to roll back.
+``--apply``: no guard statement, ``dry_run=False`` — the real write path
+— and each day's transaction is committed as it completes, so a
+mid-range failure leaves every already-processed day durably written
+rather than losing the whole run.
 """
 
 from __future__ import annotations
@@ -102,30 +118,35 @@ def run_backfill(
 
     Opens one session per day (mirroring the `MAINTENANCE_DAILY_ROLLUP`
     Celery task's one-session-per-run shape) so a failure partway through
-    a long backfill never poisons an already-committed day's transaction.
+    a long backfill never poisons an already-committed day's transaction
+    — and so the read-only guard below is re-issued fresh for EVERY day,
+    not just the first (each day gets a brand-new session/transaction).
 
-    ``apply=False`` (dry-run) still builds and executes the real upsert
-    statement against the session — the reported per-day counts reflect
-    the actual write path, not a simulation — but the session is pinned
-    ``SET default_transaction_read_only = on`` BEFORE `run_daily_rollup`
-    runs any statement (a hard DB-level guard, not just the
-    `session.rollback()` below it — the global production-DB-session
-    constraint this project holds everywhere else, e.g.
-    `scripts/analyze_hot_query_plans.py`), and every day's transaction is
-    rolled back rather than committed, so nothing is ever persisted even
-    if a future refactor skipped the rollback call.
+    ``apply=False`` (dry-run): the session's very first statement is
+    ``SET TRANSACTION READ ONLY`` (applies to the current transaction —
+    correct only because it truly is the first statement sent on this
+    fresh session), then `run_daily_rollup` runs with ``dry_run=True`` —
+    real reads and aggregation, real counts, but no write statement is
+    ever built or sent, so the transaction stays genuinely read-only for
+    its entire lifetime; `session.rollback()` closes it out afterward
+    (nothing to undo, but consistent hygiene). ``apply=True``: no guard
+    statement, `run_daily_rollup` runs with ``dry_run=False`` (the real
+    upsert), and the transaction is committed.
     """
     results: list[DayResult] = []
     for target_date in date_range(start, end):
         session = session_factory()
         try:
             if not apply:
-                # Hard DB-level backstop for dry-run: pinned BEFORE any
-                # read/write `run_daily_rollup` issues, so an accidental
-                # write fails at Postgres itself, not just at the
-                # app-level `session.rollback()` two lines down.
-                session.execute(text("SET default_transaction_read_only = on"))
-            report = run_daily_rollup(session, target_date=target_date)
+                # Real, Postgres-enforced guard: MUST be the first
+                # statement on this session (SET TRANSACTION READ ONLY
+                # only governs the current transaction if issued before
+                # any other statement establishes it). Compatible with
+                # `dry_run=True` below specifically because that path
+                # never attempts a write -- a read-only transaction would
+                # reject one outright.
+                session.execute(text("SET TRANSACTION READ ONLY"))
+            report = run_daily_rollup(session, target_date=target_date, dry_run=not apply)
             if apply:
                 session.commit()
             else:
