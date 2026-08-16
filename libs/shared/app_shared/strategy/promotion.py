@@ -11,10 +11,14 @@ pure-evaluator shape):
 * :func:`apply_promotion` — the guarded, atomic apply. Used by the flush
   task (US5, T035) once per qualifying method (access/extraction
   evaluated **separately**, FR-011). A single `UPDATE ... WHERE id=:pid
-  AND status IN (...) AND (preferred_* IS NULL OR preferred_* <> :m)`
-  statement so two workers flushing the same profile concurrently cannot
-  double-promote or corrupt `confirmed_success_count` (Edge Cases
-  "Concurrent promotion").
+  AND status IN (...)` statement so two workers flushing the same
+  profile concurrently cannot double-promote or corrupt
+  `confirmed_success_count` (Edge Cases "Concurrent promotion") — the
+  first winner's own `UPDATE` moves `status` out of the promotable set,
+  so every later apply for that profile (same method or a different one)
+  is a no-op. This also covers same-method re-promotion out of
+  `DEGRADED` (Task 3.2, 2026-08-16): the `WHERE` no longer requires the
+  preferred-method column to actually change.
 
 ## Qualifying success (gated by the caller at record time)
 
@@ -162,15 +166,41 @@ def apply_promotion(
     `UPDATE domain_strategy_profiles SET preferred_{type}_method=:m,
     {type}_confidence=:c, confirmed_success_count=confirmed_success_count+1,
     status='ACTIVE' WHERE id=:pid AND status IN ('DISCOVERY_REQUIRED',
-    'LEARNING','DEGRADED') AND (preferred_{type}_method IS NULL OR
-    preferred_{type}_method <> :m)` (contracts/promotion.md "Apply").
+    'LEARNING','DEGRADED')` (contracts/promotion.md "Apply").
 
     Returns `True` iff this call's UPDATE actually changed a row (this
     call made progress); `False` if a concurrent worker already won the
-    race (`rowcount == 0`) or the profile was `DISABLED`/already carries
-    a *different* status disqualifying it -- so two workers flushing the
+    race (`rowcount == 0`, the first winner's own UPDATE already moved
+    `status` to `ACTIVE`) or the profile was `DISABLED`/already carries a
+    *different* status disqualifying it -- so two workers flushing the
     same profile concurrently cannot double-promote or corrupt
-    `confirmed_success_count` (Edge Cases "Concurrent promotion").
+    `confirmed_success_count` (Edge Cases "Concurrent promotion"): the
+    `status IN (...)` predicate alone is the guard once the first UPDATE
+    commits, `status` is no longer in the promotable set, and every
+    subsequent apply for that profile -- same method or not -- is a no-op.
+
+    ## Same-method re-promotion from `DEGRADED` (2026-08-16, Task 3.2)
+
+    The `WHERE` clause used to also require `(preferred_{type}_method IS
+    NULL OR preferred_{type}_method <> :m)` -- so a `DEGRADED` profile
+    whose best method, on re-validation, turned out to be the *same* one
+    it already had (`method_column == validated_name`) could never match
+    this `UPDATE` and was permanently parked `DEGRADED`: discovery/
+    re-validation only ever runs for profiles the resolver still serves,
+    and nothing else flips `status` back to `ACTIVE`. Dropping that half
+    of the predicate is safe -- the `status IN (...)` filter was already
+    the sole thing preventing a double-apply (above), so removing the
+    method-changed condition does not reopen the concurrent-promotion
+    race, it only lets a *validated success* (`decision.promote=True`) on
+    an unchanged method clear `DEGRADED` the same way a changed method
+    already could. The caller (`app_shared.strategy.flush.flush_profile`)
+    is responsible for also re-basing the promoted method's
+    `strategy_attempt_stats` row in this same-method-from-`DEGRADED` case
+    -- otherwise the *lifetime* success ratio that tripped rediscovery
+    condition 2 in the first place survives the promotion unchanged and
+    the profile re-degrades on the very next evaluation, the exact bug
+    class documented in `flush.rebase_stats_after_discovery` (measured
+    live on fqtoners.com: 1,439 discovery runs/day).
     """
     if not decision.promote:
         return False
@@ -178,7 +208,6 @@ def apply_promotion(
     validated_name = validate_method_name(method_type, method_name)
 
     if method_type is MethodType.ACCESS:
-        method_column = DomainStrategyProfile.preferred_access_method
         values: dict[str, object] = {
             "preferred_access_method": validated_name,
             "access_confidence": decision.confidence,
@@ -186,7 +215,6 @@ def apply_promotion(
             "status": StrategyStatus.ACTIVE,
         }
     elif method_type is MethodType.EXTRACTION:
-        method_column = DomainStrategyProfile.preferred_extraction_method
         values = {
             "preferred_extraction_method": validated_name,
             "extraction_confidence": decision.confidence,
@@ -201,7 +229,6 @@ def apply_promotion(
         .where(
             DomainStrategyProfile.id == profile_id,
             DomainStrategyProfile.status.in_(_PROMOTABLE_STATUSES),
-            (method_column.is_(None)) | (method_column != validated_name),
         )
         .values(**values)
     )
