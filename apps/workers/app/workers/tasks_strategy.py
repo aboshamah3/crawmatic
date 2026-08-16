@@ -57,9 +57,11 @@ from app_shared.enums import (
     ExtractionMethod,
     MethodType,
     ProxyProviderStatus,
+    RequestOrigin,
     StrategyStatus,
 )
 from app_shared.models.competitors_matches import CompetitorProductMatch
+from app_shared.models.observations import RequestAttempt
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
@@ -200,6 +202,88 @@ def _select_sample_urls(
         stmt = stmt.where(CompetitorProductMatch.url_pattern == url_pattern)
     stmt = stmt.limit(max_sample)
     return [row.competitor_url for row in session.execute(stmt).scalars().all()]
+
+
+# --- probe accounting (Task 2.3, proxy-cost-reduction plan §2.3) ----------
+#
+# Discovery probes made ~87,000 real proxy requests but wrote 646
+# `request_attempts` rows (see `_fetch_via_proxy`'s docstring) -- per-URL
+# accounting and the `REQUESTS_PER_URL` circuit-breaker condition were
+# blind to the largest paid source. `_probe_sample` now writes one
+# `RequestAttempt` row per probe fetch it attempts, tagged
+# `origin=RequestOrigin.DISCOVERY`, so both the breaker's per-URL ratio
+# AND the money-spent counters finally see this traffic. Readers that
+# score *scrape* outcomes (the daily rollup, `build_recent_signals`) must
+# filter to `origin='scrape'` so this deliberately noisy, deliberately
+# multi-method ladder can never be misread as a real scrape degrading
+# (contracts/rediscovery.md condition 6, the Task 3.3 prerequisite) --
+# spend/volume accounting deliberately does NOT filter, since a discovery
+# probe's proxy request costs exactly the same money as a scrape one.
+
+
+def _match_ids_for_urls(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    competitor_id: uuid.UUID,
+    urls: list[str],
+) -> dict[str, uuid.UUID]:
+    """Best-effort `competitor_url -> CompetitorProductMatch.id` lookup for
+    the given `urls` (`RequestAttempt.match_id` is NOT NULL, so a probe
+    attempt can only be recorded when its URL already has a match). A
+    read-only, workspace-scoped query -- exposed at module scope (not
+    `_`-nested) purely so tests can monkeypatch it, the same convention
+    `test_discovery_early_exit.py` already uses for `_fetch`."""
+    if not urls:
+        return {}
+    stmt = scoped_select(CompetitorProductMatch, workspace_id).where(
+        CompetitorProductMatch.competitor_id == competitor_id,
+        CompetitorProductMatch.competitor_url.in_(urls),
+    )
+    rows = session.execute(stmt).scalars().all()
+    return {row.competitor_url: row.id for row in rows}
+
+
+def _record_probe_attempt(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    match_id: uuid.UUID | None,
+    access_method: AccessMethod,
+    url: str,
+    success: bool,
+) -> None:
+    """Best-effort write of one discovery-probe `RequestAttempt` row
+    (`origin=DISCOVERY`). A no-op when `match_id` is `None` -- an
+    operator-supplied ad hoc sample URL with no `CompetitorProductMatch`
+    yet has nothing to attribute the row to
+    (`tests/integration/test_discovery_run.py`'s scenarios are exactly
+    this shape). Never raises: this is accounting, not the probe itself --
+    a lost row must never fail a discovery run, mirroring `stats_buffer
+    .record_attempt`'s fail-open telemetry posture
+    (contracts/stats-buffer.md step 4)."""
+    if match_id is None:
+        return
+    try:
+        session.add(
+            RequestAttempt(
+                workspace_id=workspace_id,
+                created_at=datetime.now(timezone.utc),
+                match_id=match_id,
+                attempt_number=1,
+                url=url,
+                access_method=access_method,
+                success=success,
+                origin=RequestOrigin.DISCOVERY,
+            )
+        )
+    except Exception:  # noqa: BLE001 - accounting must never break a probe
+        logger.warning(
+            "strategy_discovery: failed to record probe attempt url=%s access_method=%s",
+            url,
+            access_method.value,
+            exc_info=True,
+        )
 
 
 # --- profile get-or-create (no enqueue -- see seed.py docstring) ----------
@@ -381,19 +465,58 @@ def _fetch(session: Session, workspace_id: uuid.UUID, access_method: AccessMetho
 
 
 def _probe_sample(
-    session: Session, *, workspace_id: uuid.UUID, urls: list[str], thresholds: PromotionThresholds
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    urls: list[str],
+    thresholds: PromotionThresholds,
+    competitor_id: uuid.UUID | None = None,
 ) -> dict[tuple[AccessMethod, ExtractionMethod], _Tally]:
     """Drive `urls` through each candidate access method, then the reused
     extraction chain, tallying qualifying observations per `(access,
-    extraction)` combo (contracts/discovery.md steps 3-4)."""
+    extraction)` combo (contracts/discovery.md steps 3-4).
+
+    `competitor_id` (Task 2.3, optional/keyword so older callers/tests
+    that predate probe accounting keep working unmodified) resolves each
+    URL's `CompetitorProductMatch.id` ONCE up front
+    (`_match_ids_for_urls`) so every probed `(access_method, url)`
+    attempt -- every leg this loop actually calls `_fetch` for, including
+    the paid `PROXY_HTTP` one via `_fetch_via_proxy` -- gets one
+    `origin=DISCOVERY` `RequestAttempt` row (`_record_probe_attempt`).
+    `_fetch`/`_fetch_direct`/`_fetch_via_proxy` are never reached from
+    anywhere else in this module, so this single write site covers all of
+    them without double-counting."""
     confidence_cfg = resolve_confidence_rules(
         {"min_accepted_confidence": float(thresholds.confidence_threshold)}
     )
     tallies: dict[tuple[AccessMethod, ExtractionMethod], _Tally] = {}
 
+    match_ids: dict[str, uuid.UUID] = {}
+    if competitor_id is not None:
+        try:
+            match_ids = _match_ids_for_urls(
+                session, workspace_id=workspace_id, competitor_id=competitor_id, urls=urls
+            )
+        except Exception:  # noqa: BLE001 - accounting must never break a probe
+            logger.warning(
+                "strategy_discovery: failed to resolve match ids for probe accounting "
+                "competitor_id=%s",
+                competitor_id,
+                exc_info=True,
+            )
+            match_ids = {}
+
     for access_method in _ACCESS_LADDER:
         for url in urls:
             html = _fetch(session, workspace_id, access_method, url)
+            _record_probe_attempt(
+                session,
+                workspace_id=workspace_id,
+                match_id=match_ids.get(url),
+                access_method=access_method,
+                url=url,
+                success=html is not None,
+            )
             if html is None:
                 continue
 
@@ -749,7 +872,7 @@ def run_discovery(
 
         try:
             tallies = _probe_sample(
-                session, workspace_id=ws, urls=safe_urls, thresholds=thresholds
+                session, workspace_id=ws, urls=safe_urls, thresholds=thresholds, competitor_id=comp_id
             )
             winner = select_discovery_winner(tallies)
         except Exception:

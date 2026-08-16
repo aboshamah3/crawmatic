@@ -56,7 +56,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app_shared.config import get_settings
-from app_shared.enums import ScrapeErrorCode, StrategyStatus
+from app_shared.enums import RequestOrigin, ScrapeErrorCode, StrategyStatus
 from app_shared.messaging import enqueue
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.observations import PriceObservation, RequestAttempt
@@ -407,8 +407,11 @@ def build_recent_signals(
     competitor, url_pattern)` key (`competitor_product_matches`, the same
     key the profile itself is resolved by), restricted to the profile's
     `preferred_access_method` (the "preferred method" FR-020a(b) scopes
-    every per-attempt-outcome condition to), most-recent first. Each
-    attempt is paired (`request_attempts.created_at ==
+    every per-attempt-outcome condition to) AND to `origin='scrape'`
+    (Task 2.3) — a discovery probe's rows never feed these conditions,
+    since its ladder deliberately walks multiple access methods against a
+    small sample and is not "this preferred method is degrading". Most
+    recent first. Each attempt is paired (`request_attempts.created_at ==
     price_observations.scraped_at`, same `match_id`/`workspace_id` — the
     exact correlation the scrape-core pipeline's `_flush_batch` writes both
     rows under, one `moment` per item) with its `price_observations` row
@@ -446,6 +449,13 @@ def build_recent_signals(
             CompetitorProductMatch.competitor_id == profile.competitor_id,
             CompetitorProductMatch.url_pattern == profile.url_pattern,
             RequestAttempt.access_method == profile.preferred_access_method,
+            # Task 2.3: a discovery probe's rows (`origin='discovery'`)
+            # must never feed rediscovery's per-attempt-outcome
+            # conditions (3, 5, 6, 7, 8) -- its ladder deliberately walks
+            # multiple access methods and deliberately probes URLs that
+            # may not qualify, which is not "this preferred method is
+            # degrading" (the Task 3.3 prerequisite).
+            RequestAttempt.origin == RequestOrigin.SCRAPE,
         )
         .order_by(RequestAttempt.created_at.desc())
         .limit(limit)
