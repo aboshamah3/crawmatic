@@ -188,6 +188,18 @@ class DomainStats:
     named primary cost alarms. ``failed_paid`` is "percent of spend
     producing no observation" in absolute form -- the metric that rises
     long before raw spend looks alarming.
+
+    ``successful_prices`` (Task 2.4, proxy-cost-reduction plan §2.4) is
+    the audit's core financial insight made a first-class denominator:
+    "cost per attempt is low, but cost per USABLE price can be unbounded
+    -- a domain can spend money and produce zero prices." It counts
+    ``price_observations`` rows with ``success=True`` attributed to this
+    domain via ``match_id -> competitor_product_matches -> competitors
+    .domain`` (``price_observations`` carries no ``url``/domain of its
+    own -- see ``_collect_domains``). ``proxied`` already IS "proxied
+    requests" (paid ``request_attempts``, both origins -- see the module
+    docstring and ``PAID_ACCESS_METHODS``); ``proxied_requests`` below is
+    an explicit-name alias for readers of this metric specifically.
     """
 
     domain: str
@@ -196,6 +208,7 @@ class DomainStats:
     distinct_urls: int
     proxied: int
     failed_paid: int
+    successful_prices: int = 0
 
     @property
     def success_rate(self) -> float | None:
@@ -218,6 +231,41 @@ class DomainStats:
     def estimated_usd(self) -> float:
         return cost.usd(self.proxied)
 
+    @property
+    def proxied_requests(self) -> int:
+        """Alias for ``proxied``. Paid request attempts, BOTH
+        ``RequestOrigin`` values counted (Task 2.3): a discovery probe's
+        proxy request costs exactly the same money as a scrape one, so
+        spend/volume accounting deliberately does not filter by origin
+        (see the module docstring's "Cross-workspace by construction"
+        section and ``RequestOrigin``'s own docstring). Named explicitly
+        for Task 2.4's cost-per-successful-price metric.
+        """
+        return self.proxied
+
+    @property
+    def estimated_usd_domain_rate(self) -> float:
+        """Spend using THIS domain's own $/req (``cost.usd_for_domain``),
+        not the fleet-wide average ``estimated_usd`` uses."""
+        return cost.usd_for_domain(self.domain, self.proxied_requests)
+
+    @property
+    def cost_per_successful_price(self) -> float | None:
+        """USD of proxy spend per USABLE price, at this domain's own rate.
+
+        ``None`` when there is no spend at all (nothing to divide --
+        this domain never touched the paid proxy in the window).
+        ``float('inf')`` when there IS spend but zero successful prices
+        -- the audit's named "cost per usable price can be unbounded"
+        case. That is a real, alertable state, not a divide error (same
+        semantics as ``_ratio`` elsewhere in this module).
+        """
+        if self.proxied_requests == 0:
+            return None
+        if self.successful_prices == 0:
+            return float("inf")
+        return self.estimated_usd_domain_rate / self.successful_prices
+
     def as_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out.update(
@@ -226,6 +274,9 @@ class DomainStats:
             proxied_per_url=_round(self.proxied_per_url, 3),
             wasted_paid_rate=_round(self.wasted_paid_rate, 4),
             estimated_usd=self.estimated_usd,
+            proxied_requests=self.proxied_requests,
+            estimated_usd_domain_rate=self.estimated_usd_domain_rate,
+            cost_per_successful_price=_round(self.cost_per_successful_price, 6),
         )
         return out
 
@@ -1023,6 +1074,30 @@ LIMIT :limit
 """
 
 
+#: Successful ``price_observations`` per domain (Task 2.4). Unlike
+#: ``request_attempts``, ``price_observations`` carries no ``url`` --
+#: domain attribution comes from ``match_id -> competitor_product_matches
+#: -> competitors.domain`` (same join ``apps/api/app/services
+#: /admin_usage.py`` uses for product attribution: "request_attempts has
+#: match_id, not product_id -- product attribution comes from joining
+#: competitor_product_matches"). Both joins are on primary-key /
+#: unique-indexed columns (``cpm.id``, ``competitors.id``); the only
+#: predicate is the bounded range on ``scraped_at`` -- the partition key
+#: -- so this stays SARGABLE and prunes to the touched monthly
+#: partition(s) exactly like ``_DOMAIN_AGG_SQL`` does on ``created_at``.
+_SUCCESSFUL_PRICES_SQL = """
+SELECT c.domain AS domain,
+       count(*) FILTER (WHERE po.success) AS successful_prices
+FROM price_observations po
+JOIN competitor_product_matches cpm
+  ON cpm.workspace_id = po.workspace_id AND cpm.id = po.match_id
+JOIN competitors c
+  ON c.workspace_id = cpm.workspace_id AND c.id = cpm.competitor_id
+WHERE po.scraped_at >= :since
+GROUP BY 1
+"""
+
+
 def _collect_domains(
     session: Any, now: datetime, *, limit: int = 50
 ) -> tuple[tuple[DomainStats, ...], tuple[DomainStats, ...], bool, str | None]:
@@ -1033,6 +1108,19 @@ def _collect_domains(
             text(_DOMAIN_AGG_SQL),
             {"since": since, "paid": list(PAID_ACCESS_METHODS), "limit": limit},
         ).all()
+        # Second, independent pass rather than folding into one query:
+        # `_DOMAIN_AGG_SQL` groups `request_attempts` (LIMIT'd, ordered
+        # by attempts); `price_observations` has no row-count relation
+        # to that at all, and a single query joining both would force a
+        # domain into the top-`limit` request_attempts set to see its
+        # prices, hiding the exact "spend but zero prices" case Task 2.4
+        # exists to surface (a domain can be blocked/failing so hard it
+        # falls out of the attempts ranking while still burning proxy
+        # spend). A dict lookup by domain name merges the two safely.
+        successful_by_domain: dict[str, int] = {
+            (r[0] or "(unparsed)"): int(r[1])
+            for r in session.execute(text(_SUCCESSFUL_PRICES_SQL), {"since": since}).all()
+        }
         return tuple(
             DomainStats(
                 domain=r[0] or "(unparsed)",
@@ -1041,6 +1129,7 @@ def _collect_domains(
                 distinct_urls=int(r[3]),
                 proxied=int(r[4]),
                 failed_paid=int(r[5]),
+                successful_prices=successful_by_domain.get(r[0] or "(unparsed)", 0),
             )
             for r in rows
         )
