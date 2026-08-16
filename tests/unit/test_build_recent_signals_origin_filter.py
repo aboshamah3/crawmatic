@@ -24,9 +24,20 @@ from __future__ import annotations
 
 import uuid
 
+import app_shared.strategy.rediscovery as rediscovery
 from app_shared.enums import AccessMethod
 from app_shared.models.strategy import DomainStrategyProfile
 from app_shared.strategy.rediscovery import build_recent_signals
+
+
+class _StubSettings:
+    """Minimal `get_settings()` stand-in (Task 3.3 added a `get_settings()`
+    read to `build_recent_signals` for `STRATEGY_SIGNALS_DOMAIN_JOIN`) --
+    default-off, so this test's plain profile keeps exercising the
+    pre-3.3 exact-equality join exactly as before."""
+
+    STRATEGY_SIGNALS_DOMAIN_JOIN = False
+    STRATEGY_PROFILE_SCOPE = "domain"
 
 
 class _EmptyResult:
@@ -58,7 +69,8 @@ def _profile() -> DomainStrategyProfile:
     )
 
 
-def test_build_recent_signals_filters_to_scrape_origin() -> None:
+def test_build_recent_signals_filters_to_scrape_origin(monkeypatch) -> None:
+    monkeypatch.setattr(rediscovery, "get_settings", lambda: _StubSettings())
     session = _CapturingSession()
 
     build_recent_signals(session, _profile())

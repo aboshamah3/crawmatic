@@ -213,6 +213,23 @@ def _bare_host(host: str) -> str:
     return host[len("www.") :] if host.startswith("www.") else host
 
 
+def _domain_match_terms(domain: str) -> tuple[str, str]:
+    """`(bare, www-prefixed)` forms of `domain` for a registrable-domain
+    `competitor_product_matches.url_pattern` comparison (Task 3.3,
+    `STRATEGY_SIGNALS_DOMAIN_JOIN`).
+
+    Reuses :func:`_bare_host` (the same www-stripping fix as commit
+    `36fd624`) rather than re-deriving it -- a match's stored
+    `url_pattern` (`derive_url_pattern`'s host+path grouping key) always
+    carries a www-stripped host, but `domain` itself is not guaranteed to
+    (`competitors.domain` is operator/discovery-supplied), so both this
+    profile's own domain string AND the match rows it should aggregate
+    need the same normalization applied before comparison.
+    """
+    bare = _bare_host(domain)
+    return bare, f"www.{bare}"
+
+
 def _consecutive(
     attempts: Sequence[RecentAttemptSignal], predicate: Callable[[RecentAttemptSignal], bool]
 ) -> int:
@@ -405,13 +422,24 @@ def build_recent_signals(
 
     Reads `request_attempts` for matches under this profile's `(workspace,
     competitor, url_pattern)` key (`competitor_product_matches`, the same
-    key the profile itself is resolved by), restricted to the profile's
-    `preferred_access_method` (the "preferred method" FR-020a(b) scopes
-    every per-attempt-outcome condition to) AND to `origin='scrape'`
-    (Task 2.3) — a discovery probe's rows never feed these conditions,
-    since its ladder deliberately walks multiple access methods against a
-    small sample and is not "this preferred method is degrading". Most
-    recent first. Each attempt is paired (`request_attempts.created_at ==
+    key the profile itself is resolved by) by default. Under
+    `Settings.STRATEGY_PROFILE_SCOPE="domain"` **and**
+    `Settings.STRATEGY_SIGNALS_DOMAIN_JOIN=True` (Task 3.3, default OFF),
+    the join instead matches every `competitor_product_matches.url_pattern`
+    whose registrable domain equals `profile.domain` (`_domain_match_terms`,
+    reusing `_bare_host`'s www-stripping) -- under domain scope
+    `profile.url_pattern` holds the bare competitor domain with no path,
+    while a match's stored `url_pattern` is `derive_url_pattern`'s
+    host+path grouping key, so the exact-equality join always matches 0
+    rows and rediscovery conditions 3, 5, 6, 7, 8 are dead code (measured
+    2026-08-16: 0 of 4,588 rows). Flag OFF (default) preserves the
+    exact-equality join byte-for-byte -- the rollback path. Restricted to
+    the profile's `preferred_access_method` (the "preferred method"
+    FR-020a(b) scopes every per-attempt-outcome condition to) AND to
+    `origin='scrape'` (Task 2.3) — a discovery probe's rows never feed
+    these conditions, since its ladder deliberately walks multiple access
+    methods against a small sample and is not "this preferred method is
+    degrading". Most recent first. Each attempt is paired (`request_attempts.created_at ==
     price_observations.scraped_at`, same `match_id`/`workspace_id` — the
     exact correlation the scrape-core pipeline's `_flush_batch` writes both
     rows under, one `moment` per item) with its `price_observations` row
@@ -430,6 +458,26 @@ def build_recent_signals(
     if profile.preferred_access_method is None:
         return RecentSignals(attempts=())
 
+    settings = get_settings()
+    if settings.STRATEGY_SIGNALS_DOMAIN_JOIN and settings.STRATEGY_PROFILE_SCOPE == "domain":
+        # Task 3.3: registrable-domain join, default OFF. `bare`/`www_form`
+        # cover both www-prefixed and bare match rows for this profile's
+        # domain; the LIKE branches admit any path suffix
+        # `derive_url_pattern` appended, the equality branches admit a
+        # match whose pattern is the bare/www host alone (empty path).
+        # Single WHERE with disjoint OR branches -- never a UNION/self-join
+        # -- so no row can satisfy more than one branch and no row is
+        # ever double-counted.
+        bare, www_form = _domain_match_terms(profile.domain)
+        match_condition = or_(
+            CompetitorProductMatch.url_pattern == bare,
+            CompetitorProductMatch.url_pattern.like(f"{bare}/%"),
+            CompetitorProductMatch.url_pattern == www_form,
+            CompetitorProductMatch.url_pattern.like(f"{www_form}/%"),
+        )
+    else:
+        match_condition = CompetitorProductMatch.url_pattern == profile.url_pattern
+
     stmt = (
         select(RequestAttempt, PriceObservation, ScrapeProfile.validation_rules)
         .join(
@@ -447,7 +495,7 @@ def build_recent_signals(
         .where(
             RequestAttempt.workspace_id == profile.workspace_id,
             CompetitorProductMatch.competitor_id == profile.competitor_id,
-            CompetitorProductMatch.url_pattern == profile.url_pattern,
+            match_condition,
             RequestAttempt.access_method == profile.preferred_access_method,
             # Task 2.3: a discovery probe's rows (`origin='discovery'`)
             # must never feed rediscovery's per-attempt-outcome

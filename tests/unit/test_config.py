@@ -196,3 +196,27 @@ def test_strategy_profile_scope_rejects_invalid_value(monkeypatch: pytest.Monkey
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_strategy_signals_domain_join_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STRATEGY_SIGNALS_DOMAIN_JOIN defaults False (Task 3.3, the
+    build_recent_signals domain-scoped join fix) -- flag-off must
+    preserve today's exact-equality join byte-for-byte until an operator
+    opts in."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("STRATEGY_SIGNALS_DOMAIN_JOIN", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.STRATEGY_SIGNALS_DOMAIN_JOIN is False
+
+
+def test_strategy_signals_domain_join_honors_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("STRATEGY_SIGNALS_DOMAIN_JOIN", "true")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.STRATEGY_SIGNALS_DOMAIN_JOIN is True

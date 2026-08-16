@@ -441,6 +441,28 @@ class Settings(BaseSettings):
     # pattern-level keying can be re-enabled later, data-driven.
     STRATEGY_PROFILE_SCOPE: str = "domain"
 
+    # --- `build_recent_signals` domain-scoped join fix (Task 3.3,
+    # proxy-cost-reduction plan, default OFF). Under
+    # `STRATEGY_PROFILE_SCOPE="domain"`, `build_recent_signals` still
+    # joins `competitor_product_matches.url_pattern ==
+    # profile.url_pattern` -- but under domain scope `profile.url_pattern`
+    # holds the bare competitor domain (no path), while a match's stored
+    # `url_pattern` is `derive_url_pattern`'s host+path grouping key, so
+    # the two are never equal (0 of 4,588 rows measured 2026-08-16):
+    # rediscovery conditions 3, 5, 6, 7, 8 are silently dead code for
+    # every domain-scoped profile. When `True`, the join instead matches
+    # a registrable-domain comparison (reusing `rediscovery._bare_host`,
+    # the same www-stripping fix as commit `36fd624`) so both
+    # `www.`-prefixed and bare match rows for the profile's domain are
+    # included. `False` (default) preserves today's exact-equality join
+    # byte-for-byte -- the rollback path if enabling this reveals a
+    # rediscovery/discovery loop, per the same cooldown/rate-limit
+    # backstops `STRATEGY_REDISCOVERY_MIN_INTERVAL_SECONDS` and
+    # `STRATEGY_DISCOVERY_MAX_RUNS_PER_KEY_PER_DAY` already enforce.
+    # Ignored (no effect) under `STRATEGY_PROFILE_SCOPE="url_pattern"`,
+    # where the exact-equality join is already correct.
+    STRATEGY_SIGNALS_DOMAIN_JOIN: bool = False
+
     # --- Scheduler refresh-pass tuning (SPEC-13 US2, research R8,
     # Principle IV — env-tunable, never a hardcoded literal). Poll
     # cadence and per-pass claim ceiling for `apps/scheduler`'s due-rule
