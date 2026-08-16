@@ -34,10 +34,16 @@ rather than duplicating it.
 ``--dry-run`` (the default — no flag needed): runs the full read +
 aggregate + upsert-statement path for every day in range and reports what
 WOULD be written, then rolls back each day's transaction. No row is ever
-persisted.
-``--apply``: commits each day's transaction as it completes, so a
-mid-range failure leaves every already-processed day durably written
-rather than losing the whole run.
+persisted. This is backstopped at the DATABASE level, not just the app
+level: before any statement runs for a dry-run day, the session issues
+``SET default_transaction_read_only = on`` — the same hard guard
+``scripts/analyze_hot_query_plans.py`` pins before any production
+``SELECT`` (its module docstring / line 187) — so a future refactor that
+accidentally skips the ``session.rollback()`` call still cannot commit a
+write; Postgres itself rejects it.
+``--apply``: commits each day's transaction as it completes (session
+stays writable), so a mid-range failure leaves every already-processed
+day durably written rather than losing the whole run.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app_shared.maintenance.rollups import RunReport, default_target_date, run_daily_rollup
@@ -99,13 +106,25 @@ def run_backfill(
 
     ``apply=False`` (dry-run) still builds and executes the real upsert
     statement against the session — the reported per-day counts reflect
-    the actual write path, not a simulation — but every day's transaction
-    is rolled back rather than committed, so nothing is ever persisted.
+    the actual write path, not a simulation — but the session is pinned
+    ``SET default_transaction_read_only = on`` BEFORE `run_daily_rollup`
+    runs any statement (a hard DB-level guard, not just the
+    `session.rollback()` below it — the global production-DB-session
+    constraint this project holds everywhere else, e.g.
+    `scripts/analyze_hot_query_plans.py`), and every day's transaction is
+    rolled back rather than committed, so nothing is ever persisted even
+    if a future refactor skipped the rollback call.
     """
     results: list[DayResult] = []
     for target_date in date_range(start, end):
         session = session_factory()
         try:
+            if not apply:
+                # Hard DB-level backstop for dry-run: pinned BEFORE any
+                # read/write `run_daily_rollup` issues, so an accidental
+                # write fails at Postgres itself, not just at the
+                # app-level `session.rollback()` two lines down.
+                session.execute(text("SET default_transaction_read_only = on"))
             report = run_daily_rollup(session, target_date=target_date)
             if apply:
                 session.commit()

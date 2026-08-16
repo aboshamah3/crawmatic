@@ -112,9 +112,21 @@ class _PersistentFakeSession:
         self.committed = False
         self.rolled_back = False
         self.closed = False
+        #: Every statement executed against this session, in order --
+        #: used to prove the DB-level read-only guard is (a) issued for
+        #: dry-run sessions, (b) issued BEFORE any read/write
+        #: `run_daily_rollup` statement, and (c) never issued for apply
+        #: sessions.
+        self.executed_sql: list[str] = []
 
     def execute(self, stmt):
         sql = str(stmt)
+        self.executed_sql.append(sql)
+        if "default_transaction_read_only" in sql:
+            # The DB-level dry-run guard itself: a plain `text()` DDL/SET
+            # statement with no rows and no bind params -- record it and
+            # stop, never falls through to the upsert catch-all below.
+            return _FakeResult([])
         if "DISTINCT" in sql and "price_observations" in sql:
             params = stmt.compile().params
             rows = self._in_day(params["day_start"], params["day_end"])
@@ -273,6 +285,37 @@ def test_run_backfill_dry_run_rolls_back_every_day_and_never_commits() -> None:
     # ...but every session was rolled back, never committed -- dry-run
     # must write nothing durable in the real (non-fake) path.
     assert all(session.rolled_back and not session.committed for session in sessions)
+    # AND every dry-run session got the DB-level read-only guard as its
+    # very FIRST statement -- a backstop that holds even if a future
+    # refactor accidentally drops the `session.rollback()` above.
+    assert all(
+        session.executed_sql
+        and "default_transaction_read_only" in session.executed_sql[0]
+        for session in sessions
+    )
+
+
+def test_run_backfill_apply_never_sets_read_only_guard() -> None:
+    """`--apply` sessions must stay writable -- the DB-level guard is a
+    dry-run-only backstop, never applied when the caller actually wants
+    to persist rows."""
+    observations, states, day1, day2, _, _ = _two_day_fixture()
+    store: dict = {}
+    sessions: list[_PersistentFakeSession] = []
+
+    def factory() -> _PersistentFakeSession:
+        session = _PersistentFakeSession(observations, states, store)
+        sessions.append(session)
+        return session
+
+    run_backfill(start=day1, end=day2, apply=True, session_factory=factory)
+
+    assert len(sessions) == 2
+    assert all(
+        not any("default_transaction_read_only" in sql for sql in session.executed_sql)
+        for session in sessions
+    )
+    assert all(session.committed and not session.rolled_back for session in sessions)
 
 
 def test_run_backfill_empty_range_yields_no_results() -> None:
@@ -313,6 +356,11 @@ def test_main_dry_run_never_commits(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(sessions) == 2
     assert all(s.rolled_back and not s.committed for s in sessions)
     assert len(store) == 2  # computed and reported, never persisted for real
+    # DB-level guard reaches every session through the full main() ->
+    # run_backfill() path, not just when run_backfill is called directly.
+    assert all(
+        s.executed_sql and "default_transaction_read_only" in s.executed_sql[0] for s in sessions
+    )
 
 
 def test_main_apply_commits_each_day(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -336,3 +384,9 @@ def test_main_apply_commits_each_day(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(sessions) == 2
     assert all(s.committed and not s.rolled_back for s in sessions)
     assert len(store) == 2
+    # --apply sessions never get the read-only guard -- they must stay
+    # writable through the full main() -> run_backfill() path.
+    assert all(
+        not any("default_transaction_read_only" in sql for sql in s.executed_sql)
+        for s in sessions
+    )
