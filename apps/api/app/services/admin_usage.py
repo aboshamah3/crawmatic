@@ -16,6 +16,11 @@ Three facts drive the query, all verified against the live schema:
 3. `check_successful` is read from `price_observations`, not from
    attempt success: the Fairness law (PLAN §5.1.4) consumes a credit
    only for a successful **price observation**.
+4. `request_attempts.origin` (Task 2.3) must be `'scrape'`. The domain-
+   strategy discovery probe ladder also writes `request_attempts` rows
+   now (`origin='discovery'`, with real `match_id`s), and that traffic
+   is internal COGS, not customer activity — it must never inflate a
+   customer's `links_total`/`protected_links_attempted`.
 
 `cycle_ts` is `date_trunc('hour', COALESCE(scrape_jobs.created_at,
 request_attempts.created_at))`. Hour truncation makes the export
@@ -67,7 +72,7 @@ from typing import NamedTuple
 
 from sqlalchemy import Select, and_, func, literal, select, tuple_
 
-from app_shared.enums import AccessMethod
+from app_shared.enums import AccessMethod, RequestOrigin
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob
 from app_shared.models.observations import PriceObservation, RequestAttempt
@@ -243,6 +248,18 @@ def build_usage_query(
         .where(
             RequestAttempt.created_at >= since,
             RequestAttempt.created_at < until,
+            # Task 2.3 fix round 1: discovery probes (`tasks_strategy
+            # ._probe_sample`) write `RequestAttempt` rows tagged
+            # `origin='discovery'`, with real `match_id`s resolved from
+            # `competitor_product_matches` -- internal COGS traffic, not
+            # customer activity. `per_link` is the sole source of every
+            # link/protected-link counter this export bills from, so
+            # excluding non-scrape origins here (same WHERE, same
+            # partition-pruned scan -- no second pass over
+            # `request_attempts`) keeps discovery probing from silently
+            # inflating a customer's `links_total`/
+            # `protected_links_attempted`.
+            RequestAttempt.origin == RequestOrigin.SCRAPE,
         )
         .group_by(
             RequestAttempt.workspace_id,
