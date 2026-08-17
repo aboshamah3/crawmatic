@@ -106,6 +106,21 @@ class ScrapeProfile(Base, TimestampMixin):
     title_selector: Mapped[str | None] = mapped_column(Text(), nullable=True)
     title_xpath: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
+    # RFC 6901 JSON pointers into an embedded JSON blob on the page
+    # (`<script id="__NEXT_DATA__">`, `<script type="application/json">`,
+    # `var X = {...};`), resolved by the scraping side's EMBEDDED_JSON
+    # extraction strategy (Task 3.1 / handover 2026-08-15 §7 -- named
+    # indirectly here because this package must not reference the
+    # scraping library even in a comment, see
+    # `tests/unit/test_import_boundaries.py`). Same nullable/opt-in
+    # contract as the `*_selector`/`*_xpath`/`*_regex` families above: a
+    # NULL `price_json_path` makes the strategy a no-op for this profile.
+    price_json_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    old_price_json_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    currency_json_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    stock_json_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    title_json_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
     variant_strategy: Mapped[VariantStrategy] = enum_column(
         VariantStrategy, nullable=False, default=VariantStrategy.PAGE_SINGLE_PRICE
     )
