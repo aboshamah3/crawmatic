@@ -140,6 +140,51 @@ Pass `--competitor-id <uuid>` if the competitor row already exists (e.g. it
 was created through the product UI) and you only want the access
 policy/rate-rule/profile seeded for it.
 
+### 3.1 Re-applying to an already-onboarded domain (escalation)
+
+**Plain `--apply` against a domain that already has an access policy / rate
+rule / profile does not change them.** It reuses the existing rows exactly as
+they are — but it does not pretend nothing changed either: if the fresh
+report's recommendation disagrees with what's stored, the printed summary
+says so explicitly:
+
+```
+  access_policy_id        = <uuid> (created=False)
+      *** EXISTING ROW NOT UPDATED *** -- the new recommendation disagrees:
+          strategy: 'DIRECT_ONLY' -> 'PROXY_FIRST'
+      Re-run with --apply --update-existing (add --allow-downgrade too if this is a downgrade) to escalate.
+```
+
+To actually write the escalation, add `--update-existing`:
+
+```bash
+sudo -u mahmoud -H bash -lc '
+export UV_PROJECT_ENVIRONMENT=/srv/crawmatic/.venv-core
+cd /srv/crawmatic/wt-proxy-cost
+uv run python scripts/onboard_competitor.py --domain newcompetitor.sa --urls urls.txt \
+  --apply --workspace-id <uuid> --update-existing
+'
+```
+
+Still one transaction. The printed summary shows exactly what changed
+(`escalated: strategy: 'DIRECT_ONLY' -> 'PROXY_FIRST'`, etc.) so the operator
+sees the escalation happened, not just "APPLIED".
+
+**Escalating (e.g. `DIRECT_ONLY` -> `PROXY_FIRST`, or a stricter rate limit)
+never needs anything beyond `--update-existing`.** Going the other way — a
+looser rate rule (higher rpm/concurrency, shorter cooldown) or a lower-tier
+access strategy than what's currently stored — is refused outright, before
+anything is written, unless you also pass `--allow-downgrade`. This is
+deliberate: a stale or regressed probe report re-run with `--update-existing`
+must never silently walk a domain's protection backward. If you genuinely
+mean to loosen it (e.g. the domain turned out not to need `PROXY_FIRST`
+after all), pass both flags together.
+
+A `scrape_profiles` field only ever gets *filled in* on `--update-existing`
+(`price_selector`/`price_json_path`/`currency_json_path` going from unset to
+a detected candidate) — an already-configured field is never overwritten,
+downgrade flag or not, since it may be a human's hand-confirmed value (§2).
+
 ---
 
 ## 4. Add the fixture
@@ -231,7 +276,9 @@ job. Watch:
 If the canary disagrees with the report (wrong method fires, prices look
 wrong, or requests get blocked despite `DIRECT_ONLY`), do not scale up —
 re-probe with `--urls` pointing at a larger/different sample and revisit
-§2/§3 before dispatching the full catalog.
+§2/§3 (§3.1 if the domain was already onboarded — plain `--apply` won't
+pick up the new recommendation on its own) before dispatching the full
+catalog.
 
 ---
 
@@ -242,8 +289,10 @@ for a freshly onboarded domain specifically, confirm the next day that:
 
 - the domain's `strategy_attempt_stats` success rate is where the report
   predicted (a `DIRECT_ONLY` domain that is actually getting blocked half the
-  time under real volume needs its access policy revisited — go back to §3
-  with a `PROXY_FIRST`/`DIRECT_THEN_PROXY` tier);
+  time under real volume needs its access policy revisited — re-run the
+  script with fresh `--urls`, then `--apply --update-existing` per §3.1 to
+  escalate it to `PROXY_FIRST`/`DIRECT_THEN_PROXY`; plain `--apply` alone
+  will only report the disagreement, not fix it);
 - no `cost.spend_per_domain_per_day` / `cost.wasted_paid_rate` alert fired
   for it (`docs/ops/RUNBOOK_STOP_DISPATCH_AND_SPEND.md` §1 if one did);
 - `domain_strategy_profiles` for the domain shows `status=ACTIVE` or
@@ -273,3 +322,14 @@ for a freshly onboarded domain specifically, confirm the next day that:
   for the embedded-JSON candidate scan) rather than a separate hand-rolled
   parser — a "candidate" the probe reports is guaranteed resolvable the same
   way the real chain would resolve it once configured.
+- **Reusing an existing row is never silent** (§3.1). A first version of
+  this script get-or-created everything and quietly discarded the new
+  recommendation whenever a row already existed — which broke exactly the
+  escalation workflow this runbook (§7) tells an operator to run: re-apply
+  after discovering the domain actually needs a stricter tier. `--apply`
+  alone still leaves existing rows untouched, but now always reports when
+  they disagree with the fresh recommendation; `--update-existing` is what
+  actually writes the escalation, and `--allow-downgrade` is a second,
+  separate opt-in required before any change that would *loosen* a tier or
+  rate limit versus what's already stored — a stale report re-run months
+  later must never silently walk a domain's protection backward.

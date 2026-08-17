@@ -61,8 +61,21 @@ from app_shared.enums import AccessStrategy, ExtractionMethod  # noqa: E402
 from app_shared.models.access import AccessPolicy, DomainAccessRule  # noqa: E402
 from app_shared.models.competitors_matches import Competitor  # noqa: E402
 from app_shared.models.scrape_profiles import ScrapeProfile  # noqa: E402
-from scrape_core.extraction.embedded_json import _iter_documents  # noqa: E402
 from scrape_core.extraction.jsonld import extract_jsonld  # noqa: E402
+
+# Deliberate private-API coupling, not an oversight: `_iter_documents` is
+# `embedded_json.py`'s underscore-prefixed script-tag scanner (not in that
+# module's `__all__`). Reused verbatim here rather than reimplemented so a
+# "candidate" this probe reports is guaranteed resolvable the same way the
+# real `EMBEDDED_JSON` strategy would resolve it (see
+# `detect_embedded_json_candidate`'s docstring). This is a same-repo,
+# same-commit coupling -- if `embedded_json.py`'s internal scanning shape
+# ever changes, this import breaks loudly (ImportError) rather than silently
+# drifting out of sync; no attempt is made here to shield against that,
+# since the alternative (a second parser) is exactly the drift risk this
+# avoids. Do not touch `embedded_json.py` itself to "fix" this coupling
+# (Task 3.1 owns that module).
+from scrape_core.extraction.embedded_json import _iter_documents  # noqa: E402
 
 __all__ = [
     "ProbeOutcome",
@@ -604,6 +617,139 @@ def build_report(
 
 
 # --- apply (one transaction) --------------------------------------------------------
+#
+# Escalation on re-apply (2026-08-17 review finding, Important): a first
+# version's `_get_or_create_*` helpers returned `existing, False` and
+# silently discarded the new run's recommendation whenever a row already
+# existed -- so re-running `--apply` against an already-onboarded domain
+# after real-world blocking (exactly the scenario
+# `docs/COMPETITOR_ONBOARDING.md` §7 tells the operator to do: "go back to
+# §3 with a PROXY_FIRST/DIRECT_THEN_PROXY tier") printed "APPLIED (one
+# transaction)" while changing nothing. Fixed by choosing (a) from the
+# review's two options: `--update-existing` makes a reused row's mutable
+# fields track the new recommendation (still one transaction; the diff is
+# always computed and always printed, whether or not it was applied), with
+# an explicit `--allow-downgrade` guard so an operator can never *silently*
+# loosen an access tier or rate rule by re-running with a stale/regressed
+# report -- `apply_onboarding` raises before mutating anything if a
+# downgrade is detected and `--allow-downgrade` wasn't passed (one commit
+# or none still holds: the raise happens before any `session.add`/attribute
+# mutation for that call). Without `--update-existing` at all, behavior is
+# unchanged (existing rows are reused as-is) but no longer silent: the diff
+# is still computed and surfaced, and `main()` prints an unmissable
+# "EXISTING ROW NOT UPDATED" block naming exactly what changed and which
+# flag closes the gap.
+
+
+#: Coarse "how committed to a proxy is this tier" ordering, used only to
+#: detect a downgrade on re-`--apply` (never to pick a tier -- `recommend_access`
+#: alone does that). `RESIDENTIAL_ONLY`/`BROWSER_FALLBACK` outrank
+#: `PROXY_FIRST` even though `recommend_access` never recommends either --
+#: a human may have hand-set one, and a probe-driven re-apply must not
+#: quietly walk that back either.
+_ACCESS_STRATEGY_RANK: dict[AccessStrategy, int] = {
+    AccessStrategy.DIRECT_ONLY: 0,
+    AccessStrategy.DIRECT_THEN_PROXY: 1,
+    AccessStrategy.PROXY_FIRST: 2,
+    AccessStrategy.RESIDENTIAL_ONLY: 3,
+    AccessStrategy.BROWSER_FALLBACK: 4,
+}
+
+
+@dataclass(frozen=True)
+class FieldDiff:
+    """One field's old -> new value, surfaced whether or not it was applied
+    (`ApplyResult.*_updated` says which)."""
+
+    field: str
+    old: Any
+    new: Any
+
+
+def _access_policy_diff(existing: AccessPolicy, recommendation: Recommendation) -> tuple[FieldDiff, ...]:
+    if existing.strategy == recommendation.access_strategy:
+        return ()
+    return (
+        FieldDiff(
+            "strategy",
+            existing.strategy.value if existing.strategy is not None else None,
+            recommendation.access_strategy.value,
+        ),
+    )
+
+
+def _access_policy_diff_is_downgrade(diff: tuple[FieldDiff, ...]) -> bool:
+    for field_diff in diff:
+        if field_diff.field != "strategy":
+            continue
+        old_rank = _ACCESS_STRATEGY_RANK[AccessStrategy(field_diff.old)]
+        new_rank = _ACCESS_STRATEGY_RANK[AccessStrategy(field_diff.new)]
+        if new_rank < old_rank:
+            return True
+    return False
+
+
+def _rule_diff(existing: DomainAccessRule, recommendation: Recommendation) -> tuple[FieldDiff, ...]:
+    diffs: list[FieldDiff] = []
+    if existing.max_requests_per_minute != recommendation.max_requests_per_minute:
+        diffs.append(
+            FieldDiff(
+                "max_requests_per_minute",
+                existing.max_requests_per_minute,
+                recommendation.max_requests_per_minute,
+            )
+        )
+    if existing.max_concurrent_requests != recommendation.max_concurrent_requests:
+        diffs.append(
+            FieldDiff(
+                "max_concurrent_requests",
+                existing.max_concurrent_requests,
+                recommendation.max_concurrent_requests,
+            )
+        )
+    if existing.cooldown_seconds != recommendation.cooldown_seconds:
+        diffs.append(
+            FieldDiff("cooldown_seconds", existing.cooldown_seconds, recommendation.cooldown_seconds)
+        )
+    return tuple(diffs)
+
+
+def _rule_diff_is_downgrade(diff: tuple[FieldDiff, ...]) -> bool:
+    """A rate-rule change is a downgrade if it moves toward *faster/less
+    safe* on any single field -- higher rpm, higher concurrency, or a
+    shorter cooldown than what's already there."""
+    for field_diff in diff:
+        if field_diff.field in ("max_requests_per_minute", "max_concurrent_requests"):
+            if field_diff.new > field_diff.old:
+                return True
+        elif field_diff.field == "cooldown_seconds":
+            if field_diff.new < field_diff.old:
+                return True
+    return False
+
+
+def _profile_diff(
+    existing: ScrapeProfile, extraction_config: ExtractionConfig
+) -> tuple[FieldDiff, ...]:
+    """Gap-filling only -- never proposes overwriting an already-populated
+    field. A configured `price_selector`/`price_json_path` may be a human's
+    hand-tuned confirmation (`docs/COMPETITOR_ONBOARDING.md` §2's "CONFIRM
+    by hand" step); a fresh probe run finding nothing (or a different
+    candidate) must never silently clobber it. No downgrade concept
+    applies here -- `--allow-downgrade` is never required for a profile
+    diff."""
+    if extraction_config.method is None:
+        return ()
+    diffs: list[FieldDiff] = []
+    for field, new_value in (
+        ("price_selector", extraction_config.price_selector),
+        ("price_json_path", extraction_config.price_json_path),
+        ("currency_json_path", extraction_config.currency_json_path),
+    ):
+        old_value = getattr(existing, field)
+        if old_value is None and new_value is not None:
+            diffs.append(FieldDiff(field, old_value, new_value))
+    return tuple(diffs)
 
 
 @dataclass(frozen=True)
@@ -612,10 +758,16 @@ class ApplyResult:
     competitor_created: bool
     access_policy_id: uuid.UUID
     access_policy_created: bool
+    access_policy_updated: bool
+    access_policy_diff: tuple[FieldDiff, ...]
     domain_access_rule_id: uuid.UUID
     domain_access_rule_created: bool
+    domain_access_rule_updated: bool
+    domain_access_rule_diff: tuple[FieldDiff, ...]
     scrape_profile_id: uuid.UUID
     scrape_profile_created: bool
+    scrape_profile_updated: bool
+    scrape_profile_diff: tuple[FieldDiff, ...]
 
 
 def _get_or_create_competitor(
@@ -650,31 +802,60 @@ def _get_or_create_competitor(
     return competitor, True
 
 
-def _get_or_create_access_policy(
-    session: Session, *, workspace_id: uuid.UUID, domain: str, recommendation: Recommendation
-) -> tuple[AccessPolicy, bool]:
+def _get_or_create_or_update_access_policy(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    domain: str,
+    recommendation: Recommendation,
+    update_existing: bool,
+    allow_downgrade: bool,
+) -> tuple[AccessPolicy, bool, bool, tuple[FieldDiff, ...]]:
+    """Returns `(policy, created, updated, diff)`. `diff` is always the
+    (possibly empty) difference between the stored row and `recommendation`
+    -- computed even when `update_existing` is `False`, so the caller can
+    still surface "this row is stale" without having touched it."""
     name = f"{domain}-access-policy"
     existing = session.execute(
         select(AccessPolicy).where(AccessPolicy.workspace_id == workspace_id, AccessPolicy.name == name)
     ).scalar_one_or_none()
-    if existing is not None:
-        return existing, False
+    if existing is None:
+        strategy = recommendation.access_strategy
+        policy = AccessPolicy(
+            workspace_id=workspace_id,
+            name=name,
+            strategy=strategy,
+            use_proxy_on_first_attempt=strategy
+            in (AccessStrategy.PROXY_FIRST, AccessStrategy.RESIDENTIAL_ONLY),
+            use_proxy_on_retry=strategy != AccessStrategy.DIRECT_ONLY,
+        )
+        session.add(policy)
+        session.flush()
+        return policy, True, False, ()
+
+    diff = _access_policy_diff(existing, recommendation)
+    if not diff or not update_existing:
+        return existing, False, False, diff
+
+    if not allow_downgrade and _access_policy_diff_is_downgrade(diff):
+        raise OnboardingError(
+            f"--update-existing would downgrade access policy {name!r} "
+            f"({diff[0].old} -> {diff[0].new}) -- pass --allow-downgrade to permit this. "
+            "Refusing before writing anything."
+        )
 
     strategy = recommendation.access_strategy
-    policy = AccessPolicy(
-        workspace_id=workspace_id,
-        name=name,
-        strategy=strategy,
-        use_proxy_on_first_attempt=strategy
-        in (AccessStrategy.PROXY_FIRST, AccessStrategy.RESIDENTIAL_ONLY),
-        use_proxy_on_retry=strategy != AccessStrategy.DIRECT_ONLY,
+    existing.strategy = strategy
+    existing.use_proxy_on_first_attempt = strategy in (
+        AccessStrategy.PROXY_FIRST,
+        AccessStrategy.RESIDENTIAL_ONLY,
     )
-    session.add(policy)
+    existing.use_proxy_on_retry = strategy != AccessStrategy.DIRECT_ONLY
     session.flush()
-    return policy, True
+    return existing, False, True, diff
 
 
-def _get_or_create_domain_access_rule(
+def _get_or_create_or_update_domain_access_rule(
     session: Session,
     *,
     workspace_id: uuid.UUID,
@@ -682,7 +863,9 @@ def _get_or_create_domain_access_rule(
     domain: str,
     access_policy_id: uuid.UUID,
     recommendation: Recommendation,
-) -> tuple[DomainAccessRule, bool]:
+    update_existing: bool,
+    allow_downgrade: bool,
+) -> tuple[DomainAccessRule, bool, bool, tuple[FieldDiff, ...]]:
     existing = session.execute(
         select(DomainAccessRule).where(
             DomainAccessRule.workspace_id == workspace_id,
@@ -691,44 +874,75 @@ def _get_or_create_domain_access_rule(
             DomainAccessRule.url_pattern.is_(None),
         )
     ).scalar_one_or_none()
-    if existing is not None:
-        return existing, False
+    if existing is None:
+        rule = DomainAccessRule(
+            workspace_id=workspace_id,
+            competitor_id=competitor_id,
+            domain=domain,
+            url_pattern=None,
+            access_policy_id=access_policy_id,
+            max_concurrent_requests=recommendation.max_concurrent_requests,
+            max_requests_per_minute=recommendation.max_requests_per_minute,
+            cooldown_seconds=recommendation.cooldown_seconds,
+        )
+        session.add(rule)
+        session.flush()
+        return rule, True, False, ()
 
-    rule = DomainAccessRule(
-        workspace_id=workspace_id,
-        competitor_id=competitor_id,
-        domain=domain,
-        url_pattern=None,
-        access_policy_id=access_policy_id,
-        max_concurrent_requests=recommendation.max_concurrent_requests,
-        max_requests_per_minute=recommendation.max_requests_per_minute,
-        cooldown_seconds=recommendation.cooldown_seconds,
-    )
-    session.add(rule)
+    diff = _rule_diff(existing, recommendation)
+    if not diff or not update_existing:
+        return existing, False, False, diff
+
+    if not allow_downgrade and _rule_diff_is_downgrade(diff):
+        readable = ", ".join(f"{d.field} {d.old} -> {d.new}" for d in diff)
+        raise OnboardingError(
+            f"--update-existing would loosen the domain_access_rule for {domain!r} "
+            f"({readable}) -- pass --allow-downgrade to permit this. "
+            "Refusing before writing anything."
+        )
+
+    existing.access_policy_id = access_policy_id
+    existing.max_concurrent_requests = recommendation.max_concurrent_requests
+    existing.max_requests_per_minute = recommendation.max_requests_per_minute
+    existing.cooldown_seconds = recommendation.cooldown_seconds
     session.flush()
-    return rule, True
+    return existing, False, True, diff
 
 
-def _get_or_create_scrape_profile(
-    session: Session, *, workspace_id: uuid.UUID, domain: str, extraction_config: ExtractionConfig
-) -> tuple[ScrapeProfile, bool]:
+def _get_or_create_or_update_scrape_profile(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    domain: str,
+    extraction_config: ExtractionConfig,
+    update_existing: bool,
+) -> tuple[ScrapeProfile, bool, bool, tuple[FieldDiff, ...]]:
     name = f"{domain}-profile"
     existing = session.execute(
         select(ScrapeProfile).where(ScrapeProfile.workspace_id == workspace_id, ScrapeProfile.name == name)
     ).scalar_one_or_none()
-    if existing is not None:
-        return existing, False
+    if existing is None:
+        profile = ScrapeProfile(
+            workspace_id=workspace_id,
+            name=name,
+            price_selector=extraction_config.price_selector,
+            price_json_path=extraction_config.price_json_path,
+            currency_json_path=extraction_config.currency_json_path,
+        )
+        session.add(profile)
+        session.flush()
+        return profile, True, False, ()
 
-    profile = ScrapeProfile(
-        workspace_id=workspace_id,
-        name=name,
-        price_selector=extraction_config.price_selector,
-        price_json_path=extraction_config.price_json_path,
-        currency_json_path=extraction_config.currency_json_path,
-    )
-    session.add(profile)
+    diff = _profile_diff(existing, extraction_config)
+    if not diff or not update_existing:
+        return existing, False, False, diff
+
+    # Gap-filling only (`_profile_diff` never proposes overwriting a
+    # populated field) -- no downgrade guard applies.
+    for field_diff in diff:
+        setattr(existing, field_diff.field, field_diff.new)
     session.flush()
-    return profile, True
+    return existing, False, True, diff
 
 
 def apply_onboarding(
@@ -740,17 +954,36 @@ def apply_onboarding(
     recommendation: Recommendation,
     extraction_config: ExtractionConfig,
     competitor_id: uuid.UUID | None = None,
+    update_existing: bool = False,
+    allow_downgrade: bool = False,
 ) -> ApplyResult:
-    """Get-or-create the competitor, access policy, domain rate rule, and
-    strategy profile, wiring the competitor's `default_access_policy_id`/
-    `default_scrape_profile_id` to the (possibly freshly created) rows.
+    """Get-or-create-or-update the competitor, access policy, domain rate
+    rule, and strategy profile, wiring the competitor's
+    `default_access_policy_id`/`default_scrape_profile_id` to the
+    (possibly freshly created) rows.
 
-    Idempotent (safe to re-run: an already-onboarded domain reuses its
-    existing rows rather than duplicating them) and **does not commit** —
-    mirrors `scripts/seed_bootstrap.run_seed`'s convention: the caller
-    controls the transaction boundary, so a probe/DB error partway
-    through never leaves a partial write (self-review requirement: one
-    commit, or none, for the whole onboarding).
+    Idempotent (safe to re-run) and **does not commit** — mirrors
+    `scripts/seed_bootstrap.run_seed`'s convention: the caller controls the
+    transaction boundary, so a probe/DB error (or a refused downgrade)
+    partway through never leaves a partial write (self-review requirement:
+    one commit, or none, for the whole onboarding).
+
+    `update_existing=False` (the default): an already-onboarded domain's
+    access policy / rate rule / profile are reused completely unchanged,
+    even if `recommendation`/`extraction_config` now disagrees with what's
+    stored — but the disagreement is never silent: `ApplyResult.*_diff`
+    always carries it, for `main()` to print as an "EXISTING ROW NOT
+    UPDATED" warning (2026-08-17 review finding — a prior version discarded
+    this silently, which broke exactly the escalation workflow
+    `docs/COMPETITOR_ONBOARDING.md` §7 tells an operator to run).
+
+    `update_existing=True`: a reused row's mutable fields are written to
+    match the new recommendation (still inside this one transaction), and
+    `*_updated`/`*_diff` report what changed. `allow_downgrade=False` (the
+    default) refuses the *entire* apply — raising before any row is
+    mutated — the moment either the access policy's tier or the rate rule
+    would move to a less-safe value than what's already stored; pass
+    `allow_downgrade=True` to permit that deliberately.
     """
     competitor, competitor_created = _get_or_create_competitor(
         session,
@@ -759,19 +992,30 @@ def apply_onboarding(
         name=competitor_name,
         competitor_id=competitor_id,
     )
-    policy, policy_created = _get_or_create_access_policy(
-        session, workspace_id=workspace_id, domain=domain, recommendation=recommendation
+    policy, policy_created, policy_updated, policy_diff = _get_or_create_or_update_access_policy(
+        session,
+        workspace_id=workspace_id,
+        domain=domain,
+        recommendation=recommendation,
+        update_existing=update_existing,
+        allow_downgrade=allow_downgrade,
     )
-    rule, rule_created = _get_or_create_domain_access_rule(
+    rule, rule_created, rule_updated, rule_diff = _get_or_create_or_update_domain_access_rule(
         session,
         workspace_id=workspace_id,
         competitor_id=competitor.id,
         domain=domain,
         access_policy_id=policy.id,
         recommendation=recommendation,
+        update_existing=update_existing,
+        allow_downgrade=allow_downgrade,
     )
-    profile, profile_created = _get_or_create_scrape_profile(
-        session, workspace_id=workspace_id, domain=domain, extraction_config=extraction_config
+    profile, profile_created, profile_updated, profile_diff = _get_or_create_or_update_scrape_profile(
+        session,
+        workspace_id=workspace_id,
+        domain=domain,
+        extraction_config=extraction_config,
+        update_existing=update_existing,
     )
 
     competitor.default_access_policy_id = policy.id
@@ -782,10 +1026,16 @@ def apply_onboarding(
         competitor_created=competitor_created,
         access_policy_id=policy.id,
         access_policy_created=policy_created,
+        access_policy_updated=policy_updated,
+        access_policy_diff=policy_diff,
         domain_access_rule_id=rule.id,
         domain_access_rule_created=rule_created,
+        domain_access_rule_updated=rule_updated,
+        domain_access_rule_diff=rule_diff,
         scrape_profile_id=profile.id,
         scrape_profile_created=profile_created,
+        scrape_profile_updated=profile_updated,
+        scrape_profile_diff=profile_diff,
     )
 
 
@@ -824,7 +1074,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--name", default=None, help="Competitor display name (default: --domain's value)."
     )
+    parser.add_argument(
+        "--update-existing",
+        action="store_true",
+        help="With --apply against an already-onboarded domain: write the new "
+        "recommendation's access-policy tier / rate rule / extraction config onto "
+        "the existing rows instead of leaving them untouched. Still one transaction. "
+        "Without this flag, an existing row is reused as-is and any disagreement with "
+        "the new recommendation is only reported, never applied.",
+    )
+    parser.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help="Only meaningful with --update-existing: permit an update that would "
+        "loosen the access tier (e.g. PROXY_FIRST -> DIRECT_ONLY) or the rate rule "
+        "(higher rpm/concurrency, shorter cooldown) versus what's currently stored. "
+        "Without it, --update-existing refuses the entire apply the moment it detects "
+        "a downgrade -- before writing anything.",
+    )
     return parser.parse_args(argv)
+
+
+def _print_field_row(label: str, row_id: uuid.UUID, created: bool, updated: bool, diff: tuple[FieldDiff, ...]) -> None:
+    print(f"  {label:<24}= {row_id} (created={created})")
+    if updated:
+        for field_diff in diff:
+            print(f"      escalated: {field_diff.field}: {field_diff.old!r} -> {field_diff.new!r}")
+    elif diff:
+        print("      *** EXISTING ROW NOT UPDATED *** -- the new recommendation disagrees:")
+        for field_diff in diff:
+            print(f"          {field_diff.field}: {field_diff.old!r} -> {field_diff.new!r}")
+        print(
+            "      Re-run with --apply --update-existing (add --allow-downgrade too "
+            "if this is a downgrade) to escalate."
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -854,6 +1137,13 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --apply requires --workspace-id", file=sys.stderr)
         return 2
 
+    if args.allow_downgrade and not args.update_existing:
+        print(
+            "note: --allow-downgrade has no effect without --update-existing "
+            "(nothing is written to an existing row either way).",
+            file=sys.stderr,
+        )
+
     from app_shared.database import get_session, set_workspace_context  # deferred: no DB import for dry-run
 
     with get_session() as session:
@@ -867,6 +1157,8 @@ def main(argv: list[str] | None = None) -> int:
                 recommendation=recommendation,
                 extraction_config=extraction_config,
                 competitor_id=args.competitor_id,
+                update_existing=args.update_existing,
+                allow_downgrade=args.allow_downgrade,
             )
             session.commit()
         except Exception:
@@ -875,12 +1167,18 @@ def main(argv: list[str] | None = None) -> int:
 
     print("APPLIED (one transaction):")
     print(f"  competitor_id           = {result.competitor_id} (created={result.competitor_created})")
-    print(f"  access_policy_id        = {result.access_policy_id} (created={result.access_policy_created})")
-    print(
-        f"  domain_access_rule_id   = {result.domain_access_rule_id} "
-        f"(created={result.domain_access_rule_created})"
+    _print_field_row(
+        "access_policy_id", result.access_policy_id, result.access_policy_created,
+        result.access_policy_updated, result.access_policy_diff,
     )
-    print(f"  scrape_profile_id       = {result.scrape_profile_id} (created={result.scrape_profile_created})")
+    _print_field_row(
+        "domain_access_rule_id", result.domain_access_rule_id, result.domain_access_rule_created,
+        result.domain_access_rule_updated, result.domain_access_rule_diff,
+    )
+    _print_field_row(
+        "scrape_profile_id", result.scrape_profile_id, result.scrape_profile_created,
+        result.scrape_profile_updated, result.scrape_profile_diff,
+    )
     return 0
 
 

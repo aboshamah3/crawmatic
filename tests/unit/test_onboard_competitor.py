@@ -452,6 +452,309 @@ def test_apply_onboarding_explicit_competitor_id_not_found_raises() -> None:
     assert session.added == []
 
 
+# --- apply_onboarding: escalation on re-apply (2026-08-17 review fix round 1) -------
+#
+# Finding: re-running --apply against an already-onboarded domain used to be a
+# silent no-op -- `_get_or_create_*` discarded the new recommendation whenever
+# a row already existed. These tests pin the fix: `update_existing=False`
+# (default) surfaces the disagreement via `*_diff` without writing it;
+# `update_existing=True` writes it (escalation always allowed, a downgrade
+# only with `allow_downgrade=True`, refused *before* any mutation otherwise).
+
+
+def _blocked_recommendation() -> onboard.Recommendation:
+    return onboard.recommend_access([_outcome(is_blocked=True) for _ in range(5)])
+
+
+def _existing_rows(
+    workspace_id: uuid.UUID, *, strategy: AccessStrategy, rpm: int = 10, conc: int = 1, cooldown: int = 2
+) -> dict[type, Any]:
+    competitor = Competitor(
+        id=uuid.uuid4(), workspace_id=workspace_id, name="Example", domain="example.com"
+    )
+    policy = AccessPolicy(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        name="example.com-access-policy",
+        strategy=strategy,
+    )
+    rule = DomainAccessRule(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        competitor_id=competitor.id,
+        domain="example.com",
+        url_pattern=None,
+        access_policy_id=policy.id,
+        max_concurrent_requests=conc,
+        max_requests_per_minute=rpm,
+        cooldown_seconds=cooldown,
+    )
+    profile = ScrapeProfile(
+        id=uuid.uuid4(), workspace_id=workspace_id, name="example.com-profile"
+    )
+    return {Competitor: competitor, AccessPolicy: policy, DomainAccessRule: rule, ScrapeProfile: profile}
+
+
+def test_reapply_without_update_existing_leaves_rows_untouched_but_surfaces_diff() -> None:
+    """The bug as filed: re-apply with a changed (escalated) recommendation
+    and no flag must change NOTHING in the database, but must NOT pretend
+    nothing changed either -- `ApplyResult.access_policy_diff`/
+    `domain_access_rule_diff` must carry the disagreement."""
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    session = _FakeSession(existing=rows)
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_blocked_recommendation(),  # -> PROXY_FIRST
+        extraction_config=_jsonld_extraction_config(),
+        # update_existing defaults False
+    )
+
+    assert result.access_policy_created is False
+    assert result.access_policy_updated is False
+    assert result.access_policy_diff == (
+        onboard.FieldDiff("strategy", "DIRECT_ONLY", "PROXY_FIRST"),
+    )
+    # nothing was written -- the stored row is byte-for-byte the same object,
+    # unmutated
+    assert rows[AccessPolicy].strategy == AccessStrategy.DIRECT_ONLY
+    assert session.added == []
+
+
+def test_reapply_with_identical_recommendation_has_no_diff() -> None:
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    session = _FakeSession(existing=rows)
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_jsonld_recommendation(),  # -> DIRECT_ONLY, matches stored
+        extraction_config=_jsonld_extraction_config(),
+        update_existing=True,
+    )
+
+    assert result.access_policy_updated is False
+    assert result.access_policy_diff == ()
+    assert result.domain_access_rule_updated is False
+    assert result.domain_access_rule_diff == ()
+
+
+def test_reapply_with_update_existing_escalates_and_reports_old_to_new() -> None:
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    session = _FakeSession(existing=rows)
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_blocked_recommendation(),  # -> PROXY_FIRST
+        extraction_config=_jsonld_extraction_config(),
+        update_existing=True,
+    )
+
+    assert result.access_policy_updated is True
+    assert result.access_policy_diff == (
+        onboard.FieldDiff("strategy", "DIRECT_ONLY", "PROXY_FIRST"),
+    )
+    # the escalation was actually written
+    assert rows[AccessPolicy].strategy == AccessStrategy.PROXY_FIRST
+    assert rows[AccessPolicy].use_proxy_on_first_attempt is True
+    # an escalation (not a downgrade) never needed --allow-downgrade
+    assert session.added == []  # no new rows -- everything reused/updated in place
+
+
+def test_reapply_downgrade_without_allow_downgrade_is_refused_and_writes_nothing() -> None:
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.PROXY_FIRST)
+    session = _FakeSession(existing=rows)
+
+    with pytest.raises(onboard.OnboardingError, match="downgrade"):
+        onboard.apply_onboarding(
+            session,
+            workspace_id=workspace_id,
+            domain="example.com",
+            competitor_name="Example",
+            recommendation=_jsonld_recommendation(),  # -> DIRECT_ONLY: a downgrade from PROXY_FIRST
+            extraction_config=_jsonld_extraction_config(),
+            update_existing=True,
+            # allow_downgrade defaults False
+        )
+
+    # refused BEFORE writing anything -- the stored strategy is untouched
+    assert rows[AccessPolicy].strategy == AccessStrategy.PROXY_FIRST
+    assert session.added == []
+    assert session.commit_count == 0
+
+
+def test_reapply_downgrade_with_allow_downgrade_is_permitted() -> None:
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.PROXY_FIRST)
+    session = _FakeSession(existing=rows)
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_jsonld_recommendation(),  # -> DIRECT_ONLY
+        extraction_config=_jsonld_extraction_config(),
+        update_existing=True,
+        allow_downgrade=True,
+    )
+
+    assert result.access_policy_updated is True
+    assert rows[AccessPolicy].strategy == AccessStrategy.DIRECT_ONLY
+
+
+def test_reapply_rate_rule_downgrade_without_allow_downgrade_is_refused() -> None:
+    """A looser rate rule (higher rpm here) is a downgrade even though the
+    access tier itself doesn't change."""
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY, rpm=5)
+    session = _FakeSession(existing=rows)
+    looser = onboard.Recommendation(
+        access_strategy=AccessStrategy.DIRECT_ONLY,
+        tier_label="DIRECT_ONLY",
+        rationale="test",
+        max_requests_per_minute=10,  # looser than the stored 5
+    )
+
+    with pytest.raises(onboard.OnboardingError, match="loosen"):
+        onboard.apply_onboarding(
+            session,
+            workspace_id=workspace_id,
+            domain="example.com",
+            competitor_name="Example",
+            recommendation=looser,
+            extraction_config=_jsonld_extraction_config(),
+            update_existing=True,
+        )
+
+    assert rows[DomainAccessRule].max_requests_per_minute == 5
+    assert session.added == []
+
+
+def test_reapply_rate_rule_tightening_is_never_a_downgrade() -> None:
+    """A stricter rate rule (lower rpm) is always allowed, even without
+    --allow-downgrade -- only loosening needs the guard."""
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY, rpm=10)
+    session = _FakeSession(existing=rows)
+    stricter = onboard.Recommendation(
+        access_strategy=AccessStrategy.DIRECT_ONLY,
+        tier_label="DIRECT_ONLY",
+        rationale="test",
+        max_requests_per_minute=5,  # stricter than the stored 10
+    )
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=stricter,
+        extraction_config=_jsonld_extraction_config(),
+        update_existing=True,
+    )
+
+    assert result.domain_access_rule_updated is True
+    assert rows[DomainAccessRule].max_requests_per_minute == 5
+
+
+def test_reapply_profile_update_only_fills_gaps_never_overwrites() -> None:
+    """A populated `price_selector` may be a human's hand-tuned confirmation
+    -- a fresh probe finding a *different* candidate must never clobber it,
+    even with --update-existing."""
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    rows[ScrapeProfile].price_selector = ".hand-tuned-price"
+    session = _FakeSession(existing=rows)
+
+    css_config = onboard.derive_extraction_config(
+        [
+            onboard.ProbeOutcome(
+                url="u", status_code=200, error=None, is_blocked=False, block_reason=None,
+                extraction_method="CSS_CANDIDATE", price="9.99", currency=None, detail=".different-price",
+            )
+        ]
+    )
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_jsonld_recommendation(),
+        extraction_config=css_config,
+        update_existing=True,
+    )
+
+    assert result.scrape_profile_updated is False
+    assert result.scrape_profile_diff == ()
+    assert rows[ScrapeProfile].price_selector == ".hand-tuned-price"
+
+
+def test_reapply_profile_update_fills_a_null_field() -> None:
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    assert rows[ScrapeProfile].price_selector is None
+    session = _FakeSession(existing=rows)
+
+    css_config = onboard.derive_extraction_config(
+        [
+            onboard.ProbeOutcome(
+                url="u", status_code=200, error=None, is_blocked=False, block_reason=None,
+                extraction_method="CSS_CANDIDATE", price="9.99", currency=None, detail=".price",
+            )
+        ]
+    )
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_jsonld_recommendation(),
+        extraction_config=css_config,
+        update_existing=True,
+    )
+
+    assert result.scrape_profile_updated is True
+    assert result.scrape_profile_diff == (onboard.FieldDiff("price_selector", None, ".price"),)
+    assert rows[ScrapeProfile].price_selector == ".price"
+
+
+def test_allow_downgrade_without_update_existing_has_no_effect() -> None:
+    """--allow-downgrade alone never writes anything -- it only relaxes the
+    guard that `update_existing=True` would otherwise apply."""
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.PROXY_FIRST)
+    session = _FakeSession(existing=rows)
+
+    result = onboard.apply_onboarding(
+        session,
+        workspace_id=workspace_id,
+        domain="example.com",
+        competitor_name="Example",
+        recommendation=_jsonld_recommendation(),  # -> DIRECT_ONLY
+        extraction_config=_jsonld_extraction_config(),
+        update_existing=False,
+        allow_downgrade=True,
+    )
+
+    assert result.access_policy_updated is False
+    assert rows[AccessPolicy].strategy == AccessStrategy.PROXY_FIRST
+
+
 # --- CLI plumbing --------------------------------------------------------------------
 
 
@@ -470,6 +773,19 @@ def test_parse_args_dry_run_defaults() -> None:
     assert args.domain == "example.com"
     assert args.apply is False
     assert args.workspace_id is None
+    assert args.update_existing is False
+    assert args.allow_downgrade is False
+
+
+def test_parse_args_update_existing_and_allow_downgrade() -> None:
+    args = onboard.parse_args(
+        [
+            "--domain", "example.com", "--urls", "urls.txt", "--apply",
+            "--workspace-id", str(uuid.uuid4()), "--update-existing", "--allow-downgrade",
+        ]
+    )
+    assert args.update_existing is True
+    assert args.allow_downgrade is True
 
 
 def test_main_apply_without_workspace_id_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -512,3 +828,134 @@ def test_main_dry_run_never_imports_the_database_module(
 
     exit_code = onboard.main(["--domain", "example.com", "--urls", str(urls_file)])
     assert exit_code == 0
+
+
+class _NullContext:
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def __enter__(self) -> Any:
+        return self._session
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def test_main_passes_update_existing_and_allow_downgrade_to_apply_onboarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text("https://example.com/a\n", encoding="utf-8")
+    monkeypatch.setattr(onboard, "probe_urls", lambda urls: [_outcome(method="JSON_LD")])
+
+    import app_shared.database as database_module
+
+    session = _FakeSession(
+        existing={Competitor: None, AccessPolicy: None, DomainAccessRule: None, ScrapeProfile: None}
+    )
+    monkeypatch.setattr(database_module, "get_session", lambda: _NullContext(session))
+    monkeypatch.setattr(database_module, "set_workspace_context", lambda *a, **k: None)
+
+    captured_kwargs: dict[str, Any] = {}
+    real_apply = onboard.apply_onboarding
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        captured_kwargs.update(kwargs)
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(onboard, "apply_onboarding", _spy)
+
+    workspace_id = uuid.uuid4()
+    exit_code = onboard.main(
+        [
+            "--domain", "example.com", "--urls", str(urls_file), "--apply",
+            "--workspace-id", str(workspace_id), "--update-existing", "--allow-downgrade",
+        ]
+    )
+    assert exit_code == 0
+    assert captured_kwargs["update_existing"] is True
+    assert captured_kwargs["allow_downgrade"] is True
+
+
+def test_main_prints_not_updated_warning_when_diff_exists_and_update_existing_is_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text("https://example.com/a\n", encoding="utf-8")
+    # 5 blocked probes -> PROXY_FIRST, disagreeing with the stored DIRECT_ONLY policy
+    monkeypatch.setattr(onboard, "probe_urls", lambda urls: [_outcome(is_blocked=True) for _ in range(5)])
+
+    import app_shared.database as database_module
+
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    session = _FakeSession(existing=rows)
+    monkeypatch.setattr(database_module, "get_session", lambda: _NullContext(session))
+    monkeypatch.setattr(database_module, "set_workspace_context", lambda *a, **k: None)
+
+    exit_code = onboard.main(
+        ["--domain", "example.com", "--urls", str(urls_file), "--apply", "--workspace-id", str(workspace_id)]
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "EXISTING ROW NOT UPDATED" in out
+    assert "strategy" in out and "DIRECT_ONLY" in out and "PROXY_FIRST" in out
+    assert "--update-existing" in out
+    # and it really wasn't written
+    assert rows[AccessPolicy].strategy == AccessStrategy.DIRECT_ONLY
+
+
+def test_main_prints_escalated_marker_when_update_existing_applies_a_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text("https://example.com/a\n", encoding="utf-8")
+    monkeypatch.setattr(onboard, "probe_urls", lambda urls: [_outcome(is_blocked=True) for _ in range(5)])
+
+    import app_shared.database as database_module
+
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.DIRECT_ONLY)
+    session = _FakeSession(existing=rows)
+    monkeypatch.setattr(database_module, "get_session", lambda: _NullContext(session))
+    monkeypatch.setattr(database_module, "set_workspace_context", lambda *a, **k: None)
+
+    exit_code = onboard.main(
+        [
+            "--domain", "example.com", "--urls", str(urls_file), "--apply",
+            "--workspace-id", str(workspace_id), "--update-existing",
+        ]
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "escalated: strategy" in out
+    assert "NOT UPDATED" not in out
+    assert rows[AccessPolicy].strategy == AccessStrategy.PROXY_FIRST
+
+
+def test_main_downgrade_refused_propagates_as_onboarding_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text("https://example.com/a\n", encoding="utf-8")
+    # all clean JSON_LD probes -> DIRECT_ONLY, a downgrade from the stored PROXY_FIRST
+    monkeypatch.setattr(onboard, "probe_urls", lambda urls: [_outcome(method="JSON_LD") for _ in range(5)])
+
+    import app_shared.database as database_module
+
+    workspace_id = uuid.uuid4()
+    rows = _existing_rows(workspace_id, strategy=AccessStrategy.PROXY_FIRST)
+    session = _FakeSession(existing=rows)
+    monkeypatch.setattr(database_module, "get_session", lambda: _NullContext(session))
+    monkeypatch.setattr(database_module, "set_workspace_context", lambda *a, **k: None)
+
+    with pytest.raises(onboard.OnboardingError, match="downgrade"):
+        onboard.main(
+            [
+                "--domain", "example.com", "--urls", str(urls_file), "--apply",
+                "--workspace-id", str(workspace_id), "--update-existing",
+            ]
+        )
+    # one transaction, none of it committed
+    assert session.commit_count == 0
+    assert rows[AccessPolicy].strategy == AccessStrategy.PROXY_FIRST
