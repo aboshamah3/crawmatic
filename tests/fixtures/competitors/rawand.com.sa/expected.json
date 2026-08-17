@@ -1,0 +1,10 @@
+{
+  "price": "350.00",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "disk-sourced",
+    "source": "rawand1.html (pre-existing capture on disk, /srv/crawmatic/rawand1.html)"
+  }
+}

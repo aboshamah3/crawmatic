@@ -1,0 +1,10 @@
+{
+  "price": "129",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "disk-sourced",
+    "source": "tests/fixtures/html/noon_product_real.html (pre-existing real capture, 2026-08-16, via r.jina.ai reader -- direct/curl_cffi/headless-Chrome fetches from this box are Akamai-reset)"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "price": "276.00",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://www.stech.ink/products/canon-toner-original-black-c-exv-49-irc-3300-3320-3325-3525-8524b002ac-1"
+  }
+}

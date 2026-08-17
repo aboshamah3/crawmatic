@@ -1,0 +1,10 @@
+{
+  "price": "212.75",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "disk-sourced",
+    "source": "amwaj1.html (pre-existing capture on disk, /srv/crawmatic/amwaj1.html)"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "price": "68.7",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://alshamel.sa/محول-خارجي-hdd/p681568436"
+  }
+}

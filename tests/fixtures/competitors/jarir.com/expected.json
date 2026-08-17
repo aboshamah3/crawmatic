@@ -1,0 +1,10 @@
+{
+  "price": "75.00",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://www.jarir.com/prang-oval-16-colors-and-coloring-set-27177.html"
+  }
+}

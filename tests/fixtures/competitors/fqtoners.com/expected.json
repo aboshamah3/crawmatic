@@ -1,0 +1,10 @@
+{
+  "price": "551.05",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://fqtoners.com/ar/طابعة-ليزر-اتش-بي-m111w/p1131742201"
+  }
+}
