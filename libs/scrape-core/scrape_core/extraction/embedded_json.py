@@ -71,6 +71,29 @@ _MAX_DOCUMENTS = 40
 #: Upper bound on ``= {``/``= [`` offsets probed inside a single script.
 _MAX_ASSIGNMENT_PROBES = 8
 
+#: ``raw_price_text`` for a **stock-only** candidate — one emitted for a
+#: page that positively reports the item as unavailable and, precisely
+#: because of that, carries no price to read.
+#:
+#: This deliberately mirrors the shape JSON-LD already produces for the
+#: very same real-world state rather than inventing a second one. noon's
+#: unavailable pages publish ``"price": 0`` next to
+#: ``availability: OutOfStock``, so ``extract_jsonld`` surfaces
+#: ``raw_price_text="0"`` with ``stock=OUT_OF_STOCK``; validation rejects
+#: it (``INVALID_PRICE_FORMAT``, "price must be greater than 0"), the
+#: spider's ``Rejected`` branch still threads ``candidate_extras``, and so
+#: ``stock_status=OUT_OF_STOCK`` reaches ``price_observations`` and
+#: ``pipelines`` upserts the out-of-stock badge onto
+#: ``match_current_prices``. Emitting the identical shape keeps ONE
+#: downstream path for ONE real-world state.
+#:
+#: An embedded payload that omits the price entirely (noon's real
+#: ``variants:[{offers: []}]``) is the same state expressed differently,
+#: and must not degrade to ``PRICE_NOT_FOUND`` — on a real noon page none
+#: of ``_sniff_out_of_stock``'s markers are present, so the availability
+#: signal would simply be lost.
+_NO_PRICE_SENTINEL = "0"
+
 #: ``matched_text`` cap. The enclosing object is serialized for
 #: ``reject_if_text_contains`` rules to match against; an embedded state
 #: blob can be hundreds of KB and that text is persisted on every
@@ -307,6 +330,19 @@ def extract_embedded_json(html: str, *, profile: Any = None) -> ExtractionCandid
     then resolved **against that same document** — mixing fields across
     two unrelated blobs would silently pair one seller's price with
     another's availability.
+
+    **Stock-only candidates.** If no document resolves the price pointer
+    but one resolves ``stock_json_path`` to ``OUT_OF_STOCK``, this returns
+    a price-less candidate carrying that classification
+    (``raw_price_text`` = :data:`_NO_PRICE_SENTINEL`) instead of ``None``.
+    An unavailable item having no price is an *answer*, not an extraction
+    miss, and the real shape it takes on noon is an empty ``offers``
+    array with the availability field sitting elsewhere on the product —
+    returning ``None`` there would degrade to ``PRICE_NOT_FOUND`` and
+    lose the only availability signal the page carries. A missing price
+    with any *other* availability reading (in stock, unrecognized, or no
+    stock pointer configured) still returns ``None`` so the chain falls
+    through to CSS/regex.
     """
     if profile is None:
         return None
@@ -324,28 +360,61 @@ def extract_embedded_json(html: str, *, profile: Any = None) -> ExtractionCandid
     if selector.type != "html":
         return None
 
+    stock_pointer = getattr(profile, "stock_json_path", None)
+    confidence = resolve_confidence_rules(getattr(profile, "confidence_rules", None))[
+        "embedded_json"
+    ]
+    stock_only: ExtractionCandidate | None = None
+
     for document in _iter_documents(selector):
-        raw_price_text = _scalar_or_none(_resolve_pointer(document, price_pointer))
-        if raw_price_text is None:
-            continue
-
-        currency = _optional_scalar(document, getattr(profile, "currency_json_path", None))
-        title = _optional_scalar(document, getattr(profile, "title_json_path", None))
-
-        stock_pointer = getattr(profile, "stock_json_path", None)
         stock = (
             _stock_from_value(_resolve_pointer(document, stock_pointer))
             if stock_pointer
             else None
         )
 
+        raw_price_text = _scalar_or_none(_resolve_pointer(document, price_pointer))
+        if raw_price_text is None:
+            # No price at this pointer. Two very different causes, and
+            # only the availability field can tell them apart:
+            #
+            #   * the page says the item is UNAVAILABLE -> there is no
+            #     price to find, and that is an answer, not a miss. Hold a
+            #     stock-only candidate (see `_NO_PRICE_SENTINEL`).
+            #   * anything else (in stock / unrecognized / no stock
+            #     pointer configured) -> extraction genuinely missed a
+            #     price that may well be on the page. Stay silent so the
+            #     chain falls through to CSS/regex, which is the whole
+            #     point of being a chain.
+            #
+            # Either way keep scanning: a later document may carry a real
+            # price, and a real price always beats the fallback.
+            if stock is StockStatus.OUT_OF_STOCK and stock_only is None:
+                stock_only = ExtractionCandidate(
+                    raw_price_text=_NO_PRICE_SENTINEL,
+                    currency=_optional_scalar(
+                        document, getattr(profile, "currency_json_path", None)
+                    ),
+                    method=ExtractionMethod.EMBEDDED_JSON,
+                    confidence=confidence,
+                    # The pointer that actually resolved, so an operator
+                    # debugging the row sees which rule fired.
+                    selector_used=stock_pointer,
+                    raw_title=_optional_scalar(
+                        document, getattr(profile, "title_json_path", None)
+                    ),
+                    stock=StockStatus.OUT_OF_STOCK,
+                    matched_text=_matched_text(document, stock_pointer or ""),
+                )
+            continue
+
+        currency = _optional_scalar(document, getattr(profile, "currency_json_path", None))
+        title = _optional_scalar(document, getattr(profile, "title_json_path", None))
+
         matched_text = _matched_text(document, price_pointer)
         old_price_text = _optional_scalar(document, getattr(profile, "old_price_json_path", None))
         if old_price_text and old_price_text not in matched_text:
             matched_text = f"{matched_text} {old_price_text}".strip()
-
-        profile_confidence_rules = getattr(profile, "confidence_rules", None)
-        confidence = resolve_confidence_rules(profile_confidence_rules)["embedded_json"]
 
         return ExtractionCandidate(
             raw_price_text=raw_price_text,
@@ -357,4 +426,7 @@ def extract_embedded_json(html: str, *, profile: Any = None) -> ExtractionCandid
             stock=stock,
             matched_text=matched_text,
         )
-    return None
+
+    # No document carried a price. If one of them positively said the item
+    # is out of stock, that is the answer.
+    return stock_only

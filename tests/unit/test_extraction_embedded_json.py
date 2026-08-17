@@ -21,12 +21,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app_shared.enums import ExtractionMethod, StockStatus
+from app_shared.enums import ExtractionMethod, ScrapeErrorCode, StockStatus
 
 from scrape_core.extraction.embedded_json import extract_embedded_json
 from scrape_core.extraction.jsonld import extract_jsonld
 from scrape_core.extraction.pipeline import _METHOD_TO_STRATEGY, extract
 from scrape_core.extraction.regex import extract_regex
+from scrape_core.validation import Rejected, validate_candidate
 
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "html"
 
@@ -65,6 +66,21 @@ class _NoJsonPathProfile:
     """A profile that configures no JSON pointer at all (the status quo)."""
 
     price_json_path = None
+
+
+class _NoPriceProfile:
+    """Pointers matching ``embedded_json_next_data_no_price.html``.
+
+    The price pointer walks into an **empty** ``offers`` array and so
+    resolves to nothing, exactly as it would on the real noon
+    ``variants:[{offers: []}]`` shape; availability sits on the product
+    instead and resolves fine.
+    """
+
+    jsonld_enabled = False
+    price_json_path = "/props/pageProps/product/offers/0/pricing/amount"
+    stock_json_path = "/props/pageProps/product/availability"
+    title_json_path = "/props/pageProps/product/title"
 
 
 # --- extract_embedded_json ----------------------------------------------------
@@ -285,6 +301,165 @@ def test_embedded_json_classifies_boolean_and_numeric_availability_values() -> N
     assert _stock_for('"nothing recognizable"') == StockStatus.UNKNOWN
 
 
+# --- price-less out-of-stock (review fix round 1, finding 2) ------------------
+
+
+def test_embedded_json_emits_stock_only_candidate_when_offers_array_is_empty() -> None:
+    """The real noon shape: no price anywhere, availability says unavailable.
+
+    Returning ``None`` here would degrade to ``PRICE_NOT_FOUND``, and on a
+    real noon page none of ``_sniff_out_of_stock``'s markers are present,
+    so the only availability signal on the page would be lost.
+    """
+    html = _read_fixture("embedded_json_next_data_no_price.html")
+
+    candidate = extract_embedded_json(html, profile=_NoPriceProfile())
+
+    assert candidate is not None
+    assert candidate.method == ExtractionMethod.EMBEDDED_JSON
+    assert candidate.stock == StockStatus.OUT_OF_STOCK
+    assert candidate.raw_title == "Widget Pro 2000"
+    # Mirrors the shape JSON-LD already emits for this same real-world
+    # state (noon publishes `"price": 0` + OutOfStock).
+    assert candidate.raw_price_text == "0"
+    assert candidate.selector_used == "/props/pageProps/product/availability"
+
+
+def test_embedded_json_emits_stock_only_candidate_when_price_is_null() -> None:
+    """``"amount": null`` is a price-less page too, not a malformed one."""
+    html = (
+        "<html><body>"
+        '<script type="application/json">'
+        '{"amount": null, "availability": "outOfStock"}'
+        "</script></body></html>"
+    )
+
+    class _P:
+        price_json_path = "/amount"
+        stock_json_path = "/availability"
+
+    candidate = extract_embedded_json(html, profile=_P())
+
+    assert candidate is not None
+    assert candidate.stock == StockStatus.OUT_OF_STOCK
+    assert candidate.raw_price_text == "0"
+
+
+def test_embedded_json_stays_silent_when_price_is_missing_but_item_is_in_stock() -> None:
+    """An in-stock page with no price at the pointer is a genuine miss.
+
+    The chain must stay alive so CSS/regex get their turn.
+    """
+    html = (
+        "<html><body>"
+        '<script type="application/json">{"availability": "inStock"}</script>'
+        "</body></html>"
+    )
+
+    class _P:
+        price_json_path = "/amount"
+        stock_json_path = "/availability"
+
+    assert extract_embedded_json(html, profile=_P()) is None
+
+
+def test_embedded_json_stays_silent_when_availability_is_unrecognized() -> None:
+    """``UNKNOWN`` is not permission to invent an out-of-stock answer."""
+    html = (
+        "<html><body>"
+        '<script type="application/json">{"availability": "who knows"}</script>'
+        "</body></html>"
+    )
+
+    class _P:
+        price_json_path = "/amount"
+        stock_json_path = "/availability"
+
+    assert extract_embedded_json(html, profile=_P()) is None
+
+
+def test_embedded_json_stays_silent_when_no_stock_pointer_is_configured() -> None:
+    html = '<html><body><script type="application/json">{"other": 1}</script></body></html>'
+
+    class _P:
+        price_json_path = "/amount"
+
+    assert extract_embedded_json(html, profile=_P()) is None
+
+
+def test_embedded_json_prefers_a_real_price_over_the_stock_only_fallback() -> None:
+    """A later document carrying an actual price always wins."""
+    html = (
+        "<html><body>"
+        '<script type="application/json">{"availability": "outOfStock"}</script>'
+        '<script type="application/json">{"amount": "12.50", "availability": "inStock"}</script>'
+        "</body></html>"
+    )
+
+    class _P:
+        price_json_path = "/amount"
+        stock_json_path = "/availability"
+
+    candidate = extract_embedded_json(html, profile=_P())
+
+    assert candidate is not None
+    assert candidate.raw_price_text == "12.50"
+    assert candidate.stock == StockStatus.IN_STOCK
+
+
+def test_stock_only_candidate_survives_validation_as_a_classified_out_of_stock() -> None:
+    """The end-to-end claim, proven rather than asserted in prose.
+
+    ``validate_candidate`` rejects the sentinel price
+    (``INVALID_PRICE_FORMAT``), but the spider's ``Rejected`` branch still
+    threads ``candidate_extras=candidate``, so ``result_builder`` persists
+    ``stock_status=OUT_OF_STOCK`` and ``pipelines`` upserts the badge.
+    This is byte-for-byte the path noon's JSON-LD ``"price": 0`` already
+    takes today.
+    """
+    html = _read_fixture("embedded_json_next_data_no_price.html")
+    candidate = extract_embedded_json(html, profile=_NoPriceProfile())
+    assert candidate is not None
+
+    outcome = validate_candidate(candidate, None)
+
+    assert isinstance(outcome, Rejected)
+    assert outcome.error_code == ScrapeErrorCode.INVALID_PRICE_FORMAT
+    # The classification the row is persisted with is still intact.
+    assert candidate.stock == StockStatus.OUT_OF_STOCK
+
+
+def test_pipeline_price_less_out_of_stock_page_is_classified_not_price_not_found() -> None:
+    html = _read_fixture("embedded_json_next_data_no_price.html")
+
+    candidate = extract(html, _NoPriceProfile())
+
+    assert candidate is not None
+    assert candidate.method == ExtractionMethod.EMBEDDED_JSON
+    assert candidate.stock == StockStatus.OUT_OF_STOCK
+
+
+def test_pipeline_in_stock_page_with_a_missing_pointer_still_reaches_css() -> None:
+    """Chain semantics are preserved: a miss must not swallow the chain."""
+    html = (
+        "<html><body>"
+        '<p class="price">SAR 4.00</p>'
+        '<script type="application/json">{"availability": "inStock"}</script>'
+        "</body></html>"
+    )
+
+    class _P:
+        jsonld_enabled = False
+        price_json_path = "/amount"
+        stock_json_path = "/availability"
+        price_selector = "p.price"
+
+    candidate = extract(html, _P())
+
+    assert candidate is not None
+    assert candidate.method == ExtractionMethod.CSS
+
+
 def test_embedded_json_stock_is_none_when_no_stock_pointer_is_configured() -> None:
     html = '<html><body><script type="application/json">{"p": "9.99"}</script></body></html>'
 
@@ -412,12 +587,31 @@ def test_pipeline_unavailable_item_is_classified_out_of_stock_from_json(
 # --- noon reality (real captures, 2026-08-16) ---------------------------------
 
 
-def test_real_noon_page_carries_no_json_script_body_so_embedded_json_misses() -> None:
-    """noon's SSR state is a TanStack Router JS expression, not JSON.
+def test_real_noon_page_ships_a_tanstack_js_payload_not_json() -> None:
+    """Positive evidence for the shape noon actually serves.
 
-    Pins the documented limitation. If this ever starts returning a
-    candidate, noon has re-migrated to a JSON payload and the profile
-    should be moved from ``price_regex`` onto ``price_json_path``.
+    The absence of ``__NEXT_DATA__`` from this fixture proves little on
+    its own — the file is a hand-trimmed slice and its own header says
+    markup was dropped. What *is* load-bearing is the TanStack Router
+    payload that is present, and the three JS-not-JSON constructs inside
+    it that make ``json.loads`` structurally unable to read it.
+    """
+    html = _read_fixture("noon_product_real.html")
+
+    assert 'id="$tsr-stream-barrier"' in html  # TanStack Router SSR payload
+    assert "$R[1837]=" in html  # reference-capture assignment expression
+    assert "is_bestseller:!1" in html  # JS boolean literal, unquoted key
+    assert "sale_price:129" in html  # the true price, unquoted key
+
+
+def test_real_noon_page_carries_no_json_script_body_so_embedded_json_misses() -> None:
+    """Pins the documented limitation against the captured payload.
+
+    Scoped honestly: this asserts the adapter misses on *this* TanStack
+    payload, which is the mechanism that matters. It is not by itself
+    proof about every noon page — a proxied re-capture is runbook Step 0.
+    If this ever starts returning a candidate, noon has moved to a JSON
+    payload and the profile should gain a ``price_json_path``.
     """
     html = _read_fixture("noon_product_real.html")
 
