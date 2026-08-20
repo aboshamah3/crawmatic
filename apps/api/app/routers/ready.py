@@ -25,9 +25,13 @@ follows from being a *readiness* rather than *liveness* probe:
 * It is unauthenticated, like `/health` and `/version`: it is a
   platform probe (Railway or any orchestrator hitting it with no
   credential), not a tenant or operator surface, and it leaks nothing
-  sensitive — booleans and an exception class name plus a truncated
-  message only, exactly `/version`'s discipline (never a connection
-  string, password, or traceback). Unlike `/ops/metrics` and
+  sensitive — booleans and an exception CLASS NAME only, never the
+  exception's message, exactly `/version`'s `db_error` discipline
+  (`db_error = exc.__class__.__name__`). Truncating the message instead
+  would not be enough: a DSN is at the FRONT of a driver's error text
+  (`postgresql://user:password@host/db: could not connect`), so keeping
+  the first N characters keeps precisely the part that must not be
+  published on an unauthenticated endpoint. Unlike `/ops/metrics` and
   `/v1/admin/*` it carries no `require_service_token` guard and no
   `include_in_schema=False` — it is not tagged in
   `app.openapi_public.INTERNAL_TAGS`, so (like `/health` and
@@ -73,9 +77,10 @@ independently — one hung dependency cannot delay or hide the verdict on
 the other, and the probe itself always returns within
 `_CHECK_TIMEOUT_SECONDS` of either check's completion. The pool is shut
 down with `wait=False` on timeout so a genuinely stuck call does not
-also block the request thread; it is reported as `TimeoutError`, the
-same "exception class name, no raw message" discipline as every other
-failure here.
+also block the request thread; it is reported as `TimeoutError` plus
+the budget it exceeded — a sentence this file writes itself, containing
+nothing from the failed call — the same "exception class name, no raw
+message" discipline as every other failure here.
 """
 
 from __future__ import annotations
@@ -99,12 +104,6 @@ router = APIRouter(tags=["ready"])
 #: round-trip never trips it, tight enough that a hung dependency does
 #: not make an orchestrator's own probe timeout the thing that fires.
 _CHECK_TIMEOUT_SECONDS = 2.0
-
-#: Same truncation length `/ops/metrics`'s collector failures use for
-#: reported exception messages — long enough to be useful, short enough
-#: that a message that happened to embed something sensitive can't
-#: round-trip whole.
-_MAX_ERROR_LENGTH = 200
 
 
 def _get_db_session() -> Iterator[Session]:
@@ -140,20 +139,20 @@ class ReadyResponse(BaseModel):
     checks: dict[str, DependencyCheck]
 
 
-def _truncate(message: str) -> str:
-    if len(message) <= _MAX_ERROR_LENGTH:
-        return message
-    return message[:_MAX_ERROR_LENGTH] + "…"
-
-
 def _run_with_timeout(fn: Callable[[], None], *, timeout: float) -> DependencyCheck:
     """Run `fn` (a no-arg probe) with a hard wall-clock budget.
 
     Never raises: a timeout, a connection error, or any other exception
-    all become a failed `DependencyCheck` carrying the exception class
-    name plus a truncated message — never a raw traceback, connection
-    string, or credential (same discipline as `/version`'s `db_error`
-    and `/ops/metrics`'s collector-failure reporting).
+    all become a failed `DependencyCheck` carrying the exception CLASS
+    NAME and nothing else — never the exception's message, and so never
+    a traceback, connection string, or credential. `str(exc)` is not
+    ours to publish: a psycopg/SQLAlchemy connection failure puts the
+    whole DSN, password included, in the first few characters of its
+    message, and this endpoint is unauthenticated. The class name is
+    what an orchestrator or on-call reader actually acts on ("is it
+    OperationalError or TimeoutError?"); the message belongs in the
+    server log, which is already where the traceback goes. Same
+    discipline as `/version`'s `db_error`.
     """
     pool = ThreadPoolExecutor(max_workers=1)
     try:
@@ -165,10 +164,8 @@ def _run_with_timeout(fn: Callable[[], None], *, timeout: float) -> DependencyCh
             return DependencyCheck(
                 ok=False, error=f"TimeoutError: exceeded {timeout}s budget"
             )
-        except Exception as exc:  # noqa: BLE001 - reported as class+truncated message only
-            return DependencyCheck(
-                ok=False, error=f"{exc.__class__.__name__}: {_truncate(str(exc))}"
-            )
+        except Exception as exc:  # noqa: BLE001 - reported as class name only
+            return DependencyCheck(ok=False, error=exc.__class__.__name__)
     finally:
         # `wait=False`: on a genuine timeout the submitted call is still
         # running on its worker thread. Waiting here would silently turn

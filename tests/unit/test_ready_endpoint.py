@@ -135,11 +135,11 @@ def test_ready_database_down_returns_503(client: TestClient) -> None:
     assert resp.status_code == 503
     assert body["ready"] is False
     assert body["checks"]["database"]["ok"] is False
-    assert body["checks"]["database"]["error"] == "RuntimeError: connection refused"
+    # Class name ONLY — the exception's own message is never published, so
+    # nothing the driver chose to put in it can reach this body.
+    assert body["checks"]["database"]["error"] == "RuntimeError"
+    assert "connection refused" not in resp.text
     assert body["checks"]["redis"]["ok"] is True
-    # The raw message is deliberately echoed here (it carries no secret in
-    # this fixture), but the discipline under test is class-name-first —
-    # covered for a message that WOULD carry something sensitive below.
 
 
 def test_ready_redis_down_returns_503(client: TestClient) -> None:
@@ -154,7 +154,11 @@ def test_ready_redis_down_returns_503(client: TestClient) -> None:
     assert resp.status_code == 503
     assert body["ready"] is False
     assert body["checks"]["redis"]["ok"] is False
-    assert body["checks"]["redis"]["error"].startswith("ConnectionError:")
+    assert body["checks"]["redis"]["error"] == "ConnectionError"
+    # The fixture's message is a Redis URL with a password in it; none of it
+    # may appear anywhere in the response.
+    assert "redis://" not in resp.text
+    assert "pw" not in resp.text
     assert body["checks"]["database"]["ok"] is True
 
 
@@ -173,10 +177,12 @@ def test_ready_both_deps_down_returns_503_with_both_reported(client: TestClient)
     assert body["checks"]["redis"]["ok"] is False
 
 
-def test_ready_error_message_is_truncated_and_never_a_traceback(client: TestClient) -> None:
-    long_secret_looking_message = "postgresql://user:S3cr3tPassw0rd@10.0.0.5:5432/db " + (
-        "x" * 500
-    )
+def test_ready_error_never_carries_the_connection_string(client: TestClient) -> None:
+    """A DSN lives at the FRONT of a driver's error text, so truncating the
+    message keeps exactly the part that must never be published on an
+    unauthenticated probe. Only the class name is reported."""
+    dsn = "postgresql://user:S3cr3tPassw0rd@10.0.0.5:5432/db"
+    long_secret_looking_message = f"{dsn} could not connect " + ("x" * 500)
     _setup(
         session=_FakeSession(raises=RuntimeError(long_secret_looking_message)),
         redis_client=_FakeRedis(),
@@ -186,10 +192,12 @@ def test_ready_error_message_is_truncated_and_never_a_traceback(client: TestClie
     body = resp.json()
 
     error = body["checks"]["database"]["error"]
-    assert error is not None
-    assert error.startswith("RuntimeError:")
-    # Truncated well below the full 500+-char message.
-    assert len(error) < 250
+    assert error == "RuntimeError"
+    for secret in (dsn, "S3cr3tPassw0rd", "postgresql://", "10.0.0.5", "user:"):
+        assert secret not in resp.text
+    # Nothing at all from the message survives — not a prefix, not a suffix.
+    assert "could not connect" not in resp.text
+    assert "xxx" not in resp.text
     assert "Traceback" not in resp.text
 
 
