@@ -195,6 +195,50 @@ class TestDerivedSignals:
         assert d.wasted_paid_rate == pytest.approx(0.435, abs=0.001)
         assert d.estimated_usd == pytest.approx(1.209, abs=0.01)
 
+    def test_cost_per_successful_price_uses_the_domain_specific_rate(self) -> None:
+        """Task 2.4: amazon's $/req from the 2026-08-12 report
+        (0.001066/5.06 ~= 0.00021067), not the fleet-wide average."""
+        from app_shared.opsmetrics import cost as _cost
+
+        d = DomainStats(
+            domain="amazon.sa",
+            attempts=100,
+            successes=50,
+            distinct_urls=100,
+            proxied=100,
+            failed_paid=50,
+            successful_prices=50,
+        )
+        expected = _cost.usd_for_domain("amazon.sa", 100) / 50
+        assert d.cost_per_successful_price == pytest.approx(expected)
+
+    def test_cost_per_successful_price_is_infinite_on_spend_with_zero_prices(
+        self,
+    ) -> None:
+        """The audit's named unbounded case: real signal, not a divide error."""
+        d = DomainStats(
+            domain="amazon.sa",
+            attempts=25,
+            successes=0,
+            distinct_urls=15,
+            proxied=25,
+            failed_paid=25,
+            successful_prices=0,
+        )
+        assert d.cost_per_successful_price == float("inf")
+
+    def test_cost_per_successful_price_is_none_with_no_spend_at_all(self) -> None:
+        d = DomainStats(
+            domain="afaqalhasoob.com",
+            attempts=9,
+            successes=9,
+            distinct_urls=9,
+            proxied=0,
+            failed_paid=0,
+            successful_prices=0,
+        )
+        assert d.cost_per_successful_price is None
+
     def test_domain_ratios_are_none_rather_than_dividing_by_zero(self) -> None:
         d = DomainStats(
             domain="x", attempts=0, successes=0, distinct_urls=0, proxied=0, failed_paid=0

@@ -1,0 +1,10 @@
+{
+  "price": "149",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://www.extra.com/ar-sa/mri/air-conditioner/ac-cleaning-service-/professional-washing-machine-cleaning-service-essential-package/p/100392164"
+  }
+}

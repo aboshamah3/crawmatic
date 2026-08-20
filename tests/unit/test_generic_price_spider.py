@@ -21,10 +21,15 @@ from typing import Any
 import pytest
 from scrapy.http import HtmlResponse, Request
 
-from app_shared.enums import RobotsPolicy, StockStatus
-from scrape_core.errors import PRICE_NOT_FOUND
+from pathlib import Path
+
+from app_shared.enums import ExtractionMethod, RobotsPolicy, StockStatus
+from app_shared.models.scrape_profiles import ScrapeProfile
+from scrape_core.errors import INVALID_PRICE_FORMAT, PRICE_NOT_FOUND
 
 from price_monitor.spiders import generic_price_spider as gps
+
+_FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "html"
 
 
 @pytest.fixture()
@@ -44,6 +49,19 @@ def _target(robots_policy: RobotsPolicy) -> gps.SpiderTarget:
         url="https://shop.example.com/product/1",
         profile=None,
         robots_policy=robots_policy,
+    )
+
+
+def _target_with_profile(profile: ScrapeProfile) -> gps.SpiderTarget:
+    """A target carrying a resolved scrape profile (Task 3.1)."""
+    return gps.SpiderTarget(
+        match_id=uuid.uuid4(),
+        product_id=uuid.uuid4(),
+        product_variant_id=uuid.uuid4(),
+        competitor_id=uuid.uuid4(),
+        url="https://shop.example.com/product/1",
+        profile=profile,
+        robots_policy=RobotsPolicy.RESPECT,
     )
 
 
@@ -145,6 +163,85 @@ def test_price_not_found_without_a_marker_leaves_stock_status_null(
     assert result.success is False
     assert result.error_code == PRICE_NOT_FOUND
     assert result.stock_status is None
+
+
+# --- EMBEDDED_JSON stock-only candidate, end to end through `parse` -----------
+#
+# Task 3.1 review fix round 2. `extract_embedded_json` emits a price-less
+# OUT_OF_STOCK candidate for a page whose price pointer misses but whose
+# availability pointer says the item is unavailable (the real noon shape:
+# an empty `offers` array). Everything downstream of that was previously
+# asserted in prose only -- `candidate_extras` was exercised by no test at
+# all -- so this drives the whole spider path and checks the field the
+# `pipelines` out-of-stock upsert actually keys on.
+
+
+def _no_price_out_of_stock_profile() -> ScrapeProfile:
+    """A real `ScrapeProfile`, not a duck-typed stub.
+
+    Constructing the ORM model unattached (no session) exercises the
+    actual `*_json_path` columns migration c7e1a9d34b60 added, so a
+    column rename would break this test rather than sail past a stub.
+
+    `jsonld_enabled=False` is required, not incidental: the fixture also
+    carries a JSON-LD block advertising `"price": 0`, JSON-LD runs first
+    in the chain, and `0` is a hit. Leaving it enabled would prove
+    nothing about EMBEDDED_JSON.
+    """
+    return ScrapeProfile(
+        name="embedded-json-no-price-fixture-profile",
+        jsonld_enabled=False,
+        price_json_path="/props/pageProps/product/offers/0/pricing/amount",
+        stock_json_path="/props/pageProps/product/availability",
+        title_json_path="/props/pageProps/product/title",
+    )
+
+
+def test_price_less_embedded_json_out_of_stock_reaches_the_result_as_out_of_stock(
+    spider: gps.GenericPriceSpider,
+) -> None:
+    """The end-to-end claim behind the round-1 fix, driven not narrated.
+
+    `parse` -> `extract` -> stock-only EMBEDDED_JSON candidate ->
+    `validate_candidate` rejects the sentinel price -> the `Rejected`
+    branch threads `candidate_extras` -> `result_builder` copies the
+    candidate's stock onto the result.
+    """
+    html = (_FIXTURES_DIR / "embedded_json_next_data_no_price.html").read_text(
+        encoding="utf-8"
+    )
+    target = _target_with_profile(_no_price_out_of_stock_profile())
+
+    result = _parse_once(spider, target, html)
+
+    # The field `pipelines.py`'s out-of-stock upsert branches on, together
+    # with `success is False`. Both halves of that predicate are asserted.
+    assert result.success is False
+    assert result.stock_status == StockStatus.OUT_OF_STOCK
+    assert result.price is None
+
+    # `INVALID_PRICE_FORMAT`, NOT `PRICE_NOT_FOUND`, is what proves this
+    # came through the `Rejected` branch: `_sniff_out_of_stock` is only
+    # ever consulted on the `candidate is None` path, which emits
+    # `PRICE_NOT_FOUND`.
+    assert result.error_code == INVALID_PRICE_FORMAT
+    # Only `candidate_extras` can put a method on the result.
+    assert result.extraction_method == ExtractionMethod.EMBEDDED_JSON
+
+
+def test_the_out_of_stock_sniff_could_not_have_produced_that_result() -> None:
+    """Rules out the alternative explanation for the test above.
+
+    If the fixture happened to contain one of `_sniff_out_of_stock`'s
+    markers, the previous test would pass even with `candidate_extras`
+    broken. It contains none, so the classification can only have come
+    from the candidate.
+    """
+    html = (_FIXTURES_DIR / "embedded_json_next_data_no_price.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert gps._sniff_out_of_stock(html) is None
 
 
 @pytest.mark.parametrize(

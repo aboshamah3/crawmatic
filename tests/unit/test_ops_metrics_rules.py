@@ -548,6 +548,102 @@ class TestCostAlarms:
 
 
 # --------------------------------------------------------------------------
+# Cost per successful price (Task 2.4) — the audit's "denominator" alarm
+# --------------------------------------------------------------------------
+
+
+class TestCostPerSuccessfulPrice:
+    """task-2.4 brief: 'cost per attempt is low, cost per usable price can
+    be unbounded'. Two rules: a $/price ratio ceiling, and an unconditional
+    alert on any spend that produced zero prices at all (the ratio is
+    undefined/infinite there, so a ratio-only rule would never catch it)."""
+
+    def test_threshold_matches_the_brief(self) -> None:
+        assert DEFAULT_THRESHOLDS.cost_per_successful_price_high == 0.005
+
+    def test_domain_with_spend_and_zero_prices_alerts(self) -> None:
+        """The audit's named failure mode: money spent, nothing produced."""
+        snap = healthy_snapshot(
+            domains_24h=(
+                DomainStats(
+                    domain="amazon.sa",
+                    attempts=25,
+                    successes=0,
+                    distinct_urls=15,
+                    proxied=25,
+                    failed_paid=25,
+                    successful_prices=0,
+                ),
+            )
+        )
+        alerts = by_id(evaluate(snap), "cost.zero_successful_prices")
+        assert alerts
+        assert alerts[0].severity is Severity.CRITICAL
+        assert alerts[0].subject == "amazon.sa"
+        assert alerts[0].observed["proxied_requests"] == 25
+        assert alerts[0].observed["successful_prices"] == 0
+
+    def test_healthy_domain_with_prices_and_spend_does_not_alert(self) -> None:
+        """Plenty of spend, but priced efficiently -- must stay quiet."""
+        snap = healthy_snapshot(
+            domains_24h=(
+                DomainStats(
+                    domain="noon.com",
+                    attempts=1_000,
+                    successes=950,
+                    distinct_urls=900,
+                    proxied=1_000,
+                    failed_paid=50,
+                    successful_prices=950,
+                ),
+            )
+        )
+        alerts = evaluate(snap)
+        assert not by_id(alerts, "cost.zero_successful_prices")
+        assert not by_id(alerts, "cost.per_successful_price")
+
+    def test_ratio_above_threshold_alerts_even_with_nonzero_prices(self) -> None:
+        """Prices ARE produced, but the $/price ratio still breaches the
+        ceiling -- a distinct condition from the zero-price case."""
+        snap = healthy_snapshot(
+            domains_24h=(
+                DomainStats(
+                    domain="amazon.sa",
+                    attempts=10_000,
+                    successes=10,
+                    distinct_urls=10_000,
+                    proxied=10_000,
+                    failed_paid=9_990,
+                    successful_prices=10,
+                ),
+            )
+        )
+        alerts = by_id(evaluate(snap), "cost.per_successful_price")
+        assert alerts
+        assert alerts[0].severity is Severity.HIGH
+        assert alerts[0].observed["cost_per_successful_price"] > 0.005
+        assert alerts[0].observed["successful_prices"] == 10
+
+    def test_a_domain_with_no_spend_at_all_is_quiet_regardless_of_prices(self) -> None:
+        snap = healthy_snapshot(
+            domains_24h=(
+                DomainStats(
+                    domain="afaqalhasoob.com",
+                    attempts=9,
+                    successes=9,
+                    distinct_urls=9,
+                    proxied=0,
+                    failed_paid=0,
+                    successful_prices=0,
+                ),
+            )
+        )
+        alerts = evaluate(snap)
+        assert not by_id(alerts, "cost.zero_successful_prices")
+        assert not by_id(alerts, "cost.per_successful_price")
+
+
+# --------------------------------------------------------------------------
 # Controls that are inert are as bad as controls that are failing
 # --------------------------------------------------------------------------
 
@@ -795,6 +891,7 @@ class TestEngine:
         for required in (
             "cost.requests_per_url",
             "cost.spend_per_domain_per_day",
+            "cost.cost_per_successful_price",
             "cost.month_end_forecast",
             "discovery.*",
             "queue.*",

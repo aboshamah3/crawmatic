@@ -74,9 +74,14 @@ Concretely:
 
 ### The honest cost of this choice
 
-1. **Nothing polls the endpoint yet.** The evaluation runs when someone (or
-   something) calls it. Closing that gap is one scheduled task — see
-   [Handoffs](#7-handoffs).
+1. ~~**Nothing polls the endpoint yet.**~~ **Closed.** The scheduler now runs
+   `emit_snapshot(collect_snapshot(session))` every
+   `OPS_SNAPSHOT_INTERVAL_SECONDS` (default 900) on the BYPASSRLS system
+   session — `_run_ops_snapshot_tick` in
+   `apps/scheduler/app/scheduler/scheduler_app.py`. The rules are therefore
+   evaluated on a cadence rather than only when a human curls the endpoint,
+   and every firing rule lands in the log stream as an `ops.alert` line.
+   `GET /ops/metrics` remains the pull surface for ad-hoc inspection.
 2. **No history.** Every number is computed from the durable tables at request
    time. There are no trend charts and no retention of past snapshots. Windowed
    comparisons (§3) recover most of the value; charts are not recovered.
@@ -301,10 +306,14 @@ Namespaced `ops.*` so they never collide with the existing `rate_limit.*`,
 
 Not done here, deliberately, and owned elsewhere:
 
-1. **Nothing calls the endpoint on a schedule.** A Celery beat task calling
-   `emit_snapshot(collect_snapshot(session))` every 15 minutes turns this from a
-   pull surface into an alerting record. Owned by whoever owns
-   `apps/scheduler/**`.
+1. ~~**Nothing calls the endpoint on a schedule.**~~ **Done.**
+   `_run_ops_snapshot_tick` calls `emit_snapshot(collect_snapshot(session))`
+   every `OPS_SNAPSHOT_INTERVAL_SECONDS` (900). Note it is *not* a Celery beat
+   task as sketched here — the scheduler is a custom tick loop, so this is one
+   more interval accumulator alongside the refresh poll, the durable cadence
+   poll and the health tick, and it inherits their posture: system session,
+   read-only, errors logged and swallowed so an observability probe can never
+   take down the process it observes.
 2. **No push notification.** A task that POSTs firing CRITICAL alerts to a
    Slack/Discord webhook. Destination is a deployment decision.
 3. **Scheduler partition/rollup ERROR events.** The scheduler work adds

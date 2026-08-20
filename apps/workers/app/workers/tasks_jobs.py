@@ -257,6 +257,7 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             resolved_targets,
             http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
             http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
+            browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,
         )
 
         client = ScrapydDispatchClient(settings=settings)
@@ -600,6 +601,7 @@ def recover_stalled_batches() -> None:
                 resolved_targets,
                 http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
                 http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
+                browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,
             )
 
             for batch in re_batches:

@@ -1,8 +1,9 @@
 """Ordered extraction orchestrator (contracts/extraction.md "Ordered chain").
 
 ``extract(html, profile)`` tries each strategy in :data:`_STRATEGIES`,
-in order, first hit wins: JSON-LD -> CSS -> regex (which itself falls
-back to the single-number heuristic internally, contracts/extraction.md).
+in order, first hit wins: JSON-LD -> embedded JSON -> CSS -> regex
+(which itself falls back to the single-number heuristic internally,
+contracts/extraction.md).
 ``_STRATEGIES`` is the single extension point so growing the chain never
 touches the loop itself.
 
@@ -24,6 +25,7 @@ from typing import Any
 from app_shared.enums import ExtractionMethod
 
 from scrape_core.extraction.css import extract_css
+from scrape_core.extraction.embedded_json import extract_embedded_json
 from scrape_core.extraction.jsonld import extract_jsonld
 from scrape_core.extraction.regex import extract_regex
 from scrape_core.extraction.result import ExtractionCandidate
@@ -32,16 +34,32 @@ __all__ = ["extract"]
 
 _Strategy = Callable[..., ExtractionCandidate | None]
 
-# Ordered JSON-LD -> CSS -> regex chain (contracts/extraction.md). Regex
-# itself falls back to the SINGLE_NUMBER heuristic internally when no
-# configured price_regex matches (scrape_core.extraction.regex).
-_STRATEGIES: tuple[_Strategy, ...] = (extract_jsonld, extract_css, extract_regex)
+# Ordered JSON-LD -> EMBEDDED_JSON -> CSS -> regex chain
+# (contracts/extraction.md; EMBEDDED_JSON slotted in by Task 3.1 per
+# handover 2026-08-15 §7). Regex itself falls back to the SINGLE_NUMBER
+# heuristic internally when no configured price_regex matches
+# (scrape_core.extraction.regex).
+#
+# EMBEDDED_JSON's position only ever matters for a profile that sets
+# `price_json_path`: without one, `extract_embedded_json` returns `None`
+# immediately and the chain is byte-for-byte the historical
+# JSON-LD -> CSS -> regex. It sits *after* JSON-LD because a page with
+# honest schema.org markup should keep being read the cheap standard way,
+# and *before* CSS because a configured pointer into the page's own state
+# blob is strictly better evidence than a positional selector.
+_STRATEGIES: tuple[_Strategy, ...] = (
+    extract_jsonld,
+    extract_embedded_json,
+    extract_css,
+    extract_regex,
+)
 
 #: `ExtractionMethod` -> the strategy function that can produce it (SPEC-12
 #: US2). `REGEX` and `SINGLE_NUMBER` both map to `extract_regex`, which
 #: decides between them internally -- there is no narrower entry point.
 _METHOD_TO_STRATEGY: dict[ExtractionMethod, _Strategy] = {
     ExtractionMethod.JSON_LD: extract_jsonld,
+    ExtractionMethod.EMBEDDED_JSON: extract_embedded_json,
     ExtractionMethod.CSS: extract_css,
     ExtractionMethod.REGEX: extract_regex,
     ExtractionMethod.SINGLE_NUMBER: extract_regex,
@@ -52,9 +70,10 @@ def _ordered_strategies(preferred_method: ExtractionMethod | None) -> tuple[_Str
     """The chain to try, `preferred_method`'s strategy first if recognized.
 
     An unrecognized/forward-compat `preferred_method` (e.g. a later-spec
-    method this pipeline doesn't implement yet, `PLATFORM_JSON`/
-    `EMBEDDED_JSON`/`XPATH`/`PLAYWRIGHT`) is a no-op -- the unmodified
-    default order runs, never an error.
+    method this pipeline doesn't implement yet, `PLATFORM_JSON`/`XPATH`/
+    `PLAYWRIGHT`) is a no-op -- the unmodified default order runs, never
+    an error. `EMBEDDED_JSON` stopped being one of those in Task 3.1 and
+    is now a real, learnable entry point.
     """
     if preferred_method is None:
         return _STRATEGIES

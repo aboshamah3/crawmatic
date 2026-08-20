@@ -10,8 +10,11 @@ per-target) and attaches them as :class:`ResolvedTarget` before calling
 A dispatch "batch" is a **derived** grouping, not a persisted row
 (research D1): :func:`plan_batches` groups targets by
 `(competitor_domain, mode)`, chunks each group to at most `http_max`
-match_ids (the 50-200 guidance bounds HTTP batches), and assigns each
-resulting chunk a stable `batch_index` — the enumerated position over a
+match_ids for HTTP-mode groups (the 50-200 guidance bounds HTTP
+batches) or `browser_max` for BROWSER-mode groups (M1: a much smaller
+5-25 ceiling, default 15 — a browser run pays a per-target headless-
+render cost HTTP does not), and assigns each resulting chunk a stable
+`batch_index` — the enumerated position over a
 **canonical sort** of the groups (`(domain, mode)`) so re-planning the
 exact same targets always yields the exact same indices. That
 determinism is what lets the dispatch task's idempotency guard
@@ -30,6 +33,11 @@ __all__ = ["Batch", "ResolvedTarget", "plan_batches"]
 
 DEFAULT_HTTP_MIN = 50
 DEFAULT_HTTP_MAX = 200
+# Browser batches need a much smaller ceiling than HTTP (audit item M1,
+# 5-25 guidance range) -- a browser-mode Scrapyd run pays a per-target
+# headless-render cost HTTP does not, so the same 200-wide chunk that's
+# fine for HTTP would make one browser batch's wall time enormous.
+DEFAULT_BROWSER_MAX = 15
 
 
 @dataclass(frozen=True)
@@ -62,15 +70,18 @@ def plan_batches(
     *,
     http_min: int = DEFAULT_HTTP_MIN,
     http_max: int = DEFAULT_HTTP_MAX,
+    browser_max: int = DEFAULT_BROWSER_MAX,
 ) -> list[Batch]:
-    """Group `targets` by `(competitor_domain, mode)` into HTTP batches.
+    """Group `targets` by `(competitor_domain, mode)` into batches.
 
     - Every input target lands in exactly one output batch; no match_id
       is duplicated across batches.
     - Each `(domain, mode)` group is chunked into batches of at most
-      `http_max` match_ids; a group smaller than `http_max` (down to the
-      `http_min` guidance) forms a single batch — no cross-group merging
-      (a batch always carries exactly one domain + one mode).
+      `http_max` match_ids for HTTP-mode groups, or `browser_max` for
+      BROWSER-mode groups (M1: browser batches need a much smaller
+      ceiling than HTTP's 50-200 guidance); a group smaller than its
+      ceiling forms a single batch — no cross-group merging (a batch
+      always carries exactly one domain + one mode).
     - `batch_index` is the stable enumerated position over the groups'
       canonical `(domain, mode)` sort, then chunk order within the
       group — so calling this again on the same input yields the same
@@ -94,8 +105,9 @@ def plan_batches(
     batch_index = 0
     for domain, mode in sorted(groups.keys(), key=lambda key: (key[0], key[1])):
         match_ids = groups[(domain, mode)]
-        for start in range(0, len(match_ids), http_max):
-            chunk = match_ids[start : start + http_max]
+        group_max = browser_max if mode == ScrapeProfileMode.BROWSER else http_max
+        for start in range(0, len(match_ids), group_max):
+            chunk = match_ids[start : start + group_max]
             batches.append(
                 Batch(batch_index=batch_index, mode=mode, domain=domain, match_ids=chunk)
             )

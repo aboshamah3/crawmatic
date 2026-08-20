@@ -62,6 +62,12 @@ class ScrapeProfileCreate(BaseModel):
     title_selector: str | None = None
     title_xpath: str | None = None
 
+    price_json_path: str | None = None
+    old_price_json_path: str | None = None
+    currency_json_path: str | None = None
+    stock_json_path: str | None = None
+    title_json_path: str | None = None
+
     variant_strategy: VariantStrategy = VariantStrategy.PAGE_SINGLE_PRICE
     variant_selector_config: dict[str, Any] | None = None
     price_transform_rules: dict[str, Any] | None = None
@@ -101,6 +107,12 @@ class ScrapeProfileUpdate(BaseModel):
     stock_regex: str | None = None
     title_selector: str | None = None
     title_xpath: str | None = None
+
+    price_json_path: str | None = None
+    old_price_json_path: str | None = None
+    currency_json_path: str | None = None
+    stock_json_path: str | None = None
+    title_json_path: str | None = None
 
     variant_strategy: VariantStrategy | None = None
     variant_selector_config: dict[str, Any] | None = None
@@ -147,6 +159,12 @@ class ScrapeProfileResponse(BaseModel):
     stock_regex: str | None
     title_selector: str | None
     title_xpath: str | None
+
+    price_json_path: str | None
+    old_price_json_path: str | None
+    currency_json_path: str | None
+    stock_json_path: str | None
+    title_json_path: str | None
 
     variant_strategy: VariantStrategy
     variant_selector_config: dict[str, Any] | None
@@ -205,6 +223,12 @@ class ScrapeProfileBulkUpsertItem(BaseModel):
     stock_regex: str | None = None
     title_selector: str | None = None
     title_xpath: str | None = None
+
+    price_json_path: str | None = None
+    old_price_json_path: str | None = None
+    currency_json_path: str | None = None
+    stock_json_path: str | None = None
+    title_json_path: str | None = None
 
     variant_strategy: VariantStrategy = VariantStrategy.PAGE_SINGLE_PRICE
     variant_selector_config: dict[str, Any] | None = None

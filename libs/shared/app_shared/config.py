@@ -207,6 +207,13 @@ class Settings(BaseSettings):
     # Principle IV — DB/env-tunable, never hardcoded literals) ---
     SCRAPE_DISPATCH_HTTP_BATCH_MIN: int = 50
     SCRAPE_DISPATCH_HTTP_BATCH_MAX: int = 200
+    # Browser-mode batches need a much smaller ceiling than HTTP (audit
+    # item M1, 5-25 guidance range) -- a browser Scrapyd run pays a
+    # per-target headless-render cost HTTP does not, so the same 200-wide
+    # chunk that's fine for HTTP makes one browser batch's wall time
+    # enormous. plan_batches() branches on the group's mode to apply this
+    # instead of SCRAPE_DISPATCH_HTTP_BATCH_MAX.
+    SCRAPE_BATCH_BROWSER_MAX: int = 15
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
     # TTL on the dispatch client's Redis idempotency guard
     # (``dispatched:{job}:{batch_index}``). Without an expiry the guard
@@ -434,6 +441,28 @@ class Settings(BaseSettings):
     # pattern-level keying can be re-enabled later, data-driven.
     STRATEGY_PROFILE_SCOPE: str = "domain"
 
+    # --- `build_recent_signals` domain-scoped join fix (Task 3.3,
+    # proxy-cost-reduction plan, default OFF). Under
+    # `STRATEGY_PROFILE_SCOPE="domain"`, `build_recent_signals` still
+    # joins `competitor_product_matches.url_pattern ==
+    # profile.url_pattern` -- but under domain scope `profile.url_pattern`
+    # holds the bare competitor domain (no path), while a match's stored
+    # `url_pattern` is `derive_url_pattern`'s host+path grouping key, so
+    # the two are never equal (0 of 4,588 rows measured 2026-08-16):
+    # rediscovery conditions 3, 5, 6, 7, 8 are silently dead code for
+    # every domain-scoped profile. When `True`, the join instead matches
+    # a registrable-domain comparison (reusing `rediscovery._bare_host`,
+    # the same www-stripping fix as commit `36fd624`) so both
+    # `www.`-prefixed and bare match rows for the profile's domain are
+    # included. `False` (default) preserves today's exact-equality join
+    # byte-for-byte -- the rollback path if enabling this reveals a
+    # rediscovery/discovery loop, per the same cooldown/rate-limit
+    # backstops `STRATEGY_REDISCOVERY_MIN_INTERVAL_SECONDS` and
+    # `STRATEGY_DISCOVERY_MAX_RUNS_PER_KEY_PER_DAY` already enforce.
+    # Ignored (no effect) under `STRATEGY_PROFILE_SCOPE="url_pattern"`,
+    # where the exact-equality join is already correct.
+    STRATEGY_SIGNALS_DOMAIN_JOIN: bool = False
+
     # --- Scheduler refresh-pass tuning (SPEC-13 US2, research R8,
     # Principle IV — env-tunable, never a hardcoded literal). Poll
     # cadence and per-pass claim ceiling for `apps/scheduler`'s due-rule
@@ -504,6 +533,20 @@ class Settings(BaseSettings):
     #: ~1 day behind; 3 days tolerates a missed run plus a retry without
     #: masking a real stall.
     MAINTENANCE_ROLLUP_STALE_AFTER_DAYS: int = 3
+
+    # --- Ops snapshot cadence (audit §H5) ---
+    # How often the scheduler collects `app_shared.opsmetrics.snapshot`
+    # and emits it plus every firing alert rule
+    # (`app_shared.opsmetrics.emit`). Until this existed the rules were
+    # only ever evaluated when a human happened to curl `GET /ops/metrics`,
+    # so "alerting" meant "someone was already looking" -- which is not
+    # alerting. 15 minutes is the compromise between detection latency on
+    # the slow-moving conditions the rules actually cover (queue age,
+    # spend velocity, partition/rollup health, outbox backlog, breaker
+    # posture) and the cost of the collector, which is the heaviest read
+    # pass in the scheduler: 24h and 7d aggregates across
+    # `request_attempts`/`price_observations`.
+    OPS_SNAPSHOT_INTERVAL_SECONDS: int = 900
 
     # --- Public API rate limits (PLAN §7.4, risk P5) ---
     # Per-credential fixed-window budgets. Reads are cheap and get the

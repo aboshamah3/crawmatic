@@ -1,0 +1,10 @@
+{
+  "price": "99.00",
+  "currency": "SAR",
+  "availability": "IN_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://afaqalhasoob.com/products/school-backpack-with-all-student-requirements-set-of-51-pcs-ma1034"
+  }
+}

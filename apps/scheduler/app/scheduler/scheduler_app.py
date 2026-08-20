@@ -79,6 +79,25 @@ database*, not on the scheduler's own bookkeeping, because the second,
 independent root cause of the same incident was the ``worker`` service
 missing ``SYSTEM_DATABASE_URL``/``AUTH_DATABASE_URL``: the scheduler was
 enqueueing correctly the whole time and every task died on arrival.
+
+A separate **ops snapshot tick** (``OPS_SNAPSHOT_INTERVAL_SECONDS``,
+15 min) collects ``app_shared.opsmetrics.snapshot.collect_snapshot`` and
+hands it to ``...opsmetrics.emit.emit_snapshot``, which logs the
+snapshot plus one line per firing alert rule. Audit §H5 shipped the
+collector, the rules and the emitter with exactly one caller — the
+on-demand ``GET /ops/metrics`` endpoint — so until this tick existed
+every rule in that file could only fire while an operator was already
+looking at the dashboard. Read-only, on the system session, errors
+swallowed: same posture as the health tick.
+
+``main()`` opens with
+`app_shared.config_validation.assert_production_safe` (audit §L1), the
+scheduler's equivalent of the API's import-time call in
+``apps/api/app/main.py``: a production deploy still carrying
+``.env.example``-shaped secrets, ``PGBOUNCER_AUTH_TYPE=trust`` or the DB
+owner role as ``DATABASE_URL`` refuses to boot rather than starting to
+drive fleet-wide maintenance under it. A no-op outside production, so
+local runs and CI are untouched.
 """
 
 from __future__ import annotations
@@ -90,6 +109,7 @@ from datetime import datetime, timezone
 from types import FrameType
 
 from app_shared.config import Settings, get_settings
+from app_shared.config_validation import assert_production_safe
 from app_shared.database import get_system_sessionmaker
 from app_shared.maintenance.cadence import (
     claim_cadence,
@@ -104,6 +124,7 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_PARTITION_CREATE,
     CADENCE_RETENTION_DROP,
 )
+from app_shared.opsmetrics import collect_snapshot, emit_snapshot
 from app_shared.task_names import (
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
@@ -415,7 +436,88 @@ def _run_health_tick(settings: Settings) -> None:
         logger.exception("scheduler: maintenance health tick failed")
 
 
+def _ops_snapshot_redis() -> object | None:
+    """The process Redis client, or ``None`` when it cannot be had.
+
+    Mirrors `apps/api/app/routers/ops_metrics.py::_get_redis`, including
+    the lazy import: `get_redis_client()` performs the one-shot
+    `maxmemory-policy` probe on first use (`app_shared.redis_policy`) and
+    *raises* on an eviction-capable server, which is exactly the
+    deployment state the snapshot exists to report. Letting that escape
+    would turn the observability tick into a second outage. Without a
+    client the Redis section still carries the cached
+    `redis_policy.last_report()` posture — the signal that matters (audit
+    H2) — and only loses the memory/eviction counters.
+    """
+    try:
+        from app_shared.redis_client import get_redis_client
+
+        return get_redis_client()
+    except Exception:
+        logger.exception("scheduler: ops snapshot could not obtain a redis client")
+        return None
+
+
+def _run_ops_snapshot_tick(settings: Settings) -> None:
+    """Collect the ops snapshot and emit it plus every firing alert rule.
+
+    Audit §H5 shipped the collector (`app_shared.opsmetrics.snapshot`),
+    the rules (`...opsmetrics.rules`) and the emitter
+    (`...opsmetrics.emit`), but wired them to exactly one caller: the
+    on-demand `GET /ops/metrics` endpoint. Nothing evaluated the rules on
+    a schedule, so every alert in that file could only fire while an
+    operator was already looking at the dashboard — which is the failure
+    mode H5 is about, one layer up. This tick is the scheduled evaluator:
+    `emit_snapshot` writes the `ops.snapshot` line and one `ops.alert`
+    line per firing rule (ERROR for CRITICAL/HIGH), so Railway's log view
+    and any drain get a standing alerting record.
+
+    Runs on the BYPASSRLS system sessionmaker for the same reason the API
+    route runs on `get_auth_session()`: these are *fleet* aggregates, and
+    a workspace-scoped session would silently under-report every one of
+    them (spend most damagingly). Read-only — the session is rolled back,
+    never committed.
+
+    Errors are logged and swallowed exactly like `_run_health_tick`: an
+    observability probe must never be able to take down the process it
+    observes. `collect_snapshot` is itself section-isolating and
+    documents that it never raises, so this guard covers the seams around
+    it (obtaining a session, the emit).
+    """
+    try:
+        session_factory = get_system_sessionmaker()
+        with session_factory() as session:
+            snapshot = collect_snapshot(
+                session,
+                now=datetime.now(timezone.utc),
+                redis=_ops_snapshot_redis(),
+                settings=settings,
+            )
+            alerts = emit_snapshot(snapshot)
+            if alerts:
+                logger.warning(
+                    "scheduler: ops snapshot emitted %d firing alert(s)", len(alerts)
+                )
+            session.rollback()
+    except Exception:
+        logger.exception("scheduler: ops snapshot tick failed")
+
+
 def main() -> None:
+    # Audit §L1: refuse to boot when `ENVIRONMENT`/`RAILWAY_ENVIRONMENT_NAME`
+    # says "production" and the resolved config still looks local-dev-shaped
+    # (placeholder secrets, PGBOUNCER_AUTH_TYPE=trust, the DB bootstrap/owner
+    # role as DATABASE_URL). A **no-op** whenever `is_production()` is false,
+    # so local runs, `docker compose up` and CI are unaffected.
+    #
+    # First statement of `main()`, deliberately — the equivalent of the API's
+    # import-time call in `apps/api/app/main.py`. The scheduler holds no
+    # import-time state worth guarding, but `main()` is the only way this
+    # process starts, and failing before the signal handlers/settings/loop
+    # means an unsafe production deploy crash-loops visibly instead of
+    # quietly enqueueing fleet-wide maintenance work under bad config.
+    assert_production_safe()
+
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
@@ -430,6 +532,7 @@ def main() -> None:
     outbox_reconcile_interval = settings.OUTBOX_RECONCILE_INTERVAL_SECONDS
     cadence_poll_interval = settings.MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS
     health_interval = settings.MAINTENANCE_HEALTH_INTERVAL_SECONDS
+    ops_snapshot_interval = settings.OPS_SNAPSHOT_INTERVAL_SECONDS
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush + "
@@ -437,7 +540,8 @@ def main() -> None:
         "refresh pass every %ss; DURABLE cadences partition_create every %ss / "
         "daily_rollup every %ss / retention_drop every %ss polled every %ss from "
         "maintenance_cadences; outbox_drain every %ss; outbox_reconcile every %ss; "
-        "maintenance health assertions every %ss)",
+        "maintenance health assertions every %ss; ops snapshot + alert "
+        "evaluation every %ss)",
         interval,
         refresh_interval,
         partition_create_interval,
@@ -447,6 +551,7 @@ def main() -> None:
         outbox_drain_interval,
         outbox_reconcile_interval,
         health_interval,
+        ops_snapshot_interval,
     )
 
     # Run both DB-backed passes once at boot, before the loop: a cadence
@@ -463,6 +568,15 @@ def main() -> None:
     health_elapsed = 0.0
     outbox_drain_elapsed = 0.0
     outbox_reconcile_elapsed = 0.0
+    # Deliberately NOT run once at boot, unlike the two passes above. The
+    # snapshot is the heaviest read in this process (24h + 7d aggregates
+    # across `request_attempts`/`price_observations`), and nothing it
+    # reports is more urgent in the first quarter-hour after a deploy than
+    # in the next one — every rule it evaluates is a slow-moving
+    # condition. A crash-looping scheduler would otherwise pay that scan
+    # per boot, at exactly the moment the database is least likely to be
+    # healthy.
+    ops_snapshot_elapsed = 0.0
     while not _shutdown_requested:
         time.sleep(_TICK_SECONDS)
         elapsed += _TICK_SECONDS
@@ -471,6 +585,7 @@ def main() -> None:
         health_elapsed += _TICK_SECONDS
         outbox_drain_elapsed += _TICK_SECONDS
         outbox_reconcile_elapsed += _TICK_SECONDS
+        ops_snapshot_elapsed += _TICK_SECONDS
         if elapsed >= interval:
             elapsed = 0.0
             _enqueue_light_recheck()
@@ -499,6 +614,9 @@ def main() -> None:
         if outbox_reconcile_elapsed >= outbox_reconcile_interval:
             outbox_reconcile_elapsed = 0.0
             _enqueue_outbox_reconcile()
+        if ops_snapshot_elapsed >= ops_snapshot_interval:
+            ops_snapshot_elapsed = 0.0
+            _run_ops_snapshot_tick(settings)
 
     logger.info("scheduler stopped")
 

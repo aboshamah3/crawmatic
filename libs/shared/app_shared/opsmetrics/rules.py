@@ -125,6 +125,16 @@ class Thresholds:
     wasted_paid_rate_high: float = 0.40
     wasted_paid_min_attempts: int = 200
 
+    # --- cost: cost per successful price (Task 2.4) -----------------------
+    #: task-2.4 brief, verbatim: "alert when any domain's cost/price >
+    #: $0.005 over 24h". Computed at each domain's OWN $/req rate (the
+    #: 2026-08-12 report), not the fleet average -- see
+    #: ``cost.usd_per_request_for_domain``. This is the tunable knob;
+    #: the $/req rates themselves are observations-about-the-world
+    #: constants in ``opsmetrics.cost`` (see that module's docstring),
+    #: not settable here.
+    cost_per_successful_price_high: float = 0.005
+
     # --- cost: discovery --------------------------------------------------
     #: Same number as ``PROXY_BREAKER_MAX_DISCOVERY_RUNS_PER_DOMAIN_PER_DAY``.
     discovery_runs_per_day_high: int = 50
@@ -604,6 +614,70 @@ def _r_wasted_spend(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
                         "proxied": d.proxied,
                         "wasted_usd": cost.usd(d.failed_paid),
                         "threshold": t.wasted_paid_rate_high,
+                    },
+                    runbook="#stop-proxy-spend-now",
+                )
+            )
+    return out
+
+
+_J_COST_PER_PRICE = (
+    "task-2.4 brief, verbatim: 'cost per attempt is low, but cost per "
+    "USABLE price can be unbounded (a domain can spend money and produce "
+    "zero prices). Make that denominator first-class.' Two conditions, "
+    "not one: the $/successful-price RATIO against a ceiling (computed at "
+    "this domain's own $/req rate from the 2026-08-12 report), AND -- "
+    "unconditionally, whatever the ratio threshold is set to -- ANY spend "
+    "that produced ZERO successful prices, because at that point the "
+    "ratio is infinite/undefined and a ratio-only rule can never fire on "
+    "it. Amazon on 2026-08-12 (report §4.1) is the measured instance: 25 "
+    "proxied attempts, zero successes, while still burning the largest "
+    "share of the proxy bill."
+)
+
+
+def _r_cost_per_successful_price(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    out: list[Alert] = []
+    for d in snapshot.domains_24h:
+        if d.proxied_requests == 0:
+            continue  # no spend at all -- nothing to alarm on
+        spend = d.estimated_usd_domain_rate
+        if d.successful_prices == 0:
+            out.append(
+                _alert(
+                    "cost.zero_successful_prices",
+                    Severity.CRITICAL,
+                    Category.COST,
+                    f"{d.domain}: ~${spend:.4f} of proxy spend in 24h produced "
+                    f"ZERO successful prices ({d.proxied_requests} paid attempts).",
+                    _J_COST_PER_PRICE,
+                    subject=d.domain,
+                    observed={
+                        "proxied_requests": d.proxied_requests,
+                        "successful_prices": 0,
+                        "estimated_usd_24h": spend,
+                    },
+                    runbook="#stop-proxy-spend-now",
+                )
+            )
+            continue
+        ratio = d.cost_per_successful_price
+        if ratio is not None and ratio > t.cost_per_successful_price_high:
+            out.append(
+                _alert(
+                    "cost.per_successful_price",
+                    Severity.HIGH,
+                    Category.COST,
+                    f"{d.domain}: ${ratio:.4f} per successful price over 24h "
+                    f"({d.successful_prices} prices / ${spend:.4f} spend).",
+                    _J_COST_PER_PRICE,
+                    subject=d.domain,
+                    observed={
+                        "cost_per_successful_price": round(ratio, 6),
+                        "successful_prices": d.successful_prices,
+                        "proxied_requests": d.proxied_requests,
+                        "estimated_usd_24h": spend,
+                        "threshold": t.cost_per_successful_price_high,
                     },
                     runbook="#stop-proxy-spend-now",
                 )
@@ -1314,6 +1388,13 @@ RULES: tuple[Rule, ...] = (
         "Paid attempts producing no observation",
         _J_WASTED,
         _r_wasted_spend,
+    ),
+    Rule(
+        "cost.cost_per_successful_price",
+        Category.COST,
+        "Cost per successful price, and any spend with zero prices",
+        _J_COST_PER_PRICE,
+        _r_cost_per_successful_price,
     ),
     Rule(
         "cost.month_end_forecast",

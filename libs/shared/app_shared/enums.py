@@ -195,6 +195,32 @@ class AccessMethod(StrEnum):
     PLAYWRIGHT_PROXY = "PLAYWRIGHT_PROXY"
 
 
+class RequestOrigin(StrEnum):
+    """What kind of work produced a ``request_attempts`` row (Task 2.3,
+    proxy-cost-reduction plan §2.3).
+
+    ``SCRAPE`` is the reused-forever default (``server_default``,
+    ``request_attempts.origin``) — the batched persistence pipeline
+    (the spider's ``_flush_batch`` step) that has always written this
+    table. ``DISCOVERY`` marks a row written by the domain-strategy
+    discovery probe ladder (``apps/workers/app/workers/tasks_strategy
+    .py::_probe_sample``), which previously wrote **no** audit row at all
+    (87,082 real DataImpulse proxy requests measured against 646 recorded
+    rows on one domain, 2026-08-15) — per-URL accounting and the
+    ``REQUESTS_PER_URL`` circuit-breaker condition were blind to it.
+    Every reader that scores *scrape outcomes* (the daily rollup,
+    rediscovery's ``build_recent_signals``) must filter to ``SCRAPE`` so a
+    probe's deliberately-multi-method, deliberately-noisy ladder can never
+    be misread as a real scrape degrading (the Task 3.3 prerequisite).
+    Spend/volume accounting (the circuit breaker, ops-snapshot proxy
+    counters) intentionally reads BOTH origins unfiltered — a discovery
+    probe's proxy request costs exactly the same money as a scrape one.
+    """
+
+    SCRAPE = "scrape"
+    DISCOVERY = "discovery"
+
+
 class StockStatus(StrEnum):
     """Stock/availability signal extracted alongside a price (SPEC-07 §22)."""
 

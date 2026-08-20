@@ -54,6 +54,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app_shared.enums import (
     AccessMethod,
     ExtractionMethod,
+    RequestOrigin,
     ScrapeErrorCode,
     StockStatus,
     enum_column,
@@ -145,6 +146,16 @@ class RequestAttempt(Base, WorkspaceScopedBase):
     success: Mapped[bool] = mapped_column(Boolean(), nullable=False)
     error_code: Mapped[ScrapeErrorCode | None] = enum_column(ScrapeErrorCode, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Task 2.3 (proxy-cost-reduction §2.3): ``'scrape'`` (default, the
+    #: batched persistence pipeline) or ``'discovery'`` (the discovery
+    #: probe ladder, ``tasks_strategy._probe_sample``). Readers that score
+    #: *scrape* outcomes (daily rollup, rediscovery's
+    #: ``build_recent_signals``) MUST filter to ``SCRAPE``; spend/volume
+    #: accounting (the proxy circuit breaker, ops-snapshot counters)
+    #: deliberately reads both origins unfiltered.
+    origin: Mapped[RequestOrigin] = enum_column(
+        RequestOrigin, nullable=False, default=RequestOrigin.SCRAPE, server_default=RequestOrigin.SCRAPE.value
+    )
 
 
 class MatchCurrentPrice(Base, WorkspaceScopedBase, TimestampMixin):

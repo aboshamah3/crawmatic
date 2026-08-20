@@ -4,8 +4,13 @@ FR-010/FR-011, SC-001) — ⏸ DEFERRED.
 Seeds a `domain_strategy_profiles` row plus qualifying
 `strategy_attempt_stats` directly (US1 is testable with direct writes,
 per tasks.md), then exercises `app_shared.strategy.promotion.apply_promotion`
-against the real guarded `UPDATE ... WHERE id=:pid AND status IN (...)
-AND (preferred_* IS NULL OR preferred_* <> :m)` statement:
+against the real guarded `UPDATE ... WHERE id=:pid AND status IN (...)`
+statement (2026-08-16, Task 3.2: no longer also requires the preferred-
+method column to change -- `status IN (...)` alone is the concurrency
+guard, since the first winner's own `UPDATE` moves `status` out of the
+promotable set; this is what lets a `DEGRADED` profile re-promote on an
+unchanged winning method instead of parking forever, `contracts/
+promotion.md` "Same-method re-promotion from DEGRADED"):
 
 1. A qualifying sequence (>=3 qualifying successes, confidence, access
    method) -> `apply_promotion` returns `True`, `preferred_access_method`/
@@ -15,7 +20,8 @@ AND (preferred_* IS NULL OR preferred_* <> :m)` statement:
 3. A second concurrent `apply_promotion` call for the *same* method after
    the first already won -> `rowcount == 0` -> returns `False` and does
    NOT double-increment `confirmed_success_count` (Edge Cases "Concurrent
-   promotion").
+   promotion") -- blocked by `status` no longer being in the promotable
+   set, not by the method matching.
 
 Needs a reachable Postgres instance with `DATABASE_URL` (app role, RLS
 enforced) usable AND the SPEC-12 migration already applied (`alembic

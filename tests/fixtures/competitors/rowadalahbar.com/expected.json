@@ -1,0 +1,10 @@
+{
+  "price": "999.01",
+  "currency": "SAR",
+  "availability": "OUT_OF_STOCK",
+  "extraction_method": "JSON_LD",
+  "provenance": {
+    "method": "live-captured (direct HTTP, 2026-08-17)",
+    "source": "https://rowadalahbar.com/p1407830797-brother-hl-l3270cdw-color-laser-printer"
+  }
+}

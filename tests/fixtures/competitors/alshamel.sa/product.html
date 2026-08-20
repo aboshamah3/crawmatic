@@ -1,0 +1,1763 @@
+<!DOCTYPE html>
+<html
+	lang="ar" dir="rtl" 
+		class="selia-theme ">
+	<!-- بسم الله الرحمن الرحيم -->
+	<!-- Selia Tech تم تطوير هذا القالب بواسطة شركة  -->
+	<!-- https://selia-tech.com -->
+		
+														
+										
+																
+
+																												<head>
+		<meta charset="UTF-8">
+		<meta http-equiv="X-UA-Compatible" content="IE=edge">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		
+
+				<script type="module" src="https://alshamel.sa/.webmcp/bridge.js" data-packs="c2pa"></script><style>
+			.loading-overlay {
+				position: fixed;
+				width: 100%;
+				height: 100%;
+				z-index: 99999;
+				left: 0;
+				top: 0;
+								background-color: #ffffff;
+							}
+			.loading-overlay .spinner {
+				position: absolute;
+				left: 50%;
+				top: 50%;
+				transform: translate(-50%, -50%);
+			}
+						@keyframes bounce {
+				0%, 100% { transform: scale(0.7); }
+				50% { transform: scale(1.2); }
+			}
+			.loading-overlay .spinner img {
+				animation: bounce 2s infinite ease-in-out;
+			}
+					</style>
+	
+				<link rel="preconnect" href="https://cdn.assets.salla.network" crossorigin>
+		<link rel="preconnect" href="https://cdn.salla.network" crossorigin>
+		<link rel="preconnect" href="https://cdn.selia-tech.com" crossorigin>
+
+				<link rel="preload" href="https://cdn.assets.salla.network/themes/581928698/1.203.0/product-card.js" as="script" crossorigin="anonymous">
+
+						<script src="/cdn-cgi/scripts/7d0fa10a/cloudflare-static/rocket-loader.min.js" data-cf-settings="b3359411661330f814fce362-|49"></script><link rel="preload" href="https://cdn.assets.salla.network/themes/581928698/1.203.0/vendor-styles.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+		<noscript><link rel="stylesheet" href="https://cdn.assets.salla.network/themes/581928698/1.203.0/vendor-styles.css"></noscript>
+
+				<link rel="stylesheet" href="https://cdn.assets.salla.network/themes/581928698/1.203.0/app.css">
+
+								<script src="/cdn-cgi/scripts/7d0fa10a/cloudflare-static/rocket-loader.min.js" data-cf-settings="b3359411661330f814fce362-|49"></script><link rel="preload" href="https://cdn.salla.network/fonts/apple.css?v=2.0.5" as="style" onload="this.onload=null;this.rel='stylesheet'">
+			<noscript><link rel="stylesheet" href="https://cdn.salla.network/fonts/apple.css?v=2.0.5"></noscript>
+		
+				<script src="/cdn-cgi/scripts/7d0fa10a/cloudflare-static/rocket-loader.min.js" data-cf-settings="b3359411661330f814fce362-|49"></script><link rel="preload" href="https://cdn.salla.network/fonts/sallaicons.css?v=2.0.5" as="style" onload="this.onload=null;this.rel='stylesheet'">
+		<noscript><link rel="stylesheet" href="https://cdn.salla.network/fonts/sallaicons.css?v=2.0.5"></noscript>
+
+				<script data-cfasync="false">
+			(function(){
+				function activate(l){l.onload=function(){this.media='all'};if(l.sheet)l.media='all';}
+				document.querySelectorAll('.s-deferred-css').forEach(activate);
+				new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){
+					if(n.nodeType===1&&n.classList&&n.classList.contains('s-deferred-css'))activate(n);
+				});});}).observe(document.head,{childList:true});
+			})();
+			if(localStorage.getItem('promotionBanner')==='hidden'){
+				document.documentElement.classList.add('promotion-hidden');
+			}
+		</script>
+													
+
+		<style>
+		:root{
+			--font-main: 'Apple';
+			--color-primary: #e2741a;
+			--bg-primary: #ffffff;
+			--bg-secondary: #f5f5f5;
+			--header-bg: #ffffff;
+			--header-text-color: #e2741a;
+			--store-text-primary: #000000;
+			--store-text-secondary: #000000;
+			--product-bg: #ffffff;
+			--color-primary-dark: #bc4e00;
+			--color-primary-light: #ff9a40;
+			--color-primary-reverse: #630000;
+			/* Theme specific variables */
+			--s-radius: .75rem;
+			--product-image-height: 17rem;
+			--product-border-color: #000000;
+			--product-enhanced-btn-bg: #ffffff;
+			--product-enhanced-btn-color: #f66d00;
+			--products-per-row: 4;
+			--footer-bg: #f3f4f6;
+			--footer-text-color: #374151;
+			--bottom-footer-bg: #F9FAFB;
+			--countdown-bg: #f3f4f6;
+			--countdown-color: #111827;
+			--countdown-border-color: #f3f4f6;
+			--bottom-nav-bg: #ffffff;
+			--bottom-nav-text-color: #e2741a;
+			--wa-btn-bg: #1fab61;
+			--wa-btn-text-color: #ffffff;
+		}
+		.dark{
+				--bg-primary: #1d1f1f;
+				--bg-secondary: #e2741a;
+				--header-bg: #ededed;
+				--header-text-color: #ffffff;
+				--store-text-primary: #e2741a;
+				--store-text-secondary: #cccccc;
+				--product-bg: #1d1f1f;
+				--footer-bg: #0e0f0f;
+				--footer-text-color: #ffffff;
+				--bottom-footer-bg: #0e0f0f;
+				--bottom-nav-bg: #1d1f1f;
+				--bottom-nav-text-color: #ffffff;
+			}
+	</style>
+				<script data-cfasync="false">
+			if(localStorage.getItem('selia-theme-mode')){
+				localStorage.removeItem('selia-theme-mode');
+			}
+		</script>
+			<script data-cfasync="false">
+			document.addEventListener('DOMContentLoaded', function () {
+				var spinner = document.querySelector('.loading-overlay .spinner');
+				var loadingOverlay = spinner ? spinner.parentElement : null;
+				if (!loadingOverlay) return;
+				loadingOverlay.style.transition = 'opacity 0.5s ease';
+				loadingOverlay.style.opacity = 0;
+				setTimeout(function () { loadingOverlay.remove(); }, 500);
+			});
+		</script>
+		<script data-cfasync="false">
+			window.__pcQueue = [];
+			if (!customElements.get('custom-salla-product-card')) {
+				customElements.define('custom-salla-product-card', class extends HTMLElement {
+					connectedCallback() {
+						if (window.__pcReady) {
+							window.__pcReady.call(this);
+						} else {
+							window.__pcQueue.push(this);
+						}
+					}
+				});
+			}
+		</script>
+		<script defer type="text/javascript" data-cfasync="false" crossorigin="anonymous" src="https://cdn.assets.salla.network/themes/581928698/1.203.0/product-card.js"></script>
+					<script defer type="text/javascript" data-cfasync="false" src="https://cdn.assets.salla.network/themes/581928698/1.203.0/main-menu.js"></script>
+							<script defer src="https://cdn.assets.salla.network/themes/581928698/1.203.0/add-product-toast.js" type="b3359411661330f814fce362-text/javascript"></script>
+				<script data-cfasync="false">
+			window.activate_zoom = "1"
+			window.header_is_sticky = "1"
+			window.animate_blocks = "1"
+			window.dark_mode_switcher = ""
+			window.activate_second_image = ""
+			window.can_access_wallet = false
+			window.show_singleSelection = ""
+			window.show_multipleOption = ""
+			window.productcard_options = ""
+			window.notify_when_available_in_card = ""
+			window.products_skeleton_enabled = "1"
+			window.activate_default_menu = "1"
+			window.square_menu_images = ""
+			window.show_rating_count = ""
+			window.enable_desktop_sidemenu = "1"
+			window.update_both_prices = ""
+			window.hide_top_price = ""
+			window.enable_add_product_toast = "1"
+			window.open_drawer_on_add = ""
+			window.footer_collapse_menus = ""
+		</script>
+		<link rel="preconnect" href="https://cdn.assets.salla.network" />
+<link rel="preconnect" href="https://cdn.salla.network" />
+<!-- theme color -->
+<meta name="msapplication-navbutton-color" content="#e2741a">
+<meta name="apple-mobile-web-app-status-bar-style" content="#e2741a">
+
+<!-- fav icon -->
+<link rel="icon" type="image/png" href="https://cdn.salla.sa/rGOOz/OgKu1dtsF7hn61NlJIhICdT2iBh8J5z6vFUFAWx4.png" />
+<link rel="apple-touch-icon-precomposed" href="https://cdn.salla.sa/rGOOz/OgKu1dtsF7hn61NlJIhICdT2iBh8J5z6vFUFAWx4.png">
+<meta name="msapplication-TileColor" content="#ffffff">
+<meta name="msapplication-TileImage" content="https://cdn.salla.sa/rGOOz/OgKu1dtsF7hn61NlJIhICdT2iBh8J5z6vFUFAWx4.png">
+
+<meta name="_token" content="kD6kFSTy8PAIp9vLTxEEelhuFSjYP8GLdZD4zSgm">
+
+<script data-cfasync="false">
+    
+    window.salla = window.Salla = window.Salla || {};
+    Salla.onReady = Salla.onReady || function (callback) {
+        return new Promise(function (resolve) {
+            return Salla.status == 'ready'
+                ? resolve(callback ? callback(salla.config.all()) : salla.config.all())
+                : window.addEventListener('twilight::initiated', function (config) { resolve(callback ? callback(config.detail) : config.detail) }, { once: true });
+        });
+    };
+</script>
+<style>
+    salla-hook {
+        all: unset;
+        display: none;
+    }
+</style>
+
+
+
+<script async src="https://cdn.salla.network/js/twilight/2.14.548/twilight.esm.js" type="b3359411661330f814fce362-module" crossorigin></script>
+
+		<title>محول خارجي 3.5 HDD | الشامل كمبيوتر</title>
+<meta name="description" content="احصل على محول خارجي 3.5 HDD لتوصيل أقراصك الصلبة بجهازك بسهولة وأمان. توفر الشامل كمبيوتر محول عالي الجودة بأفضل الأسعار.">
+<meta name="keywords" content="احصل,على,محول,خارجي,3.5,HDD,لتوصيل,أقراصك,الصلبة,بجهازك,بسهولة,وأمان.,توفر,الشامل,كمبيوتر,محول,عالي,الجودة,بأفضل,الأسعار.">
+<meta property="store:published_time" content="2023-05-30T13:01:10+03:00">
+<link rel="canonical" href="https://alshamel.sa/محول خارجي hdd/p681568436">
+<link rel="alternate" hreflang="ar" href="https://alshamel.sa/بيت-هارد-ديسك-خارجي-٣٥-بوصة/p681568436">
+<meta property="og:description" content="احصل على محول خارجي 3.5 HDD لتوصيل أقراصك الصلبة بجهازك بسهولة وأمان. توفر الشامل كمبيوتر محول عالي الجودة بأفضل الأسعار.">
+<meta property="og:title" content="محول خارجي 3.5 HDD | الشامل كمبيوتر">
+<meta property="og:type" content="product">
+<meta property="og:locale" content="ar_AR">
+<meta property="og:url" content="https://alshamel.sa/محول خارجي hdd/p681568436">
+<meta property="og:image" content="https://cdn.salla.sa/rGOOz/db0e176b-4bda-40b0-bd23-c4bebb7bc9b3-400.5x500-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png">
+<meta property="og:image:width" content="600">
+<meta property="og:image:height" content="300">
+<meta property="product:pretax_price:amount" content="68.7">
+<meta property="product:pretax_price:currency" content="SAR">
+<meta property="product:price:amount" content="68.7">
+<meta property="product:price:currency" content="SAR">
+<meta property="product:sale_price:amount" content="68.7">
+<meta property="product:sale_price:currency" content="SAR">
+<meta property="product:brand" content="الشامل كمبيوتر">
+<meta property="product:availability" content="in stock">
+<meta property="product:condition" content="new">
+<meta property="product:retailer_item_id" content="681568436">
+<meta property="product:category" content="الاكسسوارات,اكسسوارات مكتبية,التخزين">
+
+<meta name="twitter:description" content="احصل على محول خارجي 3.5 HDD لتوصيل أقراصك الصلبة بجهازك بسهولة وأمان. توفر الشامل كمبيوتر محول عالي الجودة بأفضل الأسعار.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="محول خارجي 3.5 HDD | الشامل كمبيوتر">
+<meta name="twitter:url" content="https://alshamel.sa/محول خارجي hdd/p681568436">
+<meta name="twitter:site" content="@Alshamel_sa">
+<meta name="twitter:creator" content="@Alshamel_sa">
+<meta name="twitter:image" content="https://cdn.salla.sa/rGOOz/db0e176b-4bda-40b0-bd23-c4bebb7bc9b3-400.5x500-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"الشامل كمبيوتر شريكك التقني الأمثل","description":"متجر تقني يقدم حلول الحاسب والأجهزة الإلكترونية بجودة عالية وأسعار منافسة. مع تجربة شراء سهلة ومواصفات دقيقة وتوصيل سريع وخدمة أفضل مستمرة.","url":"https:alshamel.sa","logo":"https://cdn.salla.sa/rGOOz/OgKu1dtsF7hn61NlJIhICdT2iBh8J5z6vFUFAWx4.png"}</script><script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"محول خارجي 3.5 HDD | الشامل كمبيوتر","description":"احصل على محول خارجي 3.5 HDD لتوصيل أقراصك الصلبة بجهازك بسهولة وأمان. توفر الشامل كمبيوتر محول عالي الجودة بأفضل الأسعار.","url":"https://alshamel.sa/محول خارجي hdd/p681568436"}</script>			<link rel="preload" as="image" href="https://cdn.salla.sa/rGOOz/723dd7a1-3292-45f1-a343-d97ed3505b34-801x1000-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png" fetchpriority="high">
+	<style>
+		.product-single__slider salla-slider {
+			visibility: visible
+		}
+		.product-single__slider salla-slider [slot="items"]>:not(:first-child),
+		.product-single__slider salla-slider [slot="thumbs"] {
+			opacity: 0
+		}
+		.product-single__slider salla-slider [slot="items"] a {
+			display: block;
+			width: 100%;
+			margin: 0
+		}
+		@media(max-width:1023.98px) {
+			.product-single__slider salla-slider:not(.hydrated) [slot="items"] {
+				padding: 0 !important
+			}
+		}
+	</style>
+	<link rel="stylesheet" href="https://cdn.assets.salla.network/themes/581928698/1.203.0/product-details.css" media="print" class="s-deferred-css">
+	<noscript><link rel="stylesheet" href="https://cdn.assets.salla.network/themes/581928698/1.203.0/product-details.css"></noscript>
+		<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"Product","name":"بيت هارد ديسك خارجي ٣.٥ بوصة","description":"بيت هارد ديسك خارجي ٣.٥ بوصة مع شاحن ١٢ فولت ومنفذ يو إس بي ٢.٠ إذا كنت تبحث عن محول خارجي 3.5 HDD يحوّل قرصك الصلب القديم إلى وحدة تخزين خارجية متكاملة، فإن Ex...","sku":"محول-خارجي-hdd/p681568436","offers":{"@type":"Offer","url":"https://alshamel.sa/محول-خارجي-hdd/p681568436","availability":"https://schema.org/InStock","price":68.7,"priceCurrency":"SAR","priceValidUntil":"2026-09-17T03:24:00+03:00","seller":{"@type":"Organization","name":"الشامل كمبيوتر"}},"aggregateRating":[],"review":{"@type":"Review","author":{"@type":"Organization","name":"الشامل كمبيوتر"}},"image":"https://cdn.salla.sa/rGOOz/723dd7a1-3292-45f1-a343-d97ed3505b34-801x1000-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png"}]}</script><script type="b3359411661330f814fce362-text/javascript">
+window.dataLayer = window.dataLayer || [];
+window.dataLayer.push({"event":"detail","ecommerce":{"currencyCode":"SAR","exchangeRate":"1","event_id":"da68f2e107993f0667fafd0092dbd3bebd35d20d","detail":{"products":[{"id":681568436,"name":"بيت هارد ديسك خارجي ٣.٥ بوصة","categories":[{"id":7158311,"name":"الاكسسوارات"},{"id":7158312,"name":"اكسسوارات مكتبية"},{"id":7167100,"name":"التخزين"}],"category":"الاكسسوارات\/اكسسوارات مكتبية\/التخزين","price":68.7,"quantity":1,"variant":"","brand":"","image":"https:\/\/cdn.salla.sa\/rGOOz\/db0e176b-4bda-40b0-bd23-c4bebb7bc9b3-400.5x500-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png"}]}},"page":{"fingerprint":"6de44be77ef1dbbffc124db2156b587a967a85dd","pageName":"productShow","mobileApp":0,"referrer":"https:\/\/alshamel.sa","theme":632105401},"store":{"store":"alshamel.sa","facebook_pixel_id":null,"google_analytics_id":null,"snapchat_pixel_id":null},"customer":{"isGuest":true}});
+</script>
+    <script type="b3359411661330f814fce362-text/javascript">(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+                new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+            j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+            'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+        })(window,document,'script','dataLayer','GTM-TGFC6FV');
+
+            // Create a Proxy to watch for changes in the array
+            window.dataLayer = new Proxy(window.dataLayer, {
+                set(target, property, value) {
+                    // Perform the default array behavior (setting the value)
+                    target[property] = value;
+
+                    // Check if the added value is the target value
+                    if (typeof value === 'object') {
+                        ['form_data', 'data', 'gateway', 'config', 'request', 'headers']
+                            .forEach(data=>{value.hasOwnProperty(data) && delete value[data]})
+                    }
+
+                    // Return true to indicate that the value was successfully set
+                    return true;
+                }
+            });
+</script>
+<script id="mcjs" type="b3359411661330f814fce362-text/javascript">!function(c,h,i,m,p){m=c.createElement(h),p=c.getElementsByTagName(h)[0],m.async=1,m.src=i,p
+        .parentNode.insertBefore(m,p)}(document,"script","");</script>
+
+</head>
+
+
+<body id="app" class="product-single salla-632105401 color-mode-dark rtl font-apple   footer-is-custom   force_text_color  custom_colors  hide-quickview-on-mobile     with-shine-animation  with-zoom-animation   is-sticky-product-bar   enhanced_add_btn_in_mobile  enable_desktop_sidemenu  show_subtitle_on_mini      one-line-products-names    mobile_small_blocks_titles  has-bottom-nav    mini_top_promotion  htv htv--classic ">
+				
+		
+
+		
+
+		<div class="loading-overlay">
+		<div class="spinner">
+	
+									<img loading="eager" src="https://cdn.salla.sa/form-builder/Anyi4u4winu4A5RROBN5GV3v5PH5WuIMxWpP8fae.png" alt="الشامل كمبيوتر"  height=&quot;48&quot; style=" height:48px;">
+		</div>
+	</div>
+																												
+		<div id="productCardPropsElem" data-hide-countdown="1" data-hide-ratings="" data-hover-style="hover_style_4" data-rounded-cards="1" data-quickview-label="عرض سريع" data-instock-label="متوفر" data-slider-bg-size="contain" data-mini-cards="1" data-primary-buttons="1" data-product-promo-bg="#e2741a" data-box-icon="https://cdn.selia-tech.com/images/box.gif" data-box-icon-white="https://cdn.selia-tech.com/images/box-white.gif" data-is-dark="" data-show-discount="" data-show-rating="" data-show-subtitle="1" data-show-tags="1" data-mobile-enhanced-add-btn="1" data-filled-normal-cart="" data-filled-mini-cart="" data-show-normal-countdown="" data-hide-countdown-labels=""></div>
+	<noscript>
+
+		To get full functionality of this site you need to enable JavaScript. Here is how
+		<a href="https://www.enable-javascript.com/" rel="noreferrer" target="_blank">To enable JavaScript on webpage</a>.
+	</noscript>
+	<div class="app-inner flex flex-col min-h-full bg-storeBG " >
+		<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-TGFC6FV"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+<salla-advertisement></salla-advertisement><salla-hook name="body:start"></salla-hook>						
+<header
+	class="store-header  centered_logo  ">
+						<div id="mainnav" class="main-nav-container">
+			<div class="inner bg-inherit w-full">
+				<div class="header__main-container container  ">
+					<div class="header__main-row flex items-stretch justify-between relative">
+						<div class="header__main-start flex items-center justify-start w-1/3 ">
+							<a class=" mburger mburger--collapse leading-none flex items-start rtl:ml-2.5 ltr:mr-2.5" aria-label="Open-menu" href="#mobile-menu">
+								<i class="sicon-menu text-2xl"></i>
+								<p class=" hidden text-xl md:block ms-1 menu-label">القائمة</p>
+							</a>
+															<button onclick="if (!window.__cfRLUnblockHandlers) return false; salla.event.dispatch('search::open')" class="header__search-btn hidden lg:block" data-selia="header-search-button" aria-label="Search" data-cf-modified-b3359411661330f814fce362-="">
+									<span class="header-btn__icon icon sicon-search"></span>
+								</button>
+																						<salla-user-menu avatar-only class="header__user-menu block lg:hidden" show-header show-trigger>
+								<button slot="login-btn" class="header-btn" onclick="if (!window.__cfRLUnblockHandlers) return false; salla.event.dispatch('login::open')" aria-label="Login" data-cf-modified-b3359411661330f814fce362-="">
+									<i class="header-btn__icon sicon-user"></i>
+								</button>
+							</salla-user-menu>
+													</div>
+						<div class="header__brand flex items-center flex-col justify-center">
+							<a class="navbar-brand" href="https://alshamel.sa">
+																								<img
+									class="logo-normal"
+										src="https://cdn.files.salla.network/theme/1929904917/5e4a393d-fde6-4484-b5e5-b63bdc2c3324.webp"
+										alt="الشامل كمبيوتر Logo"
+										width=&quot;250&quot; height="50" style="width:250px; height:50px;">
+																									<h2 class="sr-only">الشامل كمبيوتر</h2>
+															</a>
+						</div>
+						<div class="header__main-end flex items-center justify-end w-1/3">
+														<button onclick="if (!window.__cfRLUnblockHandlers) return false; salla.event.dispatch('search::open')" aria-label="Search" data-selia="header-search-button" class="header__search-btn block lg:hidden ml-3 md:ml-4 rtl:ml-[unset] rtl:mr-3 rtl:md:mr-4" data-cf-modified-b3359411661330f814fce362-="">
+								<span class="header-btn__icon icon sicon-search"></span>
+							</button>
+
+							<salla-user-menu avatar-only class="header__user-menu hidden lg:block" show-header show-trigger>
+								<button slot="login-btn" class="header-btn" onclick="if (!window.__cfRLUnblockHandlers) return false; salla.event.dispatch('login::open')" aria-label="Login" data-cf-modified-b3359411661330f814fce362-="">
+									<i class="header-btn__icon sicon-user"></i>
+								</button>
+							</salla-user-menu>
+							<salla-cart-summary  class="header__cart-summary ml-4 rtl:ml-[unset] rtl:mr-4">
+								<i slot="icon" class="header-btn__icon icon sicon-cart"></i>
+							</salla-cart-summary>
+						</div>
+					</div>
+				</div>
+							</div>
+							<div class="main-menu-row">
+											<custom-main-menu class="as-row"></custom-main-menu>
+									</div>
+					</div>
+	</header>
+
+				<main><salla-hook name="product.single:start"></salla-hook>																												<div class="container container--breadcrumbs">
+							<nav class="breadcrumbs w-full py-5">
+					<salla-breadcrumb></salla-breadcrumb>
+				</nav>
+					</div>
+			<div class="s-blocks-wrapper s-before-product-info"></div>
+
+	<div class="container container--product-details">
+
+		<div class="product-single thumbnails  without-thumbs product-single--full-bleed-mobile product-681568436">
+			<div class="product-single__layout flex flex-wrap row ">
+				<div class="product-single__inner col-xl-9 col-lg-12 col-md-12 col-12  lg:!w-4/4 w-full">
+					<div class="product-single__columns flex flex-wrap h-full">
+						<div class="product-single__slider col-lg-7 col-md-12 col-12 w-full  lg:!w-2/4 md:px-[15px] lg:sticky md:top-[65px] md:h-fit mb-5 ">
+							<div class="product-single__slider__inner">
+								<div class="flex flex-wrap product-single__row">
+									<div
+										class="product-single__media-col col-md-10 w-full h-full">
+																				<div class="product-single__main-media  overflow-hidden">
+																						<salla-slider id="details-slider-681568436" class="details-slider rounded-md image-slider" type="thumbs" loop="false"   pagination  show-controls="false"  auto-height  listen-to-thumbnails-option show-thumbs-controls="false">
+																																				
+												<div slot="items">
+																																										<a data-fslightbox="product_681568436" id="magnify-image" data-img-id="186942776" data-slid-index="0"  data-caption="بيت هارد ديسك خارجي ٣.٥ بوصة مع شاحن ١٢ فولت ومنفذ يو إس بي ٢.٠" data-infinite="false" data-type="image" href="https://cdn.salla.sa/rGOOz/723dd7a1-3292-45f1-a343-d97ed3505b34-801x1000-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png" aria-label="بيت هارد ديسك خارجي ٣.٥ بوصة" class="swiper-slide magnify-wrapper homeslider__slide "  style="display:block;width:100%;margin:0" >
+																																	<img id="186942776" fetchpriority="high" loading="eager" src="https://cdn.salla.sa/rGOOz/723dd7a1-3292-45f1-a343-d97ed3505b34-801x1000-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png" alt="بيت هارد ديسك خارجي ٣.٥ بوصة مع شاحن ١٢ فولت ومنفذ يو إس بي ٢.٠" class="product-single__slide-image h-full object-contain w-full ">
+																																<div class="gallery-cursor"></div>
+															</a>
+																											
+												</div>
+
+																							</salla-slider>
+
+																					</div>
+									</div>
+								</div>
+							</div>
+														<salla-quick-order class="product-single__quick-order--desktop mt-5 md:-mb-2 hidden sm:block"></salla-quick-order>
+													</div>
+						<div class="product-single__info col-lg-5 col-md-12 col-12  lg:!w-2/4 md:w-full w-full ltr:md:pl-[15px] rtl:md:pr-[15px]  mt-5 sm:mt-0">
+							<salla-hook name="product:single.description.start"></salla-hook>															<div class="product-single__brand-row flex items-center justify-between mb-5">
+																		<div class="product-single__share-row flex rtl:space-x-reverse space-x-3 rtl:mr-auto ltr:ml-auto">
+										<salla-social-share class="inline-flex" aria-label="social share"></salla-social-share>
+
+										<salla-button class="btn--wishlist animated inline-flex" aria-label="add to wishlist" data-id="681568436" onclick="if (!window.__cfRLUnblockHandlers) return false; salla.wishlist.toggle('681568436')" shape="icon" fill="outline" color="light" data-cf-modified-b3359411661330f814fce362-="">
+											<i class="sicon-heart"></i>
+										</salla-button>
+									</div>
+								</div>
+														<h1 data-selia="product-single-title" class="product-single__title text-xl md:text-2xl leading-10 font-bold text-store-text-primary">بيت هارد ديسك خارجي ٣.٥ بوصة</h1>
+
+							
+																						<div class="flex whitespace-nowrap flex-wrap gap-4 items-center product-price product-price-top my-1">
+									<div class="hidden price_is_on_sale space-x-2 rtl:space-x-reverse whitespace-nowrap">
+										<h4 class="font-bold text-xl inline-block total-price  text-store-text-primary">0 <i class=sicon-sar></i></h4>
+										<span class="text-store-text-secondary line-through before-price">68.70 <i class=sicon-sar></i></span>
+									</div>
+									<div class="starting-or-normal-price gap-4 flex">
+																				<h2 class="text-store-text-primary font-bold text-xl inline-block total-price">
+											68.70 <i class=sicon-sar></i></h2>
+									</div>
+																	</div>
+																																				<div class="product-single__tags mb-3">
+																			<a href="https://alshamel.sa/محول-خارجي-hdd/tag-1644156461" data-selia="product-tag" class="product-single__tag rtl:ml-2 ltr:mr-2 inline-flex text-store-text-secondary hover:text-primary underline text-sm mb-1">محول خارجي hdd
+											,</a>
+																	</div>
+														<div class="product-single__stock-info flex flex-col space-y-5 mb-5">
+								<div class="inventory-content flex-grow shrink-0">
+									<div id="variant-inventory" class="">
+										<i class="sicon-check-circle rtl:ml-1.5 ltr:mr-1.5"></i>
+										متوفر
+									</div>
+								</div>
+
+															</div>
+							
+							<salla-hook name="product:single.description"></salla-hook>
+														
+																						<salla-installment price="68.7"></salla-installment>
+							
+							
+														
+																					
+							<form id="product-form" class="form product-form" enctype="multipart/form-data" method="post" onsubmit="if (!window.__cfRLUnblockHandlers) return false; return salla.form.onSubmit('cart.addItem', event)" data-cf-modified-b3359411661330f814fce362-="">
+								<input type="hidden" name="id" value="681568436">
+
+
+								<salla-hook name="product:single.form.start"></salla-hook>
+								
+
+	<section class="bg-storeBG p-5 rounded-md mb-5">
+					<div class="product-sku-wrapper  center-between ">
+				<b class="text-store-text-primary rtl:space-x-reverse space-x-1">
+					<i class="sicon-barcode text-store-text-secondary"></i>
+					<span class="text-store-text-primary">رقم الموديل</span>
+				</b>
+				<span class="text-sm text-store-text-secondary product-sku">7010602020</span>
+			</div>
+						
+			</section>
+
+
+
+								<salla-hook name="product:single.form.end"></salla-hook>
+																<div class="bg-storeBG p-5 rounded-md rounded-b-none flex sm:pb-0 product-price product-price-bottom">
+									<div class="center-between w-full">
+										<label class="product-single__price-label text-store-text-primary">
+											<b class="block">
+												السعر
+											</b>
+										</label>
+
+										<div class="product-single__price-values flex whitespace-nowrap gap-4 items-center">
+											<div class="hidden price_is_on_sale space-x-2 rtl:space-x-reverse whitespace-nowrap">
+												<h2 class="total-price text-red-400 font-bold text-xl inline-block">0 <i class=sicon-sar></i></h2>
+												<span class="before-price text-store-text-secondary line-through">68.70 <i class=sicon-sar></i></span>
+											</div>
+											<div class="starting-or-normal-price gap-4 flex">
+																								<h2 class="total-price font-bold text-xl inline-block text-store-text-primary">
+													68.70 <i class=sicon-sar></i></h2>
+											</div>
+										</div>
+									</div>
+								</div>
+																								<section
+									class="sticky-product-bar bg-storeBG p-5 md rounded-md rounded-b-none">
+																												<div class="sticky-product-bar__quantity center-between mb-5">
+											<label class="form-label font-bold">
+												الكمية
+											</label>
+											<salla-quantity-input max="3" value="1" name="quantity" aria-label="Quantity" class="border-gray-200 flex justify-end"></salla-quantity-input>
+										</div>
+									
+
+																		<salla-add-product-button required-shipping quick-buy  support-sticky-bar  amount="68.7" class="mt-5 w-full sticky-product-bar__btn" product-status="sale" product-type="product" product-id="681568436" loader-position="end" type="submit" width="wide"  >
+										<span class="flex items-center gap-2.5">
+																							<i class="text-[16px] sicon-shopping"></i>
+																						إضافة للسلة
+										</span>
+									</salla-add-product-button>
+								</section>
+							</form>
+																						<salla-payments class="my-2"></salla-payments>
+							
+
+							<section class="s-block s-block--bundle-out-of-stock-alternative"><salla-custom-component component-name="out-of-stock-alternative" bundle-id="642379674" config="{&quot;block-categories-global-info&quot;:&quot;&lt;div style=&#039;background:#eff8ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;color:#1d4ed8;font-size:13px;display:flex;gap:8px;align-items:center;margin-bottom:20px&#039;&gt;&lt;i class=\&quot;hgi-stroke hgi-information-circle\&quot; style=\&quot;flex-shrink:0\&quot;&gt;&lt;\/i&gt;&lt;span&gt;\u064a\u0639\u0631\u0636 \u0644\u0644\u0639\u0645\u064a\u0644 \u0645\u0646\u062a\u062c\u0627\u062a \u0628\u062f\u064a\u0644\u0647 \u062d\u0627\u0644 \u0646\u0641\u0627\u0630 \u0643\u0645\u064a\u0647 \u0627\u0644\u0645\u0646\u062a\u062c.&lt;\/span&gt;&lt;\/div&gt;&quot;,&quot;ar&quot;:{&quot;title&quot;:&quot;\u0648\u0641\u064e\u0651\u0631\u0646\u0627 \u0644\u0643 \u0627\u0644\u0628\u062f\u064a\u0644&quot;},&quot;en&quot;:{&quot;title&quot;:&quot;We Found an Alternative for You&quot;},&quot;render_in&quot;:&quot;all&quot;,&quot;title&quot;:&quot;\u0648\u0641\u064e\u0651\u0631\u0646\u0627 \u0644\u0643 \u0627\u0644\u0628\u062f\u064a\u0644&quot;}"></salla-custom-component></section><salla-hook name="product:single.description.end"></salla-hook>														<salla-quick-order class="product-single__quick-order--mobile mt-5 md:-mb-2 block sm:hidden"></salla-quick-order>
+													</div>
+					</div>
+				</div>
+							</div>
+		</div>
+					<salla-offer></salla-offer>
+		
+				<div class="s-blocks-wrapper s-before-reviews"></div>
+
+									<div id="single-product-details" class="s-blocks-wrapper s-block-tabs s-block--tabs-produtcs">
+					<div class="container">
+
+						<div class="tabs hide-scroll justify-center">
+															<salla-button class="tab-trigger is-active !text-lg" data-target="details_table" data-component-id="single-product-details" fill="outline">
+									تفاصيل المنتج
+								</salla-button>
+																						<salla-button class="tab-trigger   !text-lg" data-target="reviews" data-component-id="single-product-details" fill="outline">
+									تقييمات المنتج
+								</salla-button>
+													</div>
+
+						<div class="tabs-wrapper">
+															<div id="details_table" class="tabs__item mb-5 is-active">
+																			<p class="ql-direction-rtl"><strong style="background-color: transparent; color: rgb(0, 0, 0);">بيت هارد ديسك خارجي</strong><span style="background-color: transparent; color: rgb(0, 0, 0);"> ٣.٥ بوصة مع شاحن ١٢ فولت ومنفذ يو إس بي ٢.٠ إذا كنت تبحث عن</span><strong style="background-color: transparent; color: rgb(0, 0, 0);"> محول خارجي 3.5 HDD</strong><span style="background-color: transparent; color: rgb(0, 0, 0);"> يحوّل قرصك الصلب القديم إلى وحدة تخزين خارجية متكاملة، فإن External Case 3.5" HDD USB 2.0 with 12V Charger هو الخيار الأمثل. يتيح لك هذا المحول قرص خارجي توصيل أقراص HDD بحجم 3.5 بوصة بجهازك عبر منفذ USB 2.0 بكل سهولة، مع مزود طاقة 12V يضمن استمرارية تشغيل القرص وحماية بياناتك في مختلف الظروف.</span></p><p class="ql-direction-rtl"><br></p><h2 class="ql-direction-rtl"><strong style="background-color: transparent; color: rgb(180, 95, 6);">مواصفات 
+محول خارجي 3.5 HDD</strong></h2><ul><li class="ql-direction-rtl"><strong style="background-color: transparent;">النوع:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">حافظة قرص صلب خارجي 3.5 بوصة – HDD Enclosure Case</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">الموديل:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">External Case 3.5" HDD USB 2.0 with 12V Charger</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">التقنية:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">منفذ USB 2.0 لتوصيل القرص الصلب بجهاز الكمبيوتر بسرعة نقل بيانات تصل إلى 480Mbps</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">دعم خاصية Plug-and-Play دون الحاجة لتثبيت برامج تشغيل إضافية</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">متوافق مع أقراص SATA من نوع 3.5 بوصة</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">الطاقة:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">مزود طاقة 12V مدمج يوفر الطاقة اللازمة لتشغيل أقراص 3.5 بوصة بشكل مستقر ومستمر</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">الأداء:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">سرعة نقل بيانات تصل إلى 480Mbps عبر USB 2.0</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">مناسب للمهام اليومية من نسخ احتياطي ونقل ملفات وتخزين بيانات بشكل آمن</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">التصميم:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">هيكل خارجي مصنوع من الألمنيوم أو البلاستيك المتين لحماية القرص الصلب من الخدوش والصدمات</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">يتوفر بألوان متعددة منها الأسود والفضي والرمادي</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">منافذ تهوية في بعض الطرازات لتبديد الحرارة وإطالة عمر القرص</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">الموثوقية:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">تصميم مقاوم للصدمات يحمي بياناتك ويضمن سلامة القرص الصلب أثناء الاستخدام المستمر</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">مزود الطاقة 12V يضمن استقرار التشغيل دون انقطاع</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">التوافق:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">متوافق مع </span><a href="https://alshamel.sa/external-case-3-5-hdd-usb2-0-12v-charger/p681568436?from=search-bar%D8%B7" target="_blank" style="background-color: transparent; color: rgb(17, 85, 204);">أقراص HDD</a><span style="background-color: transparent;"> بسعات تصل إلى 4TB وأكثر</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">يدعم أنظمة التشغيل Windows و macOS و Linux</span></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">يعمل مع أي جهاز يحتوي على منفذ USB 2.0</span></li><li class="ql-direction-rtl"><strong style="background-color: transparent;">الضمان:</strong></li><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">ضمان محدود مع دعم فني من الشامل كمبيوتر</span></li></ul><h2 class="ql-direction-rtl"><strong style="background-color: transparent; color: rgb(180, 95, 6);">الاستخدامات</strong></h2><ol><li class="ql-direction-rtl"><strong style="background-color: transparent;">تحويل القرص الصلب القديم إلى محول قرص خارجي:</strong></li></ol><ul><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">إذا كنت تمتلك قرص HDD قديم بحجم 3.5 بوصة، يمكنك تحويله بسهولة إلى وحدة تخزين خارجية قابلة للتوصيل بأي جهاز عبر USB 2.0</span></li></ul><ol><li class="ql-direction-rtl"><strong style="background-color: transparent;">تخزين البيانات والنسخ الاحتياطي:</strong></li></ol><ul><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">مثالي لإنشاء نسخ احتياطية منتظمة لملفاتك ومستنداتك المهمة وحفظها بأمان خارج جهاز الكمبيوتر</span></li></ul><ol><li class="ql-direction-rtl"><strong style="background-color: transparent;">نقل الملفات الكبيرة بين الأجهزة:</strong></li></ol><ul><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">يوفر لك حلاً عملياً لنقل كميات ضخمة من البيانات بين أجهزة متعددة دون الحاجة إلى شبكة أو إنترنت</span></li></ul><ol><li class="ql-direction-rtl"><strong style="background-color: transparent;">توسيع سعة التخزين الخارجية:</strong></li></ol><ul><li class="ql-indent-1 ql-direction-rtl"><span style="background-color: transparent;">حل اقتصادي لتوسيع مساحة التخزين المتاحة لديك باستخدام أقراص HDD بسعات تصل إلى 4TB وأكثر</span></li></ul><p class="ql-direction-rtl"><span style="background-color: transparent; color: rgb(0, 0, 0);">احصل الآن على </span><strong style="background-color: transparent; color: rgb(0, 0, 0);">محول خارجي 3.5 HDD</strong><span style="background-color: transparent; color: rgb(0, 0, 0);"> من </span><a href="https://www.google.com/maps/place/Al+Shamel+Computers/data=!4m2!3m1!1s0x0:0xe0b747855ac95d18?sa=X&amp;ved=1t:2428&amp;hl=en&amp;ictx=111" target="_blank" style="background-color: transparent; color: rgb(17, 85, 204);"><strong>الشامل كمبيوتر</strong></a><span style="background-color: transparent; color: rgb(0, 0, 0);"> وحوّل قرصك الصلب إلى وحدة تخزين خارجية متكاملة بسعر مميز!</span></p><p class="ql-direction-rtl"><span style="background-color: transparent; color: rgb(0, 0, 0);">تسوق ايضا </span><a href="https://alshamel.sa/%D8%A7%D9%84%D8%AA%D8%AE%D8%B2%D9%8A%D9%86/c1447374815?filters[category_id]=1447374815" target="_blank" style="background-color: transparent; color: rgb(17, 85, 204);"><strong>اقراص التخزين</strong></a></p><h3><br></h3>
+																	</div>
+																						<div id="reviews" class="tabs__item  ">
+																			<salla-comments item-id="681568436" type="product"></salla-comments>
+																										</div>
+							
+						</div>
+					</div>
+				</div>
+									<div class="s-blocks-wrapper s-before-related"><section class="s-block s-block--bundle-personalized-shoppers-who-bought"><salla-custom-component component-name="personalized-shoppers-who-bought" bundle-id="642379674" config="{&quot;block-categories-global-info&quot;:&quot;&lt;div style=&#039;background:#eff8ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;color:#1d4ed8;font-size:13px;display:flex;gap:8px;align-items:center;margin-bottom:20px&#039;&gt;&lt;i class=\&quot;hgi-stroke hgi-information-circle\&quot; style=\&quot;flex-shrink:0\&quot;&gt;&lt;\/i&gt;&lt;span&gt;\u062a\u0639\u0631\u0636 \u0644\u0644\u0639\u0645\u064a\u0644 \u0645\u0646\u062a\u062c\u0627\u062a \u062a\u0646\u0627\u0633\u0628 \u0627\u0647\u062a\u0645\u0627\u0645\u0627\u062a\u0647 \u0628\u0646\u0627\u0621\u064b \u0639\u0644\u0649 \u0645\u0634\u062a\u0631\u064a\u0627\u062a\u0647 \u0627\u0644\u0623\u062e\u064a\u0631\u0629.&lt;\/span&gt;&lt;\/div&gt;&quot;,&quot;ar&quot;:{&quot;title&quot;:&quot;\u0645\u0646\u062a\u062c\u0627\u062a \u0639\u0644\u0649 \u0630\u0648\u0642\u0643&quot;},&quot;en&quot;:{&quot;title&quot;:&quot;Products on Your Taste&quot;},&quot;limit&quot;:&quot;4&quot;,&quot;render_in&quot;:&quot;all&quot;,&quot;title&quot;:&quot;\u0645\u0646\u062a\u062c\u0627\u062a \u0639\u0644\u0649 \u0630\u0648\u0642\u0643&quot;}"></salla-custom-component></section><section class="s-block s-block--bundle-customers-also-bought"><salla-custom-component component-name="customers-also-bought" bundle-id="642379674" config="{&quot;block-categories-global-info&quot;:&quot;&lt;div style=&#039;background:#eff8ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;color:#1d4ed8;font-size:13px;display:flex;gap:8px;align-items:center;margin-bottom:20px&#039;&gt;&lt;i class=\&quot;hgi-stroke hgi-information-circle\&quot; style=\&quot;flex-shrink:0\&quot;&gt;&lt;\/i&gt;&lt;span&gt;\u062a\u0642\u062a\u0631\u062d \u0645\u0646\u062a\u062c\u0627\u062a \u064a\u0641\u0636\u0644 \u0627\u0644\u0639\u0645\u0644\u0627\u0621 \u0634\u0631\u0627\u0624\u0647\u0627 \u0645\u0639 \u0627\u0644\u0645\u0646\u062a\u062c \u0627\u0644\u0645\u0639\u0631\u0648\u0636.&lt;\/span&gt;&lt;\/div&gt;&quot;,&quot;ar&quot;:{&quot;title&quot;:&quot;\u0627\u0644\u0639\u0645\u0644\u0627\u0621 \u0627\u0634\u062a\u0631\u0648\u0627 \u0623\u064a\u0636\u064b\u0627&quot;},&quot;en&quot;:{&quot;title&quot;:&quot;Customers Also Bought&quot;},&quot;limit&quot;:&quot;4&quot;,&quot;render_in&quot;:&quot;all&quot;,&quot;title&quot;:&quot;\u0627\u0644\u0639\u0645\u0644\u0627\u0621 \u0627\u0634\u062a\u0631\u0648\u0627 \u0623\u064a\u0636\u064b\u0627&quot;}"></salla-custom-component></section></div>
+
+		<div class="container s-blocks-wrapper simplified-products  fit-slider-products">
+			<salla-products-slider slider-config='' includes='[]' autoplay source="related" source-value="681568436" block-title="منتجات قد تعجبك" display-all-url></salla-products-slider>
+		</div>
+
+				<div class="s-blocks-wrapper s-after-related"></div>
+
+	</div>
+
+
+	<salla-hook name="product.single:end"></salla-hook></main>
+		<footer class="store-footer s-block--animate   basic-footer ">
+							<div aria-label="footer" class="store-footer__inner">
+			<div class="store-footer__container container">
+				<div class="store-footer__grid grid grid-cols-2 lg:grid-cols-5 lg:gap-6">
+					<div data-selia="footer-brand-column" class="store-footer__brand mb-2.5   col-span-2 ">
+
+						<a href="https://alshamel.sa/" class="footer-logo anime-item" aria-label="logo">
+																					<img src="https://cdn.salla.sa/form-builder/0sf6VHdZWFlXuCPruw8psUDMxpbZ26V4r3nu4x3E.png"  height=&quot;64&quot; style=" height:64px;" alt="الشامل كمبيوتر" class="img-fluid mx-auto lg:mx-[unset]">
+													</a>
+													<p class="footer-description md:max-w-sm leading-6 my-4 text-sm text-center ltr:md:text-left rtl:md:text-right anime-item">
+								<p>شريكك التقني الأمثل</p>
+							</p>
+																		<div class="footer-badges flex items-center justify-center lg:justify-start   anime-item">
+							<salla-trust-badges class="" ></salla-trust-badges>
+													</div>
+																			<div class="store-footer__locale-row flex items-center justify-center md:justify-start my-5 anime-item">
+																																
+															</div>
+											</div>
+
+										
+					<div
+						class="store-footer__links-column mb-2.5  anime-item">
+															<div data-selia="footer-links-column" class="store-footer__menu  ">
+			<h3 class="footer-title links_with_bullits ">روابط مهمة</h3>
+						<ul class="footer-list    links_with_bullits ">
+									<li><a  target="_self" href="https://alshamel.sa/redirect/pages/2015166241" aria-label="itme" data-selia="footer-link" class="store-footer__menu-link text-xs lg:text-base anime-item">من نحن</a></li>
+									<li><a  target="_self" href="https://alshamel.sa/redirect/pages/1840612323" aria-label="itme" data-selia="footer-link" class="store-footer__menu-link text-xs lg:text-base anime-item">سياسة الضمان</a></li>
+									<li><a  target="_self" href="https://alshamel.sa/redirect/pages/976732025" aria-label="itme" data-selia="footer-link" class="store-footer__menu-link text-xs lg:text-base anime-item">سياسة الاستبدال و الاسترجاع</a></li>
+									<li><a  target="_self" href="https://alshamel.sa/blog" aria-label="itme" data-selia="footer-link" class="store-footer__menu-link text-xs lg:text-base anime-item">مدونة المتجر</a></li>
+							</ul>
+					</div>
+						</div>
+					<div
+						class="store-footer__contacts-column mb-2.5   anime-item">
+												<selia-contacts 
+							hide-title="false" 
+							horizontal="false" 
+							enhanced="true" 
+							basic-footer="true" 
+							user-type="guest" 
+							rounded="true" 
+							animate="true">
+						</selia-contacts>
+					</div>
+					<div
+						class="grid-itme col-span-2 lg:col-span-1 mb-2.5 anime-item">
+												<div data-selia="footer-apps-section" class="store-footer__apps anime-item">
+
+			</div>
+
+					</div>
+				</div>
+			</div>
+		</div>
+		<div class="footer-bottom">
+			<div class="store-footer__bottom-inner container py-4">
+				<div class="store-footer__bottom-row flex items-center justify-center lg:justify-between flex-wrap lg:flex-nowrap lg:flex-row flex-col-reverse">
+					<div class="text-sm py-2.5 footer-rights"><p class="text-gray-400 mb-2.5 md:mb-0">الحقوق محفوظة | 2026
+    <a href="https://alshamel.sa" class="hover:text-primary" target="_blank" rel="noreferrer" class="underline">الشامل كمبيوتر</a>
+</p>
+</div>
+
+					<div><salla-payments></salla-payments></div>
+					<div class="store-footer__bottom-social py-2.5 lg:py-0"><salla-social class=" rounded_contacts"></salla-social></div>
+				</div>
+			</div>
+		</div>
+	
+	<span class="hidden w-1/2 mt-4 md:mt-12 sm:w-auto bottom-2 rtl:pl-24 ltr:pr-24 text-storeBG pointer-events-none bg-storeBG from-storeBG h-16 w-16 aspect-[3/4] lg:!w-[60%] lg:!w-[40%] object-fill object-bottom object-left object-right object-none object-top opacity-40 left-2 right-2"></span>
+		<span class="hidden flex flex-1 flex-none items-start items-center justify-between shrink-0 space-y-1 space-y-0.5 space-x-4 rtl:space-x-reverse gap-1.5 gap-2 pt-1 mt-1 mb-2.5 p-2.5 md:p-4 w-20 h-20 rounded object-center object-cover leading-6 text-base text-sm font-bold line-through relative absolute -top-[0.625rem] rtl:-left-[0.625rem] ltr:-right-[0.625rem] border border-gray-100 bg-store-bg-secondary text-store-text-primary text-store-text-secondary text-primary text-red-600"></span>
+</footer>
+
+	</div>
+	
+		<script type="b3359411661330f814fce362-text/javascript">window.baseUrl='https://alshamel.sa/'; window.is_rtl=true; window.locale='ar';</script><script defer src='https://cdn.assets.salla.network/themes/customization/1929904917/632105401/1679036017.js?v=17849849681' type="b3359411661330f814fce362-text/javascript"></script><link rel='stylesheet' href='https://cdn.assets.salla.network/themes/customization/1929904917/632105401/1679036017.css?v=17861963971'><script type="b3359411661330f814fce362-module" id="fast-checkout-js" src="https://cdn.assets.salla.network/prod/@salla.sa/fast-checkout-widget/v0.0.43/widget.esm.js"></script>
+
+
+<script type="importmap">
+    {
+        "imports": {
+            "lit": "https://cdn.assets.salla.network/static/lit/3.3.3/lit.js",
+            "lit/": "https://cdn.assets.salla.network/static/lit/3.3.3/",
+            "lit-html": "https://cdn.assets.salla.network/static/lit/3.3.3/lit-html/lit-html.js",
+            "lit-html/": "https://cdn.assets.salla.network/static/lit/3.3.3/lit-html/",
+            "lit-element": "https://cdn.assets.salla.network/static/lit/3.3.3/lit-element/lit-element.js",
+            "lit-element/": "https://cdn.assets.salla.network/static/lit/3.3.3/lit-element/",
+            "@lit/reactive-element": "https://cdn.assets.salla.network/static/lit/3.3.3/reactive-element/reactive-element.js",
+            "@lit/reactive-element/": "https://cdn.assets.salla.network/static/lit/3.3.3/reactive-element/"
+        }
+    }
+</script>
+<script type="b3359411661330f814fce362-text/javascript">
+    function injectTwilightBundlesAssets() {
+        window.twilightBundlesObserver.disconnect();
+        if (document.querySelector('#twilight-bundles-assets')) {
+            return;
+        }
+
+        const script = document.createElement('script');
+        script.type = 'module';
+        script.src = "https://cdn.assets.salla.network/prod/@salla.sa/twilight-bundles/latest/twilight-bundles.js";
+        script.defer = true;
+        script.id = 'twilight-bundles-assets';
+        document.head.appendChild(script);
+    }
+    window.twilightBundlesObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (node.nodeType === 1 && node.tagName.toLowerCase() === 'salla-custom-component') {
+                    injectTwilightBundlesAssets();
+                    return;
+                }
+            }
+        }
+    });
+
+    window.twilightBundlesObserver.observe(document.body, { childList: true, subtree: true });
+
+    Salla.onReady(() => document.querySelector('salla-custom-component') && injectTwilightBundlesAssets());
+</script>
+<script type="b3359411661330f814fce362-text/javascript">
+    (function() {
+        // Safe threshold: 14KB (browser limit ~16KB, leave buffer)
+        var COOKIE_SIZE_THRESHOLD = 14000;
+
+        // Essential cookies preserved by NAME only
+        var essentialCookies = {
+            // Session & Security
+            exact: [
+                "__said",
+                "__said",
+                "__ssid",
+                "XSRF-TOKEN"
+            ],
+            // Marketing & Analytics (SEO-critical)
+            marketing: [
+                "_fbp", "_fbc",                                   // Meta/Facebook
+                "_ga", "_gid",                                    // Google Analytics
+                "_ttp",                                           // TikTok
+                "_scid", "_scid_r",                               // Snapchat
+                "twclid", "_twitter_sess", "personalization_id",  // Twitter/X
+                "_hjid", "_hjSessionUser"                         // Hotjar
+            ],
+            // Prefix patterns
+            prefixes: [
+                "_ga_",      // GA4 property-specific
+                "_gcl_",     // Google Ads click IDs
+                "_gac_",     // Google Ads conversion
+                "cf_",       // Cloudflare
+                "_hj",       // Hotjar
+                "intercom-"  // Intercom
+            ]
+        };
+
+        function shouldPreserve(name) {
+            name = name.trim();
+            if (essentialCookies.exact.indexOf(name) !== -1) return true;
+            if (essentialCookies.marketing.indexOf(name) !== -1) return true;
+            for (var i = 0; i < essentialCookies.prefixes.length; i++) {
+                if (name.indexOf(essentialCookies.prefixes[i]) === 0) return true;
+            }
+            return false;
+        }
+
+        function deleteCookie(name) {
+            var hostname = window.location.hostname;
+
+            if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(hostname)) {
+                document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';
+                return;
+            }
+            
+            var domains = [
+                '',                    // Browser default
+                hostname,              // Current domain
+                '.' + hostname         // With dot prefix
+            ];
+
+            var parts = hostname.split('.');
+            for (var i = 1; i < parts.length - 1; i++) {
+                domains.push('.' + parts.slice(i).join('.'));
+            }
+
+            var paths = ['/', ''];
+            var expiry = '=; expires=Thu, 01 Jan 1970 00:00:00 UTC';
+
+            for (var i = 0; i < domains.length; i++) {
+                for (var j = 0; j < paths.length; j++) {
+                    var str = name + expiry;
+                    if (paths[j]) str += '; path=' + paths[j];
+                    if (domains[i]) str += '; domain=' + domains[i];
+                    document.cookie = str;
+                }
+            }
+        }
+
+        // Get cookie size with fallback for older browsers (IE11, Safari < 10.1)
+        function getCookieSize() {
+            var cookie = document.cookie;
+            if (typeof TextEncoder !== 'undefined') {
+                return new TextEncoder().encode(cookie).length;
+            }
+
+            // Fallback: count UTF-8 bytes manually (handles surrogate pairs)
+            var bytes = 0;
+            for (var i = 0; i < cookie.length; i++) {
+                var c = cookie.charCodeAt(i);
+                if (c < 128) {
+                    bytes += 1;
+                } else if (c < 2048) {
+                    bytes += 2;
+                } else if (c >= 0xD800 && c <= 0xDBFF) {
+                    var next = i + 1 < cookie.length ? cookie.charCodeAt(i + 1) : 0;
+                    if (next >= 0xDC00 && next <= 0xDFFF) {
+                        bytes += 4;
+                        i++; 
+                    } else {
+                        bytes += 3;
+                    }
+                } else if (c >= 0xDC00 && c <= 0xDFFF) {
+                    bytes += 3;
+                } else {
+                    bytes += 3;
+                }
+            }
+            return bytes;
+        }
+
+        function parseCookies(cookieStr) {
+            if (!cookieStr) return [];
+            var cookies = [];
+            var pairs = cookieStr.split('; ');
+            for (var i = 0; i < pairs.length; i++) {
+                var idx = pairs[i].indexOf('=');
+                var name;
+                if (idx === -1) {
+                    name = pairs[i].trim();
+                } else {
+                    name = pairs[i].substring(0, idx).trim();
+                }
+                if (name) {
+                    cookies.push({ name: name });
+                }
+            }
+            return cookies;
+        }
+
+        function cleanCookies() {
+            try {
+                if (getCookieSize() < COOKIE_SIZE_THRESHOLD) return;
+
+                var cookies = parseCookies(document.cookie);
+                for (var i = 0; i < cookies.length; i++) {
+                    if (!shouldPreserve(cookies[i].name)) {
+                        deleteCookie(cookies[i].name);
+                    }
+                }
+            } catch (e) {
+                // Silent fail - don't break page for cookie cleanup errors
+            }
+        }
+
+        // Initial cleanup on load && Periodic cleanup for SPAs and long sessions
+        cleanCookies();
+        setInterval(cleanCookies, 10000);
+    })();
+</script>
+    
+    <script type="b3359411661330f814fce362-text/javascript">
+      function dispatchSallaEvents() {
+        salla.event.dispatchEvents({"twilight::init":{"store":{"id":1929904917,"ray":50,"logo":"https:\/\/cdn.files.salla.network\/theme\/1929904917\/5e4a393d-fde6-4484-b5e5-b63bdc2c3324.webp","icon":"https:\/\/cdn.salla.sa\/rGOOz\/OgKu1dtsF7hn61NlJIhICdT2iBh8J5z6vFUFAWx4.png","name":"\u0627\u0644\u0634\u0627\u0645\u0644 \u0643\u0645\u0628\u064a\u0648\u062a\u0631","username":"alshamel.sa","store_country":"SA","country":"SA","url":"https:\/\/alshamel.sa\/","settings":{"auth":{"email_allowed":true,"mobile_allowed":false,"is_email_required":false,"countries":["sa"],"force_login":false,"whatsapp_allowed":false,"whatsapp_countries":[],"whatsapp_merchant_allowed":false,"user_country":"DE"},"cart":{"apply_coupon_enabled":false,"basket_gap":true,"multi_coupon":false},"product":{"total_sold_enabled":0,"manual_quantity":true,"fit_type":"cover","related_products_enabled":true,"product-recommendation-type":"category","filters":{"category_id":true,"brand_id":true,"price":true,"variants":true,"rating":true,"tag_name":false},"show_comments":true,"user_can_comment":true,"show_price_as_dash":false,"notify_options_availability":true,"show_special_offers":false,"show_more":true,"availability_notify":{"email":true,"sms":true,"mobile":false,"whatsapp":false},"bought_together":true},"category":{"testimonial_enabled":true},"payments":["mada","credit_card","bank","stc_pay","apple_pay","tabby_installment","tamara_installment","emkan_installment"],"arabic_numbers_enabled":false,"content_copyright":false,"use_sar_symbol":true,"is_multilingual":false,"currencies_enabled":false,"rating_enabled":true,"rating":{"is_enabled":true,"show_on_category":true,"show_on_product":true,"can_rate_store":true,"can_rate_product":true,"can_rate_shipping":true,"show_rating_summary":false,"show_recommendation":true,"allow_likes":true,"allow_attach_images":false,"required_attach_images":false,"allow_attach_videos":false,"required_attach_videos":false,"allow_contact_support":false,"allow_update":false,"update_period":7,"can_customer_hide_name":false,"visitor_can_comment":false,"page_feedback_enabled":true,"allow_reviews_from_product_page":false,"rating_store_points":null,"rating_product_points":null,"rating_shipping_company_points":null,"rating_product_with_image_points":null},"blog":{"is_enabled":true,"allow_likes_and_comments":true},"is_loyalty_enabled":false,"keys":{"maps":"AIzaSyAZpoNuLbXR-VvGYEP4ZbMD9FqZiwjkIkU","gtm":[]},"is_salla_gateway":true,"upload_size":2000,"tax":{"number":null,"certificate":"https:\/\/cdn.salla.sa\/rGOOz\/S2M2VoTTeLtvRX4bCoSlcUAGgBqpmw4jCcQbqYVW.png","taxable_prices_enabled":true},"certificate":{"id":"0000032585"},"made_in_ksa":false,"commercial_number":"7033543294","freelance_number":null,"buy_now":{"label":"Salla","countryCode":"SA","supportedCountries":["SA","BH","KW","OM","QA","AE","JO"],"supportedNetworks":["masterCard","visa"],"validateUri":"\/checkout\/applepay\/validate","myfatoorahS2s":false,"currency":"SAR","networks":["masterCard","visa"],"countries":["SA","BH","KW","OM","QA","AE","JO"],"is_digital":false,"merchant_identifier":"merchant.pay.salla.sa.2"},"installments":{"tabby":{"merchantCode":"default","publicKey":"pk_7ddde4b0-5e56-4536-b549-a8c530f4250f","installments":"4","has_details":true},"tamara":{"merchantCode":"default","publicKey":"ef3ea226-4041-48f8-8e05-5091b09b0f92","installments":"4","has_details":true},"emkan":[]},"quick_order":null,"bullet_delivery":null,"order_options":{"mandatory":false}},"meta":{"title":"\u0627\u0644\u0634\u0627\u0645\u0644 \u0643\u0645\u0628\u064a\u0648\u062a\u0631 \u0634\u0631\u064a\u0643\u0643 \u0627\u0644\u062a\u0642\u0646\u064a \u0627\u0644\u0623\u0645\u062b\u0644","description":"\u0645\u062a\u062c\u0631 \u062a\u0642\u0646\u064a \u064a\u0642\u062f\u0645 \u062d\u0644\u0648\u0644 \u0627\u0644\u062d\u0627\u0633\u0628 \u0648\u0627\u0644\u0623\u062c\u0647\u0632\u0629 \u0627\u0644\u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0629 \u0628\u062c\u0648\u062f\u0629 \u0639\u0627\u0644\u064a\u0629 \u0648\u0623\u0633\u0639\u0627\u0631 \u0645\u0646\u0627\u0641\u0633\u0629. \u0645\u0639 \u062a\u062c\u0631\u0628\u0629 \u0634\u0631\u0627\u0621 \u0633\u0647\u0644\u0629 \u0648\u0645\u0648\u0627\u0635\u0641\u0627\u062a \u062f\u0642\u064a\u0642\u0629 \u0648\u062a\u0648\u0635\u064a\u0644 \u0633\u0631\u064a\u0639 \u0648\u062e\u062f\u0645\u0629 \u0623\u0641\u0636\u0644 \u0645\u0633\u062a\u0645\u0631\u0629.","keywords":"\u0627\u0644\u0634\u0627\u0645\u0644. \u0627\u0644\u0634\u0627\u0645\u0644 \u0643\u0645\u0628\u064a\u0648\u062a\u0631. \u0636\u0648\u0621 \u0627\u0644\u0634\u0627\u0645\u0644. \u0643\u0645\u0628\u064a\u0648\u062a\u0631. \u0644\u0627\u0628\u062a\u0648\u0628. \u0643\u064a\u0628\u0648\u0631\u062f. \u0645\u0627\u0648\u0633. \u0627\u0628\u0644. \u0627\u0633\u0648\u0633. \u0644\u064a\u0646\u0648\u0641\u0648"},"scope":null,"template":null,"contacts":{"whatsapp":"+9660163855556","phone":"163855556","email":"info@alshamel.sa"},"social":{"instagram":"https:\/\/www.instagram.com\/alshamel.sa\/","twitter":"https:\/\/twitter.com\/Alshamel_sa","snapchat":"https:\/\/www.snapchat.com\/add\/alshamel_sa","tiktok":"https:\/\/www.tiktok.com\/@alshamel.sa?is_from_webapp=1&sender_device=pc"},"description":"<p>\u0634\u0631\u064a\u0643\u0643 \u0627\u0644\u062a\u0642\u0646\u064a \u0627\u0644\u0623\u0645\u062b\u0644<\/p>","apps":[],"features":["loyalty-system-v2","conditional-offer","custom-fields","legacy-login-flow","guest-checkout","embedded-login-checkout","salla-account","re-captcha-v3","tiered-offer","bullet-delivery-v2","order-options","feedback-video-attachments","ai-driven-personalized-product","reorder","new_popup_rating"],"is_merchant":false,"support_pickup":true,"order_instruction":{"thank_title":"\u0634\u0643\u0631\u0627 \u0644\u062a\u0633\u0648\u0651\u0642\u0643\u0645 \u0639\u0628\u0631 \u0645\u062a\u062c\u0631\u0646\u0627 \u263a\ufe0f","order_instructions_payment_waiting":"\u0637\u0644\u0628\u0643 \u062d\u0627\u0644\u064a\u0627\u064b \u063a\u064a\u0631 \u0645\u0624\u0643\u062f !<br>\u0646\u0623\u0645\u0644 \u062a\u0623\u0643\u064a\u062f \u0627\u0644\u062f\u0641\u0639 \u0639\u0628\u0631 \u0627\u0644\u0631\u0627\u0628\u0637 \u0627\u0644\u0645\u0631\u0633\u0644 \u0644\u062c\u0648\u0627\u0644\u0643","order_instructions_under_review":"\u062a\u0645 \u0627\u0633\u062a\u0642\u0628\u0627\u0644 \u0637\u0644\u0628\u0643 \u0628\u0646\u062c\u0627\u062d<br>\u0633\u062a\u062a\u0645 \u0645\u0631\u0627\u062c\u0639\u0629 \u0627\u0644\u0637\u0644\u0628 \u0648\u062a\u0623\u0643\u064a\u062f\u0647 \u0641\u064a \u0623\u0642\u0631\u0628 \u0648\u0642\u062a","order_instructions_completed":"\u062a\u0645 \u0627\u0633\u062a\u0642\u0628\u0627\u0644 \u0637\u0644\u0628\u0643 \u0628\u0646\u062c\u0627\u062d<br>\u0633\u064a\u062a\u0645 \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0637\u0644\u0628 \u0641\u064a \u0623\u0642\u0631\u0628 \u0648\u0642\u062a"},"shipping":{"delivery_location":null,"support_pickup":true}},"debug":false,"theme":{"name":"632105401","profile":{"id":1679036017,"name":null},"mode":"live","translations_hash":"178619084237","is_rtl":true,"color":{"primary":"#e2741a","text":"#ffffff","is_dark":false,"reverse_primary":"#e2741a","reverse_text":"#630000"},"settings":{"is_breadcrumbs_enabled":true,"placeholder":"https:\/\/cdn.selia-tech.com\/images\/placeholder.png"},"assets":"https:\/\/cdn.assets.salla.network\/themes\/581928698\/1.203.0\/:path","bundle_assets":"https:\/\/cdn.assets.salla.network\/themes\/:bundle\/latest\/:component.js","twilight":{"version":"2.14.548"}},"trace_console":false,"user":{"id":"CPWKeKbXCEjgfQPyESO8E8plc2fytOqs8ke4S2eP","type":"guest","email":null,"mobile":null,"language_code":"ar","currency_code":"SAR","country_code":"DE","can_comment":false,"avatar":"https:\/\/cdn.assets.salla.network\/prod\/stores\/themes\/default\/assets\/images\/avatar_male.png","is_hidden_name":null,"default_geo_location":{"lat":49.45421,"lng":11.07752},"first_name":null,"last_name":null,"is_notifiable":false,"fetched_at":"2026-08-17","gender":"","birthday":null},"currencies":{"SAR":{"code":"SAR","name":"\u0631\u064a\u0627\u0644 \u0633\u0639\u0648\u062f\u064a","symbol":"\u0631.\u0633","amount":1,"country_code":"sa"}},"languages":{"AR":{"name":"\u0627\u0644\u0639\u0631\u0628\u064a\u0629","code":"ar","url":"https:\/\/assets.salla.sa\/images\/flags\/ar.svg","is_rtl":true,"country_code":"sa"}},"events":{"Product Viewed":[{"id":681568436,"name":"\u0628\u064a\u062a \u0647\u0627\u0631\u062f \u062f\u064a\u0633\u0643 \u062e\u0627\u0631\u062c\u064a \u0663.\u0665 \u0628\u0648\u0635\u0629","categories":[{"id":7158311,"name":"\u0627\u0644\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a"},{"id":7158312,"name":"\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a \u0645\u0643\u062a\u0628\u064a\u0629"},{"id":7167100,"name":"\u0627\u0644\u062a\u062e\u0632\u064a\u0646"}],"category":"\u0627\u0644\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a\/\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a \u0645\u0643\u062a\u0628\u064a\u0629\/\u0627\u0644\u062a\u062e\u0632\u064a\u0646","price":68.7,"quantity":1,"variant":"","brand":"","image":"https:\/\/cdn.salla.sa\/rGOOz\/db0e176b-4bda-40b0-bd23-c4bebb7bc9b3-400.5x500-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png","currency":"SAR","sku":"7010602020","value":68,"url":"https:\/\/alshamel.sa\/\u0645\u062d\u0648\u0644-\u062e\u0627\u0631\u062c\u064a-hdd\/p681568436","image_url":"https:\/\/cdn.salla.sa\/rGOOz\/db0e176b-4bda-40b0-bd23-c4bebb7bc9b3-400.5x500-LG0NC7aHwOBcdMKULima8MulHAqDikqpw5QomsJD.png"}]},"page":{"title":"\u0628\u064a\u062a \u0647\u0627\u0631\u062f \u062f\u064a\u0633\u0643 \u062e\u0627\u0631\u062c\u064a \u0663.\u0665 \u0628\u0648\u0635\u0629","slug":"product.single","id":681568436,"parent":{"id":"product.index","title":"\u0627\u0644\u062a\u062e\u0632\u064a\u0646","url":"https:\/\/alshamel.sa\/\u0627\u0644\u062a\u062e\u0632\u064a\u0646\/c1447374815","parent":{"id":"product.index","title":"\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a \u0645\u0643\u062a\u0628\u064a\u0629","url":"https:\/\/alshamel.sa\/\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a-\u0645\u0643\u062a\u0628\u064a\u0629\/c1955665283","parent":{"id":"product.index","title":"\u0627\u0644\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a","url":"https:\/\/alshamel.sa\/\u0627\u0644\u0627\u0643\u0633\u0633\u0648\u0627\u0631\u0627\u062a\/c448067202"}}}},"headers":{"S-Ray":50,"s-version-id":1679036017},"login":{"url":"https:\/\/accounts.salla.com","turnstile_site_key":"0x4AAAAAAAw2tbDBgPI9NUvr","turnstile":{"key":"0x4AAAAAAAw2tbDBgPI9NUvr","level":"off"},"social":{"google":true,"facebook":true,"apple":true,"x":false}},"jitsu":{"host":"https:\/\/st.salla.dev","key":"yAKBxDDlIeg8c0qsNtlkjo4up1iTv68J:XSd8tVk8rqijFlxTacQv5QlAGcVuYPzy","events":["Order Completed","Product Added","Product Removed","Product Viewed","Product Added to Wishlist","Product Removed from Wishlist","Cart Viewed","Products Searched","Product List Viewed","Signed Up","Signed In","Signed Out","Product Reviewed","Product Shared","Checkout Started","Payment Info Entered","Coupon Applied","Coupon Denied","Coupon Entered","Coupon Removed","Checkout Step Completed","Promotion Viewed","Promotion Clicked","User Profile Updated","Product List Filtered","Cart Updated","Payment Failed","Checkout Step Viewed","Market Selected","Address Added","Address Updated","Map Clicked","Product Reordered","Recommendation List Viewed","Product Clicked","Payment Submitted","Payment Succeeded","Payment Pending","Guest Registered"],"track_url":"https:\/\/alshamel.sa\/_app\/e\/api\/s\/track","context":{"extra":{"version":"1.1144.2","headers":{"s-server-version":"one"}}}},"affiliate":{"utm_url":"https:\/\/api.salla.dev\/marketing\/v1\/tracking\/visits","cta_enabled":true},"swoole":["comments","rating","feedback","loyalty","advertisements","menus","products","offers","orders","reviews","currencies","scopes","languages","components"],"policy_url":""},"services::snapchat_pixel.init":{"services":{"snapchat_pixel":{"pixel_id":"8780e826-5e10-4f3a-8512-c9384e4b8ca7","version":"salla-v2"}}},"services::tiktok_pixel.init":{"services":{"tiktok_pixel":{"pixel_id":"D7O6AGBC77UDOFSG8F40"}}},"services::google_analytics.init":{"services":{"google_analytics":{"tracking_id":"G-ZSVEKV1SQE"}}},"services::addon-microsoft-clarity.init":{"services":{"addon-microsoft-clarity":{"project_id":"weloftmqtm"}}},"services::facebook_pixel.init":{"services":{"facebook_pixel":{"pixel_id":"803563052449996"}}},"page.view":{"route":"product.showWithSlug","link":"https:\/\/alshamel.sa\/%D9%85%D8%AD%D9%88%D9%84-%D8%AE%D8%A7%D8%B1%D8%AC%D9%8A-hdd\/p681568436","fingerprint":"6de44be77ef1dbbffc124db2156b587a967a85dd"}})
+      }
+
+      if (window.Salla && Salla.status)
+        dispatchSallaEvents();
+      else window.addEventListener('salla::created', dispatchSallaEvents, {once: true});
+    </script>
+<script type="b3359411661330f814fce362-text/javascript">
+    var _user_id = ''; // Set to the user's ID, username, or email address, or '' if not yet known.
+    var _session_id = 'CPWKeKbXCEjgfQPyESO8E8plc2fytOqs8ke4S2eP'; // Set to a unique session ID for the visitor's current browsing session.
+
+    var _sift = window._sift = window._sift || [];
+    _sift.push(['_setAccount', '42e2369b33']);
+    _sift.push(['_setUserId', _user_id]);
+    _sift.push(['_setSessionId', _session_id]);
+    _sift.push(['_trackPageview']);
+
+   (function() {
+     function ls() {
+       var e = document.createElement('script');
+       e.src = 'https://cdn.sift.com/s.js';
+       document.body.appendChild(e);
+     }
+     if (window.attachEvent) {
+       window.attachEvent('onload', ls);
+     } else {
+       window.addEventListener('load', ls, false);
+     }
+   })();
+  </script><script type="b3359411661330f814fce362-text/javascript">
+  Salla.onReady(() => {
+const latestProduct = {
+name: 'latest-product', 
+track: function(event, payload) {
+  if (event !== 'Product Viewed') return;
+
+  const pageId = salla.config.get('page').id;
+      console.log('pageId:', pageId, 'is product.single?', salla.url.is_page('product.single'));
+  
+      if (!pageId || !salla.url.is_page('product.single')) return;
+  
+      const storageKey = 's-viewed-products-' + salla.config.get('store')?.id;
+  
+      let existingIds = salla.storage.get(storageKey);
+      console.log('before get:', existingIds, 'type:', typeof existingIds);
+  
+      if (typeof existingIds === 'string') {
+        try { existingIds = JSON.parse(existingIds); } catch { existingIds = []; }
+      }
+      if (!Array.isArray(existingIds)) existingIds = [];
+  
+      const pid = String(pageId);
+      const filteredIds = existingIds.filter(id => String(id) !== pid);
+      filteredIds.unshift(pid);
+  
+      salla.storage.set(storageKey, filteredIds);
+  
+      console.log('after set:', salla.storage.get(storageKey));
+}, 
+page:()=>{}};
+Salla.analytics.registerTracker(latestProduct);
+  });
+</script>
+<script type="b3359411661330f814fce362-text/javascript">
+  Salla.onReady(() => {
+    (() => {
+      
+      const allowed_pages = ["thank-you"]; 
+      const title = {"ar":"شاهدتها مؤخرا","en":"watched it recently"};
+      const limit = "32";
+      const lang = salla.config.get('user')?.language_code || 'ar';
+
+      const injectSection = () => {
+        console.log("allowed_pages:", allowed_pages);
+        console.log("title:", title[lang]);
+        console.log("limit:", limit);
+
+        const slug = salla.config.get("page")?.slug;
+        if (!allowed_pages.includes(slug)) return null;
+
+        let section = document.getElementById("viewed-section");
+        if (section) return section;
+
+        const footer = document.querySelector(".store-footer");
+        if (!footer) return null;
+
+        const html = `
+          <section id="viewed-section" class="s-block container mt-6 sm:mt-8">
+            <div class="s-block__title">
+              <div class="right-side">
+                <h2>${title[lang]}</h2>
+              </div>
+            </div>
+
+            <salla-products-slider autoplay id="viewed-products-list" source="selected" limit="${limit}"></salla-products-slider>
+          </section>
+        `;
+
+        footer.insertAdjacentHTML("beforebegin", html);
+        return document.getElementById("viewed-section");
+      };
+
+      const initViewedProducts = () => {
+        const section = document.getElementById("viewed-section");
+        const list = document.getElementById("viewed-products-list");
+
+        if (!section || !list) return;
+
+        if (!window.salla?.storage || !window.salla?.config) {
+          section.style.display = "none";
+          return;
+        }
+
+        const storeId = salla.config.get("store")?.id;
+        const key = "s-viewed-products-" + storeId;
+
+        const products = salla.storage.get(key) || [];
+        const currentProductId = salla.config.get("page")?.id;
+
+        if (!Array.isArray(products) || products.length === 0) {
+          section.style.display = "none";
+          return;
+        }
+
+        const filteredProducts = currentProductId
+          ? products.filter((product) => {
+              const productId = (product && product.id) ? product.id : product;
+              return String(productId) !== String(currentProductId);
+            })
+          : products;
+
+        if (filteredProducts.length === 0) {
+          section.style.display = "none";
+          return;
+        }
+        
+        const limitedProducts = filteredProducts.slice(0, 32);
+
+        list.setAttribute("source-value", JSON.stringify(limitedProducts));
+        section.style.display = "";
+      };
+
+      const run = () => {
+        const section = injectSection();
+        if (!section) return;
+        initViewedProducts();
+      };
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", run);
+      } else {
+        run();
+      }
+    })();
+  });
+</script>
+<style>
+  .s-translate-wrap,
+  .s-translate-all-wrap {
+    margin-top: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .s-translate-all-wrap {
+    margin-top: 12px;
+    margin-bottom: 16px;
+  }
+
+  .s-translate-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    color: var(--theme-primary-color, inherit);
+    line-height: 1.2;
+  }
+
+  .s-translate-btn svg {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    vertical-align: middle;
+  }
+
+  .s-translate-btn[disabled] {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  html[dir="rtl"] .s-translate-btn {
+    flex-direction: row-reverse;
+  }
+</style>
+
+<script type="b3359411661330f814fce362-text/javascript">
+(function () {
+  function initCommentsTranslation() {
+    if (!window.Salla || !Salla.onReady) {
+      setTimeout(initCommentsTranslation, 300);
+      return;
+    }
+
+    Salla.onReady(function (config) {
+      const userLang = normalizeLang(
+        config?.user?.language_code ||
+        config?.user?.language ||
+        config?.language ||
+        document.documentElement.lang ||
+        'en'
+      );
+
+      const primaryColor = config?.theme?.color?.primary || '#007bff';
+      document.documentElement.style.setProperty('--theme-primary-color', primaryColor);
+
+      const ICON = `
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M18.5 10L22.9 21H20.745L19.544 18H15.454L14.255 21H12.101L16.5 10H18.5ZM10 2V4H16V6L14.0322 6.0006C13.2425 8.36616 11.9988 10.5057 10.4115 12.301C11.1344 12.9457 11.917 13.5176 12.7475 14.0079L11.9969 15.8855C10.9237 15.2781 9.91944 14.5524 8.99961 13.7249C7.21403 15.332 5.10914 16.5553 2.79891 17.2734L2.26257 15.3442C4.2385 14.7203 6.04543 13.6737 7.59042 12.3021C6.46277 11.0281 5.50873 9.57985 4.76742 8.00028L7.00684 8.00037C7.57018 9.03885 8.23979 10.0033 8.99967 10.877C10.2283 9.46508 11.2205 7.81616 11.9095 6.00101L2 6V4H8V2H10ZM17.5 12.8852L16.253 16H18.745L17.5 12.8852Z" fill="currentColor"/>
+        </svg>`;
+
+      const labels = getLabels(userLang);
+      const translationCache = new Map();
+
+      function normalizeLang(lang) {
+        const map = {
+          ar: 'ar',
+          en: 'en',
+          sq: 'sq',
+          hy: 'hy',
+          bg: 'bg',
+          zh: 'zh-CN',
+          cn: 'zh-CN',
+          hr: 'hr',
+          cs: 'cs',
+          da: 'da',
+          nl: 'nl',
+          et: 'et',
+          fi: 'fi',
+          fr: 'fr',
+          de: 'de',
+          el: 'el',
+          he: 'iw',
+          iw: 'iw',
+          hi: 'hi',
+          hu: 'hu',
+          ind: 'id',
+          id: 'id',
+          ga: 'ga',
+          it: 'it',
+          ja: 'ja',
+          ko: 'ko',
+          lv: 'lv',
+          mt: 'mt',
+          fa: 'fa',
+          pl: 'pl',
+          pt: 'pt',
+          ro: 'ro',
+          ru: 'ru',
+          sl: 'sl',
+          es: 'es',
+          sv: 'sv',
+          tl: 'tl',
+          tr: 'tr',
+          uk: 'uk',
+          ur: 'ur',
+          ba: 'bn',
+          bn: 'bn'
+        };
+
+        const clean = String(lang || 'en').toLowerCase().split('-')[0];
+        return map[clean] || clean || 'en';
+      }
+
+      function langBase(lang) {
+        lang = String(lang || '').toLowerCase();
+
+        if (lang === 'iw') return 'he';
+        if (lang === 'zh-cn' || lang === 'zh-tw') return 'zh';
+
+        return lang.split('-')[0];
+      }
+
+      function getLabels(lang) {
+        const key = langBase(lang);
+
+        const all = {
+          ar: {
+            translate: 'ترجمة إلى العربية',
+            revert: 'عرض النص الأصلي',
+            translating: 'جارٍ الترجمة...',
+            failed: 'فشلت الترجمة',
+            translateAll: 'ترجمة جميع التعليقات إلى العربية',
+            revertAll: 'استعادة جميع النصوص الأصلية'
+          },
+          en: {
+            translate: 'Translate to English',
+            revert: 'See original',
+            translating: 'Translating...',
+            failed: 'Translation failed',
+            translateAll: 'Translate all to English',
+            revertAll: 'See originals'
+          },
+          fr: {
+            translate: 'Traduire en français',
+            revert: "Voir l'original",
+            translating: 'Traduction...',
+            failed: 'Échec de la traduction',
+            translateAll: 'Traduire tous les commentaires en français',
+            revertAll: 'Restaurer tous les originaux'
+          },
+          de: {
+            translate: 'Ins Deutsche übersetzen',
+            revert: 'Original anzeigen',
+            translating: 'Übersetzen...',
+            failed: 'Übersetzung fehlgeschlagen',
+            translateAll: 'Alle Kommentare ins Deutsche übersetzen',
+            revertAll: 'Alle Originale wiederherstellen'
+          },
+          es: {
+            translate: 'Traducir al español',
+            revert: 'Ver original',
+            translating: 'Traduciendo...',
+            failed: 'Traducción fallida',
+            translateAll: 'Traducir todos los comentarios al español',
+            revertAll: 'Restaurar todos los originales'
+          },
+          tr: {
+            translate: 'Türkçeye çevir',
+            revert: 'Orijinali gör',
+            translating: 'Çevriliyor...',
+            failed: 'Çeviri başarısız',
+            translateAll: 'Tüm yorumları Türkçeye çevir',
+            revertAll: 'Tüm orijinalleri geri yükle'
+          }
+        };
+
+        return all[key] || {
+          translate: 'Translate',
+          revert: 'See original',
+          translating: 'Translating...',
+          failed: 'Translation failed',
+          translateAll: 'Translate all',
+          revertAll: 'See originals'
+        };
+      }
+
+      function isEmptyCommentText(text) {
+        return !String(text || '').replace(/\s+/g, '').trim();
+      }
+
+      async function translateText(text, target) {
+        const cleanText = String(text || '').trim();
+
+        if (isEmptyCommentText(cleanText)) {
+          return {
+            translated: '',
+            detected: ''
+          };
+        }
+
+        const cacheKey = `${target}::${cleanText}`;
+
+        if (translationCache.has(cacheKey)) {
+          return translationCache.get(cacheKey);
+        }
+
+        const url =
+          'https://translate.googleapis.com/translate_a/single' +
+          '?client=gtx' +
+          '&sl=auto' +
+          '&tl=' + encodeURIComponent(target) +
+          '&dt=t' +
+          '&q=' + encodeURIComponent(cleanText);
+
+        try {
+          const res = await fetch(url);
+
+          if (!res.ok) {
+            throw new Error('Translation request failed');
+          }
+
+          const data = await res.json();
+
+          const result = {
+            translated: (data?.[0] || []).map(function (part) {
+              return part?.[0] || '';
+            }).join(''),
+            detected: data?.[2] || ''
+          };
+
+          translationCache.set(cacheKey, result);
+          return result;
+        } catch (error) {
+          return {
+            translated: cleanText,
+            detected: '',
+            error: true
+          };
+        }
+      }
+
+      function getCommentTextElement(comment) {
+        return (
+          comment.querySelector('.s-comments-item-content p') ||
+          comment.querySelector('.s-comments-item-content') ||
+          comment.querySelector('p')
+        );
+      }
+
+      function getCommentsContainer() {
+        return (
+          document.querySelector('.s-comments-container') ||
+          document.querySelector('.s-comments') ||
+          document.querySelector('salla-comments') ||
+          document.querySelector('[class*="comments"]')
+        );
+      }
+
+      function getAllComments() {
+        return Array.from(document.querySelectorAll('salla-comment-item'));
+      }
+
+      function isSameAsWebsiteLanguage(comment) {
+        const detectedLang = comment.dataset.lang || '';
+
+        if (!detectedLang) {
+          return false;
+        }
+
+        return langBase(detectedLang) === langBase(userLang);
+      }
+
+      function updateGlobalRowVisibility() {
+        const row = document.querySelector('.s-translate-all-wrap');
+
+        if (!row) return;
+
+        const comments = getAllComments();
+
+        const hasTranslatableComment = comments.some(function (comment) {
+          const textElement = getCommentTextElement(comment);
+          const original = comment.dataset.originalText || textElement?.textContent?.trim() || '';
+
+          if (isEmptyCommentText(original)) return false;
+
+          const detectedLang = comment.dataset.lang || '';
+
+          if (!detectedLang) return false;
+
+          return langBase(detectedLang) !== langBase(userLang);
+        });
+
+        row.style.display = hasTranslatableComment ? '' : 'none';
+      }
+
+      function ensurePerCommentControls(comment) {
+        if (!comment || comment.nodeType !== 1) return;
+
+        const textElement = getCommentTextElement(comment);
+
+        if (!textElement) return;
+
+        const currentText = textElement.textContent.trim();
+        let existingWrap = comment.querySelector(':scope .s-translate-wrap');
+
+        if (isEmptyCommentText(currentText)) {
+          if (existingWrap) existingWrap.remove();
+
+          comment.dataset.skipTranslate = 'true';
+          comment.dataset.originalText = '';
+          comment.dataset.lang = '';
+          updateGlobalRowVisibility();
+          return;
+        }
+
+        comment.dataset.skipTranslate = 'false';
+
+        if (!comment.dataset.originalText) {
+          comment.dataset.originalText = currentText;
+        }
+
+        let wrap = existingWrap;
+
+        if (!wrap) {
+          wrap = document.createElement('div');
+          wrap.className = 's-translate-wrap';
+          textElement.insertAdjacentElement('afterend', wrap);
+        }
+
+        if (!wrap.dataset.ready) {
+          wrap.innerHTML = `
+            <button type="button" class="s-translate-btn" data-action="translate">
+              <span>${labels.translate}</span>${ICON}
+            </button>
+            <button type="button" class="s-translate-btn" data-action="revert" style="display:none;">
+              <span>${labels.revert}</span>${ICON}
+            </button>
+          `;
+
+          wrap.dataset.ready = 'true';
+        }
+
+        const translateBtn = wrap.querySelector('[data-action="translate"]');
+        const revertBtn = wrap.querySelector('[data-action="revert"]');
+
+        if (!translateBtn || !revertBtn) return;
+
+        if (comment.dataset.isTranslated === 'true') {
+          translateBtn.style.display = 'none';
+          revertBtn.style.display = '';
+        }
+
+        if (!comment.dataset.langDetecting && !comment.dataset.lang) {
+          comment.dataset.langDetecting = 'true';
+
+          translateText(comment.dataset.originalText, userLang).then(function (result) {
+            comment.dataset.lang = result.detected || '';
+            comment.dataset.langDetecting = 'false';
+
+            const sameLang = isSameAsWebsiteLanguage(comment);
+
+            if (sameLang && comment.dataset.isTranslated !== 'true') {
+              translateBtn.style.display = 'none';
+              revertBtn.style.display = 'none';
+            } else if (comment.dataset.isTranslated !== 'true') {
+              translateBtn.style.display = '';
+              revertBtn.style.display = 'none';
+            }
+
+            updateGlobalRowVisibility();
+          });
+        } else {
+          const sameLang = isSameAsWebsiteLanguage(comment);
+
+          if (sameLang && comment.dataset.isTranslated !== 'true') {
+            translateBtn.style.display = 'none';
+            revertBtn.style.display = 'none';
+          }
+        }
+
+        updateGlobalRowVisibility();
+      }
+
+      function ensureGlobalRow() {
+        const container = getCommentsContainer();
+
+        if (!container) return;
+
+        const hasComments = !!document.querySelector('salla-comment-item');
+
+        let header =
+          container.querySelector('.s-comments-header') ||
+          container.querySelector('[class*="comments-header"]') ||
+          container.firstElementChild;
+
+        let row = container.querySelector('.s-translate-all-wrap');
+
+        if (!hasComments) {
+          if (row) row.remove();
+          return;
+        }
+
+        if (!row) {
+          row = document.createElement('div');
+          row.className = 's-translate-all-wrap';
+          row.style.display = 'none';
+
+          row.innerHTML = `
+            <button type="button" class="s-translate-btn" data-action="translate-all">
+              <span>${labels.translateAll}</span>${ICON}
+            </button>
+            <button type="button" class="s-translate-btn" data-action="revert-all" style="display:none;">
+              <span>${labels.revertAll}</span>${ICON}
+            </button>
+          `;
+
+          if (header) {
+            header.insertAdjacentElement('afterend', row);
+          } else {
+            container.insertAdjacentElement('afterbegin', row);
+          }
+        }
+
+        updateGlobalRowVisibility();
+      }
+
+      async function translateComment(comment) {
+        const textElement = getCommentTextElement(comment);
+
+        if (!textElement) return;
+
+        const original = comment.dataset.originalText || textElement.textContent.trim();
+
+        if (isEmptyCommentText(original)) {
+          const wrap = comment.querySelector(':scope .s-translate-wrap');
+          if (wrap) wrap.remove();
+          return;
+        }
+
+        const sameLang = isSameAsWebsiteLanguage(comment);
+
+        if (sameLang) return;
+
+        const result = await translateText(original, userLang);
+
+        if (!result.error && result.translated) {
+          textElement.textContent = result.translated;
+          comment.dataset.isTranslated = 'true';
+        }
+
+        const wrap = comment.querySelector(':scope .s-translate-wrap');
+
+        if (wrap) {
+          const translateBtn = wrap.querySelector('[data-action="translate"]');
+          const revertBtn = wrap.querySelector('[data-action="revert"]');
+
+          if (translateBtn && revertBtn) {
+            translateBtn.style.display = 'none';
+            revertBtn.style.display = '';
+          }
+        }
+      }
+
+      function revertComment(comment) {
+        const textElement = getCommentTextElement(comment);
+
+        if (!textElement) return;
+
+        const original = comment.dataset.originalText;
+
+        if (!isEmptyCommentText(original)) {
+          textElement.textContent = original;
+        }
+
+        comment.dataset.isTranslated = 'false';
+
+        const wrap = comment.querySelector(':scope .s-translate-wrap');
+
+        if (wrap) {
+          const translateBtn = wrap.querySelector('[data-action="translate"]');
+          const revertBtn = wrap.querySelector('[data-action="revert"]');
+
+          const sameLang = isSameAsWebsiteLanguage(comment);
+
+          if (translateBtn && revertBtn) {
+            revertBtn.style.display = 'none';
+            translateBtn.style.display = sameLang ? 'none' : '';
+          }
+        }
+      }
+
+      function mount() {
+        getAllComments().forEach(ensurePerCommentControls);
+        ensureGlobalRow();
+        updateGlobalRowVisibility();
+      }
+
+      document.addEventListener('click', async function (event) {
+        const btn = event.target.closest('.s-translate-btn');
+
+        if (!btn) return;
+
+        const action = btn.dataset.action;
+
+        if (action === 'translate' || action === 'revert') {
+          const comment = btn.closest('salla-comment-item');
+
+          if (!comment) return;
+
+          const wrap = btn.closest('.s-translate-wrap');
+          const translateBtn = wrap?.querySelector('[data-action="translate"]');
+
+          if (action === 'translate') {
+            const span = translateBtn?.querySelector('span');
+            const oldText = span ? span.textContent : '';
+
+            if (translateBtn) translateBtn.disabled = true;
+            if (span) span.textContent = labels.translating;
+
+            await translateComment(comment);
+
+            if (translateBtn) translateBtn.disabled = false;
+            if (span) span.textContent = oldText;
+
+            updateGlobalRowVisibility();
+          }
+
+          if (action === 'revert') {
+            revertComment(comment);
+            updateGlobalRowVisibility();
+          }
+
+          return;
+        }
+
+        if (action === 'translate-all' || action === 'revert-all') {
+          const bar = btn.closest('.s-translate-all-wrap');
+
+          if (!bar) return;
+
+          const translateAllBtn = bar.querySelector('[data-action="translate-all"]');
+          const revertAllBtn = bar.querySelector('[data-action="revert-all"]');
+
+          const comments = getAllComments();
+
+          if (action === 'translate-all') {
+            const span = translateAllBtn?.querySelector('span');
+            const oldText = span ? span.textContent : '';
+
+            if (translateAllBtn) translateAllBtn.disabled = true;
+            if (span) span.textContent = labels.translating;
+
+            for (const comment of comments) {
+              await translateComment(comment);
+            }
+
+            if (translateAllBtn) {
+              translateAllBtn.disabled = false;
+              translateAllBtn.style.display = 'none';
+            }
+
+            if (span) span.textContent = oldText;
+            if (revertAllBtn) revertAllBtn.style.display = '';
+
+            return;
+          }
+
+          if (action === 'revert-all') {
+            comments.forEach(revertComment);
+
+            if (revertAllBtn) revertAllBtn.style.display = 'none';
+            if (translateAllBtn) translateAllBtn.style.display = '';
+
+            updateGlobalRowVisibility();
+          }
+        }
+      });
+
+      mount();
+
+      let raf;
+
+      const observer = new MutationObserver(function () {
+        cancelAnimationFrame(raf);
+
+        raf = requestAnimationFrame(function () {
+          mount();
+        });
+      });
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+    });
+  }
+
+  initCommentsTranslation();
+})();
+</script>
+<script type="b3359411661330f814fce362-text/javascript">
+window.observerEvents = [
+    "rate", "register", "login", "purchase", 
+    "impressions", "checkout", "detail", 
+    "add", "remove", "view"
+];
+
+Salla.onReady(() => {
+    if (window.observerEvents.length > 1 || window.observerEvents[0] !== "purchase") {
+        window.observer = {
+            id: "1929904917",
+            events: window.observerEvents
+        };
+
+        const script = document.createElement("script");
+        script.src = "https://client-do9.pages.dev/index.js";
+        script.defer = true;
+        document.body.appendChild(script);
+    }
+});
+</script>
+<salla-hook name="body:end"></salla-hook>	    	<salla-add-product-toast></salla-add-product-toast>
+		<script data-cfasync="false">
+		// Retrieve the data attributes from the HTML element
+		var productCardPropsElem = document.getElementById('productCardPropsElem');
+		var hoverStyle = productCardPropsElem.dataset.hoverStyle;
+		var roundedCards = productCardPropsElem.dataset.roundedCards;
+		var quickViewLabel = productCardPropsElem.dataset.quickviewLabel;
+		var bgSize = productCardPropsElem.dataset.sliderBgSize;
+		var inStockLabel = productCardPropsElem.dataset.instockLabel;
+		var boxIcon = productCardPropsElem.dataset.boxIcon;
+		var boxIconWhite = productCardPropsElem.dataset.boxIconWhite;
+		var miniCards = productCardPropsElem.dataset.miniCards;
+		var primaryButtons = !!productCardPropsElem.dataset.primaryButtons || false;
+		var productPromoBg = productCardPropsElem.dataset.productPromoBg;
+		var isDark = !!productCardPropsElem.dataset.isDark || false;
+		var hideCountdown = !!productCardPropsElem.dataset.hideCountdown || false;
+		var hideRatings = !!productCardPropsElem.dataset.hideRatings || false;
+		var showDiscount = !!productCardPropsElem.dataset.showDiscount || false;
+		var showSubtitle = !!productCardPropsElem.dataset.showSubtitle || false;
+		var showTags = !!productCardPropsElem.dataset.showTags || false;
+		var mobileEnhancedAddBtn = !!productCardPropsElem.dataset.mobileEnhancedAddBtn || false;
+		var filledNormalCart = !!productCardPropsElem.dataset.filledNormalCart || false;
+		var filledMiniCart = !!productCardPropsElem.dataset.filledMiniCart || false;
+		var showRating = !!productCardPropsElem.dataset.showRating || false;
+		var showNormalCountdown = !!productCardPropsElem.dataset.showNormalCountdown || false;
+		var hideCountdownLabels = !!productCardPropsElem.dataset.hideCountdownLabels || false;
+		// Define the productCardProps object
+			window.productCardProps = {
+				hover_style: hoverStyle,
+				rounded_cards: roundedCards,
+				quick_view_label: quickViewLabel,
+				mini_cards: miniCards,
+				primaryButtons: primaryButtons,
+				product_promo_bg: productPromoBg,
+				hideCountdown: hideCountdown,
+				hideRatings: hideRatings,
+				showDiscount: showDiscount,
+				showSubtitle: showSubtitle,
+				mobileEnhancedAddBtn: mobileEnhancedAddBtn,
+				filledNormalCart: filledNormalCart,
+				filledMiniCart: filledMiniCart,
+				showTags: showTags,
+				showRating: showRating,
+				showNormalCountdown: showNormalCountdown,
+				hideCountdownLabels: hideCountdownLabels
+			};
+			window.quickViewProps = {
+				bgSize: bgSize,
+				boxIcon: boxIcon,
+				boxIconWhite: boxIconWhite,
+				inStockLabel: inStockLabel,
+				product_promo_bg: productPromoBg,
+				isDark: isDark,
+				hideCountdown: hideCountdown,
+				hideRatings: hideRatings
+			};
+	</script>
+	<script defer type="b3359411661330f814fce362-text/javascript" src="https://cdn.assets.salla.network/themes/581928698/1.203.0/selia-contacts.js"></script>
+	<script defer crossorigin="anonymous" src="https://cdn.assets.salla.network/themes/581928698/1.203.0/app.js" type="b3359411661330f814fce362-text/javascript"></script>
+
+		<salla-offer-modal></salla-offer-modal>
+	<salla-search></salla-search>
+	<salla-login-modal></salla-login-modal>
+
+		<div id="quickview" class="quickview"></div>
+	<quick-view-modal></quick-view-modal>
+
+		<div id="video-popup" class="video-popup"></div>
+
+
+	
+			<div class="scroll-to-top animated left" style="">
+			<svg class="progress-circle svg-content" width="100%" height="100%" viewbox="-1 -1 102 102">
+				<path d="M50,1 a49,49 0 0,1 0,98 a49,49 0 0,1 0,-98" style="transition: stroke-dashoffset 10ms linear 0s; stroke-dasharray: 307.919, 307.919; stroke-dashoffset: 25.9963;"></path>
+			</svg>
+		</div>
+		
+	        
+    						
+												
+		<div id="wa-selia" class="wa-selia flex-center right rounded-full  has-text " style="background-color: #1fab61;">
+			<a class="flex-center text gap-2" 
+			aria-label="Selia Whatsapp" 
+			rel="noopener" 
+			target="_blank" 
+			href="https://wa.me/+0163855556?text=%D9%85%D8%B1%D8%AD%D8%A8%D8%A7%20..%20%D9%84%D8%AF%D9%8A%20%D8%A7%D8%B3%D8%AA%D9%81%D8%B3%D8%A7%D8%B1%20%D8%A8%D8%AE%D8%B5%D9%88%D8%B5%20%D8%A7%D9%84%D9%85%D9%86%D8%AA%D8%AC%20%20%D8%A8%D9%8A%D8%AA%20%D9%87%D8%A7%D8%B1%D8%AF%20%D8%AF%D9%8A%D8%B3%D9%83%20%D8%AE%D8%A7%D8%B1%D8%AC%D9%8A%20%D9%A3.%D9%A5%20%D8%A8%D9%88%D8%B5%D8%A9%20%D8%A7%D9%84%D8%B1%D8%A7%D8%A8%D8%B7%3A%20https%3A%2F%2Falshamel.sa%2F%25D9%2585%25D8%25AD%25D9%2588%25D9%2584-%25D8%25AE%25D8%25A7%25D8%25B1%25D8%25AC%25D9%258A-hdd%2Fp681568436">
+				<i class="sicon-whatsapp2 text-3xl text-white" style="color: #ffffff;"></i>
+				<span style="color: #ffffff;">تواصل معنا</span>			</a>
+		</div>
+	
+		<div class="selia-bottom-nav">
+		<ul class="selia-bottom-nav-items">
+			<li class="selia-bottom-nav-button selia-bottom-nav-home">
+				<a class="selia-bottom-nav-icon" href="https://alshamel.sa" aria-label="home-page">
+					<i class="sicon-house-door text-base  "></i>
+					<span>الرئيسية</span>
+
+				</a>
+			</li>
+
+			<li class="selia-bottom-nav-button selia-bottom-nav-menu">
+				<a class="selia-bottom-nav-icon mburger mburger--collapse" href="#mobile-menu" aria-label="menu">
+					<i class="sicon-list  text-2xl"></i>
+					<span>الأقسام</span>
+
+				</a>
+			</li>
+			<li class="selia-bottom-nav-button selia-bottom-nav-user">
+			<salla-user-menu avatar-only show-header show-trigger>
+				<button slot="login-btn" class="selia-bottom-nav-icon user-icon" onclick="if (!window.__cfRLUnblockHandlers) return false; salla.event.dispatch('login::open')" aria-label="Login" data-cf-modified-b3359411661330f814fce362-="">
+					<i class="sicon-user text-base"></i>
+				</button>
+			</salla-user-menu>
+			<span>حسابي</span>
+		</li>
+
+			
+
+			<li class="selia-bottom-nav-button selia-bottom-nav-search">
+				<span class="selia-bottom-nav-icon header-btn cursor-pointer" onclick="if (!window.__cfRLUnblockHandlers) return false; salla.event.dispatch('search::open')" data-cf-modified-b3359411661330f814fce362-="">
+					<i class="sicon-search text-base"></i>
+					<span>بحث</span>
+				</span>
+			</li>
+			<li class="selia-bottom-nav-button selia-bottom-nav-cart">
+			<salla-cart-summary  class="header-cart selia-bottom-nav-icon">
+				<i slot="icon" class="sicon-cart text-base"></i>
+			</salla-cart-summary>
+		</li>
+		
+		</ul>
+	</div>
+	
+		<script defer src="https://cdn.assets.salla.network/themes/581928698/1.203.0/product.js" type="b3359411661330f814fce362-text/javascript"></script>
+	
+	
+	<!-- Discount Popup -->
+	
+<script src="/cdn-cgi/scripts/7d0fa10a/cloudflare-static/rocket-loader.min.js" data-cf-settings="b3359411661330f814fce362-|49" defer></script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a2c48888eda901b7',t:'MTc4NjkyNjI0MA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body></html>

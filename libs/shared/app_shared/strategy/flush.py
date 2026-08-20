@@ -117,6 +117,30 @@ def _rediscovery_thresholds(settings: Settings) -> RediscoveryThresholds:
     )
 
 
+def _batch_confidence(drained: stats_buffer.DrainedDelta) -> Decimal | None:
+    """This *cycle's own* average confidence (`conf_sum` unscaled over
+    `success`) -- `None` when this cycle had no successes to average.
+
+    Deliberately NOT the same thing as `strategy_attempt_stats.avg_
+    confidence` (the column `_upsert_stats`'s `RETURNING` row carries):
+    that column is a *lifetime* weighted average blending every success
+    since the row's first insert, including pre-degradation ones. This
+    helper is the fresh-evidence counterpart -- the same "this batch's
+    own confidence, not a stale blended aggregate" shape the discovery-
+    seed path already uses (`confidences.access_confidence`/
+    `extraction_confidence`, the probe's own measured result, never the
+    row's persisted lifetime average). `flush_profile`'s Task 3.2
+    same-method `DEGRADED` re-promotion rebase must use *this*, not
+    `row.avg_confidence`, or rediscovery condition 4 (`combined_stats.
+    avg_confidence`, `EXTRACTION` rows only) can immediately re-trip on
+    stale blended data in the same flush cycle the rebase runs in --
+    the identical "remedy didn't clear the state that tripped it" bug
+    class as condition 2's success_rate."""
+    if not drained.success:
+        return None
+    return Decimal(drained.conf_sum) / _CONFIDENCE_SCALE / Decimal(drained.success)
+
+
 def _upsert_stats(
     session: Session,
     profile_id: uuid.UUID,
@@ -142,9 +166,7 @@ def _upsert_stats(
         (Decimal(drained.success) / Decimal(drained.attempt)) if drained.attempt else Decimal("0")
     )
     avg_response_time_ms = (drained.rt_ms_sum // drained.attempt) if drained.attempt else None
-    avg_confidence = (
-        (Decimal(drained.conf_sum) / _CONFIDENCE_SCALE / drained.success) if drained.success else None
-    )
+    avg_confidence = _batch_confidence(drained)
 
     stmt = pg_insert(table).values(
         id=new_uuid7(),
@@ -199,6 +221,61 @@ def _upsert_stats(
     return session.execute(stmt).one()
 
 
+def _rebase_method_stats(
+    session: Session,
+    profile_id: uuid.UUID | str,
+    method_type: MethodType,
+    method_name: str,
+    *,
+    qualifying_count: int,
+    confidence: Decimal | None,
+    now: datetime,
+) -> None:
+    """Absolute (not `count + delta`) re-base of one `(profile, method_type,
+    method_name)` `strategy_attempt_stats` row to honest fresh evidence:
+    `attempt_count=success_count=qualifying_count`, `failure_count=0`,
+    `success_rate=1`. Shared by :func:`rebase_stats_after_discovery` (a
+    discovery-seeded winner, 2026-08-15) and `flush_profile`'s same-method
+    `DEGRADED` re-promotion (Task 3.2, 2026-08-16) -- both are "this
+    method just proved itself on fresh evidence, the caller must not
+    immediately re-read a stale failure-dominated *lifetime* ratio and
+    re-trip rediscovery condition 2" situations. Idempotent per call
+    (absolute `SET`, mirrors the original inline block this was extracted
+    from)."""
+    table = StrategyAttemptStats
+    stmt = pg_insert(table).values(
+        id=new_uuid7(),
+        domain_strategy_profile_id=profile_id,
+        method_type=method_type,
+        method_name=method_name,
+        attempt_count=qualifying_count,
+        success_count=qualifying_count,
+        failure_count=0,
+        success_rate=Decimal("1"),
+        avg_response_time_ms=None,
+        avg_confidence=confidence,
+        last_success_at=now,
+        last_failed_at=None,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["domain_strategy_profile_id", "method_type", "method_name"],
+        set_={
+            "attempt_count": stmt.excluded.attempt_count,
+            "success_count": stmt.excluded.success_count,
+            "failure_count": stmt.excluded.failure_count,
+            "success_rate": stmt.excluded.success_rate,
+            # `avg_response_time_ms` is a timing statistic, not
+            # rediscovery evidence -- the probe/promotion event measures
+            # nothing comparable to a spider fetch, so the existing value
+            # is kept rather than blanked.
+            "avg_confidence": stmt.excluded.avg_confidence,
+            "last_success_at": stmt.excluded.last_success_at,
+            "updated_at": func.now(),
+        },
+    )
+    session.execute(stmt)
+
+
 def rebase_stats_after_discovery(
     session: Session,
     profile_id: uuid.UUID | str,
@@ -248,44 +325,21 @@ def rebase_stats_after_discovery(
         return
 
     moment = now or datetime.now(timezone.utc)
-    table = StrategyAttemptStats
 
     targets: list[tuple[MethodType, str]] = [(MethodType.ACCESS, winning_access.value)]
     if winning_extraction is not None:
         targets.append((MethodType.EXTRACTION, winning_extraction.value))
 
     for method_type, method_name in targets:
-        stmt = pg_insert(table).values(
-            id=new_uuid7(),
-            domain_strategy_profile_id=profile_id,
-            method_type=method_type,
-            method_name=method_name,
-            attempt_count=qualifying_count,
-            success_count=qualifying_count,
-            failure_count=0,
-            success_rate=Decimal("1"),
-            avg_response_time_ms=None,
-            avg_confidence=confidence,
-            last_success_at=moment,
-            last_failed_at=None,
+        _rebase_method_stats(
+            session,
+            profile_id,
+            method_type,
+            method_name,
+            qualifying_count=qualifying_count,
+            confidence=confidence,
+            now=moment,
         )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["domain_strategy_profile_id", "method_type", "method_name"],
-            set_={
-                "attempt_count": stmt.excluded.attempt_count,
-                "success_count": stmt.excluded.success_count,
-                "failure_count": stmt.excluded.failure_count,
-                "success_rate": stmt.excluded.success_rate,
-                # `avg_response_time_ms` is a timing statistic, not
-                # rediscovery evidence -- the probe measures nothing
-                # comparable to a spider fetch, so the existing value is
-                # kept rather than blanked.
-                "avg_confidence": stmt.excluded.avg_confidence,
-                "last_success_at": stmt.excluded.last_success_at,
-                "updated_at": func.now(),
-            },
-        )
-        session.execute(stmt)
 
 
 def _combined_stats(session: Session, profile: DomainStrategyProfile) -> CombinedStats:
@@ -358,6 +412,16 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
     promotion_thresholds = _promotion_thresholds(settings)
     now = datetime.now(timezone.utc)
 
+    # Task 3.2 (2026-08-16): snapshotted once, before the promotion loop
+    # below issues any `UPDATE` -- a Core-level bulk `update()` never syncs
+    # this ORM object's `status` attribute, so `profile.status` reads the
+    # pre-flush value for the rest of this call regardless. Used below to
+    # scope the `strategy_attempt_stats` re-base to exactly the bug this
+    # fixes: a *same-method* re-promotion out of `DEGRADED` -- a different
+    # method promoting, or a profile promoting out of `DISCOVERY_REQUIRED`/
+    # `LEARNING`, is unaffected (contracts/promotion.md "Apply").
+    was_degraded = profile.status is StrategyStatus.DEGRADED
+
     keys_flushed = 0
     any_success = False
     any_failure = False
@@ -410,6 +474,46 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
             # only cleared once the method actually promotes
             # (contracts/stats-buffer.md "Drain").
             redis.delete(stats_buffer.url_key(profile.id, method_type, method_name))
+            if was_degraded and is_preferred_method:
+                # Task 3.2 (2026-08-16): same-method re-promotion out of
+                # `DEGRADED` -- `apply_promotion`'s guarded UPDATE now
+                # allows this (the method-changed predicate was dropped),
+                # but the *lifetime* `strategy_attempt_stats.success_rate`
+                # this method already carries is exactly the ratio that
+                # tripped rediscovery condition 2 (or reflects the
+                # `recent_failure_count` streak behind condition 1) in the
+                # first place -- untouched, it survives this promotion and
+                # `evaluate_rediscovery` below (same flush cycle, freshly
+                # re-read via `_combined_stats`) would immediately re-trip
+                # on it, the identical bug class `rebase_stats_after_
+                # discovery` fixed for the discovery-seed path (measured
+                # live on fqtoners.com: 1,439 discovery runs/day). Re-base
+                # to the honest fresh evidence this promotion just proved
+                # -- N distinct qualifying URLs, N/N -- the same way a
+                # discovery winner is re-based.
+                #
+                # `confidence` is this cycle's OWN batch average
+                # (`_batch_confidence`), not `row.avg_confidence` --
+                # `row` is `_upsert_stats`'s RETURNING row, whose
+                # `avg_confidence` is a *lifetime* weighted average
+                # blending every success since the row's first insert,
+                # including pre-degradation ones. Rediscovery condition 4
+                # (`combined_stats.avg_confidence`, EXTRACTION rows only,
+                # `rediscovery.py`) reads exactly this column via
+                # `_combined_stats` immediately below in this same flush
+                # cycle -- feeding it the stale blended value here would
+                # let condition 4 re-trip on the exact data this rebase
+                # exists to clear (same bug class as condition 2's
+                # success_rate, above).
+                _rebase_method_stats(
+                    session,
+                    profile.id,
+                    method_type,
+                    method_name,
+                    qualifying_count=drained.distinct_urls,
+                    confidence=_batch_confidence(drained),
+                    now=now,
+                )
             # SPEC-16 US3 (T035a): a genuine promotion -- `apply_promotion`
             # only returns True on a real row change -- surfaced to the
             # caller for a post-commit webhook enqueue.

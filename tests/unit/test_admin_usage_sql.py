@@ -163,6 +163,31 @@ def test_query_classifies_protected_by_access_method() -> None:
     assert "PLAYWRIGHT_PROXY" in sql
 
 
+def test_query_excludes_discovery_origin_attempts() -> None:
+    """Task 2.3 fix round 1 (Important finding): discovery probes
+    (`tasks_strategy._probe_sample`) write `RequestAttempt` rows tagged
+    `origin='discovery'` with real `match_id`s, so before this filter
+    they silently inflated `links_total`/`protected_links_attempted` --
+    counters this module's docstring says the SaaS prices from.
+    Discovery probes are internal COGS, not customer activity, so the
+    `per_link` CTE (the sole source of every link/protected-link counter)
+    must exclude them."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert "request_attempts.origin = 'scrape'" in sql, sql
+
+
+def test_query_still_bounds_origin_as_a_partition_prunable_predicate() -> None:
+    """The origin filter must sit in the SAME `per_link` CTE `WHERE`
+    clause as the `created_at` partition-key bounds (docstring risk P2:
+    "the only predicate on the partitioned request_attempts ... is a
+    bounded range on their partition keys") -- i.e. it must not force a
+    second, separate scan or subquery over `request_attempts`."""
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
+    assert sql.count("FROM request_attempts") == 1, sql
+
+
 def test_query_orders_by_the_cursor_key() -> None:
     sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)).lower()
     order_by = sql.split("order by", 1)[1]

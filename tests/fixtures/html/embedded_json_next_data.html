@@ -1,0 +1,29 @@
+<!--
+  PROVENANCE: SYNTHETIC -- HAND-WRITTEN, NOT CAPTURED FROM ANY LIVE SITE.
+  ================================================================
+  This fixture models the GENERIC Next.js shape the EMBEDDED_JSON adapter is
+  specified against (handover 2026-08-15 section 7): a JSON-LD block advertising
+  `"price": 0` while the page's `__NEXT_DATA__` blob carries the true price.
+
+  It is deliberately NOT labelled "noon": the live 2026-08-16 noon capture in
+  `noon_product_real.html` proves noon no longer serves `__NEXT_DATA__` at all.
+  This fixture exercises the adapter's own contract (pointer resolution, chain
+  position, availability classification) against the many Next.js retailers that
+  DO serve it -- it must not be read as evidence about noon.
+-->
+<html><head></head><body>
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Widget Pro 2000",
+  "sku": "SKU-4821",
+  "offers": {
+    "@type": "Offer",
+    "price": 0,
+    "priceCurrency": "SAR",
+    "availability": "https://schema.org/InStock"
+  }
+}</script>
+<script>window.__PRELOAD_JUNK__ = {"not": "the product"};</script>
+<script id="__NEXT_DATA__" type="application/json">{"props": {"pageProps": {"product": {"sku": "SKU-4821", "title": "Widget Pro 2000", "offers": [{"seller": "marketplace-a", "pricing": {"amount": 249.5, "currency": "SAR"}, "availability": "https://schema.org/InStock", "labels": {"a/b": "flag~1"}}]}}}}</script>
+</body></html>

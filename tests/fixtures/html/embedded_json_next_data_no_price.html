@@ -1,0 +1,35 @@
+<!--
+  PROVENANCE: SYNTHETIC -- HAND-WRITTEN, NOT CAPTURED FROM ANY LIVE SITE.
+  ================================================================
+  The PRICE-LESS out-of-stock case, modelled on the shape of the REAL noon
+  egypt-en capture in `noon_unavailable_real.html`:
+
+      variants:[{sku:"N28408683A", offers:[]}]        <- empty, no price anywhere
+      JSON-LD availability: OutOfStock                 <- the only availability signal
+
+  So here the price pointer (`/props/pageProps/product/offers/0/pricing/amount`)
+  resolves to NOTHING because `offers` is an empty array, while the availability
+  pointer (`/props/pageProps/product/availability`) resolves fine. This is the
+  case `embedded_json_next_data_oos.html` does NOT cover: that fixture carries a
+  price *alongside* OutOfStock, so it never exercises the price-less path.
+
+  Expressed in Next.js `__NEXT_DATA__` form rather than noon's TanStack payload
+  because `EMBEDDED_JSON` cannot read the latter at all (see
+  `noon_product_real.html`). This fixture is about the ADAPTER's contract for a
+  price-less unavailable item, not about noon's markup.
+-->
+<html><head></head><body>
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Widget Pro 2000",
+  "sku": "SKU-4821",
+  "offers": {
+    "@type": "Offer",
+    "price": 0,
+    "priceCurrency": "SAR",
+    "availability": "https://schema.org/OutOfStock"
+  }
+}</script>
+<script id="__NEXT_DATA__" type="application/json">{"props": {"pageProps": {"product": {"sku": "SKU-4821", "title": "Widget Pro 2000", "availability": "https://schema.org/OutOfStock", "offers": []}}}}</script>
+</body></html>

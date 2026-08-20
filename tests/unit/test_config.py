@@ -144,6 +144,28 @@ def test_browser_scraping_knobs_honor_env_override(monkeypatch: pytest.MonkeyPat
     assert settings.BROWSER_MAX_CONTEXTS == 2
 
 
+def test_scrape_batch_browser_max_defaults_to_fifteen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SCRAPE_BATCH_BROWSER_MAX defaults to 15 when unset (M1, audit 5-25 range)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("SCRAPE_BATCH_BROWSER_MAX", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.SCRAPE_BATCH_BROWSER_MAX == 15
+
+
+def test_scrape_batch_browser_max_honors_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SCRAPE_BATCH_BROWSER_MAX is env-tunable, never hardcoded (M1)."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SCRAPE_BATCH_BROWSER_MAX", "20")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.SCRAPE_BATCH_BROWSER_MAX == 20
+
+
 def test_strategy_profile_scope_defaults_to_domain(monkeypatch: pytest.MonkeyPatch) -> None:
     """STRATEGY_PROFILE_SCOPE defaults to "domain" (the discovery-gate fix, 2026-07-11)."""
     for key, value in REQUIRED_ENV.items():
@@ -174,3 +196,27 @@ def test_strategy_profile_scope_rejects_invalid_value(monkeypatch: pytest.Monkey
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_strategy_signals_domain_join_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STRATEGY_SIGNALS_DOMAIN_JOIN defaults False (Task 3.3, the
+    build_recent_signals domain-scoped join fix) -- flag-off must
+    preserve today's exact-equality join byte-for-byte until an operator
+    opts in."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("STRATEGY_SIGNALS_DOMAIN_JOIN", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.STRATEGY_SIGNALS_DOMAIN_JOIN is False
+
+
+def test_strategy_signals_domain_join_honors_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("STRATEGY_SIGNALS_DOMAIN_JOIN", "true")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.STRATEGY_SIGNALS_DOMAIN_JOIN is True
