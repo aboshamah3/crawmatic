@@ -286,8 +286,22 @@ def bulk_upsert_products(
         .scalars()
         .all()
     )
-    grouped = _variants_by_product_id(session, ws, [p.id for p in products])
-    responses = [_to_product_response(p, grouped.get(p.id, [])) for p in products]
+    # Response order is REQUEST order (audit B1, defense in depth). The
+    # re-fetch above is a `WHERE id IN (...)` with no `ORDER BY`, so the
+    # rows come back in whatever order Postgres finds cheapest -- which
+    # for a mixed insert/update batch is neither request order nor stable
+    # between calls. A client that maps the response positionally back
+    # onto the items it sent (the SaaS control plane did exactly that)
+    # would then attribute one product's id to another product's row.
+    # Every item carries `_product_id` from `_execute_product_buckets`,
+    # so the correct order is already known here: index the fetched rows
+    # by id and emit them in `product_ids` order. Each response item also
+    # echoes `external_id`/`sku` (`_to_product_response`), so a client
+    # never has to rely on position at all.
+    by_id = {p.id: p for p in products}
+    ordered = [by_id[pid] for pid in product_ids if pid in by_id]
+    grouped = _variants_by_product_id(session, ws, [p.id for p in ordered])
+    responses = [_to_product_response(p, grouped.get(p.id, [])) for p in ordered]
     return ProductBulkUpsertResult(upserted=len(responses), products=responses)
 
 
