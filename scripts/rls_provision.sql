@@ -46,7 +46,9 @@
 -- untouched (the DO blocks below default both to NULL).
 --
 -- Safe to re-run: every statement is a CREATE-if-absent / ALTER-to-
--- desired-state / idempotent GRANT. It changes no rows and no schema.
+-- desired-state / idempotent GRANT. It changes no rows; the only
+-- schema it touches is the RLS posture it exists to REPAIR (a lost
+-- FORCE, a partition with no policies of its own).
 -- Verify the result with:  uv run python scripts/rls_verify.py
 -- =====================================================================
 

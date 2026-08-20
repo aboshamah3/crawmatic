@@ -19,7 +19,9 @@
 -- whatever password it already has (roles are still created/repaired).
 --
 -- Idempotent: every statement is a CREATE-if-absent / ALTER-to-desired-
--- state / idempotent GRANT. It changes no rows and no schema.
+-- state / idempotent GRANT. It changes no rows; the only schema it
+-- touches is the RLS posture sections 6 and 7 exist to REPAIR
+-- (a lost FORCE, a partition with no policies of its own).
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -168,3 +170,102 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- ---------------------------------------------------------------------
+-- 7. Every PARTITION inherits its parent's row-level security.
+--
+--    A partitioned parent's policies are applied to a query that names
+--    the PARENT. A query that names a CHILD PARTITION is checked
+--    against that child's own policies, and `CREATE TABLE ...
+--    PARTITION OF` gives a child none — while section 4 above grants
+--    crawmatic_app SELECT on every table in the schema, partitions
+--    included. Until the 2026-08-20 security review, that meant
+--    `SELECT * FROM request_attempts_2026_08` returned every
+--    workspace's rows to a tenant connection that
+--    `SELECT * FROM request_attempts` correctly confined: isolation
+--    defeated by spelling the table name differently.
+--
+--    The block below mirrors each parent's ENABLE/FORCE switches and
+--    each of its policies onto its children, deriving them from
+--    `pg_policy` rather than restating them, so a dual-scope table's
+--    read/write PAIR is copied as faithfully as a strict single policy
+--    and no second definition of any parent's rules exists here to
+--    drift.
+--
+--    Do NOT edit this block in place: it is byte-identical to
+--    `app_shared.models.rls.PARTITION_RLS_INHERITANCE_SQL` (the same
+--    statement the migration and the runtime partition-creation job
+--    run), and `tests/unit/test_rls_policy.py` fails if they diverge.
+-- ---------------------------------------------------------------------
+-- BEGIN partition-rls-inheritance
+DO $$
+DECLARE
+    part         record;
+    pol          record;
+    roles_clause text;
+    stmt         text;
+BEGIN
+    FOR part IN
+        SELECT child.oid AS child_oid,
+               parent.oid AS parent_oid,
+               quote_ident(ns.nspname) || '.' || quote_ident(child.relname) AS child_ident
+        FROM pg_inherits
+        JOIN pg_class AS child ON child.oid = pg_inherits.inhrelid
+        JOIN pg_class AS parent ON parent.oid = pg_inherits.inhparent
+        JOIN pg_namespace AS ns ON ns.oid = child.relnamespace
+        WHERE ns.nspname = 'public'
+          AND child.relkind = 'r'
+          AND child.relispartition
+          AND parent.relrowsecurity
+    LOOP
+        EXECUTE 'ALTER TABLE ' || part.child_ident || ' ENABLE ROW LEVEL SECURITY';
+        EXECUTE 'ALTER TABLE ' || part.child_ident || ' FORCE ROW LEVEL SECURITY';
+
+        FOR pol IN
+            SELECT p.polname,
+                   p.polpermissive,
+                   p.polroles,
+                   CASE p.polcmd
+                       WHEN '*' THEN 'ALL'
+                       WHEN 'r' THEN 'SELECT'
+                       WHEN 'a' THEN 'INSERT'
+                       WHEN 'w' THEN 'UPDATE'
+                       WHEN 'd' THEN 'DELETE'
+                   END AS cmd_text,
+                   pg_get_expr(p.polqual, p.polrelid) AS using_expr,
+                   pg_get_expr(p.polwithcheck, p.polrelid) AS check_expr
+            FROM pg_policy p
+            WHERE p.polrelid = part.parent_oid
+        LOOP
+            CONTINUE WHEN EXISTS (
+                SELECT 1 FROM pg_policy q
+                WHERE q.polrelid = part.child_oid
+                  AND q.polname = pol.polname
+            );
+
+            SELECT string_agg(quote_ident(r.rolname), ', ')
+              INTO roles_clause
+              FROM pg_roles r
+             WHERE r.oid = ANY (pol.polroles);
+
+            stmt := 'CREATE POLICY ' || quote_ident(pol.polname)
+                 || ' ON ' || part.child_ident
+                 || CASE WHEN pol.polpermissive THEN ' AS PERMISSIVE' ELSE ' AS RESTRICTIVE' END
+                 || ' FOR ' || pol.cmd_text;
+
+            IF roles_clause IS NOT NULL THEN
+                stmt := stmt || ' TO ' || roles_clause;
+            END IF;
+            IF pol.using_expr IS NOT NULL THEN
+                stmt := stmt || ' USING (' || pol.using_expr || ')';
+            END IF;
+            IF pol.check_expr IS NOT NULL THEN
+                stmt := stmt || ' WITH CHECK (' || pol.check_expr || ')';
+            END IF;
+
+            EXECUTE stmt;
+        END LOOP;
+    END LOOP;
+END
+$$;
+-- END partition-rls-inheritance

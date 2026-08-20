@@ -226,3 +226,47 @@ def test_only_missing_child_partition_is_created_existing_left_alone() -> None:
     next_suffix, _s2, _e2 = month_partition_bounds(now, 1)
     assert partition_name("price_observations", next_suffix) in report.partitions_created
     assert partition_name("price_observations", current_suffix) not in report.partitions_created
+
+
+# --- partition RLS inheritance (security review A1, 2026-08-20) -------------
+
+
+def test_creating_a_partition_also_applies_the_partition_rls_inheritance_ddl() -> None:
+    """A partition created at runtime must be born isolated.
+
+    RLS on a partitioned parent applies to a query naming the PARENT; a
+    child made by a bare `CREATE TABLE ... PARTITION OF` has no policies
+    of its own, and `crawmatic_app` holds SELECT on every table in the
+    schema — so `SELECT * FROM request_attempts_2026_08` used to return
+    every workspace's rows. This job runs every month, forever, so a
+    migration alone would have re-opened the hole on the first of each
+    month.
+    """
+    from app_shared.models.rls import PARTITION_RLS_INHERITANCE_SQL
+
+    existing = {entry.name for entry in PARTITIONED_TABLES}
+    session = _FakeSession(existing)
+    now = datetime(2026, 12, 20, tzinfo=timezone.utc)
+
+    report = create_missing_partitions(session, now_utc=now, lookahead_months=1)
+
+    assert report.partitions_created
+    assert session.executed_ddl[-1] == PARTITION_RLS_INHERITANCE_SQL, (
+        "the RLS-inheritance statement must be the last DDL of a run that created "
+        "partitions — after every CREATE, so no child is left unprotected"
+    )
+
+
+def test_run_that_creates_nothing_issues_no_rls_ddl_either() -> None:
+    """A no-op run stays a no-op: the repair is not busywork on every pass."""
+    existing = {entry.name for entry in PARTITIONED_TABLES}
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    for entry in PARTITIONED_TABLES:
+        for offset in (0, 1):
+            suffix, _start, _end = month_partition_bounds(now, offset)
+            existing.add(partition_name(entry.name, suffix))
+
+    session = _FakeSession(existing)
+    create_missing_partitions(session, now_utc=now, lookahead_months=1)
+
+    assert session.executed_ddl == []

@@ -149,3 +149,130 @@ def emit_fk_transitive_rls_policy(
             f"AND p.{workspace_column} = {ctx}));"
         ),
     )
+
+
+#: The one canonical statement that makes a PARTITION carry its parent's
+#: row-level security (security review finding A1, 2026-08-20).
+#:
+#: **Why this is needed at all.** A partitioned parent's policies are
+#: applied to a query that names the PARENT. A query that names a CHILD
+#: PARTITION is checked against that child's OWN policies — and
+#: `CREATE TABLE ... PARTITION OF` gives a child none. `crawmatic_app`
+#: holds SELECT on every partition (the blanket `GRANT ... ON ALL TABLES
+#: IN SCHEMA public`), so `SELECT * FROM request_attempts_2026_08`
+#: returned every workspace's rows to a tenant connection while
+#: `SELECT * FROM request_attempts` returned one workspace's. The
+#: isolation boundary was defeated by spelling the table name
+#: differently. `create_missing_partitions` used to state the opposite in
+#: its own docstring — true when planning through the parent, false for a
+#: direct hit — which is why every new month reopened the hole.
+#:
+#: **Why it MIRRORS the parent rather than re-emitting a fixed policy.**
+#: A partition of a dual-scope table (:func:`emit_global_readable_rls_policy`)
+#: needs that table's read/write PAIR, not the strict single policy — so
+#: a hardcoded policy here would be a second, silently-diverging
+#: definition of every parent's rules. Reading `pg_policy` instead means
+#: the child's posture is derived from the parent's, and cannot drift
+#: from it by construction.
+#:
+#: Idempotent (a policy already present on the child is skipped), and it
+#: contains **no** ``%`` and no ``:`` — so the identical text is legal as
+#: a psql script body, as ``op.execute(...)`` in a migration, and as a
+#: SQLAlchemy ``text()`` executed with a bound parameter set (psycopg3
+#: scans for ``%s``-style placeholders whenever parameters are supplied,
+#: which is what rules out the ``format(..., %I)`` style used elsewhere
+#: in ``scripts/sql/rls_roles.sql``).
+#:
+#: `scripts/sql/rls_roles.sql` carries this same block verbatim between
+#: its ``BEGIN/END partition-rls-inheritance`` markers, so the psql
+#: provisioning path applies it too; `tests/unit/test_rls_policy.py`
+#: asserts the two are the same statement.
+PARTITION_RLS_INHERITANCE_SQL = """DO $$
+DECLARE
+    part         record;
+    pol          record;
+    roles_clause text;
+    stmt         text;
+BEGIN
+    FOR part IN
+        SELECT child.oid AS child_oid,
+               parent.oid AS parent_oid,
+               quote_ident(ns.nspname) || '.' || quote_ident(child.relname) AS child_ident
+        FROM pg_inherits
+        JOIN pg_class AS child ON child.oid = pg_inherits.inhrelid
+        JOIN pg_class AS parent ON parent.oid = pg_inherits.inhparent
+        JOIN pg_namespace AS ns ON ns.oid = child.relnamespace
+        WHERE ns.nspname = 'public'
+          AND child.relkind = 'r'
+          AND child.relispartition
+          AND parent.relrowsecurity
+    LOOP
+        EXECUTE 'ALTER TABLE ' || part.child_ident || ' ENABLE ROW LEVEL SECURITY';
+        EXECUTE 'ALTER TABLE ' || part.child_ident || ' FORCE ROW LEVEL SECURITY';
+
+        FOR pol IN
+            SELECT p.polname,
+                   p.polpermissive,
+                   p.polroles,
+                   CASE p.polcmd
+                       WHEN '*' THEN 'ALL'
+                       WHEN 'r' THEN 'SELECT'
+                       WHEN 'a' THEN 'INSERT'
+                       WHEN 'w' THEN 'UPDATE'
+                       WHEN 'd' THEN 'DELETE'
+                   END AS cmd_text,
+                   pg_get_expr(p.polqual, p.polrelid) AS using_expr,
+                   pg_get_expr(p.polwithcheck, p.polrelid) AS check_expr
+            FROM pg_policy p
+            WHERE p.polrelid = part.parent_oid
+        LOOP
+            CONTINUE WHEN EXISTS (
+                SELECT 1 FROM pg_policy q
+                WHERE q.polrelid = part.child_oid
+                  AND q.polname = pol.polname
+            );
+
+            SELECT string_agg(quote_ident(r.rolname), ', ')
+              INTO roles_clause
+              FROM pg_roles r
+             WHERE r.oid = ANY (pol.polroles);
+
+            stmt := 'CREATE POLICY ' || quote_ident(pol.polname)
+                 || ' ON ' || part.child_ident
+                 || CASE WHEN pol.polpermissive THEN ' AS PERMISSIVE' ELSE ' AS RESTRICTIVE' END
+                 || ' FOR ' || pol.cmd_text;
+
+            IF roles_clause IS NOT NULL THEN
+                stmt := stmt || ' TO ' || roles_clause;
+            END IF;
+            IF pol.using_expr IS NOT NULL THEN
+                stmt := stmt || ' USING (' || pol.using_expr || ')';
+            END IF;
+            IF pol.check_expr IS NOT NULL THEN
+                stmt := stmt || ' WITH CHECK (' || pol.check_expr || ')';
+            END IF;
+
+            EXECUTE stmt;
+        END LOOP;
+    END LOOP;
+END
+$$;"""
+
+
+def emit_partition_rls_inheritance() -> str:
+    """Return :data:`PARTITION_RLS_INHERITANCE_SQL` — the single idempotent
+    statement that gives every partition in ``public`` the row-level
+    security posture of its own parent.
+
+    Callers, all three of which are required (a fix applied in only one
+    place is a fix that lapses):
+
+    * the migration that closed the eight partitions that already
+      existed;
+    * :func:`app_shared.maintenance.partitions.create_missing_partitions`,
+      so a partition created at runtime — every month, forever — is born
+      isolated rather than repaired later;
+    * ``migrate.provision_roles``, the deploy step, which applies it and
+      then *verifies* the result from the ``workspace_id`` column.
+    """
+    return PARTITION_RLS_INHERITANCE_SQL

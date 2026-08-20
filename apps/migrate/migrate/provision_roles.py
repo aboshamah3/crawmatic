@@ -35,6 +35,14 @@ SUPERUSER or BYPASSRLS, or owns any table, it exits non-zero. A deploy
 step that only issues DDL and never checks the outcome is how the
 superuser-as-app-role hole survived three audits.
 
+Since the 2026-08-20 security review it also verifies the isolation
+posture itself, asked from the `workspace_id` **column**
+(`workspace_scoped_rls_problems`): every relation in `public` carrying
+that column must have RLS enabled, FORCEd, and at least one policy.
+Read the previous way round — "of the tables where RLS is on, which lack
+FORCE?" — the eight monthly partitions that had no RLS at all were not
+even candidates for the check, which is why nothing here caught them.
+
 ENVIRONMENT
 -----------
     MIGRATION_DATABASE_URL   required — the owner/admin role, direct to
@@ -112,6 +120,90 @@ def provision(database_url: str, *, app_password: str | None, auth_password: str
         engine.dispose()
 
 
+#: Every relation in ``public`` that carries a ``workspace_id`` column,
+#: with the three facts that decide whether that column is actually
+#: enforced. Partitions are relkind ``'r'`` like any other table, so they
+#: are candidates here by construction — which is the whole point.
+_WORKSPACE_SCOPED_RLS_SQL = """
+SELECT c.relname,
+       c.relrowsecurity,
+       c.relforcerowsecurity,
+       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policy_count
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p')
+  AND EXISTS (
+      SELECT 1 FROM pg_attribute a
+      WHERE a.attrelid = c.oid
+        AND a.attname = 'workspace_id'
+        AND NOT a.attisdropped
+  )
+ORDER BY c.relname
+"""
+
+
+def workspace_scoped_rls_problems(database_url: str) -> list[str]:
+    """Return every relation that owns workspace data without enforcing it.
+
+    **Read this the right way round** (security review A1, 2026-08-20).
+    :func:`verify` used to ask only "of the tables where RLS is already
+    ENABLED, which lack FORCE?" — a question a table with no RLS at all
+    is not even a candidate for. Eight monthly partitions of
+    ``request_attempts`` / ``price_observations`` / ``price_alert_events``
+    / ``webhook_events`` each carried ``workspace_id`` and had no RLS
+    whatsoever, and that check could not have found them: it was looking
+    for a degraded posture, not an absent one.
+
+    So the question is asked from the **column** instead. Anything in
+    ``public`` with a ``workspace_id`` column holds one workspace's data
+    per row, and therefore must have RLS enabled, FORCEd (so the table
+    owner is not exempt), and at least one policy (RLS with no policy
+    denies everything, which is fail-closed but is a different bug and
+    should be reported as one). A partition is an ordinary table to this
+    query, so a partition created next month is checked on the deploy
+    after it appears — no list of table names to keep in step with the
+    schema.
+
+    The policy *content* is deliberately not asserted here: a strict
+    workspace-scoped table and a dual-scope one
+    (``emit_global_readable_rls_policy``) legitimately carry different
+    predicates, and
+    ``tests/integration/test_rls_cross_workspace.py`` is what proves the
+    predicate actually confines a stranger. This function proves the
+    control is switched on at all.
+    """
+    problems: list[str] = []
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as conn:
+            for relname, rls_on, forced, policy_count in conn.execute(
+                text(_WORKSPACE_SCOPED_RLS_SQL)
+            ):
+                if not rls_on:
+                    problems.append(
+                        f"{relname!r} has a workspace_id column but NO row-level security "
+                        "— every workspace's rows are readable by any role holding SELECT "
+                        "on it (this is what the 2026-08-20 review found on the monthly "
+                        "partitions)"
+                    )
+                    continue
+                if not forced:
+                    problems.append(
+                        f"{relname!r} has row-level security without FORCE — the table "
+                        "owner is exempt from its own policies"
+                    )
+                if policy_count == 0:
+                    problems.append(
+                        f"{relname!r} has row-level security enabled but no policy at all "
+                        "— it denies every row to every non-owner, which is a failure, not "
+                        "isolation"
+                    )
+    finally:
+        engine.dispose()
+    return problems
+
+
 def verify(database_url: str) -> list[str]:
     """Return a list of posture violations — empty means the posture holds."""
     problems: list[str] = []
@@ -175,6 +267,11 @@ def verify(database_url: str) -> list[str]:
                 )
     finally:
         engine.dispose()
+
+    # Asked from the workspace_id COLUMN rather than from relrowsecurity,
+    # so a relation with NO row-level security at all is a finding rather
+    # than a non-candidate. See workspace_scoped_rls_problems.
+    problems.extend(workspace_scoped_rls_problems(database_url))
     return problems
 
 
@@ -201,7 +298,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {problem}", file=sys.stderr)
         return 1
 
-    print(f"role posture OK: {_APP_ROLE} (no BYPASSRLS, owns nothing), {_AUTH_ROLE} (BYPASSRLS)")
+    print(
+        f"role posture OK: {_APP_ROLE} (no BYPASSRLS, owns nothing), "
+        f"{_AUTH_ROLE} (BYPASSRLS); every workspace_id-carrying relation in public "
+        "(partitions included) has RLS enabled, FORCEd and policied"
+    )
     return 0
 
 

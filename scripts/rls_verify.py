@@ -16,9 +16,10 @@ A. **Role attributes.** The connected role must be non-superuser, must
    not hold ``BYPASSRLS``, and must own no tables in ``public``.
    (Reuses :mod:`app_shared.db.rls_guard`, the same check the services
    run at startup, so the script and the runtime can never disagree.)
-B. **Forced RLS coverage.** Every workspace-scoped table must have both
-   ``relrowsecurity`` and ``relforcerowsecurity`` and at least one
-   policy.
+B. **Forced RLS coverage.** Every workspace-scoped relation — anything
+   in ``public`` carrying a ``workspace_id`` column, monthly partitions
+   included — must have both ``relrowsecurity`` and
+   ``relforcerowsecurity`` and at least one policy.
 C. **Own context sees own rows.** With ``app.workspace_id`` set to a
    workspace that owns data, that data is visible — otherwise a passing
    isolation check would be meaningless (a broken connection also
@@ -163,7 +164,22 @@ def check_role(conn: Connection, report: Report) -> OrdinaryRoleFacts:
 
 
 def check_forced_rls(conn: Connection, report: Report) -> list[str]:
-    """Check B — forced RLS coverage. Returns the probe-eligible tables."""
+    """Check B — forced RLS coverage. Returns the probe-eligible tables.
+
+    Partitions are deliberately **included** (security review A1,
+    2026-08-20). This query used to carry ``AND c.relispartition IS
+    FALSE``, which is the same blind spot `provision_roles.verify()` had
+    from the other direction: the eight monthly partitions of
+    ``request_attempts`` / ``price_observations`` / ``price_alert_events``
+    / ``webhook_events`` each carry ``workspace_id``, each had no RLS at
+    all, and each was excluded from the only check that would have said
+    so. A partition holds real workspace rows and `crawmatic_app` can
+    name it directly, so it is exactly as much of an isolation surface as
+    its parent.
+
+    The returned probe list is unaffected: it is intersected with
+    :data:`CANDIDATE_TABLES`, which names parents only.
+    """
     report.section("B. Forced RLS on workspace-scoped tables")
     rows = conn.execute(
         text(
@@ -180,7 +196,6 @@ def check_forced_rls(conn: Connection, report: Report) -> list[str]:
              AND NOT a.attisdropped
             WHERE c.relnamespace = 'public'::regnamespace
               AND c.relkind IN ('r', 'p')
-              AND c.relispartition IS FALSE
             ORDER BY c.relname
             """
         )

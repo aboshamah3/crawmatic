@@ -109,6 +109,11 @@ uv run pytest tests/integration/test_compose_smoke.py -v
 
 # Live cross-workspace RLS isolation (needs a throwaway Postgres; the
 # test applies the migrations and creates the two runtime roles itself):
+cp .env.example .env   # required: the test imports app_shared.config,
+                        # whose Settings fail fast on a missing variable —
+                        # from a fresh checkout the run ERRORs at fixture
+                        # setup without this, which reads as a broken test
+                        # rather than a missing file
 docker run -d --name cm-rls-test \
   -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \
   -e POSTGRES_DB=crawmatic -p 127.0.0.1:55444:5432 postgres:17.5-bookworm
@@ -142,3 +147,16 @@ and then **verifies the result**: it exits non-zero if `crawmatic_app`
 ends up SUPERUSER or BYPASSRLS, owns any table, or if any RLS-enabled
 table lost `FORCE`. See the posture block at the top of `.env.example`
 for which URL gets which role.
+
+Since the 2026-08-20 security review it also checks the isolation
+posture from the `workspace_id` **column**: every relation in `public`
+that carries one — monthly partitions included — must have RLS enabled,
+`FORCE`d and policied. Asked the other way round ("of the tables where
+RLS is on, which lack `FORCE`?"), the eight partitions of
+`request_attempts` / `price_observations` / `price_alert_events` /
+`webhook_events` that had no RLS at all were not candidates for the
+check, and a direct `SELECT * FROM request_attempts_2026_08` returned
+every workspace's rows to a tenant connection. Partitions now inherit
+their parent's policies in three places that each have to hold: the
+migration that closed the existing ones, the runtime partition-creation
+job that makes next month's, and this deploy step.

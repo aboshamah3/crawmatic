@@ -16,8 +16,10 @@ from app_shared.models.base import (
     metadata,
 )
 from app_shared.models.rls import (
+    PARTITION_RLS_INHERITANCE_SQL,
     emit_fk_transitive_rls_policy,
     emit_global_readable_rls_policy,
+    emit_partition_rls_inheritance,
     emit_rls_policy,
 )
 
@@ -185,6 +187,8 @@ __all__ = [
     "AccessPolicy",
     "DomainAccessRule",
     "emit_fk_transitive_rls_policy",
+    "emit_partition_rls_inheritance",
+    "PARTITION_RLS_INHERITANCE_SQL",
     "DomainStrategyProfile",
     "StrategyAttemptStats",
     "StrategyDiscoveryRun",

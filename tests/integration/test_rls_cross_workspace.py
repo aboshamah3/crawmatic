@@ -352,3 +352,196 @@ def test_app_role_cannot_disable_its_own_isolation(
     with pytest.raises(DBAPIError):
         with app_engine.begin() as conn:
             conn.execute(text("TRUNCATE" + " TABLE users"))
+
+
+# =====================================================================
+# Direct-partition access (review finding A1, 2026-08-20)
+#
+# `request_attempts`, `price_observations`, `price_alert_events` and
+# `webhook_events` are RANGE-partitioned parents. Their RLS policies are
+# on the PARENT — and a parent's policies are applied only to a query
+# that names the parent. A query that names a CHILD PARTITION directly
+# is checked against that child's own policies, and the children had
+# none, while `crawmatic_app` holds SELECT on every one of them (the
+# blanket `GRANT ... ON ALL TABLES IN SCHEMA public`). So
+# `SELECT * FROM request_attempts_2026_08` returned every workspace's
+# rows to a tenant connection: isolation that holds for the ORM's query
+# and evaporates for one that spells the table name differently.
+#
+# Two aggravators made this permanent rather than a one-off:
+#   * `maintenance/partitions.py` creates a NEW partition every month at
+#     runtime, so each month reopened the hole (its docstring asserted
+#     the opposite — "RLS on the partitioned parent already propagates
+#     to every child" — which is true for planning through the parent
+#     and false for a direct hit);
+#   * `provision_roles.verify()` looked for tables where RLS was already
+#     enabled but not FORCEd, so a table with NO RLS at all was invisible
+#     to it. It could not have caught this, by construction.
+#
+# The three tests below pin, respectively: the direct query itself, the
+# invariant stated from the `workspace_id` COLUMN (so it covers every
+# partition, present and future, and any table a later migration adds),
+# and the runtime partition-creation path.
+# =====================================================================
+
+
+def _current_partition(parent: str) -> str:
+    from app_shared.maintenance.partitions import month_partition_bounds, partition_name
+
+    from datetime import datetime, timezone
+
+    suffix, _start, _end = month_partition_bounds(datetime.now(timezone.utc), 0)
+    return partition_name(parent, suffix)
+
+
+@pytest.fixture()
+def two_workspace_attempts(
+    two_workspaces: dict[str, object], provisioned: dict[str, str]
+) -> Iterator[dict[str, object]]:
+    """One `request_attempts` row per workspace, in the current month's partition."""
+    engine = create_engine(provisioned["admin_url"])
+    attempt_a = uuid.uuid4()
+    attempt_b = uuid.uuid4()
+    insert = text(
+        "INSERT INTO request_attempts "
+        "(id, created_at, workspace_id, match_id, attempt_number, url, "
+        " access_method, success, origin) "
+        "VALUES (:id, now(), :workspace_id, :match_id, 1, 'https://example.com/p', "
+        "'http', true, 'scrape')"
+    )
+    try:
+        with engine.begin() as conn:
+            for attempt_id, workspace_key in (
+                (attempt_a, "workspace_a_id"),
+                (attempt_b, "workspace_b_id"),
+            ):
+                conn.execute(
+                    insert,
+                    {
+                        "id": str(attempt_id),
+                        "workspace_id": str(two_workspaces[workspace_key]),
+                        "match_id": str(uuid.uuid4()),
+                    },
+                )
+        yield {
+            **two_workspaces,
+            "attempt_a_id": attempt_a,
+            "attempt_b_id": attempt_b,
+            "partition": _current_partition("request_attempts"),
+        }
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM request_attempts WHERE id IN (:a, :b)"),
+                {"a": str(attempt_a), "b": str(attempt_b)},
+            )
+        engine.dispose()
+
+
+def test_direct_partition_query_is_confined_exactly_like_its_parent(
+    two_workspace_attempts: dict[str, object], app_engine: Engine
+) -> None:
+    """Naming the child partition instead of the parent must not widen the view.
+
+    The app role can spell `request_attempts_YYYY_MM` as easily as
+    `request_attempts`, and it holds SELECT on both. If the partition
+    carries no policy of its own, this query returns workspace B's rows
+    to a workspace-A connection — the isolation boundary defeated by a
+    table name.
+    """
+    partition = two_workspace_attempts["partition"]
+    with app_engine.begin() as conn:
+        conn.execute(
+            text("SELECT set_config('app.workspace_id', :w, true)"),
+            {"w": str(two_workspace_attempts["workspace_a_id"])},
+        )
+        rows = conn.execute(
+            text(f"SELECT id, workspace_id FROM {partition}")  # noqa: S608 - catalog-derived name
+        ).all()
+
+    seen_workspaces = {row[1] for row in rows}
+    seen_ids = {row[0] for row in rows}
+    assert two_workspace_attempts["workspace_b_id"] not in seen_workspaces, (
+        f"direct query on partition {partition} leaked workspace B rows to a "
+        f"workspace-A connection: {sorted(str(w) for w in seen_workspaces)}"
+    )
+    assert two_workspace_attempts["attempt_b_id"] not in seen_ids
+    assert two_workspace_attempts["attempt_a_id"] in seen_ids
+
+
+def test_every_workspace_scoped_relation_including_partitions_is_forced_and_policied(
+    provisioned: dict[str, str]
+) -> None:
+    """The invariant, stated from the COLUMN rather than from `relrowsecurity`.
+
+    Read the other way round — "of the tables that have RLS on, which
+    lack FORCE?" — a table with no RLS at all is not even a candidate,
+    which is precisely how eight partitions carrying `workspace_id` went
+    unnoticed. Anchoring on the column makes an unprotected
+    workspace-owned relation a failure instead of an absence.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "apps" / "migrate"))
+    from migrate.provision_roles import workspace_scoped_rls_problems
+
+    assert workspace_scoped_rls_problems(provisioned["admin_url"]) == []
+
+
+def test_a_partition_created_at_runtime_is_born_isolated(
+    provisioned: dict[str, str]
+) -> None:
+    """Next month's partition is made by a Celery task, not by a migration.
+
+    `maintenance.partitions.create_missing_partitions` runs every month
+    forever; if it emits a bare `CREATE TABLE ... PARTITION OF`, the hole
+    reopens on the first of every month regardless of what any migration
+    once repaired.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app_shared.maintenance.partitions import (
+        create_missing_partitions,
+        month_partition_bounds,
+        partition_name,
+    )
+    from app_shared.maintenance.registry import PARTITIONED_TABLES
+
+    # Far enough ahead that no migration or earlier maintenance run has
+    # already created them, so this really exercises the creation path.
+    far = datetime.now(timezone.utc) + timedelta(days=400)
+    suffix, _start, _end = month_partition_bounds(far, 0)
+    # The job creates that month for EVERY registered table, so every one
+    # of them is asserted on and every one of them is cleaned up — a
+    # partition this test forgot would otherwise be a real, unprotected
+    # relation left behind in whatever database it ran against.
+    children = [partition_name(entry.name, suffix) for entry in PARTITIONED_TABLES]
+
+    engine = create_engine(provisioned["admin_url"])
+    session_factory = sessionmaker(bind=engine)
+    try:
+        with session_factory() as session:
+            for child in children:
+                session.execute(text(f"DROP TABLE IF EXISTS {child}"))  # noqa: S608 - code-built
+            session.commit()
+
+            report = create_missing_partitions(session, now_utc=far, lookahead_months=0)
+            session.commit()
+
+            for child in children:
+                assert child in report.partitions_created
+                row = session.execute(
+                    text(
+                        "SELECT c.relrowsecurity, c.relforcerowsecurity, "
+                        "(SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) "
+                        "FROM pg_class c WHERE c.oid = to_regclass(:name)"
+                    ),
+                    {"name": f"public.{child}"},
+                ).one()
+                assert row[0] is True, f"{child} was created without ENABLE ROW LEVEL SECURITY"
+                assert row[1] is True, f"{child} was created without FORCE ROW LEVEL SECURITY"
+                assert row[2] >= 1, f"{child} was created with no row policy"
+    finally:
+        with session_factory() as session:
+            for child in children:
+                session.execute(text(f"DROP TABLE IF EXISTS {child}"))  # noqa: S608 - code-built
+            session.commit()
+        engine.dispose()

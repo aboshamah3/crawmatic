@@ -39,6 +39,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app_shared.maintenance.registry import PARTITIONED_TABLES
+from app_shared.models.rls import PARTITION_RLS_INHERITANCE_SQL
 
 # `pg_get_expr(relpartbound, oid)` renders a RANGE partition's bound as
 # `FOR VALUES FROM ('<literal>') TO ('<literal>')` — this matches both
@@ -230,9 +231,32 @@ def create_missing_partitions(
     ``IF NOT EXISTS`` make re-running this a no-op — no partition is
     created twice and nothing raises (FR-006, idempotent/concurrency-safe
     even against an overlapping run, contracts/partition-creation.md
-    §Concurrency). No per-partition RLS DDL is issued: RLS on the
-    partitioned parent already propagates to every child, current and
-    future (research R2).
+    §Concurrency).
+
+    **Per-partition RLS is issued** (security review A1, 2026-08-20).
+    This function used to state the opposite — "RLS on the partitioned
+    parent already propagates to every child, current and future" — and
+    that is true only of a query naming the PARENT. PostgreSQL checks a
+    query against the policies of the relation the query actually
+    references, so a child made by a bare ``CREATE TABLE ... PARTITION
+    OF`` had none, and ``crawmatic_app`` (which holds SELECT on every
+    table in the schema) could read every workspace's rows simply by
+    naming ``request_attempts_2026_08`` instead of ``request_attempts``.
+    Because this function runs monthly, forever, a migration alone would
+    have re-opened that hole on the first of every month; so any run
+    that creates a partition applies
+    :data:`~app_shared.models.rls.PARTITION_RLS_INHERITANCE_SQL`
+    immediately, in the same transaction, and the new child is isolated
+    before it is committed rather than repaired at the next deploy.
+
+    The statement is idempotent and covers the whole schema, so it is
+    issued once per run rather than once per child — and a run that
+    creates nothing issues no DDL at all.
+
+    Creating a partition of a table requires owning that table, so any
+    session that can run the ``CREATE`` above can also run the ``ALTER
+    TABLE ... ENABLE ROW LEVEL SECURITY`` this adds: the new statement
+    needs no privilege the old one did not already have.
     """
     report = RunReport()
     for entry in PARTITIONED_TABLES:
@@ -247,6 +271,9 @@ def create_missing_partitions(
                 continue
             session.execute(_create_partition_stmt(child_name, entry.name, start, end))
             report.partitions_created.append(child_name)
+
+    if report.partitions_created:
+        session.execute(text(PARTITION_RLS_INHERITANCE_SQL))
 
     return report
 
