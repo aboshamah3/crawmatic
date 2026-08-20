@@ -24,7 +24,10 @@ itself: "spiders persist only"). This task reuses everything **around**
 the fetch instead: `scrape_core.extraction.pipeline.extract` for
 extraction, `scrape_core.validation.validate_candidate` for the
 promotion-quality bar, `app_shared.url_safety.validate_competitor_url`
-for the SSRF guard, and the existing `app_shared.access`
+plus `scrape_core.safety.fetch.validate_resolved_target`
+for the SSRF guard (save-time checks AND the fetch-time
+resolve-then-check every other fetch path in this system performs --
+see `_probe_get`), and the existing `app_shared.access`
 provider/assignment plumbing for `PROXY_HTTP`. Fully off-reactor (a
 Celery task, never the Twisted reactor/Scrapy) -- blocking HTTP calls
 here are safe and expected (Constitution V).
@@ -38,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from sqlalchemy import func, select
@@ -96,6 +99,7 @@ from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 from app_shared.webhooks.payloads import build_strategy_event
 
 from scrape_core.extraction.pipeline import extract
+from scrape_core.safety.fetch import Resolver, system_resolver, validate_resolved_target
 from scrape_core.validation import Accepted, validate_candidate
 
 logger = logging.getLogger(__name__)
@@ -161,6 +165,90 @@ _PROBE_HEADERS: dict[str, str] = {
     ),
     "Accept-Language": "en",
 }
+
+#: Maximum redirect hops one probe fetch will follow. `requests` would
+#: follow them itself (and silently), but then only the FIRST URL would
+#: ever be SSRF-checked -- so redirects are followed by hand here, one
+#: validated hop at a time, exactly as Scrapy's `RedirectMiddleware`
+#: re-emits each `Location` through `SsrfGuardMiddleware`/`SafeResolver`
+#: for the spider path.
+_MAX_PROBE_REDIRECTS = 5
+
+#: Injectable resolver seam for the fetch-time SSRF guard, mirroring
+#: `scrape_core.browser.ssrf.abort_unsafe_request`'s `resolver=` argument:
+#: production uses the real system resolver, tests substitute a fake that
+#: returns a canned private/public address. Module-level (not `_`-nested)
+#: purely so tests can monkeypatch it, the same convention
+#: `_match_ids_for_urls` already uses here.
+_probe_resolver: Resolver = system_resolver
+
+
+def _probe_get(url: str, **kwargs: Any) -> "requests.Response | None":
+    """One probe fetch with the SAME fetch-time SSRF guard the spiders use.
+
+    ## Why this exists (audit H7)
+
+    `strategy_discovery_run` validates its sample URLs once, with
+    `app_shared.url_safety.validate_competitor_url` -- the **save-time**
+    validator, which by its own docstring performs no DNS resolution.
+    Every other fetch path in this system additionally performs the
+    resolve-then-check step at fetch time: the HTTP spider through
+    `safety.resolver.SafeResolver` (`DNS_RESOLVER`), the browser spider
+    through `browser.ssrf.abort_unsafe_request`
+    (`PLAYWRIGHT_ABORT_REQUEST`). These off-reactor probe fetches did
+    not, which left two real gaps:
+
+    * **DNS rebinding** -- a hostname that resolved public when the
+      match was saved (or milliseconds ago, at `validate_competitor_url`
+      time) can resolve to `169.254.169.254`/`127.0.0.1`/an RFC1918
+      address by the time `requests` connects. The save-time check
+      cannot see that; only a resolve-then-check at fetch time can.
+    * **Redirects** -- `requests.get` follows `Location` itself, so a
+      public first hop could redirect straight into the internal
+      network with nothing re-validating the new target.
+
+    Both are closed by reusing, never re-implementing,
+    `scrape_core.safety.fetch.validate_resolved_target` (the same
+    function behind both spider guards): validate the target, fetch ONE
+    hop with `allow_redirects=False`, then validate and follow each
+    `Location` in turn, bounded by `_MAX_PROBE_REDIRECTS`.
+
+    Returns the final `requests.Response`, or `None` when a hop is
+    refused / unresolvable / the redirect budget is exhausted. Fails
+    closed: a host that cannot be resolved is never treated as safe.
+    `requests.RequestException` propagates to the caller, which already
+    records it as "no qualifying observation" for this combo/url.
+    """
+    current = url
+    for _ in range(_MAX_PROBE_REDIRECTS + 1):
+        try:
+            validate_resolved_target(current, resolver=_probe_resolver)
+        except UnsafeUrlError as exc:
+            logger.warning(
+                "strategy_discovery: probe target refused by SSRF guard url=%s reason=%s",
+                current,
+                exc.reason,
+            )
+            return None
+        except OSError as exc:
+            # Fail closed -- an unresolvable/erroring host is never safe.
+            logger.info(
+                "strategy_discovery: probe target could not be resolved url=%s error=%s",
+                current,
+                exc,
+            )
+            return None
+
+        response = requests.get(
+            current, timeout=_PROBE_TIMEOUT_SECONDS, allow_redirects=False, **kwargs
+        )
+        location = response.headers.get("location") if response.is_redirect else None
+        if not location:
+            return response
+        current = urljoin(current, location)
+
+    logger.info("strategy_discovery: probe exceeded the redirect budget url=%s", url)
+    return None
 
 
 @dataclass
@@ -335,7 +423,7 @@ def _fetch_direct(url: str, *, retry: bool) -> str | None:
     attempts = 2 if retry else 1
     for attempt in range(attempts):
         try:
-            response = requests.get(url, timeout=_PROBE_TIMEOUT_SECONDS, headers=_PROBE_HEADERS)
+            response = _probe_get(url, headers=_PROBE_HEADERS)
         except requests.RequestException as exc:
             logger.info(
                 "strategy_discovery: direct fetch failed url=%s attempt=%d error=%s",
@@ -344,6 +432,10 @@ def _fetch_direct(url: str, *, retry: bool) -> str | None:
                 exc,
             )
             continue
+        if response is None:
+            # Refused by the fetch-time SSRF guard (or unresolvable) --
+            # a retry would resolve the same host, so stop here.
+            return None
         if response.ok:
             return response.text
     return None
@@ -446,9 +538,11 @@ def _fetch_via_proxy(session: Session, workspace_id: uuid.UUID, url: str) -> str
         return None
     proxy_kwargs["headers"] = {**_PROBE_HEADERS, **proxy_kwargs.get("headers", {})}
     try:
-        response = requests.get(url, timeout=_PROBE_TIMEOUT_SECONDS, **proxy_kwargs)
+        response = _probe_get(url, **proxy_kwargs)
     except requests.RequestException as exc:
         logger.info("strategy_discovery: proxy fetch failed url=%s error=%s", url, exc)
+        return None
+    if response is None:
         return None
     return response.text if response.ok else None
 

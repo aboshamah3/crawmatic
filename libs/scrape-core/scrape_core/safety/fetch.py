@@ -18,6 +18,7 @@ fetch time; this module has no opinion on how/when it is invoked.
 from __future__ import annotations
 
 import ipaddress
+import socket
 from collections.abc import Callable, Iterable
 from urllib.parse import urlsplit
 
@@ -28,7 +29,7 @@ from app_shared.url_safety import (
     validate_competitor_url,
 )
 
-__all__ = ["Resolver", "validate_resolved_target"]
+__all__ = ["Resolver", "system_resolver", "validate_resolved_target"]
 
 # host -> resolved IP address strings. Injected by the caller: production
 # wiring passes the real system resolver; fixture tests inject a fake
@@ -99,3 +100,18 @@ def validate_resolved_target(
                 UnsafeUrlReason.PRIVATE_OR_INTERNAL_IP,
                 f"host {host!r} resolved to unsafe IP {ip_str!r}",
             )
+
+
+def system_resolver(host: str) -> list[str]:
+    """Real (blocking) system DNS resolver — the production default.
+
+    The one place the real resolver is spelled, so every caller that
+    performs the resolve-then-check (the browser guard's
+    ``PLAYWRIGHT_ABORT_REQUEST``, the off-reactor discovery probe in
+    ``apps/workers``) shares one definition rather than each growing its
+    own ``socket.getaddrinfo`` call. Blocking: callers on an event loop
+    or the Twisted reactor must run it in an executor/thread, never
+    inline (see ``scrape_core.browser.ssrf.abort_unsafe_request``).
+    """
+    infos = socket.getaddrinfo(host, None)
+    return [info[4][0] for info in infos]

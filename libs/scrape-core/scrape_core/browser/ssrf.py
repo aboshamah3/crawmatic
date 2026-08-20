@@ -58,13 +58,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from app_shared.url_safety import UnsafeUrlError
 
-from scrape_core.safety.fetch import Resolver, validate_resolved_target
+from scrape_core.safety.fetch import Resolver, system_resolver, validate_resolved_target
 from scrape_core.safety.rejection_registry import mark_rejected
 
 if TYPE_CHECKING:  # pragma: no cover - type-checking only, never imported at runtime here
@@ -91,15 +90,12 @@ __all__ = ["abort_unsafe_request"]
 _COST_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font", "stylesheet"})
 
 
-def _system_resolver(host: str) -> list[str]:
-    """Real (blocking) system DNS resolver — the production default.
-
-    Always invoked through ``loop.run_in_executor`` by
-    :func:`abort_unsafe_request`, never called directly on the event-loop
-    thread.
-    """
-    infos = socket.getaddrinfo(host, None)
-    return [info[4][0] for info in infos]
+#: Real (blocking) system DNS resolver — the production default. Lives in
+#: :mod:`scrape_core.safety.fetch` so the browser guard and the off-reactor
+#: discovery probe (``apps/workers``) share one definition. Always invoked
+#: through ``loop.run_in_executor`` by :func:`abort_unsafe_request`, never
+#: called directly on the event-loop thread.
+_system_resolver = system_resolver
 
 
 def _is_navigation_request(request: Any) -> bool:
