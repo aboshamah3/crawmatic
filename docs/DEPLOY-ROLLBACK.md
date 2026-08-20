@@ -175,16 +175,17 @@ ultimately traces back to for the `api` tier specifically. Use it as the
 post-deploy gate for `api`: don't consider the `api` step of a rollout (or
 rollback) complete until `/health` returns 200 on the new deployment.
 
-**A `/ready` endpoint does not exist on this branch as of this writing.**
-Because `/health` is intentionally shallow (no DB touch, per SPEC-01), it
-cannot answer the specific question this document cares about — "has
-`migrate` actually reached the head `api` expects" — the way a
-database-aware readiness check could. `/ready` is the intended gate for
-that once it exists; another worker on this hardening pass may be adding
-it concurrently. Until it lands, use the `/version` check above
-(`db_migration_head` at or past `f2a6c1d80b37`) as the manual equivalent
-of what `/ready` would automate, and treat `/health` alone as insufficient
-proof that it is safe to route traffic to a new `api` deployment on this
+**`/ready` (`apps/api/app/routers/ready.py`) now exists on this branch** —
+an unauthenticated readiness probe that checks the database (`SELECT 1`)
+and Redis (`PING`), each independently timeboxed, returning 200 only when
+both are reachable and 503 otherwise. Because `/health` is intentionally
+shallow (no DB touch, per SPEC-01), it cannot answer the specific
+question this document cares about — "has `migrate` actually reached the
+head `api` expects" — the way a database-aware readiness check can. Use
+`/ready` as the post-deploy readiness gate for `api`: don't consider the
+`api` step of a rollout (or rollback) complete until `/ready` returns 200
+on the new deployment, and treat `/health` alone as insufficient proof
+that it is safe to route traffic to a new `api` deployment on this
 branch.
 
 ## See also

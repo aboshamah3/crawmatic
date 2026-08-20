@@ -22,6 +22,11 @@ _SINGLETON_PATHS = {
     # collection. It is not one: the response is a single
     # PriceComparisonResponse, never a list.
     "/v1/variants/{variant_id}/price-comparison",
+    # Readiness probe (2026-08-20 prelaunch hardening audit) -- one
+    # point-in-time {"ready", "checks"} snapshot of the database/Redis
+    # dependency state, same shape as `/health`/`/version` above, never a
+    # list.
+    "/ready",
 }
 
 

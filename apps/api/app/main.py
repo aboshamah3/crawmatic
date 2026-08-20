@@ -108,6 +108,17 @@ code/live-database Alembic migration heads, unauthenticated like
 table on purpose, so a stale or mismatched deploy is visible without
 shelling into a container.
 
+The 2026-08-20 prelaunch hardening audit adds `GET /ready`
+(`apps/api/app/routers/ready.py`) — the readiness variant
+`contracts/health.md` predicted by name when it first wrote FR-020:
+`/health` stays liveness-only (never touches the database), and `/ready`
+is the new, separate, unauthenticated probe that checks the database
+(`SELECT 1`) and Redis (`PING`) — via the same process-wide lazy
+singletons FR-020 requires, each independently timeboxed — and answers
+200 only when both are reachable, 503 otherwise. See that module's
+docstring for the full reasoning, including why Redis has no
+"not-configured" state to report for this process.
+
 The same audit's §H5 adds `GET /ops/metrics`
 (`apps/api/app/routers/ops_metrics.py`) — the fleet-wide operational
 snapshot (queue age, per-domain success and requests/link, proxy spend
@@ -144,6 +155,7 @@ from app.routers import (
     product_groups,
     products,
     proxy_providers,
+    ready,
     refresh_rules,
     scrape_profiles,
     strategy,
@@ -183,6 +195,7 @@ app.include_router(refresh_rules.router)
 app.include_router(webhooks.router)
 app.include_router(admin.router)
 app.include_router(version.router)
+app.include_router(ready.router)
 app.include_router(ops_metrics.router)
 
 
