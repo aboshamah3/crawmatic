@@ -67,6 +67,65 @@ jobs:
       - name: Unit test suite
         run: uv run pytest tests/unit -q
 
+  rls:
+    # Workspace isolation is the single control standing between one
+    # merchant's catalog and another's, and until 2026-08-20 it was
+    # provisioned by hand and proven by NOTHING: the test existed but was
+    # gated behind three pre-provisioned database URLs no environment ever
+    # had, so it had never once executed (audit B6). A skipped test is not
+    # a passed test.
+    #
+    # This job gives it the one thing it needed — a real Postgres — and
+    # the test does the rest itself: `alembic upgrade head`, then the same
+    # `migrate.provision_roles` deploy step production runs (statements
+    # from scripts/sql/rls_roles.sql), then the cross-workspace reads.
+    # It runs against the service container's OWNER role only as the
+    # admin/migration identity; every isolation assertion is made through
+    # the derived, non-superuser, NOBYPASSRLS `crawmatic_app` role.
+    name: rls (live cross-workspace isolation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: checks
+    services:
+      postgres:
+        image: postgres:17.5-bookworm
+        env:
+          POSTGRES_USER: crawmatic_owner
+          POSTGRES_PASSWORD: ownerpw
+          POSTGRES_DB: crawmatic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crawmatic_owner -d crawmatic"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      # Same reason as the `checks` job: `Settings(env_file=".env")` is
+      # constructed while resolving AUTH_DATABASE_URL for the two-role
+      # assertion. The placeholders never point at a real service.
+      - name: Seed local env from .env.example
+        run: cp .env.example .env
+
+      # The ONLY URL handed in is the owner/admin one. The two runtime
+      # roles are created by the test, through the production deploy step.
+      - name: Cross-workspace RLS isolation
+        env:
+          RLS_TEST_DATABASE_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
+        run: uv run pytest tests/integration/test_rls_cross_workspace.py -v
+
   images:
     name: images (build every Dockerfile docker-compose.yml references)
     runs-on: ubuntu-latest

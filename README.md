@@ -106,7 +106,39 @@ uv run pytest tests/unit -q
 cp .env.example .env   # required: docker-compose.yml's `env_file: .env`
                         # is a literal path, not resolved by --env-file
 uv run pytest tests/integration/test_compose_smoke.py -v
+
+# Live cross-workspace RLS isolation (needs a throwaway Postgres; the
+# test applies the migrations and creates the two runtime roles itself):
+docker run -d --name cm-rls-test \
+  -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \
+  -e POSTGRES_DB=crawmatic -p 127.0.0.1:55444:5432 postgres:17.5-bookworm
+RLS_TEST_DATABASE_URL=postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:55444/crawmatic \
+  uv run pytest tests/integration/test_rls_cross_workspace.py -v
 ```
 
 `.github/workflows/ci.yml` runs exactly this sequence (as separate
-`checks`/`images`/`compose-smoke` jobs) on every push and pull request.
+`checks`/`rls`/`images`/`compose-smoke` jobs) on every push and pull
+request.
+
+## Provisioning the database roles (deploy step)
+
+Workspace isolation is row-level security, and RLS is void for a
+SUPERUSER and (without `FORCE`) for a table's owner — so the role that
+serves requests must be neither. Roles are cluster-level objects with
+passwords, which is why they are deliberately not in Alembic; they are
+created by a one-shot step that runs **alongside** `alembic upgrade
+head`, in the same migration image:
+
+```bash
+# once per environment, and safe to re-run on every deploy
+docker compose run --rm migrate python -m migrate.provision_roles
+```
+
+It reads `MIGRATION_DATABASE_URL` (the owner/admin role) plus the
+optional `CRAWMATIC_APP_DB_PASSWORD` / `CRAWMATIC_AUTH_DB_PASSWORD`,
+executes `scripts/sql/rls_roles.sql` (the same statements `psql -f
+scripts/rls_provision.sql` runs — one source of truth for the GRANTs),
+and then **verifies the result**: it exits non-zero if `crawmatic_app`
+ends up SUPERUSER or BYPASSRLS, owns any table, or if any RLS-enabled
+table lost `FORCE`. See the posture block at the top of `.env.example`
+for which URL gets which role.
