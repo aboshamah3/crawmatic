@@ -73,14 +73,41 @@ services:
     # piece only — the *application* fail-closed behavior when Redis is
     # unavailable/full (H2/H3 workstream) is separate and not touched
     # here.
-    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    #
+    # AUTH (pre-launch audit, LOW): Redis holds the broker, the
+    # distributed locks, the spend counters and the dispatch idempotency
+    # keys — anyone who can reach it can release every brake in the
+    # system. It listens with no password at all. REDIS_PASSWORD wires
+    # `requirepass` through without breaking local-dev ergonomics: an
+    # EMPTY value (the .env.example default, matching PGBOUNCER_AUTH_TYPE
+    # =trust's local-only posture) starts Redis exactly as before, and any
+    # non-empty value is enforced. Compose interpolates `${REDIS_PASSWORD
+    # :+...}` at config time, so the flag is either present or absent —
+    # never `--requirepass ""` — while the value itself is expanded by the
+    # container's own shell (`$$`), so a password containing spaces or
+    # shell metacharacters survives intact.
+    #
+    # A password here MUST be matched in REDIS_URL
+    # (redis://:<password>@redis:6379/0) — that is the only thing every
+    # app service reads.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server --maxmemory-policy noeviction --appendonly yes
+        ${REDIS_PASSWORD:+--requirepass "$$REDIS_PASSWORD"}
     volumes:
       - redis_data:/data
     expose:
       - "6379"
     # Real semantic check (redis-cli PING -> PONG), not just TCP accept.
+    # Authenticates when (and only when) a password is configured.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - "CMD-SHELL"
+        - redis-cli ${REDIS_PASSWORD:+--no-auth-warning -a "$$REDIS_PASSWORD"} ping | grep -q PONG
       interval: 10s
       timeout: 5s
       retries: 5

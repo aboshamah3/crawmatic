@@ -50,6 +50,9 @@ class _FakeRedis:
 
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
+        #: Every `ex=` this fake was handed, per key — a `None` here means
+        #: a key with NO expiry was written (see the TTL test below).
+        self.ttls: dict[str, int | None] = {}
 
     def set(
         self, name: str, value: str, *, nx: bool = False, ex: int | None = None
@@ -57,6 +60,7 @@ class _FakeRedis:
         if nx and name in self.store:
             return None  # SET NX fails when the key already exists
         self.store[name] = value
+        self.ttls[name] = ex
         return True
 
     def get(self, name: str) -> str | None:
@@ -169,6 +173,39 @@ def test_schedule_sends_basic_auth_and_args_returns_jobid() -> None:
         assert call["data"][key] == value
     # jobid persisted as the durable idempotency backstop
     assert redis.get(dispatch_key(_ARGS["scrape_job_id"], _ARGS["batch_index"])) == "job-777"
+
+
+def test_every_dispatch_key_written_carries_a_ttl() -> None:
+    """No key this client writes may live forever (pre-launch audit, LOW).
+
+    Redis runs `--maxmemory-policy noeviction` on purpose — a full Redis
+    must return OOM errors rather than silently discard a lock or a spend
+    counter. The cost of that choice is that nothing ever reclaims a key
+    the application forgot to expire, so an immortal `dispatched:{job}:{n}`
+    is both a slow memory leak AND (as PLAN_AMAZON_NOON_PRICING Phase 1
+    found the hard way) a permanent suppressor of every later legitimate
+    re-dispatch of that batch.
+
+    Both writes are checked — the in-flight sentinel AND the committed
+    jobid — because only the second one was ever unbounded.
+    """
+    settings = _FakeSettings()
+    scrapyd = _FakeScrapyd(
+        expected_auth=(settings.SCRAPYD_USERNAME, settings.SCRAPYD_PASSWORD),
+        jobid="job-ttl",
+    )
+    redis = _FakeRedis()
+    client = _make_client(scrapyd, redis, settings)
+
+    client.schedule("price_monitor", "generic_price_spider", **_ARGS)
+
+    assert redis.ttls, "the client wrote no keys at all"
+    unbounded = [key for key, ttl in redis.ttls.items() if ttl is None]
+    assert unbounded == [], f"keys written with no expiry on a noeviction Redis: {unbounded}"
+    assert all(ttl > 0 for ttl in redis.ttls.values() if ttl is not None)
+
+    key = dispatch_key(_ARGS["scrape_job_id"], _ARGS["batch_index"])
+    assert redis.ttls[key] == settings.SCRAPYD_DISPATCH_GUARD_TTL_SECONDS
 
 
 def test_wrong_credentials_raise_401_and_schedule_nothing() -> None:
