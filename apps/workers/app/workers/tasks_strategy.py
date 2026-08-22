@@ -52,7 +52,7 @@ from app.workers.celery_app import app
 from app_shared.access.breaker import log_denied, paid_requests_allowed
 from app_shared.access.repository import visible_providers_select
 from app_shared.config import Settings, get_settings
-from app_shared.database import get_session, set_workspace_context
+from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.ids import new_uuid7
 from app_shared.enums import (
     AccessMethod,
@@ -1119,21 +1119,28 @@ def _combined_stats_for_profile(
     )
 
 
-def _scan_active_profile_refs(
-    session: Session, *, limit: int
-) -> list[tuple[uuid.UUID, uuid.UUID]]:
-    """Resolve `(id, workspace_id)` pairs for `ACTIVE` profiles, unscoped --
-    the `_scan_job_refs` precedent (`tasks_jobs.py`): this maintenance task
-    legitimately patrols every workspace, and every row is only read/
-    mutated after `set_workspace_context` scopes it to its own workspace
-    below (never cross-workspace data exposure)."""
-    stmt = (
-        select(DomainStrategyProfile.id, DomainStrategyProfile.workspace_id)  # noqa: workspace-scope
-        .where(DomainStrategyProfile.status == StrategyStatus.ACTIVE)
-        .order_by(DomainStrategyProfile.id)
-        .limit(limit)
-    )
-    return list(session.execute(stmt).all())
+def _scan_active_profile_refs(*, limit: int) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """Resolve `(id, workspace_id)` pairs for `ACTIVE` profiles, unscoped.
+
+    A periodic maintenance sweep necessarily spans every workspace, and
+    under FORCE ROW LEVEL SECURITY the ordinary engine's role fail-closes
+    an unscoped scan to ZERO rows when no workspace context is set --
+    which silently killed finalization for 6.5 h on 2026-08-21 (mushtryati
+    F-1). So the id-pair scan runs on the sanctioned BYPASSRLS system
+    session (`get_system_session`, the outbox-dispatcher / scheduler-claim
+    precedent, and now `_scan_job_refs` in `tasks_jobs.py`) and returns
+    plain ids; EVERY subsequent row read/write happens on the caller's
+    ordinary session, re-scoped per profile via `set_workspace_context` --
+    the system session never touches a row.
+    """
+    with get_system_session() as session:
+        stmt = (
+            select(DomainStrategyProfile.id, DomainStrategyProfile.workspace_id)  # noqa: workspace-scope
+            .where(DomainStrategyProfile.status == StrategyStatus.ACTIVE)
+            .order_by(DomainStrategyProfile.id)
+            .limit(limit)
+        )
+        return list(session.execute(stmt).all())
 
 
 @app.task(name=STRATEGY_LIGHT_RECHECK)
@@ -1163,7 +1170,7 @@ def light_recheck() -> None:
 
     with get_session() as session:
         for profile_id, workspace_id in _scan_active_profile_refs(
-            session, limit=_LIGHT_RECHECK_BATCH_SIZE
+            limit=_LIGHT_RECHECK_BATCH_SIZE
         ):
             set_workspace_context(session, workspace_id)
 
@@ -1206,17 +1213,25 @@ def light_recheck() -> None:
 # --- STRATEGY_STATS_FLUSH (US5, contracts/stats-buffer.md §Flush, FR-023) --
 
 
-def _scan_workspace_refs_with_profiles(session: Session) -> list[uuid.UUID]:
+def _scan_workspace_refs_with_profiles() -> list[uuid.UUID]:
     """Distinct workspace ids owning at least one `domain_strategy_profiles`
     row -- the periodic `flush_stats` sweep's only anchor when invoked
     with no explicit target (the job-finalization call site already knows
-    its own `workspace_id` + `profile_ids` and skips this scan entirely,
-    the `_scan_job_refs`/`_scan_active_profile_refs` precedent: this
-    maintenance task legitimately patrols every workspace, and every row
-    is only read/mutated after `set_workspace_context` scopes it to its
-    own workspace below)."""
-    stmt = select(DomainStrategyProfile.workspace_id).distinct()  # noqa: workspace-scope
-    return [row[0] for row in session.execute(stmt).all()]
+    its own `workspace_id` + `profile_ids` and skips this scan entirely).
+
+    A periodic maintenance sweep necessarily spans every workspace, and
+    under FORCE ROW LEVEL SECURITY the ordinary engine's role fail-closes
+    an unscoped scan to ZERO rows when no workspace context is set --
+    which silently killed finalization for 6.5 h on 2026-08-21 (mushtryati
+    F-1). So this scan runs on the sanctioned BYPASSRLS system session
+    (`get_system_session`, the `_scan_job_refs`/`_scan_active_profile_refs`
+    precedent) and returns plain ids; every subsequent row read/write
+    happens on the caller's ordinary session, re-scoped per workspace via
+    `set_workspace_context` -- the system session never touches a row.
+    """
+    with get_system_session() as session:
+        stmt = select(DomainStrategyProfile.workspace_id).distinct()  # noqa: workspace-scope
+        return [row[0] for row in session.execute(stmt).all()]
 
 
 def _outbox_strategy_transition(session: Session, transition: StrategyTransition) -> None:
@@ -1307,7 +1322,7 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
         if workspace_id is not None:
             ws_list = [uuid.UUID(str(workspace_id))]
         else:
-            ws_list = _scan_workspace_refs_with_profiles(session)
+            ws_list = _scan_workspace_refs_with_profiles()
 
         for ws in ws_list:
             set_workspace_context(session, ws)
@@ -1351,22 +1366,30 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
 _PATTERN_BACKFILL_BATCH_SIZE = 200
 
 
-def _scan_stale_pattern_profile_refs(
-    session: Session, *, limit: int
-) -> list[tuple[uuid.UUID, uuid.UUID]]:
+def _scan_stale_pattern_profile_refs(*, limit: int) -> list[tuple[uuid.UUID, uuid.UUID]]:
     """`(id, workspace_id)` for profiles stamped with an OLD
-    `url_pattern_version` (< current `URL_PATTERN_ALGORITHM_VERSION`), unscoped
-    -- the `_scan_active_profile_refs` precedent (every row is only
-    read/mutated after `set_workspace_context` scopes it below). At algorithm
-    version 1 (current) this returns nothing (D10 "defined mechanism, not
-    exercised at version 1")."""
-    stmt = (
-        select(DomainStrategyProfile.id, DomainStrategyProfile.workspace_id)  # noqa: workspace-scope
-        .where(DomainStrategyProfile.url_pattern_version < URL_PATTERN_ALGORITHM_VERSION)
-        .order_by(DomainStrategyProfile.id)
-        .limit(limit)
-    )
-    return list(session.execute(stmt).all())
+    `url_pattern_version` (< current `URL_PATTERN_ALGORITHM_VERSION`), unscoped.
+    At algorithm version 1 (current) this returns nothing (D10 "defined
+    mechanism, not exercised at version 1").
+
+    A periodic maintenance sweep necessarily spans every workspace, and
+    under FORCE ROW LEVEL SECURITY the ordinary engine's role fail-closes
+    an unscoped scan to ZERO rows when no workspace context is set --
+    which silently killed finalization for 6.5 h on 2026-08-21 (mushtryati
+    F-1). So this scan runs on the sanctioned BYPASSRLS system session
+    (`get_system_session`, the `_scan_job_refs`/`_scan_active_profile_refs`
+    precedent) and returns plain ids; every subsequent row read/write
+    happens on the caller's ordinary session, re-scoped per profile via
+    `set_workspace_context` -- the system session never touches a row.
+    """
+    with get_system_session() as session:
+        stmt = (
+            select(DomainStrategyProfile.id, DomainStrategyProfile.workspace_id)  # noqa: workspace-scope
+            .where(DomainStrategyProfile.url_pattern_version < URL_PATTERN_ALGORITHM_VERSION)
+            .order_by(DomainStrategyProfile.id)
+            .limit(limit)
+        )
+        return list(session.execute(stmt).all())
 
 
 @app.task(name=STRATEGY_PATTERN_BACKFILL)
@@ -1395,7 +1418,7 @@ def pattern_backfill() -> None:
         rebuilt = 0
         rediscovered = 0
         for profile_id, workspace_id in _scan_stale_pattern_profile_refs(
-            session, limit=_PATTERN_BACKFILL_BATCH_SIZE
+            limit=_PATTERN_BACKFILL_BATCH_SIZE
         ):
             set_workspace_context(session, workspace_id)
             profile = scoped_get(session, DomainStrategyProfile, profile_id, workspace_id)

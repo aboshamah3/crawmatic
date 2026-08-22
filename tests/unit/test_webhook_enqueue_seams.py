@@ -883,7 +883,7 @@ def fake_set_workspace_context(session, workspace_id):
     pass
 
 
-def fake_scan_active_profile_refs(session, limit):
+def fake_scan_active_profile_refs(*, limit):
     return [(profile_triggered_id, workspace_id), (profile_not_triggered_id, workspace_id)]
 
 
@@ -1018,4 +1018,221 @@ sys.exit(0)
     assert result.returncode == 0, (
         f"stdout={result.stdout!r}\\nstderr={result.stderr!r}"
     )
+    assert result.stdout.strip() == "OK"
+
+
+# --- 5. tasks_strategy.py's three cross-tenant scans: system session (F-1) --
+#
+# The same mushtryati F-1 incident that moved `tasks_jobs.py::_scan_job_refs`
+# onto the BYPASSRLS system session (`test_jobs_counters.py::
+# test_scan_job_refs_uses_system_session`) applies verbatim to this module's
+# three unscoped maintenance scans: `domain_strategy_profiles` also carries
+# FORCE ROW LEVEL SECURITY, so on the ordinary RLS-confined session an
+# unscoped `SELECT` with no `app.workspace_id` GUC set fails closed to ZERO
+# rows rather than erroring -- every loop body downstream simply never runs.
+# Each scan now opens its own `get_system_session()` for the id-pair lookup
+# only; every subsequent row read/write still happens on the caller's
+# ordinary session, re-scoped per row via `set_workspace_context`.
+
+_SCAN_ACTIVE_PROFILE_REFS_CHECK = """
+import sys
+sys.path.insert(0, "apps/workers")
+
+from contextlib import contextmanager
+
+import app.workers.tasks_strategy as tasks_strategy
+
+calls = {"system": 0, "ordinary": 0}
+
+
+class _FakeResult:
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    def execute(self, stmt):
+        return _FakeResult()
+
+
+@contextmanager
+def fake_system_session():
+    calls["system"] += 1
+    yield _FakeSession()
+
+
+@contextmanager
+def fake_ordinary_session():
+    calls["ordinary"] += 1
+    yield _FakeSession()
+
+
+tasks_strategy.get_system_session = fake_system_session
+tasks_strategy.get_session = fake_ordinary_session
+
+refs = tasks_strategy._scan_active_profile_refs(limit=10)
+
+if refs != []:
+    print("WRONG_REFS:" + str(refs))
+    sys.exit(1)
+if calls["system"] != 1:
+    print("SYSTEM_SESSION_NOT_USED:" + str(calls))
+    sys.exit(1)
+if calls["ordinary"] != 0:
+    print("ORDINARY_SESSION_USED:" + str(calls))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_scan_active_profile_refs_uses_system_session() -> None:
+    """The cross-tenant ACTIVE-profile scan (`light_recheck`'s sweep) must
+    run on the BYPASSRLS system session -- the `_scan_job_refs` precedent
+    (mushtryati F-1, 2026-08-21): `domain_strategy_profiles` carries FORCE
+    ROW LEVEL SECURITY, so on the ordinary session an unscoped sweep with
+    no GUC set returns nothing at all rather than erroring.
+
+    Driven in a subprocess: `apps/api/app` shadows `apps/workers/app` on
+    the shared `app` package name (the `test_jobs_counters.py` precedent).
+    """
+    result = _run(_SCAN_ACTIVE_PROFILE_REFS_CHECK)
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+_SCAN_WORKSPACE_REFS_WITH_PROFILES_CHECK = """
+import sys
+sys.path.insert(0, "apps/workers")
+
+from contextlib import contextmanager
+
+import app.workers.tasks_strategy as tasks_strategy
+
+calls = {"system": 0, "ordinary": 0}
+
+
+class _FakeResult:
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    def execute(self, stmt):
+        return _FakeResult()
+
+
+@contextmanager
+def fake_system_session():
+    calls["system"] += 1
+    yield _FakeSession()
+
+
+@contextmanager
+def fake_ordinary_session():
+    calls["ordinary"] += 1
+    yield _FakeSession()
+
+
+tasks_strategy.get_system_session = fake_system_session
+tasks_strategy.get_session = fake_ordinary_session
+
+refs = tasks_strategy._scan_workspace_refs_with_profiles()
+
+if refs != []:
+    print("WRONG_REFS:" + str(refs))
+    sys.exit(1)
+if calls["system"] != 1:
+    print("SYSTEM_SESSION_NOT_USED:" + str(calls))
+    sys.exit(1)
+if calls["ordinary"] != 0:
+    print("ORDINARY_SESSION_USED:" + str(calls))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_scan_workspace_refs_with_profiles_uses_system_session() -> None:
+    """The cross-tenant distinct-workspace scan (`flush_stats`'s periodic
+    sweep, invoked with no explicit target) must run on the BYPASSRLS
+    system session -- the `_scan_job_refs` precedent (mushtryati F-1,
+    2026-08-21): `domain_strategy_profiles` carries FORCE ROW LEVEL
+    SECURITY, so on the ordinary session an unscoped sweep with no GUC set
+    returns nothing at all rather than erroring.
+
+    Driven in a subprocess (`test_jobs_counters.py` precedent).
+    """
+    result = _run(_SCAN_WORKSPACE_REFS_WITH_PROFILES_CHECK)
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+_SCAN_STALE_PATTERN_PROFILE_REFS_CHECK = """
+import sys
+sys.path.insert(0, "apps/workers")
+
+from contextlib import contextmanager
+
+import app.workers.tasks_strategy as tasks_strategy
+
+calls = {"system": 0, "ordinary": 0}
+
+
+class _FakeResult:
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    def execute(self, stmt):
+        return _FakeResult()
+
+
+@contextmanager
+def fake_system_session():
+    calls["system"] += 1
+    yield _FakeSession()
+
+
+@contextmanager
+def fake_ordinary_session():
+    calls["ordinary"] += 1
+    yield _FakeSession()
+
+
+tasks_strategy.get_system_session = fake_system_session
+tasks_strategy.get_session = fake_ordinary_session
+
+refs = tasks_strategy._scan_stale_pattern_profile_refs(limit=200)
+
+if refs != []:
+    print("WRONG_REFS:" + str(refs))
+    sys.exit(1)
+if calls["system"] != 1:
+    print("SYSTEM_SESSION_NOT_USED:" + str(calls))
+    sys.exit(1)
+if calls["ordinary"] != 0:
+    print("ORDINARY_SESSION_USED:" + str(calls))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_scan_stale_pattern_profile_refs_uses_system_session() -> None:
+    """The cross-tenant stale-pattern scan (`pattern_backfill`'s sweep)
+    must run on the BYPASSRLS system session -- the `_scan_job_refs`
+    precedent (mushtryati F-1, 2026-08-21): `domain_strategy_profiles`
+    carries FORCE ROW LEVEL SECURITY, so on the ordinary session an
+    unscoped sweep with no GUC set returns nothing at all rather than
+    erroring.
+
+    Driven in a subprocess (`test_jobs_counters.py` precedent).
+    """
+    result = _run(_SCAN_STALE_PATTERN_PROFILE_REFS_CHECK)
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     assert result.stdout.strip() == "OK"
