@@ -127,6 +127,17 @@ def _get_redis() -> Any | None:
         return None
 
 
+# F-3 (2026-08-22 review): the probe timeout for the OPS path only.
+# `ScrapydDispatchClient`'s default is 30s, sized for a dispatch POST
+# whose failure costs a lost batch. This endpoint's probe is a read, it
+# runs serially across every configured node, and a wedged scrapyd
+# ACCEPTS the connection and then hangs — so at the default the monitor
+# burns 30s x node-count exactly during the outage it exists to report.
+# Bounded here, and only here: `dispatch_job`/`recover_stalled_batches`
+# construct their own clients and keep the 30s POST timeout.
+_SCRAPYD_PROBE_TIMEOUT_SECONDS = 5.0
+
+
 def _get_scrapyd_status(
     settings: Any | None, redis_client: Any | None
 ) -> dict[str, dict[str, Any] | None] | None:
@@ -142,6 +153,10 @@ def _get_scrapyd_status(
     raising — that ``None`` becomes the labelled absence for that one node,
     never a fake zero.
 
+    The client is built with ``_SCRAPYD_PROBE_TIMEOUT_SECONDS`` rather than
+    the dispatch default (F-3) so a hung node costs seconds, not half a
+    minute, per node.
+
     Best-effort like ``_get_redis``/``_get_settings_or_none``: returns
     ``None`` (not raises) when ``settings`` is unavailable or the client
     itself cannot be constructed, so a scrapyd outage never turns this into
@@ -153,7 +168,11 @@ def _get_scrapyd_status(
     try:
         from app_shared.scrapyd.client import ScrapydDispatchClient
 
-        client = ScrapydDispatchClient(settings=settings, redis_client=redis_client)
+        client = ScrapydDispatchClient(
+            settings=settings,
+            redis_client=redis_client,
+            timeout=_SCRAPYD_PROBE_TIMEOUT_SECONDS,
+        )
         node_urls = list(settings.SCRAPYD_HTTP_URLS) + list(settings.SCRAPYD_BROWSER_URLS)
         return {node_url: client.daemon_status(node_url) for node_url in node_urls}
     except Exception:  # noqa: BLE001 - see docstring

@@ -276,7 +276,7 @@ print("OK")
 sys.exit(0)
 """
 
-_F2_SETUP = """
+_F2_FIXTURES = """
 import sys
 import uuid
 from contextlib import contextmanager
@@ -423,7 +423,12 @@ t2 = _seed_target("t2", ScrapeTargetStatus.PENDING, old_stamp)
 t3 = _seed_target("t3", ScrapeTargetStatus.DEFERRED, old_stamp)
 # t4: terminal, never dispatched -> never selected, stays unstamped.
 t4 = _seed_target("t4", ScrapeTargetStatus.COMPLETED, None)
+"""
 
+# The fixtures above plus one clean dispatch. Split out so the F-1
+# durability check below can seed its own failure mode BEFORE the task
+# runs, without duplicating the fixture block.
+_F2_SETUP = _F2_FIXTURES + """
 tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
 
 posted_match_ids = set()
@@ -459,6 +464,83 @@ if t2.dispatched_at != old_stamp:
     sys.exit(1)
 if t4.dispatched_at is not None:
     print("T4_STAMPED_WITHOUT_POST:" + str(t4.dispatched_at))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+)
+
+
+# F-1 (2026-08-22 review): a stamp is only worth what it survives.
+# `get_session()` never commits in its `finally`, so one commit after the
+# whole batch loop meant batch 50's unreachable node rolled back the
+# stamps of every batch already POSTed -- and once the 900s Redis guard
+# TTL expired, the next dispatch delivery re-planned them all. That IS
+# the 2.71x mechanism. t1 and t3 sit on distinct domains, so they plan
+# into two batches; the second POST blows up.
+_F1_STAMP_DURABILITY_CHECK = (
+    _F2_FIXTURES
+    + """
+# On a fake session an in-memory attribute survives regardless, so only
+# what was COMMITTED before the failure propagated proves anything.
+committed = []
+_real_commit = fake_session.commit
+
+
+def recording_commit():
+    committed.append(
+        {t.match_id: t.dispatched_at for t in fake_session._rows.get(ScrapeJobTarget, [])}
+    )
+    _real_commit()
+
+
+fake_session.commit = recording_commit
+
+# `client_factory` reads `fake_post` out of module globals when the task
+# builds its client, so rebinding it here is enough.
+_ok_post = fake_post
+
+
+def failing_second_post(url, *, data, auth, timeout):
+    if calls:
+        raise requests.ConnectionError("node refused the second batch")
+    return _ok_post(url, data=data, auth=auth, timeout=timeout)
+
+
+fake_post = failing_second_post
+
+stale = {t1.match_id: t1.dispatched_at, t3.match_id: t3.dispatched_at}
+
+raised = None
+try:
+    tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+except Exception as exc:
+    raised = exc
+
+if raised is None:
+    print("SECOND_BATCH_FAILURE_WAS_SWALLOWED")
+    sys.exit(1)
+
+if len(calls) != 1:
+    print("EXPECTED_EXACTLY_ONE_SUCCESSFUL_POST_GOT:" + str(len(calls)))
+    sys.exit(1)
+
+posted = str(calls[0]["data"]["match_ids"]).split(",")
+succeeded = t1 if str(t1.match_id) in posted else t3
+failed = t3 if succeeded is t1 else t1
+
+if not committed:
+    print("NOTHING_WAS_COMMITTED_BEFORE_THE_FAILURE_PROPAGATED")
+    sys.exit(1)
+
+snapshot = committed[-1]
+stamped = snapshot.get(succeeded.match_id)
+if stamped is None or stamped == stale[succeeded.match_id]:
+    print("POSTED_BATCH_STAMP_WAS_ROLLED_BACK_BY_A_LATER_FAILURE:" + str(stamped))
+    sys.exit(1)
+if snapshot.get(failed.match_id) != stale[failed.match_id]:
+    print("UNPOSTED_BATCH_WAS_STAMPED:" + str(snapshot.get(failed.match_id)))
     sys.exit(1)
 
 print("OK")
@@ -521,3 +603,11 @@ def test_dispatch_job_stamps_dispatched_at_on_post() -> None:
     'already scheduled' return counts as dispatched too); a target the
     selection never picked up keeps `dispatched_at` untouched."""
     _run_f2(_F2_STAMP_CHECK)
+
+
+def test_dispatch_job_commits_a_posted_batchs_stamp_before_a_later_failure() -> None:
+    """Batch A is POSTed, batch B's POST raises. A's `dispatched_at` must
+    already be COMMITTED when the failure propagates — one commit after
+    the whole loop rolled it back, and past the 900s Redis guard TTL the
+    next delivery re-POSTed A: the 2.71x mechanism, one layer down."""
+    _run_f2(_F1_STAMP_DURABILITY_CHECK)

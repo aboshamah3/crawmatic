@@ -95,6 +95,27 @@ _RUNNING_JOB_STATUSES = frozenset({ScrapeJobStatus.RUNNING})
 # liveness cache must never re-probe a node it already found dead.
 _UNPROBED = object()
 
+
+def _queue_depth(status_payload: dict) -> int | None:
+    """`pending + running` off a `daemonstatus.json` payload, or `None`.
+
+    F-7 (2026-08-22 review): `ScrapydDispatchClient.daemon_status`
+    deliberately never raises — "a probe that blew up would abort the
+    whole sweep on the very node it exists to classify" — so the caller
+    must not reintroduce the raise by coercing whatever the node put in
+    the JSON. Mirrors `app_shared.opsmetrics.snapshot._as_int`: a
+    malformed payload (`"pending": null`, a list, a non-numeric string)
+    is not evidence that the node is working a queue, so it is treated
+    exactly like an unreachable node — `None`, and the reap proceeds.
+    """
+    try:
+        return int(status_payload.get("pending", 0)) + int(
+            status_payload.get("running", 0)
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 # A target in one of these statuses has progressed past "never picked
 # up" — `finalize_jobs` requires ALL of a job's targets to be terminal
 # before finalizing; `recover_stalled_batches` requires a target to be
@@ -289,41 +310,53 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
         )
 
         client = ScrapydDispatchClient(settings=settings)
-        for batch in batches:
-            if batch.mode == ScrapeProfileMode.BROWSER:
-                project, spider, nodes = (
-                    _SCRAPYD_BROWSER_PROJECT,
-                    _GENERIC_BROWSER_SPIDER,
-                    settings.SCRAPYD_BROWSER_URLS,
+        try:
+            for batch in batches:
+                if batch.mode == ScrapeProfileMode.BROWSER:
+                    project, spider, nodes = (
+                        _SCRAPYD_BROWSER_PROJECT,
+                        _GENERIC_BROWSER_SPIDER,
+                        settings.SCRAPYD_BROWSER_URLS,
+                    )
+                else:
+                    project, spider, nodes = (
+                        _SCRAPYD_PROJECT,
+                        _GENERIC_PRICE_SPIDER,
+                        settings.SCRAPYD_HTTP_URLS,
+                    )
+                node_url = select_node(batch.domain, nodes)
+                client.schedule(
+                    project,
+                    spider,
+                    workspace_id=str(workspace_uuid),
+                    scrape_job_id=str(job.id),
+                    match_ids=batch.match_ids,
+                    mode=batch.mode,
+                    batch_index=batch.batch_index,
+                    node_url=node_url,
                 )
-            else:
-                project, spider, nodes = (
-                    _SCRAPYD_PROJECT,
-                    _GENERIC_PRICE_SPIDER,
-                    settings.SCRAPYD_HTTP_URLS,
-                )
-            node_url = select_node(batch.domain, nodes)
-            client.schedule(
-                project,
-                spider,
-                workspace_id=str(workspace_uuid),
-                scrape_job_id=str(job.id),
-                match_ids=batch.match_ids,
-                mode=batch.mode,
-                batch_index=batch.batch_index,
-                node_url=node_url,
-            )
-            # F-2 (2026-08-22): stamp the batch's targets the moment they
-            # leave here, so the next dispatch delivery cannot re-plan
-            # them. A guard-deduped "already scheduled" return counts as
-            # dispatched too -- the POST that guard is standing in for did
-            # happen. One loop over the already-loaded `targets`, never an
-            # extra query.
-            dispatched_match_ids = set(batch.match_ids)
-            stamp = datetime.now(timezone.utc)
-            for target in targets:
-                if target.match_id in dispatched_match_ids:
-                    target.dispatched_at = stamp
+                # F-2 (2026-08-22): stamp the batch's targets the moment they
+                # leave here, so the next dispatch delivery cannot re-plan
+                # them. A guard-deduped "already scheduled" return counts as
+                # dispatched too -- the POST that guard is standing in for did
+                # happen. One loop over the already-loaded `targets`, never an
+                # extra query.
+                dispatched_match_ids = set(batch.match_ids)
+                stamp = datetime.now(timezone.utc)
+                for target in targets:
+                    if target.match_id in dispatched_match_ids:
+                        target.dispatched_at = stamp
+        except Exception:
+            # F-1 (2026-08-22 review): a stamp is only worth what it
+            # survives. `get_session()` never commits in its `finally`, so
+            # with one commit after the whole loop, batch 50's unreachable
+            # node used to roll back the stamps of batches 1-49 that really
+            # WERE POSTed -- and once the 900s Redis guard expired, the
+            # next dispatch delivery re-planned every one of them. That is
+            # the exact 2.71x mechanism this phase exists to remove. Commit
+            # what was earned, then let the failure propagate unchanged.
+            session.commit()
+            raise
 
         session.commit()
 
@@ -679,48 +712,62 @@ def recover_stalled_batches() -> None:
                 browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,
             )
 
-            for batch in re_batches:
-                if batch.mode == ScrapeProfileMode.BROWSER:
-                    project, spider, nodes = (
-                        _SCRAPYD_BROWSER_PROJECT,
-                        _GENERIC_BROWSER_SPIDER,
-                        settings.SCRAPYD_BROWSER_URLS,
+            try:
+                for batch in re_batches:
+                    if batch.mode == ScrapeProfileMode.BROWSER:
+                        project, spider, nodes = (
+                            _SCRAPYD_BROWSER_PROJECT,
+                            _GENERIC_BROWSER_SPIDER,
+                            settings.SCRAPYD_BROWSER_URLS,
+                        )
+                    else:
+                        project, spider, nodes = (
+                            _SCRAPYD_PROJECT,
+                            _GENERIC_PRICE_SPIDER,
+                            settings.SCRAPYD_HTTP_URLS,
+                        )
+                    node_url = select_node(batch.domain, nodes)
+                    status_payload = node_status_cache.get(node_url, _UNPROBED)
+                    if status_payload is _UNPROBED:
+                        status_payload = client.daemon_status(node_url)
+                        node_status_cache[node_url] = status_payload
+                    depth = (
+                        None if status_payload is None else _queue_depth(status_payload)
                     )
-                else:
-                    project, spider, nodes = (
-                        _SCRAPYD_PROJECT,
-                        _GENERIC_PRICE_SPIDER,
-                        settings.SCRAPYD_HTTP_URLS,
+                    if depth is not None and depth > 0:
+                        # Node alive and working its queue: these targets are
+                        # queued behind max_proc/rate limits, not stalled.
+                        continue
+                    client.schedule(
+                        project,
+                        spider,
+                        workspace_id=str(workspace_id),
+                        scrape_job_id=str(job.id),
+                        match_ids=batch.match_ids,
+                        mode=batch.mode,
+                        batch_index=f"{batch.batch_index}:r{window}",
+                        node_url=node_url,
                     )
-                node_url = select_node(batch.domain, nodes)
-                status_payload = node_status_cache.get(node_url, _UNPROBED)
-                if status_payload is _UNPROBED:
-                    status_payload = client.daemon_status(node_url)
-                    node_status_cache[node_url] = status_payload
-                if status_payload is not None and (
-                    int(status_payload.get("pending", 0))
-                    + int(status_payload.get("running", 0))
-                ) > 0:
-                    # Node alive and working its queue: these targets are
-                    # queued behind max_proc/rate limits, not stalled.
-                    continue
-                client.schedule(
-                    project,
-                    spider,
-                    workspace_id=str(workspace_id),
-                    scrape_job_id=str(job.id),
-                    match_ids=batch.match_ids,
-                    mode=batch.mode,
-                    batch_index=f"{batch.batch_index}:r{window}",
-                    node_url=node_url,
-                )
-                # A re-POSTed target's stall clock restarts here — without
-                # a fresh stamp the very next sweep would reap it again,
-                # which is the feedback loop this whole fix removes.
-                stamp = datetime.now(timezone.utc)
-                batch_match_ids = set(batch.match_ids)
-                for target in stalled_targets:
-                    if target.match_id in batch_match_ids:
-                        target.dispatched_at = stamp
+                    # A re-POSTed target's stall clock restarts here — without
+                    # a fresh stamp the very next sweep would reap it again,
+                    # which is the feedback loop this whole fix removes.
+                    stamp = datetime.now(timezone.utc)
+                    batch_match_ids = set(batch.match_ids)
+                    for target in stalled_targets:
+                        if target.match_id in batch_match_ids:
+                            target.dispatched_at = stamp
+            finally:
+                # F-1 (2026-08-22 review): commit THIS job's stamps before
+                # moving on. With one commit after the whole sweep, a
+                # single failure anywhere downstream (an unreachable node
+                # on batch 50, a job later in the scan) rolled back every
+                # stamp earned by batches that really were re-POSTed --
+                # and past the 900s Redis guard TTL those targets get
+                # re-POSTed again. Same durability hole as `dispatch_job`,
+                # same fix: a successful POST's stamp outlives a later
+                # failure. Also puts the commit inside the job's own
+                # `set_workspace_context`, rather than under whichever
+                # workspace happened to be last.
+                session.commit()
 
         session.commit()

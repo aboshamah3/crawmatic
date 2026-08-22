@@ -260,7 +260,13 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         )
 
     async def start(self) -> AsyncIterator[scrapy.Request]:
-        loaded = await await_in_thread(load_targets, self.workspace_id, self.match_ids)
+        # F-2 belt-and-braces, same as the HTTP spider: a duplicate run of
+        # this job must fetch nothing already terminal for it. Browser
+        # scrapes carry proxy + headless cost, so a duplicate here is
+        # worth several HTTP ones.
+        loaded = await await_in_thread(
+            load_targets, self.workspace_id, self.match_ids, scrape_job_id=self.scrape_job_id
+        )
         self._visible_providers = loaded.visible_providers
         self._provider_rows = loaded.provider_rows
         self._provider_passwords = loaded.provider_passwords

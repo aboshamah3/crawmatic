@@ -204,3 +204,45 @@ def test_load_targets_without_scrape_job_id_does_not_probe_terminal_status(
 
     events = _json_events(caplog, _LOGGER_NAME)
     assert not [e for e in events if e["event"] == "dispatch.duplicate_terminal_skipped"]
+
+
+# --- both spiders must actually PASS `scrape_job_id` -------------------------
+#
+# The filter above is dead weight in any spider that calls `load_targets`
+# without the kwarg (it defaults to `None` -> no probe). The browser
+# spider shipped without it (F-8, 2026-08-22 review) on the *expensive*
+# path: browser scrapes carry proxy + headless cost, so a duplicate run
+# there is worth several HTTP ones. An AST check, not a substring match,
+# so a `scrape_job_id` mentioned anywhere else in the file cannot satisfy
+# it.
+
+_SPIDER_SOURCES = (
+    "apps/scrapers/price_monitor/spiders/generic_price_spider.py",
+    "apps/scrapers-browser/price_monitor_browser/spiders/generic_browser_price_spider.py",
+)
+
+
+@pytest.mark.parametrize("relative_path", _SPIDER_SOURCES)
+def test_spider_passes_scrape_job_id_to_load_targets(relative_path: str) -> None:
+    import ast
+    import pathlib
+
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    tree = ast.parse((repo_root / relative_path).read_text(encoding="utf-8"))
+
+    load_target_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(
+            isinstance(arg, ast.Name) and arg.id == "load_targets"
+            for arg in node.args
+        )
+    ]
+    assert load_target_calls, f"no `load_targets` dispatch found in {relative_path}"
+
+    for call in load_target_calls:
+        assert "scrape_job_id" in {kw.arg for kw in call.keywords}, (
+            f"{relative_path}:{call.lineno} calls load_targets without "
+            "scrape_job_id -- the duplicate-run filter is a no-op there"
+        )

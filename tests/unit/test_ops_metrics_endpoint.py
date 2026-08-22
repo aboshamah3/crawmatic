@@ -432,3 +432,67 @@ class TestResilience:
         # `_get_redis` imports lazily inside its own body, so patching the
         # source module is what it actually resolves at call time.
         assert ops_metrics._get_redis() is None
+
+
+class TestScrapydProbe:
+    """`_get_scrapyd_status` — the one place `/ops/metrics` opens a
+    network connection of its own (T8). Both checks drive the real
+    function with a recording stand-in for `ScrapydDispatchClient`,
+    patched on its source module because `_get_scrapyd_status` imports
+    lazily inside its own body (the `_get_redis` precedent above)."""
+
+    class _Settings:
+        SCRAPYD_HTTP_URLS = ("http://scraper-a:6800", "http://scraper-b:6800")
+        SCRAPYD_BROWSER_URLS = ("http://scrapers-browser:6800",)
+
+    @staticmethod
+    def _record(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+        import app_shared.scrapyd.client as scrapyd_client
+
+        built: list[dict] = []
+
+        class _RecordingClient:
+            def __init__(self, *, settings=None, redis_client=None, timeout=None):
+                built.append({"timeout": timeout, "probed": []})
+                self._probed = built[-1]["probed"]
+
+            def daemon_status(self, node_url: str) -> dict | None:
+                self._probed.append(node_url)
+                return {"status": "ok", "pending": 0, "running": 0}
+
+        monkeypatch.setattr(
+            scrapyd_client, "ScrapydDispatchClient", _RecordingClient
+        )
+        return built
+
+    def test_probe_client_is_built_with_the_short_ops_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wedged scrapyd ACCEPTS the connection and then hangs, and the
+        probe is serial across every node — at the client's 30s dispatch
+        default the monitor burns 30s x node-count during exactly the
+        outage it exists to report."""
+        built = self._record(monkeypatch)
+
+        ops_metrics._get_scrapyd_status(self._Settings(), None)
+
+        assert built, "no probe client was constructed"
+        assert built[0]["timeout"] == ops_metrics._SCRAPYD_PROBE_TIMEOUT_SECONDS
+        assert ops_metrics._SCRAPYD_PROBE_TIMEOUT_SECONDS <= 5.0
+
+    def test_probe_covers_both_the_http_and_the_browser_fleet(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dropped `+ list(settings.SCRAPYD_BROWSER_URLS)` would leave
+        the browser fleet invisible with every other test green."""
+        built = self._record(monkeypatch)
+
+        status = ops_metrics._get_scrapyd_status(self._Settings(), None)
+
+        expected = [
+            "http://scraper-a:6800",
+            "http://scraper-b:6800",
+            "http://scrapers-browser:6800",
+        ]
+        assert built[0]["probed"] == expected
+        assert list(status) == expected

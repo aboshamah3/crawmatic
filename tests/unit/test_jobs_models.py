@@ -228,6 +228,11 @@ def test_scrape_job_target_enum_columns_render_varchar_32() -> None:
 def test_scrape_job_target_has_dispatched_at() -> None:
     col = ScrapeJobTarget.__table__.c.dispatched_at
     assert col.nullable is True
+    # The stall clock is compared against `datetime.now(timezone.utc)`.
+    # A `TIMESTAMP WITHOUT TIME ZONE` regression would still pass the
+    # nullability assertion above while silently shifting every stall
+    # cutoff by the server's UTC offset.
+    assert _compiled_type(col).upper() == "TIMESTAMP WITH TIME ZONE"
 
 
 # --- WORKSPACE_OWNED_MODELS + re-export ---------------------------------------

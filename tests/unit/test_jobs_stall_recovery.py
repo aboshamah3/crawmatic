@@ -626,6 +626,167 @@ sys.exit(0)
 """
 
 
+# The scrapers container restarted: scrapyd's queue is ephemeral, so the
+# node is ALIVE and answering but holds nothing (`pending=0, running=0`).
+# Queue cleared is not queue busy -- the target really is stranded and the
+# reaper is the ONLY path left to it (`dispatch_job` and
+# `redispatch_pending_jobs` both require `dispatched_at IS NULL`). A
+# one-character slip in the gate (`>` -> `>=`, or `is not None` ->
+# truthiness) would strand it permanently with every other test green.
+_RESTARTED_NODE_CHECK = _REAPER_PRELUDE + """
+daemon["payload"] = {"status": "ok", "pending": 0, "running": 0, "finished": 12}
+
+job = new_job(7200)
+target = new_target(job, 7200)
+stale_stamp = target.dispatched_at
+
+tasks_jobs.recover_stalled_batches()
+
+if not probes:
+    fail("NODE_WAS_NEVER_PROBED_BEFORE_REDISPATCH")
+
+if len(calls) != 1:
+    fail("EMPTY_QUEUE_ALIVE_NODE_WAS_NOT_REAPED_GOT:" + str(len(calls)))
+
+if calls[0]["data"]["match_ids"] != str(target.match_id):
+    fail("WRONG_TARGET_REAPED:" + str(calls[0]["data"]["match_ids"]))
+
+if target.dispatched_at != _FakeDatetime._now or target.dispatched_at == stale_stamp:
+    fail("RESTART_REDISPATCH_NOT_RESTAMPED:" + str(target.dispatched_at))
+
+print("OK")
+sys.exit(0)
+"""
+
+# A node whose `daemonstatus.json` carries unusable counts is not evidence
+# that it is working a queue. `daemon_status` never raises; coercing its
+# payload with a bare `int(...)` reintroduced the raise one call up, and it
+# would abort the whole sweep (losing every commit) on one bad node.
+_MALFORMED_PAYLOAD_CHECK = _REAPER_PRELUDE + """
+daemon["payload"] = {"status": "ok", "pending": None, "running": ["nope"]}
+
+job = new_job(7200)
+target = new_target(job, 7200)
+
+try:
+    tasks_jobs.recover_stalled_batches()
+except Exception as exc:
+    fail("MALFORMED_PAYLOAD_RAISED_OUT_OF_THE_SWEEP:" + repr(exc))
+
+if len(calls) != 1:
+    fail("MALFORMED_PAYLOAD_NODE_NOT_TREATED_AS_DEAD_GOT:" + str(len(calls)))
+
+if target.dispatched_at != _FakeDatetime._now:
+    fail("REAPED_TARGET_NOT_RESTAMPED:" + str(target.dispatched_at))
+
+print("OK")
+sys.exit(0)
+"""
+
+# F-1 (2026-08-22 review): batch A's node is dead (reap proceeds, POST
+# succeeds); batch B's POST then blows up. A's stamp must be COMMITTED
+# before the failure propagates -- one commit after the whole sweep rolled
+# it back, and past the 900s guard TTL A got re-POSTed all over again.
+_REAPER_STAMP_DURABILITY_CHECK = _REAPER_PRELUDE + """
+daemon["payload"] = None
+
+# Snapshot every target's `dispatched_at` at each commit: on a fake
+# session an in-memory attribute survives regardless, so only what was
+# COMMITTED before the failure propagated proves anything.
+committed = []
+_real_commit = fake_session.commit
+
+
+def recording_commit():
+    committed.append(
+        {t.match_id: t.dispatched_at for t in fake_session._rows.get(ScrapeJobTarget, [])}
+    )
+    _real_commit()
+
+
+fake_session.commit = recording_commit
+
+# `client_factory` reads `fake_post` out of module globals when the task
+# builds its client, so rebinding it here is enough.
+_ok_post = fake_post
+
+
+def failing_second_post(url, *, data, auth, timeout):
+    if calls:
+        raise requests.ConnectionError("node refused the second batch")
+    return _ok_post(url, data=data, auth=auth, timeout=timeout)
+
+
+fake_post = failing_second_post
+
+
+def new_target_on(job, domain, dispatched_seconds_ago):
+    competitor = Competitor(workspace_id=workspace_id, name=domain, domain=domain)
+    competitor.id = uuid.uuid4()
+    match = CompetitorProductMatch(
+        workspace_id=workspace_id,
+        product_id=uuid.uuid4(),
+        product_variant_id=uuid.uuid4(),
+        competitor_id=competitor.id,
+        competitor_url="https://" + domain + "/p",
+        normalized_competitor_url="https://" + domain + "/p",
+        url_pattern="https://" + domain + "/p",
+        url_pattern_version=1,
+        priority=MatchPriority.NORMAL,
+        status=MatchStatus.ACTIVE,
+    )
+    match.id = uuid.uuid4()
+    target = ScrapeJobTarget(
+        workspace_id=workspace_id,
+        scrape_job_id=job.id,
+        match_id=match.id,
+        status=ScrapeTargetStatus.PENDING,
+        created_at=base_now,
+        dispatched_at=base_now - timedelta(seconds=dispatched_seconds_ago),
+    )
+    target.id = uuid.uuid4()
+    fake_session.seed(competitor, match, target)
+    return target
+
+
+job = new_job(7200)
+t_a = new_target_on(job, "alpha.example.com", 7200)
+t_b = new_target_on(job, "beta.example.com", 7200)
+stale = {t_a.match_id: t_a.dispatched_at, t_b.match_id: t_b.dispatched_at}
+
+raised = None
+try:
+    tasks_jobs.recover_stalled_batches()
+except Exception as exc:
+    raised = exc
+
+if raised is None:
+    fail("SECOND_BATCH_FAILURE_WAS_SWALLOWED")
+
+if len(calls) != 1:
+    fail("EXPECTED_EXACTLY_ONE_SUCCESSFUL_POST_GOT:" + str(len(calls)))
+
+posted = calls[0]["data"]["match_ids"].split(",")
+succeeded = t_a if str(t_a.match_id) in posted else t_b
+failed = t_b if succeeded is t_a else t_a
+
+if not committed:
+    fail("NOTHING_WAS_COMMITTED_BEFORE_THE_FAILURE_PROPAGATED")
+
+snapshot = committed[-1]
+if snapshot.get(succeeded.match_id) != _FakeDatetime._now:
+    fail(
+        "POSTED_BATCH_STAMP_WAS_ROLLED_BACK_BY_A_LATER_FAILURE:"
+        + str(snapshot.get(succeeded.match_id))
+    )
+if snapshot.get(failed.match_id) != stale[failed.match_id]:
+    fail("UNPOSTED_BATCH_WAS_STAMPED:" + str(snapshot.get(failed.match_id)))
+
+print("OK")
+sys.exit(0)
+"""
+
+
 def _run_reaper_check(script: str) -> None:
     env = {**os.environ, **_STALL_RECOVERY_ENV}
     result = subprocess.run(
@@ -659,3 +820,28 @@ def test_reaper_reaps_when_node_unreachable() -> None:
     proceeds, and the re-POSTed targets get a fresh `dispatched_at` so
     the next sweep cannot immediately reap them again."""
     _run_reaper_check(_DEAD_NODE_CHECK)
+
+
+def test_reaper_reaps_when_node_is_alive_but_its_queue_is_empty() -> None:
+    """The scrapers-restart strand: scrapyd's queue is ephemeral, so a
+    restarted node answers `pending=0, running=0` while the target it
+    was holding is gone. Queue cleared is not queue busy — and the
+    reaper is the only path left (dispatch and redispatch both require
+    `dispatched_at IS NULL`), so it must re-POST and re-stamp."""
+    _run_reaper_check(_RESTARTED_NODE_CHECK)
+
+
+def test_reaper_treats_a_malformed_daemonstatus_payload_as_a_dead_node() -> None:
+    """`daemon_status` never raises; a bare `int(payload["pending"])` put
+    the raise back one call up, where it would abort the whole sweep.
+    Unusable counts are not evidence of a working queue — reap."""
+    _run_reaper_check(_MALFORMED_PAYLOAD_CHECK)
+
+
+def test_reaper_commits_a_posted_batchs_stamp_before_a_later_failure() -> None:
+    """Batch A is re-POSTed, batch B's POST raises. A's `dispatched_at`
+    must already be COMMITTED when the failure propagates: with one
+    commit after the whole sweep it was rolled back, and past the 900s
+    Redis guard TTL A got re-POSTed all over again — the 2.71x
+    mechanism this phase exists to remove."""
+    _run_reaper_check(_REAPER_STAMP_DURABILITY_CHECK)
