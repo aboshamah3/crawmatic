@@ -367,6 +367,29 @@ class TestRedisSection:
         assert "ConnectionError" in (snapshot.redis.unavailable_reason or "")
 
 
+class _CountSession(_BoomSession):
+    """Only the scrapyd in-flight COUNT query succeeds, returning a fixed count.
+
+    Mirrors the real query shape (``session.execute(...).scalar_one()``)
+    without a real database — T8's per-node tests need the in-flight count
+    to succeed so the section doesn't degrade for an unrelated reason.
+    """
+
+    class _Result:
+        def __init__(self, value: int) -> None:
+            self._value = value
+
+        def scalar_one(self) -> int:
+            return self._value
+
+    def __init__(self, count: int) -> None:
+        super().__init__()
+        self._count = count
+
+    def execute(self, *_a, **_k):
+        return self._Result(self._count)
+
+
 class TestScrapydSection:
     def test_daemonstatus_is_optional_and_never_fetched_by_this_module(self) -> None:
         """The collector opens no network connections of its own."""
@@ -383,11 +406,97 @@ class TestScrapydSection:
         snapshot = collect_snapshot(
             _Session(),
             now=NOW,
-            scrapyd_status={"pending": 4, "running": 8, "finished": 100},
+            scrapyd_status={
+                "http://node1:6800": {"pending": 4, "running": 8, "finished": 100},
+            },
         )
         # The DB-derived count failed, so the whole section degrades —
         # but it degrades loudly rather than reporting a half-truth.
         assert snapshot.scrapyd.available is False
+
+    def test_per_node_payloads_render_real_numbers(self) -> None:
+        """Two reachable nodes: per-node numbers AND the fleet-wide sum
+        (T8 — queued-vs-stalled becomes observable)."""
+        snapshot = collect_snapshot(
+            _CountSession(3),
+            now=NOW,
+            scrapyd_status={
+                "http://node1:6800": {
+                    "status": "ok",
+                    "pending": 2,
+                    "running": 1,
+                    "finished": 40,
+                },
+                "http://node2:6800": {
+                    "status": "ok",
+                    "pending": 5,
+                    "running": 3,
+                    "finished": 60,
+                },
+            },
+        )
+        s = snapshot.scrapyd
+        assert s.available is True
+        assert s.unavailable_reason is None
+        assert s.pending == 7
+        assert s.running == 4
+        assert s.finished == 100
+        assert s.in_flight_targets == 3
+        by_url = {n.node_url: n for n in s.nodes}
+        assert by_url["http://node1:6800"].available is True
+        assert by_url["http://node1:6800"].status == "ok"
+        assert by_url["http://node1:6800"].pending == 2
+        assert by_url["http://node1:6800"].running == 1
+        assert by_url["http://node1:6800"].finished == 40
+        assert by_url["http://node2:6800"].running == 3
+
+    def test_unreachable_node_keeps_labelled_absence_not_fake_zeros(self) -> None:
+        """A node whose probe returned `None` (`daemon_status`'s "any
+        transport/HTTP/parse error" contract, T6) must NEVER be reported as
+        `pending=0`/`running=0` — that would read as an idle, healthy node
+        rather than one we could not reach at all."""
+        snapshot = collect_snapshot(
+            _CountSession(0),
+            now=NOW,
+            scrapyd_status={
+                "http://node1:6800": {
+                    "status": "ok",
+                    "pending": 2,
+                    "running": 1,
+                    "finished": 40,
+                },
+                "http://node2:6800": None,
+            },
+        )
+        s = snapshot.scrapyd
+        assert s.available is True
+        by_url = {n.node_url: n for n in s.nodes}
+        dead = by_url["http://node2:6800"]
+        assert dead.available is False
+        assert dead.unavailable_reason
+        assert dead.pending is None
+        assert dead.running is None
+        assert dead.finished is None
+        # the reachable node's own numbers still come through unharmed
+        alive = by_url["http://node1:6800"]
+        assert alive.available is True
+        assert alive.pending == 2
+
+    def test_all_nodes_unreachable_reports_no_fake_zero_aggregate(self) -> None:
+        """Every node down: the fleet-wide aggregate is the absence, not 0."""
+        snapshot = collect_snapshot(
+            _CountSession(0),
+            now=NOW,
+            scrapyd_status={"http://node1:6800": None, "http://node2:6800": None},
+        )
+        s = snapshot.scrapyd
+        assert s.available is True
+        assert s.pending is None
+        assert s.running is None
+        assert s.finished is None
+        assert s.unavailable_reason is not None
+        assert len(s.nodes) == 2
+        assert all(not n.available for n in s.nodes)
 
 
 def test_paid_access_methods_match_the_breaker() -> None:

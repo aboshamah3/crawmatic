@@ -513,15 +513,41 @@ class RedisHealth:
 
 
 @dataclass(frozen=True)
+class ScrapydNodeHealth:
+    """One node's own ``daemonstatus.json`` (T8 — queued vs. stalled per node).
+
+    ``available=False`` + ``unavailable_reason`` is what a probe returning
+    ``None`` becomes — ``ScrapydDispatchClient.daemon_status`` already
+    collapses every transport/HTTP/parse error into ``None`` (T6), and this
+    module refuses to turn that ``None`` into fake zeros: an unreachable
+    node must never read as an idle, healthy one.
+    """
+
+    node_url: str
+    available: bool
+    unavailable_reason: str | None = None
+    status: str | None = None
+    pending: int | None = None
+    running: int | None = None
+    finished: int | None = None
+
+
+@dataclass(frozen=True)
 class ScrapydHealth:
     """Scrapyd saturation.
 
     Two views. ``pending``/``running``/``finished`` are the daemon's own
-    numbers and require an injected probe (Scrapyd is an HTTP daemon on
-    the private network; the API does not otherwise talk to it, and this
-    module refuses to open a network connection of its own). The
+    numbers — the fleet-wide sum across ``nodes`` — and require an injected
+    probe (Scrapyd is an HTTP daemon on the private network; the API does
+    not otherwise talk to it, and this module refuses to open a network
+    connection of its own). ``nodes`` carries the same numbers per node, so
+    a queue backed up on one node is distinguishable from the fleet. The
     DB-derived ``in_flight_targets`` is always available and measures the
     *effect* of saturation without any network call.
+
+    The aggregate ``pending``/``running``/``finished`` are ``None`` (not
+    ``0``) whenever no node's probe succeeded — summing zero real numbers is
+    not the same claim as "nothing pending".
     """
 
     available: bool
@@ -530,6 +556,7 @@ class ScrapydHealth:
     running: int | None = None
     finished: int | None = None
     in_flight_targets: int = 0
+    nodes: tuple[ScrapydNodeHealth, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -743,7 +770,7 @@ def collect_snapshot(
     *,
     now: datetime | None = None,
     redis: Any | None = None,
-    scrapyd_status: dict[str, Any] | None = None,
+    scrapyd_status: dict[str, dict[str, Any] | None] | None = None,
     settings: Any | None = None,
 ) -> OpsSnapshot:
     """Collect the full snapshot. Read-only; never raises.
@@ -757,8 +784,12 @@ def collect_snapshot(
             ``INFO memory``/``INFO stats`` fill in memory and eviction
             counters. When omitted, the Redis section still reports the
             cached ``redis_policy.last_report()`` posture.
-        scrapyd_status: optional pre-fetched ``daemonstatus.json`` body.
-            This module never opens a network connection itself.
+        scrapyd_status: optional mapping of ``node_url`` to that node's
+            pre-fetched ``daemonstatus.json`` body, or ``None`` for a node
+            whose probe failed (T6's ``ScrapydDispatchClient.daemon_status``
+            contract). This module never opens a network connection itself
+            — the caller iterates ``SCRAPYD_HTTP_URLS + SCRAPYD_BROWSER_URLS``
+            and probes each node before calling in.
         settings: optional ``Settings``-shaped object, used only for the
             breaker's configured ceiling.
     """
@@ -1356,7 +1387,33 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
-def _collect_scrapyd(session: Any, status: dict[str, Any] | None) -> ScrapydHealth:
+def _scrapyd_node_health(node_url: str, payload: dict[str, Any] | None) -> ScrapydNodeHealth:
+    """One entry of the per-node probe map -> its labelled-absence-safe shape.
+
+    ``payload is None`` is ``ScrapydDispatchClient.daemon_status``'s "any
+    transport/HTTP/parse error" contract (T6) — that node is reported
+    ``available=False``, never as a healthy node with zero counts.
+    """
+    if payload is None:
+        return ScrapydNodeHealth(
+            node_url=node_url,
+            available=False,
+            unavailable_reason="daemonstatus probe failed or node unreachable",
+        )
+    status_value = payload.get("status")
+    return ScrapydNodeHealth(
+        node_url=node_url,
+        available=True,
+        status=status_value if isinstance(status_value, str) else None,
+        pending=_as_int(payload.get("pending")),
+        running=_as_int(payload.get("running")),
+        finished=_as_int(payload.get("finished")),
+    )
+
+
+def _collect_scrapyd(
+    session: Any, status: dict[str, dict[str, Any] | None] | None
+) -> ScrapydHealth:
     from sqlalchemy import func, select
 
     from app_shared.models.jobs import ScrapeJobTarget
@@ -1375,12 +1432,25 @@ def _collect_scrapyd(session: Any, status: dict[str, Any] | None) -> ScrapydHeal
             unavailable_reason="no scrapyd daemonstatus probe supplied",
             in_flight_targets=in_flight,
         )
+
+    nodes = tuple(
+        _scrapyd_node_health(node_url, payload) for node_url, payload in status.items()
+    )
+    reachable = [n for n in nodes if n.available]
+    unavailable_reason = None
+    if nodes and not reachable:
+        unavailable_reason = f"all {len(nodes)} scrapyd node(s) unreachable"
+
     return ScrapydHealth(
         available=True,
-        pending=_as_int(status.get("pending")),
-        running=_as_int(status.get("running")),
-        finished=_as_int(status.get("finished")),
+        unavailable_reason=unavailable_reason,
+        # Summing zero real numbers is not the same claim as "nothing
+        # pending" — the aggregate stays the absence when no node answered.
+        pending=sum(n.pending or 0 for n in reachable) if reachable else None,
+        running=sum(n.running or 0 for n in reachable) if reachable else None,
+        finished=sum(n.finished or 0 for n in reachable) if reachable else None,
         in_flight_targets=in_flight,
+        nodes=nodes,
     )
 
 
@@ -1421,6 +1491,7 @@ __all__ = [
     "RedisHealth",
     "RollupHealth",
     "ScrapydHealth",
+    "ScrapydNodeHealth",
     "SpendVelocity",
     "collect_snapshot",
     "seconds_remaining_in_month",

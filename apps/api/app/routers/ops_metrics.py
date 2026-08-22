@@ -127,6 +127,39 @@ def _get_redis() -> Any | None:
         return None
 
 
+def _get_scrapyd_status(
+    settings: Any | None, redis_client: Any | None
+) -> dict[str, dict[str, Any] | None] | None:
+    """Per-node ``daemonstatus.json`` probe, keyed by node URL.
+
+    T8: the snapshot's scrapyd section refuses to open a network connection
+    of its own (see ``app_shared.opsmetrics.snapshot``), so THIS is where
+    that connection happens — the one place `/ops/metrics` is allowed to
+    talk to Scrapyd directly. Iterates every configured node
+    (``SCRAPYD_HTTP_URLS + SCRAPYD_BROWSER_URLS``) and probes each with
+    ``ScrapydDispatchClient.daemon_status``, which already collapses any
+    transport/HTTP/parse error into ``None`` per node (T6) rather than
+    raising — that ``None`` becomes the labelled absence for that one node,
+    never a fake zero.
+
+    Best-effort like ``_get_redis``/``_get_settings_or_none``: returns
+    ``None`` (not raises) when ``settings`` is unavailable or the client
+    itself cannot be constructed, so a scrapyd outage never turns this into
+    a second failure. The whole snapshot then falls back to "no scrapyd
+    daemonstatus probe supplied" rather than 500ing the monitor.
+    """
+    if settings is None:
+        return None
+    try:
+        from app_shared.scrapyd.client import ScrapydDispatchClient
+
+        client = ScrapydDispatchClient(settings=settings, redis_client=redis_client)
+        node_urls = list(settings.SCRAPYD_HTTP_URLS) + list(settings.SCRAPYD_BROWSER_URLS)
+        return {node_url: client.daemon_status(node_url) for node_url in node_urls}
+    except Exception:  # noqa: BLE001 - see docstring
+        return None
+
+
 def _get_settings_or_none() -> Any | None:
     """``Settings``, or ``None`` when it cannot be constructed.
 
@@ -154,8 +187,13 @@ def ops_metrics(
         description="Also write the snapshot and firing alerts to the structured log.",
     ),
 ) -> Response:
+    redis_client = _get_redis()
+    settings = _get_settings_or_none()
     snapshot = collect_snapshot(
-        session, redis=_get_redis(), settings=_get_settings_or_none()
+        session,
+        redis=redis_client,
+        settings=settings,
+        scrapyd_status=_get_scrapyd_status(settings, redis_client),
     )
     alerts = evaluate(snapshot)
 
