@@ -154,6 +154,8 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
     # Set by the in-flight lock (SPEC-11); read by stall recovery to skip
     # locked-but-live matches.
     locked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    # Last scrapyd POST for this target (F-2): dispatch selection + per-target stall aging key. NULL = never dispatched.
+    dispatched_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     error_code: Mapped[ScrapeErrorCode | None] = enum_column(ScrapeErrorCode, nullable=True)

@@ -225,6 +225,11 @@ def test_scrape_job_target_enum_columns_render_varchar_32() -> None:
     assert _compiled_type(table.c.error_code).upper() == "VARCHAR(32)"
 
 
+def test_scrape_job_target_has_dispatched_at() -> None:
+    col = ScrapeJobTarget.__table__.c.dispatched_at
+    assert col.nullable is True
+
+
 # --- WORKSPACE_OWNED_MODELS + re-export ---------------------------------------
 
 
