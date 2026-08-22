@@ -268,7 +268,9 @@ class GenericPriceSpider(scrapy.Spider):
     async def start(self) -> AsyncIterator[scrapy.Request]:
         from app_shared.config import get_settings
 
-        loaded = await await_in_thread(load_targets, self.workspace_id, self.match_ids)
+        loaded = await await_in_thread(
+            load_targets, self.workspace_id, self.match_ids, scrape_job_id=self.scrape_job_id
+        )
         self._visible_providers = loaded.visible_providers
         self._provider_rows = loaded.provider_rows
         self._provider_passwords = loaded.provider_passwords

@@ -93,6 +93,7 @@ from app_shared.messaging import enqueue
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import Workspace
+from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.profiles.repository import GLOBAL_DEFAULT_PROFILE_NAME, profile_visibility_map
 from app_shared.profiles.resolution import (
@@ -394,7 +395,11 @@ class _LoadedTargets:
 # --- bounded profile + access-policy resolution + target load (blocking) ---
 
 
-def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _LoadedTargets:
+def load_targets(
+    workspace_id: uuid.UUID,
+    match_ids: list[uuid.UUID],
+    scrape_job_id: uuid.UUID | None = None,
+) -> _LoadedTargets:
     """Load the workspace-scoped matches + their resolved scrape profile + access policy.
 
     **Blocking** — DB + Redis round trips. Must only ever be called
@@ -437,6 +442,17 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
     aborts the whole bounded load -- it is recorded on that one target's
     ``variant_config_error`` instead, for the spider to surface as a
     terminal ``SELECTOR_BROKEN`` result before dispatch.
+
+    F-2 belt-and-braces (2026-08-22 duplicate-runs incident): when
+    ``scrape_job_id`` is given, any ``match_id`` whose
+    ``scrape_job_targets`` row for that job has already reached a
+    terminal status (``COMPLETED``/``FAILED``/``SKIPPED``) is dropped
+    before any resolution/fetch work happens. Dispatch is supposed to
+    never re-POST a finished target, but a duplicate spider run must not
+    depend on dispatch getting that right -- this is the second,
+    independent line of defense (one cheap scoped ``IN`` query kills the
+    entire class of duplicate-fetch bugs regardless of *why* dispatch
+    misfired).
     """
     if not match_ids:
         return _LoadedTargets(targets=[])
@@ -446,6 +462,37 @@ def load_targets(workspace_id: uuid.UUID, match_ids: list[uuid.UUID]) -> _Loaded
     strategy_profile_scope = get_settings().STRATEGY_PROFILE_SCOPE
 
     with workspace_txn(workspace_id) as session:
+        if scrape_job_id is not None:
+            terminal_match_ids = set(
+                session.execute(
+                    select(ScrapeJobTarget.match_id).where(
+                        ScrapeJobTarget.workspace_id == workspace_id,
+                        ScrapeJobTarget.scrape_job_id == scrape_job_id,
+                        ScrapeJobTarget.match_id.in_(match_ids),
+                        ScrapeJobTarget.status.in_(
+                            (
+                                ScrapeTargetStatus.COMPLETED,
+                                ScrapeTargetStatus.FAILED,
+                                ScrapeTargetStatus.SKIPPED,
+                            )
+                        ),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if terminal_match_ids:
+                log_event(
+                    logger,
+                    "dispatch.duplicate_terminal_skipped",
+                    workspace_id=workspace_id,
+                    scrape_job_id=scrape_job_id,
+                    skipped=len(terminal_match_ids),
+                )
+                match_ids = [m for m in match_ids if m not in terminal_match_ids]
+                if not match_ids:
+                    return _LoadedTargets(targets=[])
+
         matches = (
             session.execute(
                 scoped_select(CompetitorProductMatch, workspace_id).where(
