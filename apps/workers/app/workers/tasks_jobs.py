@@ -26,7 +26,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
@@ -211,11 +211,22 @@ def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID
 def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
     """Expand `scrape_job_id`'s PENDING targets into domain/mode-grouped Scrapyd runs.
 
-    Idempotent: a duplicate/at-least-once delivery re-plans the exact
-    same batches (deterministic `batch_index`) and re-attempts
-    `client.schedule` for each — the client's Redis `SET NX` guard on
-    `dispatched:{scrape_job_id}:{batch_index}` neutralizes any repeat
-    POST (FR-013, SC-003).
+    Idempotent per TARGET, not merely per Redis guard window (F-2,
+    2026-08-22): selection is `(PENDING AND dispatched_at IS NULL) OR
+    DEFERRED`, and every target carried in a POSTed batch is stamped
+    `dispatched_at` before the commit. A duplicate/at-least-once delivery
+    therefore re-plans nothing it already sent. The client's Redis
+    `SET NX` guard on `dispatched:{scrape_job_id}:{batch_index}` still
+    neutralizes a repeat POST inside one TTL window (FR-013, SC-003), but
+    it is no longer what carries the guarantee — its TTL (900s) is far
+    shorter than scrapyd queue latency, which is why the 2026-08-21
+    mushtryati run re-POSTed the whole backlog at every guard expiry
+    (11,830 attempts over 4,372 targets = 2.71x, ~$0.50 wasted).
+
+    The contract this establishes for the rest of the pipeline: a PENDING
+    target with `dispatched_at IS NOT NULL` is scrapyd's problem (or, past
+    `SCRAPE_STALL_TIMEOUT_SECONDS`, `recover_stalled_batches`'s), never
+    this task's.
     """
     settings = get_settings()
     workspace_uuid = uuid.UUID(str(workspace_id))
@@ -240,8 +251,19 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                     # target reaper below (`recover_stalled_batches`) is a
                     # separate query and is deliberately NOT changed here --
                     # DEFERRED must never be treated as stalled.
-                    ScrapeJobTarget.status.in_(
-                        (ScrapeTargetStatus.PENDING, ScrapeTargetStatus.DEFERRED)
+                    #
+                    # F-2 (2026-08-22): only never-dispatched PENDING plus
+                    # DEFERRED handbacks. A PENDING target with a
+                    # dispatched_at stamp is queued on a scrapyd node (or
+                    # the reaper's problem past the stall timeout) -- re-
+                    # planning it here is what re-POSTed the entire backlog
+                    # on every guard expiry during the 2026-08-21 run.
+                    or_(
+                        and_(
+                            ScrapeJobTarget.status == ScrapeTargetStatus.PENDING,
+                            ScrapeJobTarget.dispatched_at.is_(None),
+                        ),
+                        ScrapeJobTarget.status == ScrapeTargetStatus.DEFERRED,
                     ),
                 )
             )
@@ -286,6 +308,17 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 batch_index=batch.batch_index,
                 node_url=node_url,
             )
+            # F-2 (2026-08-22): stamp the batch's targets the moment they
+            # leave here, so the next dispatch delivery cannot re-plan
+            # them. A guard-deduped "already scheduled" return counts as
+            # dispatched too -- the POST that guard is standing in for did
+            # happen. One loop over the already-loaded `targets`, never an
+            # extra query.
+            dispatched_match_ids = set(batch.match_ids)
+            stamp = datetime.now(timezone.utc)
+            for target in targets:
+                if target.match_id in dispatched_match_ids:
+                    target.dispatched_at = stamp
 
         session.commit()
 
@@ -493,6 +526,11 @@ def redispatch_pending_jobs() -> None:
       dispatch delivery was lost; re-enqueue unconditionally.
     - job has >= 1 `DEFERRED` target — re-enqueue so `dispatch_job`
       re-plans them; on pickup they re-enter the lock+limiter gate.
+    - job has >= 1 `PENDING` target with `dispatched_at IS NULL` (F-2,
+      2026-08-22) — a dispatch delivery lost *after* the job started. Now
+      that `dispatch_job` refuses to re-plan an already-stamped target,
+      an unstamped one is the only shape nothing else would pick up:
+      `recover_stalled_batches` owns the stamped-but-unprogressed ones.
 
     Duplicate-delivery safety is unchanged: the dispatch client's Redis
     `SET NX` guard (now TTL-bounded, `SCRAPYD_DISPATCH_GUARD_TTL_SECONDS`)
@@ -524,6 +562,27 @@ def redispatch_pending_jobs() -> None:
                     .first()
                 )
                 needs_redispatch = deferred_exists is not None
+            if not needs_redispatch:
+                # F-2 (2026-08-22): a dispatch delivery lost AFTER the job
+                # started leaves PENDING targets that were never POSTed --
+                # `started_at IS NULL` no longer catches them and
+                # `recover_stalled_batches` owns only targets that WERE
+                # dispatched, so without this probe nothing ever re-enqueues
+                # them and the job wedges short of its target count.
+                undispatched_pending = (
+                    session.execute(
+                        scoped_select(ScrapeJobTarget, workspace_id)
+                        .where(
+                            ScrapeJobTarget.scrape_job_id == job.id,
+                            ScrapeJobTarget.status == ScrapeTargetStatus.PENDING,
+                            ScrapeJobTarget.dispatched_at.is_(None),
+                        )
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                needs_redispatch = undispatched_pending is not None
             if not needs_redispatch:
                 continue
 

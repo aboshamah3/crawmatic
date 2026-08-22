@@ -89,13 +89,14 @@ def _job(status, started):
     return job
 
 
-def _target(job, status):
+def _target(job, status, dispatched=False):
     target = ScrapeJobTarget(
         workspace_id=workspace_id,
         scrape_job_id=job.id,
         match_id=uuid.uuid4(),
         status=status,
         created_at=now,
+        dispatched_at=now if dispatched else None,
     )
     target.id = uuid.uuid4()
     fake_session.seed(target)
@@ -111,11 +112,13 @@ job_deferred = _job(ScrapeJobStatus.RUNNING, started=True)
 _target(job_deferred, ScrapeTargetStatus.DEFERRED)
 _target(job_deferred, ScrapeTargetStatus.COMPLETED)
 
-# 3) RUNNING job, targets STARTED/terminal/bare-PENDING only -> untouched
-#    (bare-PENDING stalls belong to recover_stalled_batches).
+# 3) RUNNING job, targets STARTED/terminal/already-dispatched-PENDING only
+#    -> untouched (a PENDING target that HAS a `dispatched_at` stamp is
+#    queued on a scrapyd node; if it never progresses it belongs to
+#    `recover_stalled_batches`, never to this sweep).
 job_inflight = _job(ScrapeJobStatus.RUNNING, started=True)
 _target(job_inflight, ScrapeTargetStatus.STARTED)
-_target(job_inflight, ScrapeTargetStatus.PENDING)
+_target(job_inflight, ScrapeTargetStatus.PENDING, dispatched=True)
 
 # 4) Terminal job with a leftover DEFERRED target -> untouched.
 job_done = _job(ScrapeJobStatus.COMPLETED, started=True)
@@ -149,6 +152,100 @@ print("OK")
 sys.exit(0)
 """
 
+_MID_JOB_LOSS_CHECK = """
+import sys
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+sys.path.insert(0, "apps/workers")
+sys.path.insert(0, "tests/unit")
+
+from _jobs_fake_session import FakeOrmSession
+from app_shared.enums import (
+    ScrapeJobSource,
+    ScrapeJobStatus,
+    ScrapeJobType,
+    ScrapeScope,
+    ScrapeTargetStatus,
+)
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+
+import app.workers.tasks_jobs as tasks_jobs
+
+fake_session = FakeOrmSession()
+
+
+@contextmanager
+def fake_get_session():
+    yield fake_session
+
+
+enqueued = []
+
+tasks_jobs.get_session = fake_get_session
+tasks_jobs.get_system_session = fake_get_session
+tasks_jobs.set_workspace_context = lambda session, workspace_id: None
+tasks_jobs.enqueue = lambda name, *, queue=None, kwargs=None: enqueued.append(kwargs)
+
+workspace_id = uuid.uuid4()
+now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _job(status, started):
+    job = ScrapeJob(
+        workspace_id=workspace_id,
+        type=ScrapeJobType.MANUAL,
+        scope=ScrapeScope.MATCH,
+        status=status,
+        total_targets=1,
+        source=ScrapeJobSource.API,
+        created_at=now,
+        started_at=now if started else None,
+    )
+    job.id = uuid.uuid4()
+    fake_session.seed(job)
+    return job
+
+
+def _target(job, status, dispatched):
+    target = ScrapeJobTarget(
+        workspace_id=workspace_id,
+        scrape_job_id=job.id,
+        match_id=uuid.uuid4(),
+        status=status,
+        created_at=now,
+        dispatched_at=now if dispatched else None,
+    )
+    target.id = uuid.uuid4()
+    fake_session.seed(target)
+    return target
+
+
+# A dispatch delivery lost AFTER the job started: the job is RUNNING with
+# `started_at` set, holds no DEFERRED target, and its remaining targets are
+# PENDING with NO `dispatched_at` stamp -- nothing else in the system will
+# ever re-enqueue them (`recover_stalled_batches` owns only targets that
+# WERE dispatched). This sweep must.
+job_mid_loss = _job(ScrapeJobStatus.RUNNING, started=True)
+_target(job_mid_loss, ScrapeTargetStatus.COMPLETED, dispatched=True)
+_target(job_mid_loss, ScrapeTargetStatus.PENDING, dispatched=False)
+
+# Control: same shape but every PENDING target already dispatched.
+job_inflight = _job(ScrapeJobStatus.RUNNING, started=True)
+_target(job_inflight, ScrapeTargetStatus.PENDING, dispatched=True)
+
+tasks_jobs.redispatch_pending_jobs()
+
+got = {call["scrape_job_id"] for call in enqueued}
+if got != {str(job_mid_loss.id)}:
+    print("WRONG_JOBS_REDISPATCHED:" + str(sorted(got)))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+
 _REDISPATCH_ENV = {
     "DATABASE_URL": "postgresql+psycopg://crawmatic:crawmatic@pgbouncer:6432/crawmatic",
     "REDIS_URL": "redis://redis:6379/0",
@@ -165,6 +262,23 @@ def test_redispatch_pending_jobs_targets_only_lost_and_deferred() -> None:
     env = {**os.environ, **_REDISPATCH_ENV}
     result = subprocess.run(
         [sys.executable, "-c", _REDISPATCH_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=None,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+def test_redispatch_covers_undispatched_pending_mid_job() -> None:
+    """A dispatch delivery lost AFTER job start leaves PENDING/NULL targets
+    that nothing re-enqueues: eligibility must include 'has PENDING targets
+    never dispatched', not only `started_at IS NULL` or DEFERRED-exists."""
+    env = {**os.environ, **_REDISPATCH_ENV}
+    result = subprocess.run(
+        [sys.executable, "-c", _MID_JOB_LOSS_CHECK],
         capture_output=True,
         text=True,
         timeout=30,

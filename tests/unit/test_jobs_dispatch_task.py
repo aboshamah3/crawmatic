@@ -276,6 +276,197 @@ print("OK")
 sys.exit(0)
 """
 
+_F2_SETUP = """
+import sys
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, "apps/workers")
+sys.path.insert(0, "tests/unit")
+
+import requests
+
+from _jobs_fake_session import FakeOrmSession
+from app_shared.enums import (
+    MatchPriority,
+    MatchStatus,
+    ScrapeJobSource,
+    ScrapeJobStatus,
+    ScrapeJobType,
+    ScrapeScope,
+    ScrapeTargetStatus,
+)
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+from app_shared.scrapyd.client import ScrapydDispatchClient as RealClient
+
+import app.workers.tasks_jobs as tasks_jobs
+
+
+class FakeRedis:
+    def __init__(self):
+        self.store = {}
+
+    def set(self, name, value, *, nx=False, ex=None):
+        if nx and name in self.store:
+            return None
+        self.store[name] = value
+        return True
+
+    def get(self, name):
+        return self.store.get(name)
+
+    def delete(self, *names):
+        removed = 0
+        for name in names:
+            if self.store.pop(name, None) is not None:
+                removed += 1
+        return removed
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+calls = []
+
+
+def fake_post(url, *, data, auth, timeout):
+    calls.append({"url": url, "data": dict(data), "auth": auth})
+    return FakeResponse(200, {"status": "ok", "jobid": "job-" + str(len(calls))})
+
+
+fake_redis = FakeRedis()
+
+
+def client_factory(*, settings=None):
+    http_session = requests.Session()
+    http_session.post = fake_post
+    return RealClient(settings=settings, redis_client=fake_redis, session=http_session)
+
+
+tasks_jobs.ScrapydDispatchClient = client_factory
+tasks_jobs.set_workspace_context = lambda session, workspace_id: None
+
+fake_session = FakeOrmSession()
+
+
+@contextmanager
+def fake_get_session():
+    yield fake_session
+
+
+tasks_jobs.get_session = fake_get_session
+
+workspace_id = uuid.uuid4()
+job_id = uuid.uuid4()
+now = datetime.now(timezone.utc)
+old_stamp = now - timedelta(minutes=5)
+
+job = ScrapeJob(
+    workspace_id=workspace_id,
+    type=ScrapeJobType.MANUAL,
+    scope=ScrapeScope.MATCH,
+    status=ScrapeJobStatus.PENDING,
+    total_targets=4,
+    source=ScrapeJobSource.API,
+    created_at=now,
+)
+job.id = job_id
+fake_session.seed(job)
+
+
+def _seed_target(label, status, dispatched_at):
+    competitor_id = uuid.uuid4()
+    match_id = uuid.uuid4()
+    competitor = Competitor(
+        workspace_id=workspace_id, name=label, domain=label + ".example.com"
+    )
+    competitor.id = competitor_id
+    match = CompetitorProductMatch(
+        workspace_id=workspace_id,
+        product_id=uuid.uuid4(),
+        product_variant_id=uuid.uuid4(),
+        competitor_id=competitor_id,
+        competitor_url="https://" + label + ".example.com/p",
+        normalized_competitor_url="https://" + label + ".example.com/p",
+        url_pattern="https://" + label + ".example.com/p",
+        url_pattern_version=1,
+        priority=MatchPriority.NORMAL,
+        status=MatchStatus.ACTIVE,
+    )
+    match.id = match_id
+    target = ScrapeJobTarget(
+        workspace_id=workspace_id,
+        scrape_job_id=job_id,
+        match_id=match_id,
+        status=status,
+        created_at=now,
+        dispatched_at=dispatched_at,
+    )
+    target.id = uuid.uuid4()
+    fake_session.seed(competitor, match, target)
+    return target
+
+
+# t1: never dispatched PENDING -> must be POSTed.
+t1 = _seed_target("t1", ScrapeTargetStatus.PENDING, None)
+# t2: PENDING but already stamped -> scrapyd's (or the reaper's) problem.
+t2 = _seed_target("t2", ScrapeTargetStatus.PENDING, old_stamp)
+# t3: DEFERRED handback -> must be POSTed even though already stamped.
+t3 = _seed_target("t3", ScrapeTargetStatus.DEFERRED, old_stamp)
+# t4: terminal, never dispatched -> never selected, stays unstamped.
+t4 = _seed_target("t4", ScrapeTargetStatus.COMPLETED, None)
+
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+posted_match_ids = set()
+for call in calls:
+    for raw in str(call["data"]["match_ids"]).split(","):
+        posted_match_ids.add(raw)
+"""
+
+_F2_SELECTION_CHECK = (
+    _F2_SETUP
+    + """
+expected = {str(t1.match_id), str(t3.match_id)}
+if posted_match_ids != expected:
+    print("WRONG_SELECTION:" + str(sorted(posted_match_ids)))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+)
+
+_F2_STAMP_CHECK = (
+    _F2_SETUP
+    + """
+if t1.dispatched_at is None:
+    print("T1_NOT_STAMPED")
+    sys.exit(1)
+if t3.dispatched_at is None or t3.dispatched_at == old_stamp:
+    print("T3_NOT_RESTAMPED:" + str(t3.dispatched_at))
+    sys.exit(1)
+if t2.dispatched_at != old_stamp:
+    print("T2_STAMP_MUTATED:" + str(t2.dispatched_at))
+    sys.exit(1)
+if t4.dispatched_at is not None:
+    print("T4_STAMPED_WITHOUT_POST:" + str(t4.dispatched_at))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+)
+
+
 _DISPATCH_TASK_ENV = {
     "DATABASE_URL": "postgresql+psycopg://crawmatic:crawmatic@pgbouncer:6432/crawmatic",
     "REDIS_URL": "redis://redis:6379/0",
@@ -300,3 +491,33 @@ def test_dispatch_job_dispatches_batches_idempotently() -> None:
     )
     assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     assert result.stdout.strip() == "OK"
+
+
+def _run_f2(script: str) -> None:
+    env = {**os.environ, **_DISPATCH_TASK_ENV}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=None,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+def test_dispatch_job_skips_already_dispatched_pending_targets() -> None:
+    """A PENDING target with `dispatched_at` set is already in scrapyd's
+    queue — the 2026-08-21 mushtryati run re-POSTed the whole backlog on
+    every guard expiry (11,830 attempts over 4,372 targets = 2.71x,
+    ~$0.50 wasted). Selection must be
+    `(PENDING AND dispatched_at IS NULL) OR DEFERRED`."""
+    _run_f2(_F2_SELECTION_CHECK)
+
+
+def test_dispatch_job_stamps_dispatched_at_on_post() -> None:
+    """Every target carried in a POSTed batch gets stamped (a guard-deduped
+    'already scheduled' return counts as dispatched too); a target the
+    selection never picked up keeps `dispatched_at` untouched."""
+    _run_f2(_F2_STAMP_CHECK)
