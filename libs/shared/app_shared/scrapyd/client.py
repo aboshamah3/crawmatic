@@ -166,6 +166,30 @@ class ScrapydDispatchClient:
         self._redis.set(key, jobid, ex=self._settings.SCRAPYD_DISPATCH_GUARD_TTL_SECONDS)
         return jobid
 
+    def daemon_status(self, node_url: str) -> dict | None:
+        """GET ``/daemonstatus.json`` — ``None`` on any transport/HTTP/parse error.
+
+        The reaper treats ``None`` as 'node dead' (reap-eligible) and a
+        healthy payload with ``pending + running > 0`` as 'queued, not
+        stalled'. It must therefore never raise: a probe that blew up
+        would abort the whole sweep on the very node it exists to
+        classify.
+        """
+        base = node_url.rstrip("/")
+        getter = self._session.get if self._session is not None else requests.get
+        try:
+            response = getter(
+                f"{base}/daemonstatus.json",
+                auth=(self._settings.SCRAPYD_USERNAME, self._settings.SCRAPYD_PASSWORD),
+                timeout=self._timeout,
+            )
+            if response.status_code >= 400:
+                return None
+            payload = response.json()
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _post_schedule(
         self,
         project: str,

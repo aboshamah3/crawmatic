@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -89,6 +89,11 @@ _NON_TERMINAL_JOB_STATUSES = frozenset(ScrapeJobStatus) - _TERMINAL_JOB_STATUSES
 # `recover_stalled_batches` only ever acts on a job actually in flight —
 # a `PENDING` job has no `started_at` yet, so there is nothing to stall.
 _RUNNING_JOB_STATUSES = frozenset({ScrapeJobStatus.RUNNING})
+
+# Distinguishes "this node has not been probed yet" from "this node was
+# probed and came back unreachable" (a real, cached `None`) — F-2's node
+# liveness cache must never re-probe a node it already found dead.
+_UNPROBED = object()
 
 # A target in one of these statuses has progressed past "never picked
 # up" — `finalize_jobs` requires ALL of a job's targets to be terminal
@@ -612,9 +617,13 @@ def recover_stalled_batches() -> None:
     """Re-dispatch batches whose targets never left PENDING past the stall timeout.
 
     Scans RUNNING jobs with `started_at` set; for each, selects targets
-    still bare `PENDING` (never progressed to STARTED/terminal) and not
-    `locked_at`-live, whose age past the job's `started_at` exceeds
-    `SCRAPE_STALL_TIMEOUT_SECONDS`. Re-resolves each stalled target's
+    still bare `PENDING` (never progressed to STARTED/terminal), not
+    `locked_at`-live, and whose OWN `dispatched_at` is older than
+    `SCRAPE_STALL_TIMEOUT_SECONDS` (F-2, 2026-08-22 — see the query
+    below for why job-age was wrong). Before re-POSTing, the target
+    scrapyd node is probed: a node alive and working its queue means
+    those targets are queued, not stalled. Re-resolves each stalled
+    target's
     domain/mode set-based (the same one-read pattern as `dispatch_job`,
     not per-target — U3), re-plans batches, and re-dispatches each to a
     deterministically selected, mode-appropriate node under a
@@ -628,6 +637,10 @@ def recover_stalled_batches() -> None:
     now = datetime.now(timezone.utc)
     window = stall_window(now, timeout)
 
+    # One liveness probe per node per task invocation — N batches landing
+    # on the same node must not become N `daemonstatus.json` round-trips.
+    node_status_cache: dict = {}
+
     with get_session() as session:
         client = ScrapydDispatchClient(settings=settings)
 
@@ -638,16 +651,18 @@ def recover_stalled_batches() -> None:
             if job is None or job.started_at is None:
                 continue
 
-            age_seconds = (now - job.started_at).total_seconds()
-            if age_seconds <= timeout:
-                continue
-
+            # F-2 (2026-08-22): age per TARGET (its own last dispatch), not
+            # per job — job-age classified every rate-limited tail target
+            # as stalled from minute 15 onward on 2026-08-21.
+            cutoff = now - timedelta(seconds=timeout)
             stalled_targets = list(
                 session.execute(
                     scoped_select(ScrapeJobTarget, workspace_id).where(
                         ScrapeJobTarget.scrape_job_id == job.id,
                         ScrapeJobTarget.status == ScrapeTargetStatus.PENDING,
                         ScrapeJobTarget.locked_at.is_(None),
+                        ScrapeJobTarget.dispatched_at.is_not(None),
+                        ScrapeJobTarget.dispatched_at < cutoff,
                     )
                 )
                 .scalars()
@@ -678,6 +693,17 @@ def recover_stalled_batches() -> None:
                         settings.SCRAPYD_HTTP_URLS,
                     )
                 node_url = select_node(batch.domain, nodes)
+                status_payload = node_status_cache.get(node_url, _UNPROBED)
+                if status_payload is _UNPROBED:
+                    status_payload = client.daemon_status(node_url)
+                    node_status_cache[node_url] = status_payload
+                if status_payload is not None and (
+                    int(status_payload.get("pending", 0))
+                    + int(status_payload.get("running", 0))
+                ) > 0:
+                    # Node alive and working its queue: these targets are
+                    # queued behind max_proc/rate limits, not stalled.
+                    continue
                 client.schedule(
                     project,
                     spider,
@@ -688,5 +714,13 @@ def recover_stalled_batches() -> None:
                     batch_index=f"{batch.batch_index}:r{window}",
                     node_url=node_url,
                 )
+                # A re-POSTed target's stall clock restarts here — without
+                # a fresh stamp the very next sweep would reap it again,
+                # which is the feedback loop this whole fix removes.
+                stamp = datetime.now(timezone.utc)
+                batch_match_ids = set(batch.match_ids)
+                for target in stalled_targets:
+                    if target.match_id in batch_match_ids:
+                        target.dispatched_at = stamp
 
         session.commit()

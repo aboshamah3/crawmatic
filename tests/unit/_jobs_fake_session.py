@@ -74,6 +74,13 @@ def _eval_clause(clause: Any, obj: Any) -> bool:
     # `tuple_(...) > tuple_(...)` keyset predicate, which only the
     # pagination-aware `_alerts_fake_session` double evaluates.
     if op in (operator.ge, operator.gt, operator.le, operator.lt):
+        # SQL three-valued logic: a scalar comparison against NULL is NULL,
+        # never true, so the row is excluded. This fake evaluates every
+        # AND-branch eagerly (no short-circuit), so a nullable column such
+        # as `ScrapeJobTarget.dispatched_at` reaches here as `None` even
+        # when a sibling `.is_not(None)` already excluded the row.
+        if actual is None:
+            return False
         return bool(op(actual, _resolve_bind_value(clause.right)))
     if op is sa_operators.is_:
         # `.is_(None)`/`.is_(True)`/`.is_(False)` each compile to a
@@ -90,6 +97,17 @@ def _eval_clause(clause: Any, obj: Any) -> bool:
         if isinstance(clause.right, False_):
             return actual is False
         return actual is _resolve_bind_value(clause.right)
+    if op is sa_operators.is_not:
+        # `.is_not(None)` — the same dedicated SQL-literal nodes as `is_`
+        # above, negated (`ScrapeJobTarget.dispatched_at.is_not(None)`,
+        # the F-2 per-target stall gate).
+        if isinstance(clause.right, Null):
+            return actual is not None
+        if isinstance(clause.right, True_):
+            return actual is not True
+        if isinstance(clause.right, False_):
+            return actual is not False
+        return actual is not _resolve_bind_value(clause.right)
     raise NotImplementedError(f"unsupported operator {op!r}")
 
 

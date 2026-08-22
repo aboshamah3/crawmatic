@@ -135,6 +135,20 @@ def _make_client(
     )
 
 
+def _make_status_client(
+    daemon_get: Any,
+    settings: _FakeSettings | None = None,
+) -> ScrapydDispatchClient:
+    """A client whose session answers ``daemonstatus.json`` probes (F-2)."""
+    session = requests.Session()
+    session.get = daemon_get  # type: ignore[assignment]
+    return ScrapydDispatchClient(
+        settings=settings or _FakeSettings(),  # type: ignore[arg-type]
+        redis_client=_FakeRedis(),
+        session=session,
+    )
+
+
 _ARGS = {
     "workspace_id": "11111111-1111-1111-1111-111111111111",
     "scrape_job_id": "22222222-2222-2222-2222-222222222222",
@@ -290,3 +304,20 @@ def test_concurrent_in_flight_claim_is_not_double_scheduled() -> None:
         client.schedule("price_monitor", "generic_price_spider", **_ARGS)
 
     assert len(scrapyd.calls) == 0
+
+
+def test_daemon_status_returns_none_on_connection_error() -> None:
+    """A node that cannot be reached must read as `None`, never raise (F-2).
+
+    `recover_stalled_batches` probes every node it is about to re-POST to
+    and treats `None` as "the node died" — the one case the reaper exists
+    for. A raised transport error there would abort the whole sweep, so
+    the probe swallows it and reports the absence instead.
+    """
+
+    def exploding_get(url: str, *, auth: Any = None, timeout: float | None = None):
+        raise requests.ConnectionError("node down")
+
+    client = _make_status_client(exploding_get)
+
+    assert client.daemon_status("http://scrapers:6800") is None

@@ -6,9 +6,13 @@ through the REAL, unchanged `ScrapydDispatchClient` (never a real
 DB/Redis/Scrapyd), plus a monkeypatched `datetime` so the stall-window
 bucket can be advanced deterministically without sleeping. Per
 `contracts/stall-recovery.md`: a target still bare PENDING past
-`SCRAPE_STALL_TIMEOUT_SECONDS` (measured from the job's `started_at`) is
-re-dispatched; STARTED/terminal or `locked_at`-live targets, and jobs not
-yet past the timeout, are excluded; within one stall window a duplicate
+`SCRAPE_STALL_TIMEOUT_SECONDS` (measured from its OWN `dispatched_at` —
+F-2, 2026-08-22; job-age classified every rate-limited tail target
+"stalled" from minute 15 of the 2026-08-21 run) whose node is not alive
+and working its queue is re-dispatched; STARTED/terminal or
+`locked_at`-live targets, never-dispatched targets, targets dispatched
+inside the timeout, and batches on a live node are excluded; within one
+stall window a duplicate
 recovery delivery produces no second POST (the client's `SET NX` guard);
 crossing into a fresh window mints a new suffixed key and permits a
 genuine re-dispatch; the same domain always maps to the same node.
@@ -93,12 +97,19 @@ def fake_post(url, *, data, auth, timeout):
     return FakeResponse(200, {"status": "ok", "jobid": jobid})
 
 
+def fake_get(url, *, auth=None, timeout=None):
+    # F-2: every node this suite reaps is DEAD -- an unreachable node is
+    # the one case the reaper exists for, so re-dispatch must proceed.
+    raise requests.ConnectionError("node down")
+
+
 fake_redis = FakeRedis()
 
 
 def client_factory(*, settings=None):
     http_session = requests.Session()
     http_session.post = fake_post
+    http_session.get = fake_get
     return RealClient(settings=settings, redis_client=fake_redis, session=http_session)
 
 
@@ -202,13 +213,15 @@ match_completed = _match()
 match_fresh = _match()
 fake_session.seed(match_stale, match_started, match_locked, match_completed, match_fresh)
 
-# Still bare PENDING, never locked -- eligible for recovery.
+# Still bare PENDING, never locked, and its OWN dispatch is long past the
+# timeout -- eligible for recovery (F-2: aged per target, not per job).
 target_stale = ScrapeJobTarget(
     workspace_id=workspace_id,
     scrape_job_id=stalled_job_id,
     match_id=match_stale.id,
     status=ScrapeTargetStatus.PENDING,
     created_at=base_now,
+    dispatched_at=base_now - timedelta(seconds=TIMEOUT * 2),
 )
 target_stale.id = uuid.uuid4()
 
@@ -220,6 +233,7 @@ target_started = ScrapeJobTarget(
     status=ScrapeTargetStatus.STARTED,
     started_at=base_now - timedelta(seconds=TIMEOUT),
     created_at=base_now,
+    dispatched_at=base_now - timedelta(seconds=TIMEOUT * 2),
 )
 target_started.id = uuid.uuid4()
 
@@ -231,6 +245,7 @@ target_locked = ScrapeJobTarget(
     status=ScrapeTargetStatus.PENDING,
     locked_at=base_now,
     created_at=base_now,
+    dispatched_at=base_now - timedelta(seconds=TIMEOUT * 2),
 )
 target_locked.id = uuid.uuid4()
 
@@ -242,6 +257,7 @@ target_completed = ScrapeJobTarget(
     status=ScrapeTargetStatus.COMPLETED,
     completed_at=base_now,
     created_at=base_now,
+    dispatched_at=base_now - timedelta(seconds=TIMEOUT * 2),
 )
 target_completed.id = uuid.uuid4()
 
@@ -254,6 +270,7 @@ target_fresh = ScrapeJobTarget(
     match_id=match_fresh.id,
     status=ScrapeTargetStatus.PENDING,
     created_at=base_now,
+    dispatched_at=base_now - timedelta(seconds=10),
 )
 target_fresh.id = uuid.uuid4()
 fake_session.seed(target_fresh)
@@ -283,11 +300,17 @@ if len(calls) != 1:
 
 # --- a fresh stall window: a genuine re-dispatch is permitted -------------
 
-_FakeDatetime._now = base_now + timedelta(seconds=TIMEOUT)
-# Keep the still-fresh job's `started_at` pinned relative to the advanced
-# clock -- otherwise simply teleporting "now" forward would spuriously
-# stall it too, which isn't what this section is testing.
+# Two windows on, so the re-dispatched target's OWN refreshed
+# `dispatched_at` (stamped by the first pass) is itself now past the
+# timeout -- a target re-POSTed to a node that stayed dead is stalled
+# again, and a fresh window key permits the genuine retry.
+_FakeDatetime._now = base_now + timedelta(seconds=TIMEOUT * 2)
+# Keep the still-fresh job's `started_at` -- and, since F-2 ages per
+# TARGET, its target's own `dispatched_at` -- pinned relative to the
+# advanced clock; otherwise simply teleporting "now" forward would
+# spuriously stall it too, which isn't what this section is testing.
 fresh_job.started_at = _FakeDatetime._now - timedelta(seconds=10)
+target_fresh.dispatched_at = _FakeDatetime._now - timedelta(seconds=10)
 
 tasks_jobs.recover_stalled_batches()
 
@@ -334,3 +357,305 @@ def test_recover_stalled_batches_redispatches_idempotently() -> None:
     )
     assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     assert result.stdout.strip() == "OK"
+
+
+# --- F-2: per-target aging + node-liveness probe ---------------------------
+#
+# Shared prelude for the three reaper regression checks below. Same
+# subprocess idiom and same fakes as `_STALL_RECOVERY_CHECK` above, but
+# the fixture rows are minted by helpers so each check can seed exactly
+# the target shape it is about, and the fake `daemonstatus.json` payload
+# is switchable per check (`daemon["payload"] = None` -> node dead).
+_REAPER_PRELUDE = """
+import sys
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, "apps/workers")
+sys.path.insert(0, "tests/unit")
+
+import requests
+
+from _jobs_fake_session import FakeOrmSession
+from app_shared.enums import (
+    MatchPriority,
+    MatchStatus,
+    ScrapeJobSource,
+    ScrapeJobStatus,
+    ScrapeJobType,
+    ScrapeScope,
+    ScrapeTargetStatus,
+)
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+from app_shared.scrapyd.client import ScrapydDispatchClient as RealClient
+
+import app.workers.tasks_jobs as tasks_jobs
+
+
+class FakeRedis:
+    def __init__(self):
+        self.store = {}
+
+    def set(self, name, value, *, nx=False, ex=None):
+        if nx and name in self.store:
+            return None
+        self.store[name] = value
+        return True
+
+    def get(self, name):
+        return self.store.get(name)
+
+    def delete(self, *names):
+        removed = 0
+        for name in names:
+            if self.store.pop(name, None) is not None:
+                removed += 1
+        return removed
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+calls = []
+probes = []
+# The `daemonstatus.json` payload every probed node returns. `None` means
+# the node is unreachable -- the reaper's "the node died" case.
+daemon = {"payload": None}
+
+
+def fake_post(url, *, data, auth, timeout):
+    calls.append({"url": url, "data": dict(data)})
+    return FakeResponse(200, {"status": "ok", "jobid": "job-" + str(len(calls))})
+
+
+def fake_get(url, *, auth=None, timeout=None):
+    probes.append(url)
+    if daemon["payload"] is None:
+        raise requests.ConnectionError("node down")
+    return FakeResponse(200, daemon["payload"])
+
+
+fake_redis = FakeRedis()
+
+
+def client_factory(*, settings=None):
+    http_session = requests.Session()
+    http_session.post = fake_post
+    http_session.get = fake_get
+    return RealClient(settings=settings, redis_client=fake_redis, session=http_session)
+
+
+tasks_jobs.ScrapydDispatchClient = client_factory
+
+fake_session = FakeOrmSession()
+
+
+@contextmanager
+def fake_get_session():
+    yield fake_session
+
+
+tasks_jobs.get_session = fake_get_session
+tasks_jobs.get_system_session = fake_get_session
+tasks_jobs.set_workspace_context = lambda session, workspace_id: None
+
+TIMEOUT = 900
+base_now = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+class _FakeDatetime(datetime):
+    _now = base_now
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._now
+
+
+tasks_jobs.datetime = _FakeDatetime
+
+workspace_id = uuid.uuid4()
+
+competitor_id = uuid.uuid4()
+competitor = Competitor(workspace_id=workspace_id, name="Shop", domain="shop.example.com")
+competitor.id = competitor_id
+fake_session.seed(competitor)
+
+
+def new_job(started_seconds_ago):
+    job = ScrapeJob(
+        workspace_id=workspace_id,
+        type=ScrapeJobType.MANUAL,
+        scope=ScrapeScope.MATCH,
+        status=ScrapeJobStatus.RUNNING,
+        total_targets=0,
+        source=ScrapeJobSource.API,
+        created_at=base_now - timedelta(seconds=started_seconds_ago),
+        started_at=base_now - timedelta(seconds=started_seconds_ago),
+    )
+    job.id = uuid.uuid4()
+    fake_session.seed(job)
+    return job
+
+
+def new_match():
+    match = CompetitorProductMatch(
+        workspace_id=workspace_id,
+        product_id=uuid.uuid4(),
+        product_variant_id=uuid.uuid4(),
+        competitor_id=competitor_id,
+        competitor_url="https://shop.example.com/p",
+        normalized_competitor_url="https://shop.example.com/p",
+        url_pattern="https://shop.example.com/p",
+        url_pattern_version=1,
+        priority=MatchPriority.NORMAL,
+        status=MatchStatus.ACTIVE,
+    )
+    match.id = uuid.uuid4()
+    fake_session.seed(match)
+    return match
+
+
+def new_target(job, dispatched_seconds_ago):
+    match = new_match()
+    target = ScrapeJobTarget(
+        workspace_id=workspace_id,
+        scrape_job_id=job.id,
+        match_id=match.id,
+        status=ScrapeTargetStatus.PENDING,
+        created_at=base_now,
+        dispatched_at=(
+            None
+            if dispatched_seconds_ago is None
+            else base_now - timedelta(seconds=dispatched_seconds_ago)
+        ),
+    )
+    target.id = uuid.uuid4()
+    fake_session.seed(target)
+    return target
+
+
+def fail(message):
+    print(message)
+    sys.exit(1)
+"""
+
+# Job started 2h ago; t1 dispatched 20s ago, t2 dispatched 2h ago, t3
+# never dispatched. Only t2 is stall-eligible -- job-age eligibility
+# classified every rate-limited tail target "stalled" from minute 15 of
+# the 2026-08-21 run (the feedback loop behind the 2.71x duplicate
+# attempts).
+_AGES_PER_TARGET_CHECK = _REAPER_PRELUDE + """
+job = new_job(7200)
+t1 = new_target(job, 20)
+t2 = new_target(job, 7200)
+t3 = new_target(job, None)
+
+tasks_jobs.recover_stalled_batches()
+
+if len(calls) != 1:
+    fail("EXPECTED_EXACTLY_ONE_STALLED_TARGET_REDISPATCHED_GOT:" + str(len(calls)))
+
+dispatched = calls[0]["data"]["match_ids"].split(",")
+if dispatched != [str(t2.match_id)]:
+    fail("WRONG_TARGETS_AGED_AS_STALLED:" + str(dispatched))
+
+print("OK")
+sys.exit(0)
+"""
+
+# A node answering `daemonstatus.json` with a non-empty queue is alive and
+# working: its targets are queued behind max_proc/rate limits, not stalled.
+_ALIVE_NODE_CHECK = _REAPER_PRELUDE + """
+daemon["payload"] = {"status": "ok", "pending": 3, "running": 8, "finished": 41}
+
+job = new_job(7200)
+target = new_target(job, 7200)
+
+tasks_jobs.recover_stalled_batches()
+
+if not probes:
+    fail("NODE_WAS_NEVER_PROBED_BEFORE_REDISPATCH")
+
+if calls:
+    fail("ALIVE_AND_WORKING_NODE_WAS_RE_POSTED:" + str(len(calls)))
+
+print("OK")
+sys.exit(0)
+"""
+
+# A node that cannot be reached at all is the scenario the reaper exists
+# for: re-POST proceeds, and the re-POSTed targets get a fresh
+# `dispatched_at` so the very next sweep does not reap them again.
+_DEAD_NODE_CHECK = _REAPER_PRELUDE + """
+daemon["payload"] = None
+
+job = new_job(7200)
+target = new_target(job, 7200)
+stale_stamp = target.dispatched_at
+
+tasks_jobs.recover_stalled_batches()
+
+if len(calls) != 1:
+    fail("UNREACHABLE_NODE_WAS_NOT_REAPED_GOT:" + str(len(calls)))
+
+if calls[0]["data"]["match_ids"] != str(target.match_id):
+    fail("WRONG_TARGET_REAPED:" + str(calls[0]["data"]["match_ids"]))
+
+if target.dispatched_at == stale_stamp:
+    fail("REDISPATCHED_TARGET_KEPT_ITS_STALE_DISPATCHED_AT")
+
+if target.dispatched_at != _FakeDatetime._now:
+    fail("REDISPATCHED_TARGET_NOT_STAMPED_NOW:" + str(target.dispatched_at))
+
+# ... and the immediately-following sweep must therefore find nothing.
+tasks_jobs.recover_stalled_batches()
+
+if len(calls) != 1:
+    fail("FRESH_STAMP_DID_NOT_PREVENT_IMMEDIATE_RE_REAP:" + str(len(calls)))
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def _run_reaper_check(script: str) -> None:
+    env = {**os.environ, **_STALL_RECOVERY_ENV}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=None,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+def test_reaper_ages_per_target_not_per_job() -> None:
+    """Job started 2h ago; t1 dispatched 20s ago, t2 dispatched 2h ago,
+    t3 never dispatched. Only t2 is stall-eligible: job-age eligibility
+    classified every rate-limited tail target 'stalled' from minute 15
+    of the 2026-08-21 run (the feedback loop behind the 2.71x)."""
+    _run_reaper_check(_AGES_PER_TARGET_CHECK)
+
+
+def test_reaper_skips_batches_whose_node_is_alive_and_working() -> None:
+    """A node reporting pending+running > 0 is working its queue — its
+    targets are queued, not stalled, so nothing is re-POSTed."""
+    _run_reaper_check(_ALIVE_NODE_CHECK)
+
+
+def test_reaper_reaps_when_node_unreachable() -> None:
+    """An unreachable node IS the stall the reaper exists for: re-POST
+    proceeds, and the re-POSTed targets get a fresh `dispatched_at` so
+    the next sweep cannot immediately reap them again."""
+    _run_reaper_check(_DEAD_NODE_CHECK)
