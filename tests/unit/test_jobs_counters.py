@@ -14,6 +14,7 @@ never mutates the parent job's counters.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import uuid
@@ -225,23 +226,109 @@ sys.exit(0)
 """
 
 
+#: Env every in-repo subprocess check in this module needs to import
+#: `app.workers.tasks_jobs` (settings are validated at import time). No
+#: connection is ever opened — the sessions are faked inside the script.
+_SUBPROCESS_ENV = {
+    "DATABASE_URL": "postgresql+psycopg://crawmatic:crawmatic@pgbouncer:6432/crawmatic",
+    "REDIS_URL": "redis://redis:6379/0",
+    "SCRAPYD_HTTP_URLS": "http://scrapers:6800",
+    "SCRAPYD_BROWSER_URLS": "http://scrapers-browser:6800",
+    "SCRAPYD_USERNAME": "scrapyd",
+    "SCRAPYD_PASSWORD": "change-me",
+    "JWT_SECRET": "test-jwt-secret",
+    "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
+}
+
+
 def test_refresh_job_counters_writes_counts_in_one_update() -> None:
     result = subprocess.run(
         [sys.executable, "-c", _REFRESH_COUNTERS_CHECK],
         capture_output=True,
         text=True,
         timeout=30,
-        env={
-            **__import__("os").environ,
-            "DATABASE_URL": "postgresql+psycopg://crawmatic:crawmatic@pgbouncer:6432/crawmatic",
-            "REDIS_URL": "redis://redis:6379/0",
-            "SCRAPYD_HTTP_URLS": "http://scrapers:6800",
-            "SCRAPYD_BROWSER_URLS": "http://scrapers-browser:6800",
-            "SCRAPYD_USERNAME": "scrapyd",
-            "SCRAPYD_PASSWORD": "change-me",
-            "JWT_SECRET": "test-jwt-secret",
-            "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
-        },
+        env={**os.environ, **_SUBPROCESS_ENV},
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+# --- _scan_job_refs: the cross-tenant scan runs on the system session ---------
+
+_SCAN_SESSION_CHECK = """
+import sys
+sys.path.insert(0, "apps/workers")
+sys.path.insert(0, "tests/unit")
+
+from contextlib import contextmanager
+
+import app.workers.tasks_jobs as tasks_jobs
+
+calls = {"system": 0, "ordinary": 0}
+
+
+class _FakeResult:
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    def execute(self, stmt):
+        return _FakeResult()
+
+
+@contextmanager
+def fake_system_session():
+    calls["system"] += 1
+    yield _FakeSession()
+
+
+@contextmanager
+def fake_ordinary_session():
+    calls["ordinary"] += 1
+    yield _FakeSession()
+
+
+tasks_jobs.get_system_session = fake_system_session
+tasks_jobs.get_session = fake_ordinary_session
+
+refs = tasks_jobs._scan_job_refs(tasks_jobs._NON_TERMINAL_JOB_STATUSES)
+
+if refs != []:
+    print("WRONG_REFS:" + str(refs))
+    sys.exit(1)
+if calls["system"] != 1:
+    print("SYSTEM_SESSION_NOT_USED:" + str(calls))
+    sys.exit(1)
+if calls["ordinary"] != 0:
+    print("ORDINARY_SESSION_USED:" + str(calls))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_scan_job_refs_uses_system_session() -> None:
+    """The cross-tenant job scan must run on the BYPASSRLS system session.
+
+    (The outbox-dispatcher precedent.) On the ordinary RLS-confined
+    session it fail-closes to 0 rows and finalization dies silently
+    (mushtryati F-1, 2026-08-21): `scrape_jobs` carries FORCE ROW LEVEL
+    SECURITY with a `workspace_id = current_setting('app.workspace_id')`
+    policy, so an unscoped sweep with no GUC set returns nothing at all
+    rather than erroring — every loop body downstream simply never runs.
+
+    Driven in a subprocess because `apps/api/app` shadows
+    `apps/workers/app` on the shared `app` package name (the same reason
+    every other worker-task check in this repo is a subprocess script).
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _SCAN_SESSION_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, **_SUBPROCESS_ENV},
     )
     assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     assert result.stdout.strip() == "OK"

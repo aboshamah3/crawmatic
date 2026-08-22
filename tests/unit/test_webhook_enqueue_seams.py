@@ -383,6 +383,10 @@ def fake_set_workspace_context(session, workspace_id):
 
 
 tasks_jobs.get_session = fake_get_session
+# The cross-tenant `_scan_job_refs` sweep runs on the BYPASSRLS system
+# session (mushtryati F-1) -- point it at the same fake, so the scan
+# still reads the seeded rows and no real engine is ever constructed.
+tasks_jobs.get_system_session = fake_get_session
 tasks_jobs.set_workspace_context = fake_set_workspace_context
 
 

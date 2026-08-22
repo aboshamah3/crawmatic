@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
 from app_shared.config import get_settings
-from app_shared.database import get_session, set_workspace_context
+from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetStatus
 from app_shared.ids import new_uuid7
 from app_shared.jobs.batching import ResolvedTarget, plan_batches
@@ -187,23 +187,24 @@ def _resolve_domains_and_modes(
     return resolved
 
 
-def _scan_job_refs(
-    session: Session, statuses: frozenset[ScrapeJobStatus]
-) -> list[tuple[uuid.UUID, uuid.UUID]]:
+def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID, uuid.UUID]]:
     """Resolve `(job_id, workspace_id)` pairs for every job in `statuses`.
 
-    A periodic maintenance sweep necessarily spans every workspace before
-    it can scope each job's own subsequent read/write — mirrors the
-    router precedent of resolving `(id, workspace_id)` pairs unscoped
-    (e.g. `apps/api/app/routers/matches.py`), then re-scoping via
-    `set_workspace_context` per row before touching anything else. This
-    is the one place in the module a workspace-owned model is queried
-    without a `workspace_id` predicate already in hand.
+    A periodic maintenance sweep necessarily spans every workspace, and
+    under FORCE ROW LEVEL SECURITY the ordinary engine's role fail-closes
+    an unscoped scan to ZERO rows when no workspace context is set — which
+    silently killed finalization for 6.5 h on 2026-08-21 (mushtryati F-1).
+    So the id-pair scan runs on the sanctioned BYPASSRLS system session
+    (`get_system_session`, the outbox-dispatcher / scheduler-claim
+    precedent) and returns plain ids; EVERY subsequent row read/write
+    happens on the caller's ordinary session, re-scoped per job via
+    `set_workspace_context` — the system session never touches a row.
     """
-    stmt = select(ScrapeJob.id, ScrapeJob.workspace_id).where(  # noqa: workspace-scope
-        ScrapeJob.status.in_(statuses)
-    )
-    return list(session.execute(stmt).all())
+    with get_system_session() as session:
+        stmt = select(ScrapeJob.id, ScrapeJob.workspace_id).where(  # noqa: workspace-scope
+            ScrapeJob.status.in_(statuses)
+        )
+        return list(session.execute(stmt).all())
 
 
 @app.task(name=SCRAPE_DISPATCH_JOB)
@@ -385,7 +386,7 @@ def finalize_jobs() -> None:
     at-least-once delivery and bounded retries.
     """
     with get_session() as session:
-        for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
+        for job_id, workspace_id in _scan_job_refs(_NON_TERMINAL_JOB_STATUSES):
             set_workspace_context(session, workspace_id)
 
             job = scoped_get(session, ScrapeJob, job_id, workspace_id)
@@ -501,7 +502,7 @@ def redispatch_pending_jobs() -> None:
     on one job is logged and the sweep moves on.
     """
     with get_session() as session:
-        for job_id, workspace_id in _scan_job_refs(session, _NON_TERMINAL_JOB_STATUSES):
+        for job_id, workspace_id in _scan_job_refs(_NON_TERMINAL_JOB_STATUSES):
             set_workspace_context(session, workspace_id)
 
             job = scoped_get(session, ScrapeJob, job_id, workspace_id)
@@ -571,7 +572,7 @@ def recover_stalled_batches() -> None:
     with get_session() as session:
         client = ScrapydDispatchClient(settings=settings)
 
-        for job_id, workspace_id in _scan_job_refs(session, _RUNNING_JOB_STATUSES):
+        for job_id, workspace_id in _scan_job_refs(_RUNNING_JOB_STATUSES):
             set_workspace_context(session, workspace_id)
 
             job = scoped_get(session, ScrapeJob, job_id, workspace_id)

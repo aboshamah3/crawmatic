@@ -62,6 +62,10 @@ def fake_enqueue(name, *, queue=None, kwargs=None):
 
 
 tasks_jobs.get_session = fake_get_session
+# The cross-tenant `_scan_job_refs` sweep runs on the BYPASSRLS system
+# session (mushtryati F-1) -- point it at the same fake, so the scan
+# still reads the seeded rows and no real engine is ever constructed.
+tasks_jobs.get_system_session = fake_get_session
 tasks_jobs.set_workspace_context = lambda session, workspace_id: None
 tasks_jobs.enqueue = fake_enqueue
 
