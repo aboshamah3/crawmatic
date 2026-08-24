@@ -55,6 +55,9 @@ from app.schemas.admin import (
     AdminApiKeyCreateResponse,
     AdminApiKeyListItem,
     AdminApiKeyListResponse,
+    ApiKeyRevokeResponse,
+    ConnectorKeyCreateRequest,
+    ConnectorKeyCreateResponse,
     UsageListResponse,
     UsageRow,
     WorkspaceArchiveResponse,
@@ -104,6 +107,19 @@ BOOTSTRAP_SCOPES: list[str] = [
     "scrape_profiles:write",
     "domain_rules:read",
     "domain_rules:write",
+]
+
+#: What a store connector actually does (audit P0.3): read catalog, manage
+#: competitors and matches. Everything else in BOOTSTRAP_SCOPES —
+#: jobs/refresh_rules/webhooks/scrape_profiles/domain_rules writes — is
+#: SaaS-worker business and never belongs on a key that lives in WordPress.
+CONNECTOR_SCOPES: list[str] = [
+    "products:read",
+    "variants:read",
+    "competitors:read",
+    "competitors:write",
+    "matches:read",
+    "matches:write",
 ]
 
 
@@ -208,6 +224,100 @@ def provision_workspace(
         api_key=full_secret,
         external_ref=payload.external_ref,
     )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/connector-keys",
+    response_model=ConnectorKeyCreateResponse,
+    status_code=201,
+)
+def create_connector_key(
+    workspace_id: uuid.UUID,
+    payload: ConnectorKeyCreateRequest,
+    session: Session = Depends(get_admin_session),
+) -> ConnectorKeyCreateResponse:
+    """`POST /v1/admin/workspaces/{workspace_id}/connector-keys` -- mint a
+    key scoped to `CONNECTOR_SCOPES` for a store connector that lives in
+    WordPress (audit P0.3).
+
+    Unlike `create_workspace_api_key` above, the scope set is NOT
+    caller-suppliable here: a connector key is always exactly
+    `CONNECTOR_SCOPES`, never wider, so WordPress can never end up
+    holding `jobs:write`/`webhooks:write`/etc. by passing `scopes` in
+    the request body -- there is no such field on
+    `ConnectorKeyCreateRequest`.
+
+    404s on an unknown `workspace_id`, same rationale as
+    `create_workspace_api_key`: the caller is the trusted,
+    service-token-holding SaaS control plane.
+
+    The plaintext key is returned exactly once and never persisted --
+    same contract as `provision_workspace` above.
+    """
+    workspace = session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)  # noqa: workspace-scope
+    ).scalar_one_or_none()
+    if workspace is None:
+        raise _not_found("Workspace not found.")
+
+    full_secret, key_prefix, key_hash = generate_api_key()
+    api_key = ApiKey(
+        workspace_id=workspace_id,
+        name=f"connector:{payload.connector}:{workspace_id}",
+        key_prefix=key_prefix,
+        key_hash=key_hash,
+        scopes=list(CONNECTOR_SCOPES),
+        status=ApiKeyStatus.ACTIVE,
+    )
+    session.add(api_key)
+    session.flush()
+
+    return ConnectorKeyCreateResponse(
+        key_id=api_key.id,
+        api_key=full_secret,  # returned exactly once; never persisted/re-shown
+        key_prefix=key_prefix,
+    )
+
+
+@router.post(
+    "/api-keys/{key_id}/revoke",
+    response_model=ApiKeyRevokeResponse,
+)
+def revoke_api_key(
+    key_id: uuid.UUID,
+    session: Session = Depends(get_admin_session),
+) -> ApiKeyRevokeResponse:
+    """`POST /v1/admin/api-keys/{key_id}/revoke` -- revoke any
+    admin-minted key by id (audit P0.3, primarily used to revoke a
+    connector key on unpair).
+
+    Not workspace-scoped in the path (unlike
+    `revoke_workspace_api_key`'s `DELETE
+    .../workspaces/{workspace_id}/api-keys/{api_key_id}`) -- the SaaS
+    control plane tracks the connector key id directly and this is the
+    trusted, service-token-gated admin surface, so a plain lookup by id
+    is safe here. 404s on an unknown id via `_not_found`, mirroring
+    `create_connector_key`/`create_workspace_api_key` above (contrast
+    `revoke_workspace_api_key`'s deliberate 204-always idempotency,
+    which exists to avoid leaking cross-workspace existence to a path
+    with a workspace_id segment -- this route has none).
+
+    Only sets `revoked_at` on the first revocation, mirroring
+    `revoke_workspace_api_key`, so a redundant revoke is a no-op rather
+    than clobbering the original revocation timestamp.
+    """
+    existing = session.execute(
+        select(ApiKey).where(ApiKey.id == key_id)  # noqa: workspace-scope
+    ).scalar_one_or_none()
+    if existing is None:
+        raise _not_found("API key not found.")
+
+    if existing.status != ApiKeyStatus.REVOKED:
+        existing.status = ApiKeyStatus.REVOKED
+        existing.revoked_at = datetime.now(timezone.utc)
+        session.flush()
+
+    return ApiKeyRevokeResponse(key_id=existing.id, status=existing.status)
 
 
 @router.post(

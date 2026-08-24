@@ -109,3 +109,34 @@ class AdminApiKeyListItem(BaseModel):
 
 class AdminApiKeyListResponse(BaseModel):
     items: list[AdminApiKeyListItem]
+
+
+class ConnectorKeyCreateRequest(BaseModel):
+    """`POST /v1/admin/workspaces/{workspace_id}/connector-keys` body.
+
+    `connector` names the WordPress connector the key is being minted
+    for (e.g. `"woo"`) -- it drives the stored key `name`
+    (`f"connector:{connector}:{workspace_id}"`) and nothing else; the
+    scope set is always `app.routers.admin.CONNECTOR_SCOPES`, never
+    caller-supplied (audit P0.3 -- WordPress never holds a key wider
+    than read-catalog + manage-competitors/matches).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector: str = Field(min_length=1, max_length=100)
+
+
+class ConnectorKeyCreateResponse(BaseModel):
+    """The plaintext key is returned exactly once and never stored."""
+
+    key_id: uuid.UUID
+    api_key: str
+    key_prefix: str
+
+
+class ApiKeyRevokeResponse(BaseModel):
+    """`POST /v1/admin/api-keys/{key_id}/revoke` response."""
+
+    key_id: uuid.UUID
+    status: ApiKeyStatus
