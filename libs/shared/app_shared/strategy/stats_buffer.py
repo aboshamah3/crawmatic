@@ -83,6 +83,7 @@ _FAILURE = "failure"
 _RT_MS_SUM = "rt_ms_sum"
 _CONF_SUM = "conf_sum"
 _QUAL_SUCCESS = "qual_success"
+_OPERATIONAL_FAILURE = "operational_failure"
 
 #: Scale factor `confidence` (a `Decimal`/`float` in `[0, 1]`) is multiplied
 #: by before `HINCRBY` — Redis hash counters are integers only
@@ -112,18 +113,39 @@ return {stat_fields, distinct_urls}
 _drain_script: Any = None
 
 
-def _stat_key(profile_id: uuid.UUID | str, method_type: Any, method_name: str) -> str:
-    return f"stratstat:{profile_id}:{_method_type_value(method_type)}:{method_name}"
+def _method_key_suffix(
+    method_type: Any,
+    method_name: str,
+    strategy_method_id: uuid.UUID | str | None,
+) -> str:
+    if strategy_method_id is not None:
+        return f"strategy:{strategy_method_id}:{_method_type_value(method_type)}"
+    # Exact pre-migration key suffix: old pending counters remain drainable.
+    return f"{_method_type_value(method_type)}:{method_name}"
 
 
-def url_key(profile_id: uuid.UUID | str, method_type: Any, method_name: str) -> str:
+def _stat_key(
+    profile_id: uuid.UUID | str,
+    method_type: Any,
+    method_name: str,
+    strategy_method_id: uuid.UUID | str | None = None,
+) -> str:
+    return f"stratstat:{profile_id}:{_method_key_suffix(method_type, method_name, strategy_method_id)}"
+
+
+def url_key(
+    profile_id: uuid.UUID | str,
+    method_type: Any,
+    method_name: str,
+    strategy_method_id: uuid.UUID | str | None = None,
+) -> str:
     """`straturl:{profile_id}:{method_type}:{method_name}` -- exposed
     (not `_`-prefixed) so `app_shared/strategy/flush.py` can `DELETE` it
     once a method actually promotes (contracts/stats-buffer.md "Drain":
     the distinct-URL SET survives every `drain` call and is only cleared
     at that point) without reaching into this module's private key
     builders."""
-    return f"straturl:{profile_id}:{_method_type_value(method_type)}:{method_name}"
+    return f"straturl:{profile_id}:{_method_key_suffix(method_type, method_name, strategy_method_id)}"
 
 
 def dirty_key(workspace_id: uuid.UUID | str) -> str:
@@ -171,6 +193,7 @@ class PendingDelta:
     conf_sum: int
     qualifying_success: int
     distinct_urls: int
+    operational_failure: int = 0
 
 
 @dataclass(frozen=True)
@@ -188,6 +211,7 @@ class DrainedDelta:
     conf_sum: int
     qualifying_success: int
     distinct_urls: int
+    operational_failure: int = 0
 
 
 def record_attempt(
@@ -203,6 +227,8 @@ def record_attempt(
     url: str,
     qualifying: bool,
     ttl_seconds: int,
+    strategy_method_id: uuid.UUID | str | None = None,
+    operational_failure: bool = False,
 ) -> None:
     """Atomically buffer one attempt's outcome (contracts/stats-buffer.md
     `record_attempt`, O(1), no read-modify-write in Python):
@@ -228,8 +254,10 @@ def record_attempt(
     `app_shared/access/budget.py`'s fail-open posture).
     """
     try:
-        stat_key = _stat_key(profile_id, method_type, method_name)
-        this_url_key = url_key(profile_id, method_type, method_name)
+        stat_key = _stat_key(profile_id, method_type, method_name, strategy_method_id)
+        this_url_key = url_key(
+            profile_id, method_type, method_name, strategy_method_id
+        )
         this_dirty_key = dirty_key(workspace_id)
         ttl_ms = ttl_seconds * 1000
 
@@ -237,6 +265,8 @@ def record_attempt(
 
         redis.hincrby(stat_key, _ATTEMPT, 1)
         redis.hincrby(stat_key, _SUCCESS if success else _FAILURE, 1)
+        if operational_failure:
+            redis.hincrby(stat_key, _OPERATIONAL_FAILURE, 1)
         if response_time_ms is not None:
             redis.hincrby(stat_key, _RT_MS_SUM, int(response_time_ms))
         if success and confidence is not None:
@@ -269,6 +299,7 @@ def read_pending(
     profile_id: uuid.UUID | str,
     method_type: Any,
     method_name: str,
+    strategy_method_id: uuid.UUID | str | None = None,
 ) -> PendingDelta:
     """Non-destructive `HGETALL` + `SCARD` snapshot of the pending buffer
     (contracts/stats-buffer.md `read_pending`) -- used by promotion/
@@ -276,8 +307,10 @@ def read_pending(
     draining (FR-024). An absent hash/set (no pending activity, or the
     keys already expired/were never written) reads back as all-zero
     (never raises)."""
-    stat_key = _stat_key(profile_id, method_type, method_name)
-    this_url_key = url_key(profile_id, method_type, method_name)
+    stat_key = _stat_key(profile_id, method_type, method_name, strategy_method_id)
+    this_url_key = url_key(
+        profile_id, method_type, method_name, strategy_method_id
+    )
 
     fields = redis.hgetall(stat_key) or {}
     # A real `redis.Redis` (with `decode_responses=True`, the project
@@ -298,6 +331,7 @@ def read_pending(
         conf_sum=_as_int(normalized.get(_CONF_SUM)),
         qualifying_success=_as_int(normalized.get(_QUAL_SUCCESS)),
         distinct_urls=int(distinct_urls),
+        operational_failure=_as_int(normalized.get(_OPERATIONAL_FAILURE)),
     )
 
 
@@ -307,6 +341,7 @@ def drain(
     profile_id: uuid.UUID | str,
     method_type: Any,
     method_name: str,
+    strategy_method_id: uuid.UUID | str | None = None,
 ) -> DrainedDelta:
     """Atomic read-and-reset of the stat HASH via a single Lua `EVAL`
     (registered once, `register_script` -- the SPEC-11 `bucket.py`/
@@ -318,8 +353,10 @@ def drain(
     only cleared by the flush task once the method actually promotes.
     """
     global _drain_script
-    stat_key = _stat_key(profile_id, method_type, method_name)
-    this_url_key = url_key(profile_id, method_type, method_name)
+    stat_key = _stat_key(profile_id, method_type, method_name, strategy_method_id)
+    this_url_key = url_key(
+        profile_id, method_type, method_name, strategy_method_id
+    )
 
     if _drain_script is None:
         _drain_script = redis.register_script(_DRAIN_LUA)
@@ -341,4 +378,5 @@ def drain(
         conf_sum=_as_int(fields.get(_CONF_SUM)),
         qualifying_success=_as_int(fields.get(_QUAL_SUCCESS)),
         distinct_urls=int(distinct_urls or 0),
+        operational_failure=_as_int(fields.get(_OPERATIONAL_FAILURE)),
     )

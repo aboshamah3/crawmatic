@@ -95,6 +95,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.identity import Workspace
 from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.models.strategy import DomainStrategyMethod
 from app_shared.profiles.repository import GLOBAL_DEFAULT_PROFILE_NAME, profile_visibility_map
 from app_shared.profiles.resolution import (
     ResolutionResult,
@@ -114,12 +115,20 @@ from app_shared.strategy.resolution import (
     resolve_or_create_strategy_profile,
     resolve_strategy_start,
 )
+from app_shared.strategy.methods import resolve_method_candidate
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
 
 from scrape_core.browser.variant import VariantConfigError, resolve_variant_values
 from scrape_core.db import as_awaitable, await_in_thread, run_in_thread, workspace_txn
-from scrape_core.limiter import LockGrant, Permission, acquire_lock, acquire_permission, release_slot
+from scrape_core.limiter import (
+    LockGrant,
+    Permission,
+    acquire_lock,
+    acquire_permission,
+    release_lock,
+    release_slot,
+)
 from scrape_core.observability import log_event
 from scrape_core.reactor import deferred_delay
 from scrape_core.defer_budget import consume_defer_budget
@@ -147,6 +156,7 @@ __all__ = [
     "overflow_to_dispatch",
     "dispatch_admission",
     "sticky_proxy_username",
+    "next_strategy_method",
 ]
 
 #: `{provider_id: (status, type, country)}` -- the shape `assign_proxy` expects.
@@ -205,6 +215,15 @@ class SpiderTarget:
     # tests predating SPEC-12) keep constructing without changes.
     domain_strategy_profile_id: uuid.UUID | None = None
     strategy_start: StrategyStart | None = None
+    # Versioned runnable method selected by job dispatch.  The full ordered
+    # list is carried so either spider can outcome-condition a handoff
+    # without another DB read on the reactor thread.
+    strategy_method_id: uuid.UUID | None = None
+    strategy_methods: tuple[DomainStrategyMethod, ...] = ()
+    strategy_attempt_ordinal: int = 0
+    chain_token: uuid.UUID | None = None
+    competitor_variant_identifier: str | None = None
+    competitor_variant_sku: str | None = None
     # SPEC-14 (T005): browser-mode fields, resolved from the profile row
     # `load_targets` already loaded -- no new query.
     wait_for_selector: str | None = None
@@ -244,6 +263,25 @@ class _RequeueState:
 
     requeue_count: int = 0
     cumulative_wait: float = 0.0
+
+
+def next_strategy_method(
+    target: SpiderTarget,
+    outcome: ScrapeErrorCode,
+):
+    """Return the next configured method after ``outcome``, or ``None``.
+
+    Pure and safe on the reactor thread: every candidate was loaded in one
+    bounded query by :func:`load_targets`.
+    """
+    if target.strategy_method_id is None:
+        return None
+    return resolve_method_candidate(
+        target.strategy_methods,
+        current_method_id=target.strategy_method_id,
+        outcome=outcome,
+        current_attempt_ordinal=target.strategy_attempt_ordinal,
+    )
 
 
 def _mark_target_deferred_rate_limited(
@@ -669,6 +707,7 @@ def load_targets(
         # (possibly stale) stored `competitor_product_matches.url_pattern`,
         # so a version bump can never silently mix patterns (FR-005).
         strategy_profile_id_by_group: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
+        strategy_profile_by_group: dict[tuple[uuid.UUID, str], Any] = {}
         strategy_start_by_group: dict[tuple[uuid.UUID, str], StrategyStart | None] = {}
         for (competitor_id, url_pattern), group in groups.items():
             domain = competitor_domain_by_id.get(competitor_id, "")
@@ -687,6 +726,7 @@ def load_targets(
                 url_pattern=lookup_pattern,
             )
             strategy_profile_id_by_group[(competitor_id, url_pattern)] = strategy_profile.id
+            strategy_profile_by_group[(competitor_id, url_pattern)] = strategy_profile
             learned_start = resolve_strategy_start(
                 strategy_profile, algorithm_version=URL_PATTERN_ALGORITHM_VERSION
             )
@@ -704,6 +744,88 @@ def load_targets(
                     if learned_start.extraction_method is not None
                     else None,
                 )
+
+        # Versioned method candidates + durable per-job cursor.  This is one
+        # bounded load for the batch, never one query per target.  A target
+        # dispatched before the migration can still resolve the profile's
+        # preferred/first eligible method here as a compatibility fallback.
+        strategy_profile_ids = set(strategy_profile_id_by_group.values())
+        strategy_methods_by_profile: dict[uuid.UUID, list[DomainStrategyMethod]] = {}
+        if strategy_profile_ids:
+            method_rows = (
+                session.execute(
+                    scoped_select(DomainStrategyMethod, workspace_id).where(
+                        DomainStrategyMethod.domain_strategy_profile_id.in_(
+                            strategy_profile_ids
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for method in method_rows:
+                strategy_methods_by_profile.setdefault(
+                    method.domain_strategy_profile_id, []
+                ).append(method)
+            for method_list in strategy_methods_by_profile.values():
+                method_list.sort(key=lambda row: (row.priority, str(row.id)))
+
+        job_target_by_match: dict[uuid.UUID, ScrapeJobTarget] = {}
+        if scrape_job_id is not None:
+            job_target_by_match = {
+                row.match_id: row
+                for row in session.execute(
+                    scoped_select(ScrapeJobTarget, workspace_id).where(
+                        ScrapeJobTarget.scrape_job_id == scrape_job_id,
+                        ScrapeJobTarget.match_id.in_([match.id for match in matches]),
+                    )
+                )
+                .scalars()
+                .all()
+            }
+
+        strategy_method_by_match: dict[uuid.UUID, DomainStrategyMethod | None] = {}
+        strategy_methods_by_match: dict[uuid.UUID, tuple[DomainStrategyMethod, ...]] = {}
+        for (competitor_id, url_pattern), group in groups.items():
+            strategy_profile = strategy_profile_by_group[(competitor_id, url_pattern)]
+            method_list = strategy_methods_by_profile.get(strategy_profile.id, [])
+            method_by_id = {method.id: method for method in method_list}
+            for match in group:
+                job_target = job_target_by_match.get(match.id)
+                selected_method = method_by_id.get(
+                    job_target.current_strategy_method_id if job_target is not None else None
+                )
+                if selected_method is None:
+                    selection = resolve_method_candidate(
+                        method_list,
+                        preferred_method_id=strategy_profile.preferred_method_id,
+                        current_attempt_ordinal=(
+                            job_target.strategy_attempt_ordinal if job_target is not None else 0
+                        ),
+                    )
+                    selected_method = selection.method if selection is not None else None
+                strategy_method_by_match[match.id] = selected_method
+                strategy_methods_by_match[match.id] = tuple(method_list)
+
+        # A selected method may intentionally use a different versioned
+        # scrape profile from the match/default resolution above.
+        method_profile_ids = {
+            method.scrape_profile_id
+            for method in strategy_method_by_match.values()
+            if method is not None and method.scrape_profile_id is not None
+        }
+        missing_method_profile_ids = method_profile_ids - set(profiles_by_id)
+        if missing_method_profile_ids:
+            rows = (
+                session.execute(
+                    select(ScrapeProfile).where(
+                        ScrapeProfile.id.in_(missing_method_profile_ids)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            profiles_by_id.update({row.id: row for row in rows})
 
         resolved_policy_ids = {pid for pid in resolved_policy_id_by_match.values() if pid is not None}
         access_policies_by_id: dict[uuid.UUID, AccessPolicy] = {}
@@ -742,9 +864,16 @@ def load_targets(
         targets: list[SpiderTarget] = []
         for match in matches:
             profile_id = resolved_profile_id_by_match.get(match.id)
+            selected_strategy_method = strategy_method_by_match.get(match.id)
+            if (
+                selected_strategy_method is not None
+                and selected_strategy_method.scrape_profile_id is not None
+            ):
+                profile_id = selected_strategy_method.scrape_profile_id
             profile = profiles_by_id.get(profile_id) if profile_id else None
             policy_id = resolved_policy_id_by_match.get(match.id)
             strategy_group_key = (match.competitor_id, match.url_pattern)
+            job_target = job_target_by_match.get(match.id)
             variant_selector_config = profile.variant_selector_config if profile is not None else None
 
             # SPEC-14 (T025, US3): resolve every action's `value_from`
@@ -772,7 +901,11 @@ def load_targets(
                     product_id=match.product_id,
                     product_variant_id=match.product_variant_id,
                     competitor_id=match.competitor_id,
-                    url=match.competitor_url,
+                    url=(
+                        job_target.strategy_url_override
+                        if job_target is not None and job_target.strategy_url_override
+                        else match.competitor_url
+                    ),
                     profile=profile,
                     robots_policy=competitor_robots_policy_by_id.get(
                         match.competitor_id, RobotsPolicy.RESPECT
@@ -781,7 +914,26 @@ def load_targets(
                     access_policy=access_policies_by_id.get(policy_id) if policy_id else None,
                     domain_rule=domain_rule_by_match.get(match.id),
                     domain_strategy_profile_id=strategy_profile_id_by_group.get(strategy_group_key),
-                    strategy_start=strategy_start_by_group.get(strategy_group_key),
+                    strategy_start=(
+                        StrategyStart(
+                            access_method=selected_strategy_method.access_method,
+                            extraction_method=selected_strategy_method.extraction_method,
+                        )
+                        if selected_strategy_method is not None
+                        else strategy_start_by_group.get(strategy_group_key)
+                    ),
+                    strategy_method_id=(
+                        selected_strategy_method.id
+                        if selected_strategy_method is not None
+                        else None
+                    ),
+                    strategy_methods=strategy_methods_by_match.get(match.id, ()),
+                    strategy_attempt_ordinal=(
+                        job_target.strategy_attempt_ordinal if job_target is not None else 0
+                    ),
+                    chain_token=(job_target.chain_token if job_target is not None else None),
+                    competitor_variant_identifier=match.competitor_variant_identifier,
+                    competitor_variant_sku=match.competitor_variant_sku,
                     wait_for_selector=profile.wait_for_selector if profile is not None else None,
                     browser_timeout_ms=profile.browser_timeout_ms if profile is not None else None,
                     variant_selector_config=variant_selector_config,
@@ -830,6 +982,7 @@ def _dedup_group_key(target: SpiderTarget) -> tuple | None:
         target.url,
         profile.id if profile is not None else None,
         target.access_policy.id if target.access_policy is not None else None,
+        target.strategy_method_id,
     )
 
 
@@ -1598,6 +1751,48 @@ async def dispatch_admission(
         return None
 
     redis = get_redis_client()
+    async def build_or_config_result(lock_grant: LockGrant) -> Any:
+        try:
+            return build_request(
+                target,
+                attempt_number,
+                plan,
+                proxy_assignment,
+                perm,
+                lock_grant,
+            )
+        except Exception as exc:
+            # Adapter configuration is validated at the API boundary, but a
+            # stale/bypassed row must fail one target cleanly and release both
+            # leases instead of aborting the whole spider.  Keep unrelated
+            # programmer errors loud.
+            from scrape_core.adapters.config import AdapterConfigurationError
+
+            if not isinstance(exc, AdapterConfigurationError):
+                raise
+            await release_slot(
+                redis,
+                key=perm.semaphore_key,
+                token=perm.semaphore_token,
+            )
+            await release_lock(redis, key=lock_grant.key, token=lock_grant.token)
+            selection = next_strategy_method(target, ScrapeErrorCode.SELECTOR_BROKEN)
+            return build_scrape_result(
+                target,
+                target.url,
+                datetime.now(UTC),
+                workspace_id=ctx.workspace_id,
+                scrape_job_id=ctx.scrape_job_id,
+                status_code=None,
+                success=False,
+                error_code=ScrapeErrorCode.SELECTOR_BROKEN,
+                error_message=f"adapter configuration invalid: {exc}",
+                access_method=plan.access_method,
+                attempt_number=attempt_number,
+                chain_complete=selection is None,
+                next_strategy_method_id=(selection.method.id if selection else None),
+            )
+
     if reuse_lock is not None:
         # ISSUES_FULL_RUN_2026-07-17 Issue 3: a same-spider retry of the
         # same target inherits the lock its failed prior attempt still
@@ -1608,7 +1803,7 @@ async def dispatch_admission(
         # whole DIRECT->PROXY escalation. The TTL from the original
         # acquire still bounds the chain; if it lapses mid-retry the
         # fencing-token release simply no-ops.
-        return build_request(target, attempt_number, plan, proxy_assignment, perm, reuse_lock)
+        return await build_or_config_result(reuse_lock)
     lock = await acquire_lock(
         redis,
         workspace_id=ctx.workspace_id,
@@ -1641,4 +1836,4 @@ async def dispatch_admission(
             attempt_number=attempt_number,
         )
 
-    return build_request(target, attempt_number, plan, proxy_assignment, perm, lock)
+    return await build_or_config_result(lock)

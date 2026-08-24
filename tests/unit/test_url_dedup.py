@@ -277,5 +277,6 @@ def test_errback_stops_instead_of_dispatching_a_phantom_browser_attempt(
     # never-dispatched skip row -- and it releases the held lock.
     assert len(items) == 1
     assert items[0].success is False
+    assert items[0].chain_complete is True
     assert items[0].attempt_number == 3
     assert items[0].match_lock_key == "lock:scrape:x:f"

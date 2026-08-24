@@ -45,7 +45,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKeyConstraint, Integer, UniqueConstraint, Uuid
+from sqlalchemy import ForeignKeyConstraint, Integer, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.enums import (
@@ -138,6 +138,12 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
             ["workspaces.id"],
             name="fk_scrape_job_targets_workspace_id_workspaces",
         ),
+        ForeignKeyConstraint(
+            ["current_strategy_method_id"],
+            ["domain_strategy_methods.id"],
+            name="fk_sjt_current_strategy_method_dsm",
+            ondelete="SET NULL",
+        ),
     )
 
     scrape_job_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
@@ -159,5 +165,20 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
     started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     error_code: Mapped[ScrapeErrorCode | None] = enum_column(ScrapeErrorCode, nullable=True)
+
+    # Durable strategy-chain cursor.  A target can hand off between HTTP
+    # and browser nodes without losing which versioned candidate is next;
+    # the token also makes duplicate deliveries distinguishable from a new
+    # chain for the same job/match.
+    current_strategy_method_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    chain_token: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    strategy_attempt_ordinal: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0
+    )
+    strategy_url_override: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)

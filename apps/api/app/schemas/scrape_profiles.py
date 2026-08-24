@@ -43,6 +43,7 @@ class ScrapeProfileCreate(BaseModel):
     name: str
     mode: ScrapeProfileMode = ScrapeProfileMode.HTTP
     adapter_key: AdapterKey = AdapterKey.DEFAULT_HTTP
+    adapter_config: dict[str, Any] | None = None
     jsonld_enabled: bool = True
     platform_patterns_enabled: bool = True
     embedded_json_enabled: bool = True
@@ -89,6 +90,7 @@ class ScrapeProfileUpdate(BaseModel):
     name: str | None = None
     mode: ScrapeProfileMode | None = None
     adapter_key: AdapterKey | None = None
+    adapter_config: dict[str, Any] | None = None
     jsonld_enabled: bool | None = None
     platform_patterns_enabled: bool | None = None
     embedded_json_enabled: bool | None = None
@@ -141,6 +143,8 @@ class ScrapeProfileResponse(BaseModel):
     name: str
     mode: ScrapeProfileMode
     adapter_key: AdapterKey
+    adapter_config: dict[str, Any] | None
+    version: int
     jsonld_enabled: bool
     platform_patterns_enabled: bool
     embedded_json_enabled: bool
@@ -189,6 +193,23 @@ class ScrapeProfileListResponse(BaseModel):
     next_cursor: str | None
 
 
+class ScrapeProfileRevisionResponse(BaseModel):
+    """One immutable, reproducible profile configuration revision."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    scrape_profile_id: uuid.UUID
+    version: int
+    snapshot: dict[str, Any]
+    created_at: datetime
+
+
+class ScrapeProfileRevisionListResponse(BaseModel):
+    items: list[ScrapeProfileRevisionResponse]
+    next_cursor: str | None = None
+
+
 # --- Bulk-upsert DTOs (`contracts/profiles-bulk-upsert.md`) -----------------
 
 
@@ -205,6 +226,7 @@ class ScrapeProfileBulkUpsertItem(BaseModel):
     name: str
     mode: ScrapeProfileMode = ScrapeProfileMode.HTTP
     adapter_key: AdapterKey = AdapterKey.DEFAULT_HTTP
+    adapter_config: dict[str, Any] | None = None
     jsonld_enabled: bool = True
     platform_patterns_enabled: bool = True
     embedded_json_enabled: bool = True

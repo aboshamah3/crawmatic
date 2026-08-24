@@ -21,7 +21,9 @@ from __future__ import annotations
 import pytest
 
 from app_shared.enums import RobotsPolicy
+from app_shared.enums import ScrapeErrorCode
 
+from scrape_core.errors import classify_exception
 from scrape_core.robots import RobotsBlockedError, RobotsPolicyMiddleware
 
 
@@ -60,6 +62,12 @@ def test_respect_blocks_a_disallowed_path() -> None:
     assert fetcher.calls == ["https://shop.example.com/robots.txt"]  # type: ignore[attr-defined]
 
 
+def test_robots_denial_is_a_policy_outcome_not_a_retryable_block() -> None:
+    assert classify_exception(RobotsBlockedError("denied")) == (
+        ScrapeErrorCode.POLICY_BLOCKED
+    )
+
+
 def test_respect_allows_a_path_not_disallowed() -> None:
     fetcher = _fetcher_returning(_ROBOTS_BODY_DISALLOW_PRIVATE)
     middleware = RobotsPolicyMiddleware(robots_fetcher=fetcher)
@@ -76,6 +84,58 @@ def test_respect_caches_the_robots_fetch_per_origin() -> None:
     middleware._decide_respect("https://shop.example.com/product/2", "price_monitor")
 
     assert fetcher.calls == ["https://shop.example.com/robots.txt"]  # type: ignore[attr-defined]
+
+
+def test_respect_revalidates_after_cache_ttl() -> None:
+    now = [100.0]
+    fetcher = _fetcher_returning(_ROBOTS_BODY_DISALLOW_PRIVATE)
+    middleware = RobotsPolicyMiddleware(
+        robots_fetcher=fetcher,
+        cache_ttl_seconds=30,
+        clock=lambda: now[0],
+    )
+
+    middleware._decide_respect("https://shop.example.com/product/1", "configured-agent")
+    now[0] += 31
+    middleware._decide_respect("https://shop.example.com/product/2", "configured-agent")
+
+    assert fetcher.calls == [  # type: ignore[attr-defined]
+        "https://shop.example.com/robots.txt",
+        "https://shop.example.com/robots.txt",
+    ]
+
+
+def test_respect_fetches_robots_with_configured_user_agent() -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fetch(robots_url: str, user_agent: str) -> str:
+        calls.append((robots_url, user_agent))
+        return "User-agent: *\nAllow: /\n"
+
+    middleware = RobotsPolicyMiddleware(robots_fetcher=fetch)
+    middleware._decide_respect(
+        "https://shop.example.com/product/1",
+        "Mozilla/5.0 Crawmatic",
+    )
+
+    assert calls == [
+        ("https://shop.example.com/robots.txt", "Mozilla/5.0 Crawmatic")
+    ]
+
+
+def test_respect_evaluates_canonical_product_path_when_supplied() -> None:
+    fetcher = _fetcher_returning(
+        "User-agent: *\nDisallow: /tracking/\nAllow: /dp/\n"
+    )
+    middleware = RobotsPolicyMiddleware(robots_fetcher=fetcher)
+
+    # The stale/tracking URL is disallowed, but the strategy supplied a
+    # canonical immutable-ID URL that robots permits.
+    middleware._decide_respect(
+        "https://shop.example.com/tracking/old-slug",
+        "configured-agent",
+        "https://shop.example.com/dp/IMMUTABLE123",
+    )
 
 
 def test_respect_allows_everything_when_robots_txt_is_absent() -> None:

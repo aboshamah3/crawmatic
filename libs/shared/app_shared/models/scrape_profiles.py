@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import ForeignKeyConstraint, Index, Integer, Text, Uuid, text
+from sqlalchemy import ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -87,6 +87,11 @@ class ScrapeProfile(Base, TimestampMixin):
     adapter_key: Mapped[AdapterKey] = enum_column(
         AdapterKey, nullable=False, default=AdapterKey.DEFAULT_HTTP
     )
+    # Monotonic configuration revision.  Every create/change is also
+    # snapshotted in ``scrape_profile_revisions`` so attempts that record a
+    # profile/version pair remain reproducible after later edits.
+    version: Mapped[int] = mapped_column(Integer(), nullable=False, default=1)
+    adapter_config: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
     jsonld_enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     platform_patterns_enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     embedded_json_enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
@@ -134,3 +139,36 @@ class ScrapeProfile(Base, TimestampMixin):
     browser_timeout_ms: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     headers: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
     cookies: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
+
+
+class ScrapeProfileRevision(Base, TimestampMixin):
+    """Immutable JSON snapshot of one scrape-profile configuration revision."""
+
+    __tablename__ = "scrape_profile_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "scrape_profile_id", "version", name="uq_scrape_profile_revisions_profile_version"
+        ),
+        ForeignKeyConstraint(
+            ["scrape_profile_id"],
+            ["scrape_profiles.id"],
+            name="fk_spr_profile_id_scrape_profiles",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="fk_scrape_profile_revisions_workspace_id_workspaces",
+        ),
+    )
+
+    # Mirrors the parent's dual scope: NULL means a privileged global profile
+    # revision and is readable (but not tenant-writable) by every workspace.
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    scrape_profile_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer(), nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSONB(), nullable=False)

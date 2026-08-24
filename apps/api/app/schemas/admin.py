@@ -140,3 +140,33 @@ class ApiKeyRevokeResponse(BaseModel):
 
     key_id: uuid.UUID
     status: ApiKeyStatus
+
+
+class TargetReconciliationRequest(BaseModel):
+    """Dry-run-first repair request for one explicitly selected scrape job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool = True
+    expected_match_ids: list[uuid.UUID] | None = None
+    requested_by: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class TargetReconciliationCounts(BaseModel):
+    success: int
+    failure: int
+    skipped: int
+    total: int
+
+
+class TargetReconciliationResponse(BaseModel):
+    workspace_id: uuid.UUID
+    scrape_job_id: uuid.UUID
+    dry_run: bool
+    candidate_match_ids: list[uuid.UUID]
+    candidate_count: int
+    before: TargetReconciliationCounts
+    projected: TargetReconciliationCounts
+    job_status_before: str
+    job_status_projected: str | None
+    applied_count: int

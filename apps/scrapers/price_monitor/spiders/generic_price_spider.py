@@ -101,19 +101,23 @@ import scrapy
 from scrapy.http import Response
 
 from app_shared.access.engine import AttemptPlan, ProxyAssignment
-from app_shared.enums import AccessMethod, StockStatus
+from app_shared.enums import AdapterKey, AccessMethod, ScrapeErrorCode, StockStatus
 from app_shared.models.access import ProxyProvider
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
 from scrape_core.db import await_in_thread
+from scrape_core.adapters import (
+    AdapterContext,
+    AdapterOutcome,
+    AdapterResponse,
+    get_adapter,
+)
 from scrape_core.errors import (
-    PRICE_NOT_FOUND,
     RATE_LIMITED,
     classify_exception,
     classify_http_status,
 )
-from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, acquire_lock, release_lock, release_slot
 from scrape_core.result_builder import build_scrape_result
@@ -137,8 +141,14 @@ from scrape_core.targets import (
     prepare_dispatch_with_backoff,
     redispatch_job,
     sticky_proxy_username,
+    next_strategy_method,
 )
-from scrape_core.validation import Accepted, Rejected, validate_candidate
+from scrape_core.validation import (
+    Accepted,
+    Rejected,
+    parse_optional_old_price,
+    validate_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +187,30 @@ def _sniff_out_of_stock(html: str) -> StockStatus | None:
         if any(marker.casefold() in haystack for marker in _OUT_OF_STOCK_MARKERS)
         else None
     )
+
+
+def _strategy_handoff_kwargs(
+    target: SpiderTarget,
+    outcome: ScrapeErrorCode,
+    *,
+    canonical_url: str | None = None,
+) -> dict[str, Any]:
+    selection = next_strategy_method(target, outcome)
+    if selection is None:
+        return {}
+    return {
+        "chain_complete": False,
+        "next_strategy_method_id": selection.method.id,
+        "canonical_url": canonical_url,
+    }
+
+
+def _adapter_error_code(outcome: AdapterOutcome) -> ScrapeErrorCode:
+    if outcome is AdapterOutcome.NOT_LISTED:
+        return ScrapeErrorCode.NOT_LISTED
+    if outcome is AdapterOutcome.IDENTITY_MISMATCH:
+        return ScrapeErrorCode.IDENTITY_MISMATCH
+    return ScrapeErrorCode.PRICE_NOT_FOUND
 
 # Re-exported so every pre-SPEC-14 import site (this module's own test
 # suite: `SpiderTarget`/`_RequeueState`/`_prepare_dispatch`/`load_targets`/
@@ -507,6 +541,14 @@ class GenericPriceSpider(scrapy.Spider):
         if plan is None:
             plan = AttemptPlan(access_method=AccessMethod.DIRECT_HTTP, use_proxy=False)
 
+        adapter_key = (
+            target.profile.adapter_key
+            if target.profile is not None
+            else AdapterKey.DEFAULT_HTTP
+        )
+        adapter_context = AdapterContext.from_target(target)
+        adapter_request = get_adapter(adapter_key).build_request(adapter_context)
+
         meta: dict[str, Any] = {
             "match_id": target.match_id,
             "download_slot": str(target.match_id),
@@ -525,7 +567,15 @@ class GenericPriceSpider(scrapy.Spider):
             # retry semantics (`next_attempt`/`max_retries`), so Scrapy's
             # own RetryMiddleware must not multiply attempts underneath it.
             "dont_retry": True,
+            "adapter_key": adapter_key,
+            "adapter_requested_url": adapter_request.url,
         }
+        if not adapter_request.follow_redirects:
+            # RedirectMiddleware uses this request flag.  Identity-sensitive
+            # profiles can therefore classify a storefront-root redirect
+            # before any homepage extractor runs.
+            meta["dont_redirect"] = True
+            meta["handle_httpstatus_all"] = True
         if target.access_policy is not None and target.access_policy.timeout_ms:
             # Issue 4: the resolved policy timeout was never translated
             # into the request -- Scrapy's 180 s DOWNLOAD_TIMEOUT applied
@@ -544,7 +594,7 @@ class GenericPriceSpider(scrapy.Spider):
             # after the observation/attempt write commits (T023).
             meta["match_lock_key"] = lock.key
             meta["match_lock_token"] = lock.token
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(adapter_request.headers)
 
         if proxy_assignment is not None:
             provider = self._provider_rows.get(proxy_assignment.provider_id)
@@ -565,7 +615,7 @@ class GenericPriceSpider(scrapy.Spider):
                     headers["Proxy-Authorization"] = f"Basic {token}"
 
         return scrapy.Request(
-            url=target.url,
+            url=adapter_request.url,
             callback=self.parse,
             errback=self.errback,
             dont_filter=True,
@@ -592,7 +642,14 @@ class GenericPriceSpider(scrapy.Spider):
         # time) -- never the pre-SPEC-10 hardcoded `DIRECT_HTTP`.
         attempt_kwargs = _attempt_kwargs_from_meta(response.meta)
 
+        adapter_key = response.meta.get("adapter_key", AdapterKey.DEFAULT_HTTP)
         status_error_code = classify_http_status(response.status)
+        # Repair/search endpoints may legitimately answer 404 when the exact
+        # immutable ID is absent. Let the adapter inspect that response and
+        # produce terminal NOT_LISTED instead of treating it as a transport
+        # retry. This is adapter behavior, never a domain special case.
+        if adapter_key is AdapterKey.EXACT_ID_URL_REPAIR and response.status == 404:
+            status_error_code = None
         if status_error_code is not None:
             for result in self._results_with_siblings(
                 target,
@@ -602,38 +659,56 @@ class GenericPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=status_error_code,
                 error_message=f"HTTP {response.status}",
+                final_url=response.url,
+                **_strategy_handoff_kwargs(target, status_error_code),
                 **attempt_kwargs,
             ):
                 yield result
             return
 
-        # SPEC-12 US2 (contracts/consumption.md step 3, D6): a learned
-        # extraction method is tried first, falling back to the full
-        # default order only if it misses -- never a narrower chain.
-        candidate = extract(
-            response.text,
-            target.profile,
+        final_url = response.url
+        if 300 <= response.status < 400 and response.headers.get("Location"):
+            final_url = response.urljoin(response.headers["Location"].decode("utf-8"))
+        adapter_result = get_adapter(adapter_key).adapt(
+            AdapterResponse(
+                body=response.body,
+                final_url=final_url,
+                requested_url=response.meta.get("adapter_requested_url", response.request.url),
+                status=response.status,
+            ),
+            AdapterContext.from_target(target),
             preferred_method=(
-                target.strategy_start.extraction_method if target.strategy_start is not None else None
+                target.strategy_start.extraction_method
+                if target.strategy_start is not None
+                else None
             ),
         )
-        if candidate is None:
-            # 2026-08-09: "no price on the page" has two very different
-            # causes -- extraction missed one that is there, or the product
-            # is genuinely unavailable and there is no price to find. Only
-            # the second one is a state worth showing a user, so sniff the
-            # HTML for an availability marker and let it ride on the
-            # PRICE_NOT_FOUND result (`stock_status` is a nullable column on
-            # `price_observations`; `None` keeps the old NULL behaviour).
+        candidate = adapter_result.candidate
+        if adapter_result.outcome is not AdapterOutcome.FOUND or candidate is None:
+            error_code = _adapter_error_code(adapter_result.outcome)
+            canonical_url = (
+                adapter_result.canonical_url
+                if adapter_result.outcome is AdapterOutcome.REPAIRED
+                else None
+            )
             for result in self._results_with_siblings(
                 target,
                 response.url,
                 now,
                 status_code=response.status,
                 success=False,
-                error_code=PRICE_NOT_FOUND,
-                error_message="no extraction strategy matched a price",
-                stock_status=_sniff_out_of_stock(response.text),
+                error_code=error_code,
+                error_message=(
+                    adapter_result.message
+                    or "adapter found no exact, identity-valid price"
+                ),
+                final_url=adapter_result.final_url,
+                identity_validation_result=adapter_result.identity.status.value,
+                **_strategy_handoff_kwargs(
+                    target,
+                    error_code,
+                    canonical_url=canonical_url,
+                ),
                 **attempt_kwargs,
             ):
                 yield result
@@ -654,6 +729,9 @@ class GenericPriceSpider(scrapy.Spider):
                 error_code=outcome.error_code,
                 error_message=outcome.message,
                 candidate_extras=candidate,
+                final_url=adapter_result.final_url,
+                identity_validation_result=adapter_result.identity.status.value,
+                **_strategy_handoff_kwargs(target, outcome.error_code),
                 **attempt_kwargs,
             ):
                 yield result
@@ -668,7 +746,14 @@ class GenericPriceSpider(scrapy.Spider):
             success=True,
             comparable=outcome.comparable,
             price=outcome.price,
+            old_price=parse_optional_old_price(
+                adapter_result.old_price_text,
+                current_price=outcome.price,
+            ),
             candidate_extras=candidate,
+            final_url=adapter_result.final_url,
+            identity_validation_result=adapter_result.identity.status.value,
+            canonical_url=adapter_result.canonical_url,
             **attempt_kwargs,
         ):
             yield result
@@ -718,6 +803,26 @@ class GenericPriceSpider(scrapy.Spider):
         attempt_number = failure.request.meta.get("attempt_number", 1)
         next_attempt_number = attempt_number + 1
 
+        if target.strategy_method_id is not None:
+            # Versioned candidates own their own outcome-conditioned chain;
+            # do not let the legacy access-policy retry ladder invent an
+            # unversioned transport between two retained method rows.
+            handoff_kwargs = _strategy_handoff_kwargs(target, failed_error_code)
+            for result in self._results_with_siblings(
+                target,
+                failure.request.url,
+                now,
+                status_code=None,
+                success=False,
+                error_code=failed_error_code,
+                error_message=str(failure.value),
+                final_url=failure.request.url,
+                **handoff_kwargs,
+                **_attempt_kwargs_from_meta(failure.request.meta),
+            ):
+                yield result
+            return
+
         # ISSUES_FULL_RUN_2026-07-17 Issue 3: decide the retry BEFORE
         # emitting the failed attempt's result. If a retry will dispatch,
         # it inherits the match lock this failed attempt still holds
@@ -758,6 +863,10 @@ class GenericPriceSpider(scrapy.Spider):
             success=False,
             error_code=failed_error_code,
             error_message=str(failure.value),
+            # The attempt is intermediate whenever a retry will dispatch or
+            # a separately-recorded admission outcome follows.  Only STOP /
+            # fully exhausted chain makes this failed fetch terminal.
+            chain_complete=(decision.plan is None and decision.skip_error_code is None),
             **failed_attempt_kwargs,
         ):
             yield result
@@ -842,6 +951,10 @@ class GenericPriceSpider(scrapy.Spider):
         contract; kept as a spider method so existing call sites/tests
         that drive this directly (``spider._build_result(...)``) keep
         working unchanged."""
+        # This spider owns its retry/access chain.  Single-outcome paths are
+        # terminal by default; errback explicitly overrides this while a
+        # retry or defer outcome remains.
+        kwargs.setdefault("chain_complete", True)
         return build_scrape_result(
             target,
             url,

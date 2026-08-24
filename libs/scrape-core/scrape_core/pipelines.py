@@ -9,14 +9,15 @@ routes through the single reactor-safe DB seam
 call ever runs on the reactor thread (Principle V, US5).
 
 SPEC-08 T052 (FR-017/018/019, SC-007, ``contracts/lifecycle-counters.md``)
-wires this pipeline into the jobs-orchestration result path: every item
-that carries a non-null ``scrape_job_id`` also terminalizes its
-``scrape_job_targets`` row (COMPLETED on success, FAILED with
-``error_code`` otherwise) via ``app_shared.jobs.targets.mark_target``,
-in the SAME ``workspace_txn`` transaction as the observation/attempt
-writes — no extra reactor hop, no second ``run_in_thread``. Once that
-transaction commits, ``finalize_jobs`` resolves counters/status
-event-driven, without depending on the SPEC-13 beat.
+wires this pipeline into the jobs-orchestration result path. Every item is
+persisted, while an item carrying a non-null ``scrape_job_id`` transitions its
+``scrape_job_targets`` row only on success, explicit defer/skip, or an
+explicitly chain-complete failure. Intermediate failure attempts remain
+non-terminal until their chain owner emits the final outcome. Transitions use
+``app_shared.jobs.targets.mark_target`` in the SAME ``workspace_txn``
+transaction as the observation/attempt writes — no extra reactor hop, no
+second ``run_in_thread``. Once that transaction commits, ``finalize_jobs``
+resolves counters/status event-driven, without depending on the SPEC-13 beat.
 
 2026-08-15 (audit risk H1): the two follow-ups this flush produces —
 ``SCRAPE_FINALIZE_JOBS`` once per distinct affected ``scrape_job_id``,
@@ -80,7 +81,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from twisted.internet.defer import Deferred, DeferredList
 from twisted.internet.task import LoopingCall
@@ -93,12 +94,18 @@ from app_shared.ids import new_uuid7
 from app_shared.jobs.targets import mark_target
 from app_shared.limiter.locks import release_match_lock
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.outbox import write_outbox_message
 from app_shared.redis_client import get_redis_client
 from app_shared.strategy.stats_buffer import record_attempt
+from app_shared.strategy.methods import is_method_health_failure
 
 from scrape_core.defer_budget import consume_defer_budget
-from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE, SCRAPE_FINALIZE_JOBS
+from app_shared.task_names import (
+    PRICE_ANALYSIS_RECOMPUTE,
+    SCRAPE_DISPATCH_JOB,
+    SCRAPE_FINALIZE_JOBS,
+)
 
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.items import ScrapeResult
@@ -242,8 +249,15 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 created_at=moment,
                 scrape_job_id=item.scrape_job_id,
                 match_id=item.match_id,
+                strategy_method_id=item.strategy_method_id,
+                scrape_profile_id=item.scrape_profile_id,
+                scrape_profile_version=item.scrape_profile_version,
+                adapter_key=item.adapter_key,
                 attempt_number=item.attempt_number,
                 url=item.url,
+                final_url=item.final_url,
+                identity_validation_result=item.identity_validation_result,
+                terminal_for_target=item.terminal_for_target,
                 access_method=item.access_method,
                 proxy_provider_id=item.proxy_provider_id,
                 proxy_country=item.proxy_country,
@@ -355,15 +369,59 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             )
             session.execute(oos_stmt)
 
-        # T052: terminalize each item's target in this SAME transaction --
-        # no second run_in_thread/reactor hop. An item with no
-        # scrape_job_id (e.g. a non-orchestrated/ad-hoc scrape) marks
-        # nothing.
+        # T052 + 2026-08-24 lifecycle correction: persist every attempt, but
+        # terminalize only when the chain owner says this is its final
+        # outcome.  A retryable/intermediate failure therefore leaves the
+        # target STARTED and a later success may still complete it.  The
+        # existing mark_target terminal-state guard continues to reject
+        # genuinely late results after a real terminal outcome.
         for item in batch:
             if item.scrape_job_id is None:
                 continue
             if item.success:
                 target_status = ScrapeTargetStatus.COMPLETED
+            elif item.next_strategy_method_id is not None:
+                # Durable cross-mode handoff: persist the next candidate and
+                # its optional repaired canonical URL in the same transaction
+                # as this intermediate attempt, then re-enter dispatch.  The
+                # worker derives HTTP/browser mode from that selected method.
+                target_row = session.execute(
+                    select(ScrapeJobTarget).where(
+                        ScrapeJobTarget.workspace_id == item.workspace_id,
+                        ScrapeJobTarget.scrape_job_id == item.scrape_job_id,
+                        ScrapeJobTarget.match_id == item.match_id,
+                    )
+                ).scalar_one_or_none()
+                if target_row is None:
+                    continue
+                mark_target(
+                    session,
+                    workspace_id=item.workspace_id,
+                    scrape_job_id=item.scrape_job_id,
+                    match_id=item.match_id,
+                    status=ScrapeTargetStatus.DEFERRED,
+                    error_code=item.error_code,
+                )
+                target_row.current_strategy_method_id = item.next_strategy_method_id
+                target_row.strategy_attempt_ordinal = item.strategy_attempt_ordinal + 1
+                target_row.chain_token = item.chain_token or new_uuid7()
+                target_row.strategy_url_override = item.canonical_url
+                target_row.dispatched_at = None
+                write_outbox_message(
+                    session,
+                    workspace_id=item.workspace_id,
+                    task_name=SCRAPE_DISPATCH_JOB,
+                    queue="scrape_dispatch",
+                    kwargs={
+                        "scrape_job_id": str(item.scrape_job_id),
+                        "workspace_id": str(item.workspace_id),
+                    },
+                    dedup_key=(
+                        f"strategy-handoff:{item.scrape_job_id}:{item.match_id}:"
+                        f"{item.next_strategy_method_id}:{item.strategy_attempt_ordinal + 1}"
+                    ),
+                )
+                continue
             elif item.defer_target and consume_defer_budget(
                 get_redis_client(),
                 scrape_job_id=item.scrape_job_id,
@@ -393,6 +451,19 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 # (US3 T026, tasks.md) -- a known, tracked gap, not a new
                 # persistence path.
                 target_status = ScrapeTargetStatus.SKIPPED
+            elif item.error_code in {
+                ScrapeErrorCode.NOT_LISTED,
+                ScrapeErrorCode.POLICY_BLOCKED,
+            }:
+                # Permanent catalog/policy outcomes are not scraper
+                # operational failures. They finish the target without
+                # inflating the job's failure count or driving retries.
+                target_status = ScrapeTargetStatus.SKIPPED
+            elif not item.chain_complete:
+                # Observation + request-attempt rows above are deliberately
+                # retained for audit/stats.  There is simply no target
+                # transition or premature finalize trigger for this item.
+                continue
             else:
                 target_status = ScrapeTargetStatus.FAILED
             mark_target(
@@ -548,6 +619,8 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             url=item.url,
             qualifying=qualifying,
             ttl_seconds=stats_ttl_seconds,
+            strategy_method_id=item.strategy_method_id,
+            operational_failure=is_method_health_failure(item.error_code),
         )
         if item.extraction_method is not None:
             record_attempt(
@@ -562,6 +635,8 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 url=item.url,
                 qualifying=qualifying,
                 ttl_seconds=stats_ttl_seconds,
+                strategy_method_id=item.strategy_method_id,
+                operational_failure=is_method_health_failure(item.error_code),
             )
 
 

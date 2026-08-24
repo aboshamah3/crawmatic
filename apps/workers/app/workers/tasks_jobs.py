@@ -36,21 +36,24 @@ from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetSta
 from app_shared.ids import new_uuid7
 from app_shared.jobs.batching import ResolvedTarget, plan_batches
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
+from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.jobs.nodes import select_node
 from app_shared.jobs.targets import Counts, aggregate_counts
 from app_shared.messaging import enqueue
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
-from app_shared.models.strategy import DomainStrategyProfile
+from app_shared.models.strategy import DomainStrategyMethod, DomainStrategyProfile
 from app_shared.outbox import write_outbox_message
 from app_shared.repository import scoped_get, scoped_select
+from app_shared.strategy.methods import mode_for_access_method, resolve_method_candidate
 from app_shared.scrapyd import ScrapydDispatchClient
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_RECOVER_STALLED,
+    SCRAPE_RECONCILE_FALSE_FAILURES,
     SCRAPE_REDISPATCH_JOBS,
     STRATEGY_STATS_FLUSH,
 )
@@ -94,6 +97,49 @@ _RUNNING_JOB_STATUSES = frozenset({ScrapeJobStatus.RUNNING})
 # probed and came back unreachable" (a real, cached `None`) — F-2's node
 # liveness cache must never re-probe a node it already found dead.
 _UNPROBED = object()
+
+
+@app.task(name=SCRAPE_RECONCILE_FALSE_FAILURES)
+def reconcile_false_failed_targets(
+    workspace_id: str,
+    scrape_job_id: str,
+    *,
+    dry_run: bool = True,
+    expected_match_ids: list[str] | None = None,
+    requested_by: str | None = None,
+) -> dict[str, object]:
+    """Preview/apply the bounded false-failure lifecycle repair.
+
+    Dry-run is the safe default.  Applying requires the exact match-id list
+    returned by a reviewed dry-run; the shared service locks/rechecks the set
+    before changing any row.  The structured log records who requested the
+    operation and its complete report even though this deployment does not
+    configure a Celery result backend.
+    """
+
+    if not dry_run and not requested_by:
+        raise ValueError("requested_by is required for an applying reconciliation")
+
+    workspace_uuid = uuid.UUID(str(workspace_id))
+    job_uuid = uuid.UUID(str(scrape_job_id))
+    with get_session() as session:
+        set_workspace_context(session, workspace_uuid)
+        report = reconcile_successful_failed_targets(
+            session,
+            workspace_id=workspace_uuid,
+            scrape_job_id=job_uuid,
+            dry_run=dry_run,
+            expected_match_ids=expected_match_ids,
+        )
+        if not dry_run:
+            session.commit()
+    payload = report.as_dict()
+    logger.info(
+        "scrape_target_reconciliation requested_by=%s report=%s",
+        requested_by,
+        payload,
+    )
+    return payload
 
 
 def _queue_depth(status_payload: dict) -> int | None:
@@ -193,6 +239,54 @@ def _resolve_domains_and_modes(
             .all()
         }
 
+    # Resolve durable strategy cursors set-based.  Existing handoffs retain
+    # their selected method; a fresh target selects the preferred/first
+    # runnable method and persists that cursor before it is scheduled.
+    current_method_ids = {
+        target.current_strategy_method_id
+        for target in targets
+        if target.current_strategy_method_id is not None
+    }
+    current_methods: dict[uuid.UUID, DomainStrategyMethod] = {}
+    if current_method_ids:
+        current_methods = {
+            method.id: method
+            for method in session.execute(
+                scoped_select(DomainStrategyMethod, workspace_id).where(
+                    DomainStrategyMethod.id.in_(current_method_ids)
+                )
+            )
+            .scalars()
+            .all()
+        }
+
+    strategy_profiles = list(
+        session.execute(
+            scoped_select(DomainStrategyProfile, workspace_id).where(
+                DomainStrategyProfile.competitor_id.in_(competitor_ids)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    strategy_profile_by_key = {
+        (profile.competitor_id, profile.domain, profile.url_pattern): profile
+        for profile in strategy_profiles
+    }
+    strategy_profile_ids = {profile.id for profile in strategy_profiles}
+    methods_by_profile: dict[uuid.UUID, list[DomainStrategyMethod]] = {}
+    if strategy_profile_ids:
+        for method in (
+            session.execute(
+                scoped_select(DomainStrategyMethod, workspace_id).where(
+                    DomainStrategyMethod.domain_strategy_profile_id.in_(strategy_profile_ids)
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            methods_by_profile.setdefault(method.domain_strategy_profile_id, []).append(method)
+
     resolved: list[ResolvedTarget] = []
     for target in targets:
         match = matches.get(target.match_id)
@@ -201,11 +295,36 @@ def _resolve_domains_and_modes(
         domain = domains.get(match.competitor_id)
         if domain is None:
             continue
-        mode = (
-            modes.get(match.scrape_profile_id, ScrapeProfileMode.HTTP)
-            if match.scrape_profile_id is not None
-            else ScrapeProfileMode.HTTP
-        )
+        selected_method = current_methods.get(target.current_strategy_method_id)
+        if selected_method is None:
+            # Domain-scoped strategy profiles are the current default; an
+            # exact URL-pattern profile remains a supported, more-specific
+            # fallback for workspaces that opt into pattern scope.
+            strategy_profile = strategy_profile_by_key.get(
+                (match.competitor_id, domain, domain)
+            ) or strategy_profile_by_key.get(
+                (match.competitor_id, domain, match.url_pattern)
+            )
+            if strategy_profile is not None:
+                selection = resolve_method_candidate(
+                    methods_by_profile.get(strategy_profile.id, ()),
+                    preferred_method_id=strategy_profile.preferred_method_id,
+                    current_attempt_ordinal=target.strategy_attempt_ordinal,
+                )
+                if selection is not None:
+                    selected_method = selection.method  # type: ignore[assignment]
+                    target.current_strategy_method_id = selected_method.id
+                    target.strategy_attempt_ordinal = selection.attempt_ordinal
+                    target.chain_token = target.chain_token or new_uuid7()
+
+        if selected_method is not None:
+            mode = mode_for_access_method(selected_method.access_method)
+        else:
+            mode = (
+                modes.get(match.scrape_profile_id, ScrapeProfileMode.HTTP)
+                if match.scrape_profile_id is not None
+                else ScrapeProfileMode.HTTP
+            )
         resolved.append(
             ResolvedTarget(match_id=target.match_id, competitor_domain=domain, mode=mode)
         )
@@ -345,6 +464,16 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 stamp = datetime.now(timezone.utc)
                 for target in targets:
                     if target.match_id in dispatched_match_ids:
+                        # A DEFERRED row is a ready-to-dispatch handback. Once
+                        # this POST succeeds it becomes an ordinary in-flight
+                        # PENDING row carrying a stamp; duplicate task
+                        # deliveries then exclude it, while stall recovery can
+                        # still reclaim it if the scraper node dies. This also
+                        # makes durable cross-mode handoffs idempotent after
+                        # their chain cursor has advanced.
+                        if target.status is ScrapeTargetStatus.DEFERRED:
+                            target.status = ScrapeTargetStatus.PENDING
+                            target.error_code = None
                         target.dispatched_at = stamp
         except Exception:
             # F-1 (2026-08-22 review): a stamp is only worth what it

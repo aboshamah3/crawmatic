@@ -19,6 +19,7 @@ SCRAPE_DISPATCH_JOB = "scrape_dispatch.dispatch_job"
 SCRAPE_RECOVER_STALLED = "maintenance.recover_stalled_batches"
 SCRAPE_FINALIZE_JOBS = "maintenance.finalize_jobs"
 SCRAPE_REDISPATCH_JOBS = "maintenance.redispatch_pending_jobs"
+SCRAPE_RECONCILE_FALSE_FAILURES = "maintenance.reconcile_false_failed_targets"
 
 # --- Price analysis (SPEC-09 FR-012, D4) ---
 # Enqueued via ``app_shared.messaging.enqueue`` from three triggers (scrape

@@ -142,7 +142,7 @@ def _parse_once(spider: gps.GenericPriceSpider, target: gps.SpiderTarget, html: 
     return items[0]
 
 
-def test_price_not_found_on_an_out_of_stock_page_records_out_of_stock(
+def test_price_not_found_does_not_trust_whole_document_out_of_stock_copy(
     spider: gps.GenericPriceSpider,
 ) -> None:
     result = _parse_once(spider, _target(RobotsPolicy.RESPECT), _OUT_OF_STOCK_HTML)
@@ -150,7 +150,9 @@ def test_price_not_found_on_an_out_of_stock_page_records_out_of_stock(
     assert result.success is False
     assert result.error_code == PRICE_NOT_FOUND
     assert result.price is None
-    assert result.stock_status == StockStatus.OUT_OF_STOCK
+    # Availability must come from a profile-scoped offer/buy-box rule.  A
+    # whole document marker may describe another seller/recommendation.
+    assert result.stock_status is None
 
 
 def test_price_not_found_without_a_marker_leaves_stock_status_null(

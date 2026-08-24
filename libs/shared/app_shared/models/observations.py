@@ -48,10 +48,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.enums import (
+    AdapterKey,
     AccessMethod,
     ExtractionMethod,
     RequestOrigin,
@@ -128,6 +130,18 @@ class RequestAttempt(Base, WorkspaceScopedBase):
             ["workspaces.id"],
             name="fk_request_attempts_workspace_id_workspaces",
         ),
+        ForeignKeyConstraint(
+            ["strategy_method_id"],
+            ["domain_strategy_methods.id"],
+            name="fk_request_attempts_strategy_method_id_domain_strategy_methods",
+            ondelete="SET NULL",
+        ),
+        ForeignKeyConstraint(
+            ["scrape_profile_id"],
+            ["scrape_profiles.id"],
+            name="fk_request_attempts_scrape_profile_id_scrape_profiles",
+            ondelete="SET NULL",
+        ),
         {"postgresql_partition_by": "RANGE (created_at)"},
     )
 
@@ -136,8 +150,21 @@ class RequestAttempt(Base, WorkspaceScopedBase):
 
     scrape_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     match_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
+    strategy_method_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    scrape_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    scrape_profile_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    adapter_key: Mapped[AdapterKey | None] = enum_column(AdapterKey, nullable=True)
     attempt_number: Mapped[int] = mapped_column(Integer(), nullable=False, default=1)
     url: Mapped[str] = mapped_column(Text(), nullable=False)
+    final_url: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    identity_validation_result: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    terminal_for_target: Mapped[bool] = mapped_column(
+        Boolean(), nullable=False, default=True, server_default=text("true")
+    )
     access_method: Mapped[AccessMethod] = enum_column(AccessMethod, nullable=False)
     proxy_provider_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     proxy_country: Mapped[str | None] = mapped_column(Text(), nullable=True)
@@ -154,7 +181,10 @@ class RequestAttempt(Base, WorkspaceScopedBase):
     #: accounting (the proxy circuit breaker, ops-snapshot counters)
     #: deliberately reads both origins unfiltered.
     origin: Mapped[RequestOrigin] = enum_column(
-        RequestOrigin, nullable=False, default=RequestOrigin.SCRAPE, server_default=RequestOrigin.SCRAPE.value
+        RequestOrigin,
+        nullable=False,
+        default=RequestOrigin.SCRAPE,
+        server_default=RequestOrigin.SCRAPE.value,
     )
 
 

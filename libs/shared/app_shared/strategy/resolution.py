@@ -24,17 +24,26 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sqlalchemy import select
 
-from app_shared.enums import AccessMethod, ExtractionMethod, StrategyStatus
+from app_shared.enums import (
+    AccessMethod,
+    ExtractionMethod,
+    ScrapeErrorCode,
+    StrategyMethodProofState,
+    StrategyStatus,
+)
 from app_shared.messaging import enqueue
 from app_shared.models.domain_playbooks import DomainPlaybook
-from app_shared.models.strategy import DomainStrategyProfile
+from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.models.strategy import DomainStrategyMethod, DomainStrategyProfile
 from app_shared.strategy.repository import resolve_profile
 from app_shared.task_names import STRATEGY_DISCOVERY_RUN
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION
@@ -55,6 +64,131 @@ _DISCOVERY_QUEUE = "strategy_discovery"
 #: `DEGRADED` row (US2 contract: "not DEGRADED-without-preference" is
 #: automatically satisfied here since DEGRADED is never eligible at all).
 _ACTIVE_STATUSES: tuple[StrategyStatus, ...] = (StrategyStatus.ACTIVE,)
+
+
+def _materialize_playbook_methods(
+    session: Session,
+    *,
+    profile: DomainStrategyProfile,
+    playbook: DomainPlaybook,
+) -> None:
+    """Create one workspace's runnable rows from global, declarative templates.
+
+    Domain knowledge stays in ``domain_playbooks.method_templates`` and global
+    scrape profiles.  This function is deliberately generic: it validates the
+    common method vocabulary and never branches on a domain, customer, or
+    product type.  Missing named profiles are skipped with a visible log so a
+    bad optional template cannot make target loading fail wholesale.
+    """
+
+    templates = playbook.method_templates or []
+    if not isinstance(templates, list) or not templates:
+        return
+
+    names = {
+        str(template.get("scrape_profile_name") or playbook.scrape_profile_name)
+        for template in templates
+        if isinstance(template, Mapping)
+        and (template.get("scrape_profile_name") or playbook.scrape_profile_name)
+    }
+    profiles_by_name: dict[str, ScrapeProfile] = {}
+    if names:
+        profiles_by_name = {
+            row.name: row
+            for row in session.execute(
+                select(ScrapeProfile).where(
+                    ScrapeProfile.workspace_id.is_(None), ScrapeProfile.name.in_(names)
+                )
+            )
+            .scalars()
+            .all()
+        }
+
+    now = datetime.now(timezone.utc)
+    methods: list[DomainStrategyMethod] = []
+    priorities: set[int] = set()
+    for ordinal, template in enumerate(templates):
+        if not isinstance(template, Mapping):
+            logger.warning("ignoring non-object method template for domain=%s", playbook.domain)
+            continue
+        try:
+            priority = int(template.get("priority", ordinal))
+            if priority < 0 or priority in priorities:
+                raise ValueError("priority must be unique and non-negative")
+            access = AccessMethod(str(template["access_method"]))
+            extraction_value = template.get("extraction_method")
+            extraction = (
+                None if extraction_value in (None, "") else ExtractionMethod(str(extraction_value))
+            )
+            proof_state = StrategyMethodProofState(
+                str(template.get("proof_state", StrategyMethodProofState.CANDIDATE.value))
+            )
+            enter_on = list(template.get("enter_on") or [])
+            fallback_on = list(template.get("fallback_on") or [])
+            for outcome in (*enter_on, *fallback_on):
+                if str(outcome) != "*":
+                    ScrapeErrorCode(str(outcome))
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "ignoring invalid method template domain=%s ordinal=%s error=%s",
+                playbook.domain,
+                ordinal,
+                exc,
+            )
+            continue
+
+        profile_name_value = template.get("scrape_profile_name") or playbook.scrape_profile_name
+        scrape_profile = (
+            profiles_by_name.get(str(profile_name_value)) if profile_name_value else None
+        )
+        if profile_name_value and scrape_profile is None:
+            logger.warning(
+                "ignoring method template domain=%s priority=%s: global scrape profile %r missing",
+                playbook.domain,
+                priority,
+                profile_name_value,
+            )
+            continue
+
+        priorities.add(priority)
+        cooldown_seconds = max(0, int(template.get("cooldown_seconds", 0) or 0))
+        canary_seconds = max(0, int(template.get("canary_after_seconds", 0) or 0))
+        methods.append(
+            DomainStrategyMethod(
+                workspace_id=profile.workspace_id,
+                domain_strategy_profile_id=profile.id,
+                scrape_profile_id=None if scrape_profile is None else scrape_profile.id,
+                scrape_profile_version=None if scrape_profile is None else scrape_profile.version,
+                access_method=access,
+                extraction_method=extraction,
+                priority=priority,
+                method_version=max(1, int(template.get("method_version", 1) or 1)),
+                enter_on=enter_on,
+                fallback_on=fallback_on,
+                enabled=template.get("enabled") is not False,
+                proof_state=proof_state,
+                cooldown_until=(now + timedelta(seconds=cooldown_seconds)) if cooldown_seconds else None,
+                next_canary_at=(now + timedelta(seconds=canary_seconds)) if canary_seconds else None,
+                proof_sample_size=max(0, int(template.get("proof_sample_size", 0) or 0)),
+            )
+        )
+
+    if not methods:
+        return
+    session.add_all(methods)
+    session.flush()
+    preferred = next(
+        (
+            method
+            for method in sorted(methods, key=lambda row: row.priority)
+            if method.enabled and method.proof_state is StrategyMethodProofState.PROVEN
+        ),
+        next((method for method in sorted(methods, key=lambda row: row.priority) if method.enabled), None),
+    )
+    if preferred is not None:
+        profile.preferred_method_id = preferred.id
+        profile.preferred_access_method = preferred.access_method
+        profile.preferred_extraction_method = preferred.extraction_method
 
 
 @dataclass(frozen=True)
@@ -229,6 +363,7 @@ def resolve_or_create_strategy_profile(
         return existing
 
     if playbook is not None:
+        _materialize_playbook_methods(session, profile=candidate, playbook=playbook)
         logger.info(
             "app_shared.strategy.resolution: strategy_profile_seeded workspace_id=%s "
             "competitor_id=%s domain=%s url_pattern=%s source=PLAYBOOK access_method=%s",

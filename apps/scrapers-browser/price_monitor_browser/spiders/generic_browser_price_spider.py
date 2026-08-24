@@ -51,21 +51,25 @@ from scrapy.http import Response
 
 from app_shared.access.engine import AttemptPlan, ProxyAssignment
 from app_shared.config import get_settings
-from app_shared.enums import AccessMethod, ScrapeErrorCode
+from app_shared.enums import AdapterKey, AccessMethod, ScrapeErrorCode
 from app_shared.models.access import ProxyProvider
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
 from scrape_core.browser.page import build_page_methods, effective_timeout
 from scrape_core.browser.variant import VariantConfigError
+from scrape_core.adapters import (
+    AdapterContext,
+    AdapterOutcome,
+    AdapterResponse,
+    get_adapter,
+)
 from scrape_core.db import await_in_thread
 from scrape_core.errors import (
-    PRICE_NOT_FOUND,
     classify_exception,
     classify_http_status,
     classify_playwright_exception,
 )
-from scrape_core.extraction.pipeline import extract
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, release_slot
 from scrape_core.result_builder import build_scrape_result
@@ -82,14 +86,44 @@ from scrape_core.targets import (
     load_targets,
     prepare_dispatch_with_backoff,
     sticky_proxy_username,
+    next_strategy_method,
 )
-from scrape_core.validation import Accepted, Rejected, validate_candidate
+from scrape_core.validation import (
+    Accepted,
+    Rejected,
+    parse_optional_old_price,
+    validate_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODE = "BROWSER"
 
 __all__ = ["GenericBrowserPriceSpider", "classify_browser_failure"]
+
+
+def _strategy_handoff_kwargs(
+    target: SpiderTarget,
+    outcome: ScrapeErrorCode,
+    *,
+    canonical_url: str | None = None,
+) -> dict[str, Any]:
+    selection = next_strategy_method(target, outcome)
+    if selection is None:
+        return {}
+    return {
+        "chain_complete": False,
+        "next_strategy_method_id": selection.method.id,
+        "canonical_url": canonical_url,
+    }
+
+
+def _adapter_error_code(outcome: AdapterOutcome) -> ScrapeErrorCode:
+    if outcome is AdapterOutcome.NOT_LISTED:
+        return ScrapeErrorCode.NOT_LISTED
+    if outcome is AdapterOutcome.IDENTITY_MISMATCH:
+        return ScrapeErrorCode.IDENTITY_MISMATCH
+    return ScrapeErrorCode.PRICE_NOT_FOUND
 
 
 def _variant_selectors(target: "SpiderTarget") -> set[str]:
@@ -199,8 +233,9 @@ def classify_browser_failure(
        that isn't SSRF/robots-blocked, variant-related, or proxy-context-
        shaped.
     """
-    if classify_exception(exc, hostname=hostname) == ScrapeErrorCode.BLOCKED:
-        return ScrapeErrorCode.BLOCKED
+    classified = classify_exception(exc, hostname=hostname)
+    if classified in (ScrapeErrorCode.BLOCKED, ScrapeErrorCode.POLICY_BLOCKED):
+        return classified
 
     if isinstance(exc, VariantConfigError):
         return ScrapeErrorCode.SELECTOR_BROKEN
@@ -303,6 +338,13 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 except VariantConfigError as exc:
                     variant_error_message = str(exc)
             if variant_error_message is not None:
+                configured_browser_method = (
+                    target.strategy_start.access_method
+                    if target.strategy_start is not None
+                    and target.strategy_start.access_method
+                    in (AccessMethod.PLAYWRIGHT_DIRECT, AccessMethod.PLAYWRIGHT_PROXY)
+                    else AccessMethod.PLAYWRIGHT_DIRECT
+                )
                 yield self._build_result(
                     target,
                     target.url,
@@ -311,7 +353,7 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                     success=False,
                     error_code=ScrapeErrorCode.SELECTOR_BROKEN,
                     error_message=variant_error_message,
-                    access_method=AccessMethod.PLAYWRIGHT_PROXY,
+                    access_method=configured_browser_method,
                     attempt_number=1,
                 )
                 continue
@@ -348,14 +390,25 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 # `_DispatchDecision` docstring (exactly as HTTP).
                 continue
 
-            # R7: this spider only ever dispatches a browser fetch --
-            # override the shared decision's HTTP-shaped access_method to
-            # PLAYWRIGHT_PROXY (the admission gate's rate-limit bucket
-            # and in-flight match lock are then keyed/TTL'd for the
-            # browser mode, `MATCH_LOCK_BROWSER_TTL_SECONDS`), keeping
-            # `use_proxy` for the future proxied-context branch (T032).
+            # Browser-direct and browser-proxy are distinct audited methods.
+            configured_access = (
+                target.strategy_start.access_method
+                if target.strategy_start is not None
+                else decision.plan.access_method
+            )
+            browser_method = (
+                configured_access
+                if configured_access
+                in (AccessMethod.PLAYWRIGHT_DIRECT, AccessMethod.PLAYWRIGHT_PROXY)
+                else (
+                    AccessMethod.PLAYWRIGHT_PROXY
+                    if decision.plan.use_proxy
+                    else AccessMethod.PLAYWRIGHT_DIRECT
+                )
+            )
             browser_plan = AttemptPlan(
-                access_method=AccessMethod.PLAYWRIGHT_PROXY, use_proxy=decision.plan.use_proxy
+                access_method=browser_method,
+                use_proxy=browser_method is AccessMethod.PLAYWRIGHT_PROXY,
             )
             result = await dispatch_admission(
                 self._admission_context(),
@@ -408,7 +461,16 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         (T033) -- never a silent direct fetch.
         """
         if plan is None:
-            plan = AttemptPlan(access_method=AccessMethod.PLAYWRIGHT_PROXY, use_proxy=False)
+            plan = AttemptPlan(access_method=AccessMethod.PLAYWRIGHT_DIRECT, use_proxy=False)
+
+        adapter_key = (
+            target.profile.adapter_key
+            if target.profile is not None
+            else AdapterKey.PLAYWRIGHT_RENDERED
+        )
+        adapter_request = get_adapter(adapter_key).build_request(
+            AdapterContext.from_target(target)
+        )
 
         settings = get_settings()
         timeout_ms = effective_timeout(target, settings)
@@ -433,6 +495,8 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             # timeout (R10), on top of the process-wide
             # `PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT` default.
             "playwright_page_goto_kwargs": {"timeout": timeout_ms},
+            "adapter_key": adapter_key,
+            "adapter_requested_url": adapter_request.url,
         }
         # Headless Chromium's default UA ("HeadlessChrome") gets a
         # bot-challenge page from amazon.sa with none of the product
@@ -481,10 +545,11 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             meta["playwright_context_kwargs"] = context_kwargs
 
         return scrapy.Request(
-            url=target.url,
+            url=adapter_request.url,
             callback=self.parse,
             errback=self.errback,
             dont_filter=True,
+            headers=dict(adapter_request.headers) or None,
             meta=meta,
         )
 
@@ -505,7 +570,10 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         now = datetime.now(UTC)
         attempt_kwargs = _attempt_kwargs_from_meta(response.meta)
 
+        adapter_key = response.meta.get("adapter_key", AdapterKey.PLAYWRIGHT_RENDERED)
         status_error_code = classify_http_status(response.status)
+        if adapter_key is AdapterKey.EXACT_ID_URL_REPAIR and response.status == 404:
+            status_error_code = None
         if status_error_code is not None:
             yield self._build_result(
                 target,
@@ -515,26 +583,52 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=status_error_code,
                 error_message=f"HTTP {response.status}",
+                final_url=response.url,
+                **_strategy_handoff_kwargs(target, status_error_code),
                 **attempt_kwargs,
             )
             return
 
-        candidate = extract(
-            response.text,
-            target.profile,
+        adapter_result = get_adapter(adapter_key).adapt(
+            AdapterResponse(
+                body=response.body,
+                final_url=response.url,
+                requested_url=response.meta.get("adapter_requested_url", response.request.url),
+                status=response.status,
+            ),
+            AdapterContext.from_target(target),
             preferred_method=(
-                target.strategy_start.extraction_method if target.strategy_start is not None else None
+                target.strategy_start.extraction_method
+                if target.strategy_start is not None
+                else None
             ),
         )
-        if candidate is None:
+        candidate = adapter_result.candidate
+        if adapter_result.outcome is not AdapterOutcome.FOUND or candidate is None:
+            error_code = _adapter_error_code(adapter_result.outcome)
+            canonical_url = (
+                adapter_result.canonical_url
+                if adapter_result.outcome is AdapterOutcome.REPAIRED
+                else None
+            )
             yield self._build_result(
                 target,
                 response.url,
                 now,
                 status_code=response.status,
                 success=False,
-                error_code=PRICE_NOT_FOUND,
-                error_message="no extraction strategy matched a price",
+                error_code=error_code,
+                error_message=(
+                    adapter_result.message
+                    or "adapter found no exact, identity-valid price"
+                ),
+                final_url=adapter_result.final_url,
+                identity_validation_result=adapter_result.identity.status.value,
+                **_strategy_handoff_kwargs(
+                    target,
+                    error_code,
+                    canonical_url=canonical_url,
+                ),
                 **attempt_kwargs,
             )
             return
@@ -554,6 +648,9 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 error_code=outcome.error_code,
                 error_message=outcome.message,
                 candidate_extras=candidate,
+                final_url=adapter_result.final_url,
+                identity_validation_result=adapter_result.identity.status.value,
+                **_strategy_handoff_kwargs(target, outcome.error_code),
                 **attempt_kwargs,
             )
             return
@@ -567,7 +664,14 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             success=True,
             comparable=outcome.comparable,
             price=outcome.price,
+            old_price=parse_optional_old_price(
+                adapter_result.old_price_text,
+                current_price=outcome.price,
+            ),
             candidate_extras=candidate,
+            final_url=adapter_result.final_url,
+            identity_validation_result=adapter_result.identity.status.value,
+            canonical_url=adapter_result.canonical_url,
             **attempt_kwargs,
         )
 
@@ -607,10 +711,13 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             success=False,
             error_code=error_code,
             error_message=str(failure.value),
+            final_url=failure.request.url,
+            **_strategy_handoff_kwargs(target, error_code),
             **_attempt_kwargs_from_meta(failure.request.meta),
         )
-        # R4: single attempt, no retry -- the failed attempt's own row
-        # above is the terminal outcome for this target.
+        # The browser process still performs one fetch.  A configured next
+        # method is handed back durably to dispatch rather than retried in
+        # this process, so HTTP/browser node boundaries remain explicit.
 
     def _build_result(
         self,
@@ -622,6 +729,10 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         """Thin wrapper over :func:`scrape_core.result_builder.build_scrape_result`
         (SPEC-14 T007) -- supplies this spider's own `workspace_id`/
         `scrape_job_id`."""
+        # The browser spider currently owns a single-attempt chain, so every
+        # result it emits is terminal.  Keep the stamp explicit so future
+        # browser fallbacks must consciously change the lifecycle contract.
+        kwargs.setdefault("chain_complete", True)
         return build_scrape_result(
             target,
             url,

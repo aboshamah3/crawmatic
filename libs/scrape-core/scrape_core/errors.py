@@ -42,6 +42,8 @@ existing ``ScrapeErrorCode`` members only (no enum change):
 
 from __future__ import annotations
 
+import re
+
 from app_shared.enums import ScrapeErrorCode
 
 from scrape_core.safety.rejection_registry import was_recently_rejected
@@ -75,6 +77,13 @@ __all__ = [
     "RATE_LIMITED",
     "LIMIT_REACHED",
     "PLAYWRIGHT_FAILED",
+    "NOT_LISTED",
+    "IDENTITY_MISMATCH",
+    "POLICY_BLOCKED",
+    "CONNECTION_FAILED",
+    "TLS_CONNECTION_FAILED",
+    "TLS_VERIFICATION_FAILED",
+    "PROTOCOL_FAILED",
     "SSRF_REJECTED_ERROR_CODE",
     "ROBOTS_BLOCKED_ERROR_CODE",
     "classify_http_status",
@@ -108,13 +117,20 @@ LIMIT_REACHED = ScrapeErrorCode.LIMIT_REACHED
 # reuses this same forward-compat member (declared by SPEC-07, never a new
 # enum value) -- see classify_playwright_exception below.
 PLAYWRIGHT_FAILED = ScrapeErrorCode.PLAYWRIGHT_FAILED
+NOT_LISTED = ScrapeErrorCode.NOT_LISTED
+IDENTITY_MISMATCH = ScrapeErrorCode.IDENTITY_MISMATCH
+POLICY_BLOCKED = ScrapeErrorCode.POLICY_BLOCKED
+CONNECTION_FAILED = ScrapeErrorCode.CONNECTION_FAILED
+TLS_CONNECTION_FAILED = ScrapeErrorCode.TLS_CONNECTION_FAILED
+TLS_VERIFICATION_FAILED = ScrapeErrorCode.TLS_VERIFICATION_FAILED
+PROTOCOL_FAILED = ScrapeErrorCode.PROTOCOL_FAILED
 
 # An SSRF/unsafe-target rejection (no body download) and a robots-policy
 # skip both surface as BLOCKED — there is no dedicated SSRF code in §34
 # (contracts/errors.md "Note"). Named aliases document the call site's
 # intent without introducing a new code.
 SSRF_REJECTED_ERROR_CODE = ScrapeErrorCode.BLOCKED
-ROBOTS_BLOCKED_ERROR_CODE = ScrapeErrorCode.BLOCKED
+ROBOTS_BLOCKED_ERROR_CODE = ScrapeErrorCode.POLICY_BLOCKED
 
 # HTTP status codes with a dedicated §34 member. 407 (Proxy Authentication
 # Required) is a proxy-specific failure (SPEC-10 US3) -- distinct from the
@@ -198,6 +214,7 @@ def classify_exception(
             return status_code
 
     name = type(exc).__name__.lower()
+    message = str(exc).lower()
     if "timeout" in name:
         return ScrapeErrorCode.TIMEOUT
     if (
@@ -216,7 +233,62 @@ def classify_exception(
     # the more specific proxy classification only when neither matched.
     if "tunnel" in name or "proxy" in name:
         return ScrapeErrorCode.PROXY_FAILED
+    transport_code = _classify_transport_exception(exc, name=name, message=message)
+    if transport_code is not None:
+        return transport_code
     return ScrapeErrorCode.UNKNOWN_ERROR
+
+
+_CURL_CODE_PATTERN = re.compile(
+    r"(?:curl(?: error)?(?: code)?\s*[:=(]?\s*|curl:\s*\()(\d+)\)?",
+    re.IGNORECASE,
+)
+
+
+def _classify_transport_exception(
+    exc: BaseException,
+    *,
+    name: str | None = None,
+    message: str | None = None,
+) -> ScrapeErrorCode | None:
+    """Map recognizable curl/Twisted transport failures to stable outcomes."""
+    name = name or type(exc).__name__.lower()
+    message = message or str(exc).lower()
+
+    curl_code = getattr(exc, "curl_code", None)
+    if not isinstance(curl_code, int) and "curl" in name:
+        candidate = getattr(exc, "code", None)
+        curl_code = candidate if isinstance(candidate, int) else None
+    if not isinstance(curl_code, int):
+        match = _CURL_CODE_PATTERN.search(message)
+        curl_code = int(match.group(1)) if match else None
+
+    if curl_code == 16:
+        return ScrapeErrorCode.PROTOCOL_FAILED
+    if curl_code == 35:
+        return ScrapeErrorCode.TLS_CONNECTION_FAILED
+    if curl_code == 60:
+        return ScrapeErrorCode.TLS_VERIFICATION_FAILED
+    if curl_code == 7:
+        if "proxy" in message or "connect tunnel" in message:
+            return ScrapeErrorCode.PROXY_FAILED
+        return ScrapeErrorCode.CONNECTION_FAILED
+
+    if "certificate" in message and any(
+        marker in message for marker in ("issuer", "verify", "verification", "unable to get")
+    ):
+        return ScrapeErrorCode.TLS_VERIFICATION_FAILED
+    if any(marker in message for marker in ("http/2", "http2", "settings frame")) and any(
+        marker in message for marker in ("protocol", "settings", "stream")
+    ):
+        return ScrapeErrorCode.PROTOCOL_FAILED
+    if "tls" in message and any(
+        marker in message for marker in ("abrupt", "closed", "close", "handshake", "eof")
+    ):
+        return ScrapeErrorCode.TLS_CONNECTION_FAILED
+    if "connectionlost" in name or name in {"connectionlost", "connectiondone"}:
+        return ScrapeErrorCode.CONNECTION_FAILED
+    return None
 
 
 def _chained_error_code(exc: BaseException) -> ScrapeErrorCode | None:
@@ -268,4 +340,7 @@ def classify_playwright_exception(exc: BaseException) -> ScrapeErrorCode:
         return ScrapeErrorCode.TIMEOUT
     if "timeout" in type(exc).__name__.lower():
         return ScrapeErrorCode.TIMEOUT
+    transport_code = _classify_transport_exception(exc)
+    if transport_code is not None:
+        return transport_code
     return ScrapeErrorCode.PLAYWRIGHT_FAILED

@@ -24,13 +24,15 @@ from sqlalchemy.exc import IntegrityError
 
 from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
 from app_shared.models.identity import Workspace
-from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.models.scrape_profiles import ScrapeProfile, ScrapeProfileRevision
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.profiles.repository import (
     assert_profile_assignable,
     owned_profile_get,
     visible_profiles_select,
+    visible_profile_revisions_select,
 )
+from app_shared.profiles.revisioning import record_profile_revision
 from app_shared.profiles.upsert import build_profiles_upsert, prepare_profiles
 from app_shared.profiles.validation import ProfileValidationError, validate_profile
 
@@ -42,6 +44,8 @@ from app.schemas.scrape_profiles import (
     ScrapeProfileBulkUpsertResult,
     ScrapeProfileCreate,
     ScrapeProfileListResponse,
+    ScrapeProfileRevisionListResponse,
+    ScrapeProfileRevisionResponse,
     ScrapeProfileResponse,
     ScrapeProfileUpdate,
     WorkspaceDefaultProfileAssignment,
@@ -113,6 +117,9 @@ def create_scrape_profile(
             "(unique(workspace_id, name))."
         ) from exc
 
+    record_profile_revision(session, profile)
+    session.flush()
+
     return ScrapeProfileResponse.model_validate(profile)
 
 
@@ -160,6 +167,53 @@ def get_scrape_profile(
     return ScrapeProfileResponse.model_validate(profile)
 
 
+@router.get(
+    "/{profile_id}/versions", response_model=ScrapeProfileRevisionListResponse
+)
+def list_scrape_profile_versions(
+    profile_id: uuid.UUID,
+    limit: int | None = None,
+    cursor: str | None = None,
+    principal_ctx: tuple = Depends(require_scopes("scrape_profiles:read")),
+) -> ScrapeProfileRevisionListResponse:
+    """List every retained revision for an own-workspace or global profile."""
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+
+    visible = visible_profiles_select(principal.workspace_id).where(
+        ScrapeProfile.id == profile_id
+    )
+    if session.execute(visible).scalar_one_or_none() is None:
+        raise _not_found("Scrape profile not found.")
+    page_limit = clamp_limit(limit)
+    revisions_stmt = visible_profile_revisions_select(
+        principal.workspace_id, profile_id
+    ).order_by(None)
+    if cursor is not None:
+        try:
+            after = decode_cursor(cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+        revisions_stmt = revisions_stmt.where(
+            keyset_predicate(ScrapeProfileRevision, after)
+        )
+    revisions_stmt = revisions_stmt.order_by(
+        ScrapeProfileRevision.created_at, ScrapeProfileRevision.id
+    ).limit(page_limit + 1)
+    revisions = session.execute(revisions_stmt).scalars().all()
+    envelope = paginate(revisions, page_limit)
+    return ScrapeProfileRevisionListResponse(
+        items=[
+            ScrapeProfileRevisionResponse.model_validate(row)
+            for row in envelope["items"]
+        ],
+        next_cursor=envelope["next_cursor"],
+    )
+
+
 @router.patch("/{profile_id}", response_model=ScrapeProfileResponse)
 def update_scrape_profile(
     profile_id: uuid.UUID,
@@ -190,6 +244,7 @@ def update_scrape_profile(
 
     for field, value in updates.items():
         setattr(profile, field, value)
+    profile.version += 1
 
     try:
         session.flush()
@@ -199,6 +254,9 @@ def update_scrape_profile(
             "A scrape profile with this name already exists in this workspace "
             "(unique(workspace_id, name))."
         ) from exc
+
+    record_profile_revision(session, profile)
+    session.flush()
 
     return ScrapeProfileResponse.model_validate(profile)
 
@@ -262,6 +320,9 @@ def bulk_upsert_scrape_profiles(
         .scalars()
         .all()
     )
+    for profile in profiles:
+        record_profile_revision(session, profile)
+    session.flush()
     return ScrapeProfileBulkUpsertResult(
         upserted=len(profiles),
         profiles=[ScrapeProfileResponse.model_validate(p) for p in profiles],

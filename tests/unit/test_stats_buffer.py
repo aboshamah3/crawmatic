@@ -189,6 +189,49 @@ def _record(
     )
 
 
+def test_same_access_name_isolated_by_strategy_method_id() -> None:
+    redis = _FakeRedis()
+    workspace_id = uuid.uuid4()
+    profile_id = uuid.uuid4()
+    first_method = uuid.uuid4()
+    second_method = uuid.uuid4()
+    for strategy_method_id, success in (
+        (first_method, True),
+        (second_method, False),
+    ):
+        record_attempt(
+            redis,
+            workspace_id=workspace_id,
+            profile_id=profile_id,
+            strategy_method_id=strategy_method_id,
+            method_type=MethodType.ACCESS,
+            method_name=AccessMethod.DIRECT_HTTP.value,
+            success=success,
+            response_time_ms=100,
+            confidence=None,
+            url="https://shop.example/p/1",
+            qualifying=False,
+            ttl_seconds=_TTL_SECONDS,
+        )
+
+    first = read_pending(
+        redis,
+        profile_id=profile_id,
+        strategy_method_id=first_method,
+        method_type=MethodType.ACCESS,
+        method_name=AccessMethod.DIRECT_HTTP.value,
+    )
+    second = read_pending(
+        redis,
+        profile_id=profile_id,
+        strategy_method_id=second_method,
+        method_type=MethodType.ACCESS,
+        method_name=AccessMethod.DIRECT_HTTP.value,
+    )
+    assert (first.attempt, first.success, first.failure) == (1, 1, 0)
+    assert (second.attempt, second.success, second.failure) == (1, 0, 1)
+
+
 # --- record_attempt: HINCRBY accumulation, no primary-store write -------------
 
 
@@ -216,6 +259,34 @@ def test_record_attempt_accumulates_via_hincrby() -> None:
     assert pending.rt_ms_sum == 500  # 5 attempts * 100ms
     assert pending.qualifying_success == 4
     assert pending.distinct_urls == 4  # one fingerprint per qualifying success's distinct URL
+
+
+def test_operational_failure_is_buffered_separately_from_catalog_failure() -> None:
+    redis = _redis_client()
+    workspace_id = uuid.uuid4()
+    profile_id = uuid.uuid4()
+    record_attempt(
+        redis,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        method_type=MethodType.ACCESS,
+        method_name=AccessMethod.DIRECT_HTTP.value,
+        success=False,
+        response_time_ms=100,
+        confidence=None,
+        url="https://shop.example.com/products/a",
+        qualifying=False,
+        ttl_seconds=_TTL_SECONDS,
+        operational_failure=True,
+    )
+    pending = read_pending(
+        redis,
+        profile_id=profile_id,
+        method_type=MethodType.ACCESS,
+        method_name=AccessMethod.DIRECT_HTTP.value,
+    )
+    assert pending.failure == 1
+    assert pending.operational_failure == 1
 
 
 def test_record_attempt_no_primary_store_write() -> None:

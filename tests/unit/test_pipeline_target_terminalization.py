@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from app_shared.enums import (
@@ -37,7 +38,7 @@ from app_shared.enums import (
     ScrapeTargetStatus,
     StockStatus,
 )
-from app_shared.task_names import SCRAPE_FINALIZE_JOBS
+from app_shared.task_names import SCRAPE_DISPATCH_JOB, SCRAPE_FINALIZE_JOBS
 
 from scrape_core import pipelines as pipelines_mod
 from scrape_core.items import ScrapeResult
@@ -57,6 +58,8 @@ def _make_result(
     match_id: uuid.UUID | None = None,
     scrape_job_id: uuid.UUID | None | object = _UNSET,
     error_code: ScrapeErrorCode | None = None,
+    chain_complete: bool = True,
+    defer_target: bool = False,
 ) -> ScrapeResult:
     resolved_job_id = uuid.uuid4() if scrape_job_id is _UNSET else scrape_job_id
     return ScrapeResult(
@@ -76,6 +79,8 @@ def _make_result(
         extraction_confidence=Decimal("0.9500") if success else None,
         error_code=None if success else (error_code or ScrapeErrorCode.PRICE_NOT_FOUND),
         error_message=None if success else "no price candidate found",
+        chain_complete=chain_complete,
+        defer_target=defer_target,
     )
 
 
@@ -85,12 +90,16 @@ class _FakeSession:
     def __init__(self) -> None:
         self.added: list[list[Any]] = []
         self.executed: list[Any] = []
+        self.target_row: Any = None
 
     def add_all(self, items: Any) -> None:
         self.added.append(list(items))
 
-    def execute(self, stmt: Any) -> None:
+    def execute(self, stmt: Any) -> Any:
         self.executed.append(stmt)
+        if self.target_row is not None:
+            return SimpleNamespace(scalar_one_or_none=lambda: self.target_row)
+        return None
 
 
 class _FakeWorkspaceTxn:
@@ -264,6 +273,132 @@ def test_failed_item_marks_its_target_failed_with_error_code(monkeypatch: Any) -
     assert call["match_id"] == match_id
     assert call["status"] == ScrapeTargetStatus.FAILED
     assert call["error_code"] == ScrapeErrorCode.HTTP_403
+
+
+def test_permanent_not_listed_is_terminal_but_non_operational(
+    monkeypatch: Any,
+) -> None:
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
+    item = _make_result(success=False, error_code=ScrapeErrorCode.NOT_LISTED)
+
+    _flush_batch(WORKSPACE_ID, [item])
+
+    assert mark_target.calls[0]["status"] is ScrapeTargetStatus.SKIPPED
+    assert mark_target.calls[0]["error_code"] is ScrapeErrorCode.NOT_LISTED
+
+
+def test_intermediate_failure_is_persisted_but_does_not_terminalize(
+    monkeypatch: Any,
+) -> None:
+    session, _txn, mark_target, enqueue, _redis = _install_fakes(monkeypatch)
+    item = _make_result(success=False, chain_complete=False)
+
+    _flush_batch(WORKSPACE_ID, [item])
+
+    # Observation and request attempt are still written for audit.
+    assert len(session.added[0]) == 1
+    assert len(session.added[1]) == 1
+    assert mark_target.calls == []
+    assert [c for c in enqueue.calls if c["name"] == SCRAPE_FINALIZE_JOBS] == []
+
+
+def test_cross_mode_handoff_persists_cursor_and_reenters_dispatch(
+    monkeypatch: Any,
+) -> None:
+    session, _txn, mark_target, enqueue, _redis = _install_fakes(monkeypatch)
+    next_method_id = uuid.uuid4()
+    chain_token = uuid.uuid4()
+    repaired_url = "https://shop.example.com/products/repaired-id"
+    item = _make_result(success=False, chain_complete=False)
+    item.next_strategy_method_id = next_method_id
+    item.strategy_attempt_ordinal = 2
+    item.chain_token = chain_token
+    item.canonical_url = repaired_url
+    session.target_row = SimpleNamespace(
+        current_strategy_method_id=None,
+        strategy_attempt_ordinal=0,
+        chain_token=None,
+        strategy_url_override=None,
+        dispatched_at=object(),
+    )
+
+    _flush_batch(WORKSPACE_ID, [item])
+
+    assert mark_target.calls[0]["status"] is ScrapeTargetStatus.DEFERRED
+    assert session.target_row.current_strategy_method_id == next_method_id
+    assert session.target_row.strategy_attempt_ordinal == 3
+    assert session.target_row.chain_token == chain_token
+    assert session.target_row.strategy_url_override == repaired_url
+    assert session.target_row.dispatched_at is None
+    dispatches = [call for call in enqueue.calls if call["name"] == SCRAPE_DISPATCH_JOB]
+    assert len(dispatches) == 1
+    assert [call for call in enqueue.calls if call["name"] == SCRAPE_FINALIZE_JOBS] == []
+
+
+def test_failed_attempt_followed_by_success_only_completes_target(
+    monkeypatch: Any,
+) -> None:
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
+    job_id = uuid.uuid4()
+    match_id = uuid.uuid4()
+    batch = [
+        _make_result(
+            success=False,
+            scrape_job_id=job_id,
+            match_id=match_id,
+            chain_complete=False,
+        ),
+        _make_result(success=True, scrape_job_id=job_id, match_id=match_id),
+    ]
+
+    _flush_batch(WORKSPACE_ID, batch)
+
+    assert len(mark_target.calls) == 1
+    assert mark_target.calls[0]["status"] == ScrapeTargetStatus.COMPLETED
+    assert mark_target.calls[0]["error_code"] is None
+
+
+def test_failed_attempt_followed_by_rate_limit_defer_only_defers_target(
+    monkeypatch: Any,
+) -> None:
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
+    monkeypatch.setattr(pipelines_mod, "consume_defer_budget", lambda *args, **kwargs: True)
+    # The defer branch reads this extra setting before calling the patched
+    # budget seam.
+    monkeypatch.setattr(_FakeSettings, "SCRAPE_MAX_DEFER_CYCLES", 3, raising=False)
+    job_id = uuid.uuid4()
+    match_id = uuid.uuid4()
+    batch = [
+        _make_result(
+            success=False,
+            scrape_job_id=job_id,
+            match_id=match_id,
+            chain_complete=False,
+        ),
+        _make_result(
+            success=False,
+            scrape_job_id=job_id,
+            match_id=match_id,
+            error_code=ScrapeErrorCode.RATE_LIMITED,
+            defer_target=True,
+        ),
+    ]
+
+    _flush_batch(WORKSPACE_ID, batch)
+
+    assert len(mark_target.calls) == 1
+    assert mark_target.calls[0]["status"] == ScrapeTargetStatus.DEFERRED
+    assert mark_target.calls[0]["error_code"] == ScrapeErrorCode.RATE_LIMITED
+
+
+def test_fully_exhausted_chain_emits_one_terminal_failure(monkeypatch: Any) -> None:
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
+    item = _make_result(success=False, chain_complete=True)
+
+    _flush_batch(WORKSPACE_ID, [item])
+
+    assert len(mark_target.calls) == 1
+    assert mark_target.calls[0]["status"] == ScrapeTargetStatus.FAILED
 
 
 def test_item_with_null_scrape_job_id_marks_nothing(monkeypatch: Any) -> None:

@@ -18,19 +18,30 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Numeric, cast, func, literal
+from sqlalchemy import Numeric, cast, func, literal, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app_shared.config import Settings, get_settings
 from app_shared.database import set_workspace_context
-from app_shared.enums import AccessMethod, ExtractionMethod, MethodType, StrategyStatus
+from app_shared.enums import (
+    AccessMethod,
+    ExtractionMethod,
+    MethodType,
+    StrategyMethodProofState,
+    StrategyStatus,
+)
 from app_shared.ids import new_uuid7
-from app_shared.models.strategy import DomainStrategyProfile, StrategyAttemptStats
+from app_shared.models.strategy import (
+    DomainStrategyMethod,
+    DomainStrategyProfile,
+    StrategyAttemptStats,
+)
+from app_shared.repository import scoped_select
 from app_shared.strategy import stats_buffer
 from app_shared.strategy.promotion import (
     MethodStats,
@@ -141,6 +152,72 @@ def _batch_confidence(drained: stats_buffer.DrainedDelta) -> Decimal | None:
     return Decimal(drained.conf_sum) / _CONFIDENCE_SCALE / Decimal(drained.success)
 
 
+def _update_method_circuit(
+    method: DomainStrategyMethod,
+    drained: stats_buffer.DrainedDelta,
+    settings: Settings,
+    now: datetime,
+) -> None:
+    """Persist the breaker for exactly one combined strategy-method row.
+
+    Catalog/policy outcomes never enter ``operational_failure`` in the
+    recorder, so deleted products cannot quarantine a healthy transport.
+    Success closes a quarantined method; otherwise the configured streak or
+    method-local failure rate opens it and schedules a canary.
+    """
+    operational_failures = drained.operational_failure
+    observed_attempts = drained.success + operational_failures
+    if observed_attempts == 0:
+        return
+
+    method.circuit_attempt_count = (method.circuit_attempt_count or 0) + observed_attempts
+    method.circuit_failure_count = (
+        method.circuit_failure_count or 0
+    ) + operational_failures
+    if drained.success:
+        method.consecutive_failure_count = 0
+        method.proof_sample_size = (method.proof_sample_size or 0) + drained.success
+        if method.proof_state is StrategyMethodProofState.QUARANTINED:
+            method.proof_state = StrategyMethodProofState.PROVEN
+            method.cooldown_until = None
+            method.next_canary_at = None
+        return
+
+    method.consecutive_failure_count = (
+        method.consecutive_failure_count or 0
+    ) + operational_failures
+    minimum_attempts = max(
+        1, int(getattr(settings, "STRATEGY_METHOD_BREAKER_MIN_ATTEMPTS", 10))
+    )
+    failure_rate = method.circuit_failure_count / method.circuit_attempt_count
+    opens = method.consecutive_failure_count >= max(
+        1,
+        int(
+            getattr(
+                settings,
+                "STRATEGY_REDISCOVERY_CONSECUTIVE_FAILURES",
+                3,
+            )
+        ),
+    ) or (
+        method.circuit_attempt_count >= minimum_attempts
+        and failure_rate
+        >= float(getattr(settings, "STRATEGY_METHOD_BREAKER_FAILURE_RATE", 0.80))
+    )
+    if not opens:
+        return
+    cooldown_seconds = max(
+        0, int(getattr(settings, "STRATEGY_METHOD_BREAKER_COOLDOWN_SECONDS", 1800))
+    )
+    canary_seconds = max(
+        1,
+        int(getattr(settings, "STRATEGY_METHOD_BREAKER_CANARY_INTERVAL_SECONDS", 600)),
+    )
+    method.proof_state = StrategyMethodProofState.QUARANTINED
+    method.cooldown_until = now + timedelta(seconds=cooldown_seconds)
+    method.next_canary_at = now + timedelta(seconds=canary_seconds)
+
+
 def _upsert_stats(
     session: Session,
     profile_id: uuid.UUID,
@@ -148,6 +225,8 @@ def _upsert_stats(
     method_name: str,
     drained: stats_buffer.DrainedDelta,
     now: datetime,
+    *,
+    strategy_method_id: uuid.UUID | None = None,
 ) -> Any:
     """Single atomic `count = count + delta` UPSERT (FR-023) -- no
     app-side read-modify-write. Every `SET` expression is computed
@@ -171,6 +250,7 @@ def _upsert_stats(
     stmt = pg_insert(table).values(
         id=new_uuid7(),
         domain_strategy_profile_id=profile_id,
+        strategy_method_id=strategy_method_id,
         method_type=method_type,
         method_name=method_name,
         attempt_count=drained.attempt,
@@ -186,8 +266,16 @@ def _upsert_stats(
     new_attempt = table.attempt_count + stmt.excluded.attempt_count
     new_success = table.success_count + stmt.excluded.success_count
 
+    if strategy_method_id is not None:
+        conflict_elements = ["strategy_method_id", "method_type"]
+        conflict_where = table.strategy_method_id.is_not(None)
+    else:
+        conflict_elements = ["domain_strategy_profile_id", "method_type", "method_name"]
+        conflict_where = table.strategy_method_id.is_(None)
+
     stmt = stmt.on_conflict_do_update(
-        index_elements=["domain_strategy_profile_id", "method_type", "method_name"],
+        index_elements=conflict_elements,
+        index_where=conflict_where,
         set_={
             "attempt_count": new_attempt,
             "success_count": new_success,
@@ -429,27 +517,88 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
     preferred_failure_delta = 0
     transitions: list[StrategyTransition] = []
 
-    for method_type, method_name in _CANDIDATE_METHODS:
-        drained = stats_buffer.drain(
-            redis, profile_id=profile.id, method_type=method_type, method_name=method_name
+    execute = getattr(session, "execute", None)
+    strategy_methods = (
+        execute(
+            scoped_select(DomainStrategyMethod, profile.workspace_id).where(
+                DomainStrategyMethod.domain_strategy_profile_id == profile.id
+            )
         )
+        .scalars()
+        .all()
+        if execute is not None
+        else []
+    )
+    strategy_methods_by_id = {method.id: method for method in strategy_methods}
+    candidates: list[tuple[uuid.UUID | None, MethodType, str]] = [
+        (None, method_type, method_name)
+        for method_type, method_name in _CANDIDATE_METHODS
+    ]
+    for strategy_method in strategy_methods:
+        candidates.append(
+            (
+                strategy_method.id,
+                MethodType.ACCESS,
+                strategy_method.access_method.value,
+            )
+        )
+        if strategy_method.extraction_method is not None:
+            candidates.append(
+                (
+                    strategy_method.id,
+                    MethodType.EXTRACTION,
+                    strategy_method.extraction_method.value,
+                )
+            )
+
+    for strategy_method_id, method_type, method_name in candidates:
+        drain_kwargs = {
+            "profile_id": profile.id,
+            "method_type": method_type,
+            "method_name": method_name,
+        }
+        if strategy_method_id is not None:
+            drain_kwargs["strategy_method_id"] = strategy_method_id
+        drained = stats_buffer.drain(redis, **drain_kwargs)
         if drained.attempt == 0:
             continue  # nothing pending for this key this cycle
 
         keys_flushed += 1
-        row = _upsert_stats(session, profile.id, method_type, method_name, drained, now)
+        if strategy_method_id is None:
+            row = _upsert_stats(
+                session, profile.id, method_type, method_name, drained, now
+            )
+        else:
+            row = _upsert_stats(
+                session,
+                profile.id,
+                method_type,
+                method_name,
+                drained,
+                now,
+                strategy_method_id=strategy_method_id,
+            )
 
         if drained.success:
             any_success = True
         if drained.failure:
             any_failure = True
 
-        is_preferred_method = (
-            method_type is MethodType.ACCESS and method_name == profile.preferred_access_method
-        ) or (
-            method_type is MethodType.EXTRACTION
-            and method_name == profile.preferred_extraction_method
-        )
+        if strategy_method_id is not None and method_type is MethodType.ACCESS:
+            strategy_method = strategy_methods_by_id.get(strategy_method_id)
+            if strategy_method is not None:
+                _update_method_circuit(strategy_method, drained, settings, now)
+
+        if strategy_method_id is not None:
+            is_preferred_method = strategy_method_id == profile.preferred_method_id
+        else:
+            is_preferred_method = (
+                method_type is MethodType.ACCESS
+                and method_name == profile.preferred_access_method
+            ) or (
+                method_type is MethodType.EXTRACTION
+                and method_name == profile.preferred_extraction_method
+            )
         if is_preferred_method:
             preferred_qualifying_delta += drained.qualifying_success
             preferred_failure_delta += drained.failure
@@ -470,10 +619,21 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
             decision=decision,
         )
         if promoted:
+            if strategy_method_id is not None:
+                profile.preferred_method_id = strategy_method_id
             # The distinct-URL SET is the running promotion evidence --
             # only cleared once the method actually promotes
             # (contracts/stats-buffer.md "Drain").
-            redis.delete(stats_buffer.url_key(profile.id, method_type, method_name))
+            redis.delete(
+                stats_buffer.url_key(profile.id, method_type, method_name)
+                if strategy_method_id is None
+                else stats_buffer.url_key(
+                    profile.id,
+                    method_type,
+                    method_name,
+                    strategy_method_id,
+                )
+            )
             if was_degraded and is_preferred_method:
                 # Task 3.2 (2026-08-16): same-method re-promotion out of
                 # `DEGRADED` -- `apply_promotion`'s guarded UPDATE now

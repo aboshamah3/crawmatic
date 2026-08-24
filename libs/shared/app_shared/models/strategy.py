@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     ForeignKeyConstraint,
     Index,
     Integer,
@@ -53,7 +54,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.enums import (
@@ -61,6 +64,7 @@ from app_shared.enums import (
     DiscoveryRunStatus,
     ExtractionMethod,
     MethodType,
+    StrategyMethodProofState,
     StrategyStatus,
     enum_column,
 )
@@ -82,6 +86,7 @@ class DomainStrategyProfile(Base, WorkspaceScopedBase, TimestampMixin):
 
     __tablename__ = "domain_strategy_profiles"
     __table_args__ = (
+        UniqueConstraint("workspace_id", "id", name="uq_dsp_workspace_id_id"),
         UniqueConstraint(
             "workspace_id",
             "competitor_id",
@@ -98,6 +103,13 @@ class DomainStrategyProfile(Base, WorkspaceScopedBase, TimestampMixin):
             ["workspace_id"],
             ["workspaces.id"],
             name="fk_domain_strategy_profiles_workspace_id_workspaces",
+        ),
+        ForeignKeyConstraint(
+            ["preferred_method_id"],
+            ["domain_strategy_methods.id"],
+            name="fk_dsp_preferred_method_domain_strategy_methods",
+            ondelete="SET NULL",
+            use_alter=True,
         ),
         # Version-guarded consumption lookup (D6): resolve_strategy_start
         # never mixes a stale url_pattern_version into a fresh lookup.
@@ -124,6 +136,11 @@ class DomainStrategyProfile(Base, WorkspaceScopedBase, TimestampMixin):
     preferred_extraction_method: Mapped[ExtractionMethod | None] = enum_column(
         ExtractionMethod, nullable=True
     )
+    # Fast-path pointer into the ordered, versioned candidate list.  The
+    # legacy preferred_* fields above remain cached for old consumers.
+    preferred_method_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
     access_confidence: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=5, scale=4), nullable=True
     )
@@ -135,6 +152,88 @@ class DomainStrategyProfile(Base, WorkspaceScopedBase, TimestampMixin):
     last_discovery_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     last_failed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class DomainStrategyMethod(Base, WorkspaceScopedBase, TimestampMixin):
+    """One retained version of a runnable access + extraction-profile candidate."""
+
+    __tablename__ = "domain_strategy_methods"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "domain_strategy_profile_id"],
+            ["domain_strategy_profiles.workspace_id", "domain_strategy_profiles.id"],
+            name="fk_dsm_workspace_profile_domain_strategy_profiles",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["scrape_profile_id"],
+            ["scrape_profiles.id"],
+            name="fk_dsm_scrape_profile_id_scrape_profiles",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["supersedes_method_id"],
+            ["domain_strategy_methods.id"],
+            name="fk_dsm_supersedes_domain_strategy_methods",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name="fk_domain_strategy_methods_workspace_id_workspaces",
+        ),
+        Index(
+            "uq_dsm_profile_active_priority",
+            "domain_strategy_profile_id",
+            "priority",
+            unique=True,
+            postgresql_where=text("retired_at IS NULL"),
+        ),
+        Index(
+            "ix_dsm_profile_enabled_priority",
+            "domain_strategy_profile_id",
+            "enabled",
+            "priority",
+        ),
+    )
+
+    domain_strategy_profile_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), nullable=False, index=True
+    )
+    # Nullable only for migrated legacy preferences that never had an
+    # assignable extraction profile. New runnable methods require it at the
+    # repository/API boundary; retaining such rows avoids discarding history.
+    scrape_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    scrape_profile_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    access_method: Mapped[AccessMethod] = enum_column(AccessMethod, nullable=False)
+    extraction_method: Mapped[ExtractionMethod | None] = enum_column(
+        ExtractionMethod, nullable=True
+    )
+    priority: Mapped[int] = mapped_column(Integer(), nullable=False)
+    method_version: Mapped[int] = mapped_column(Integer(), nullable=False, default=1)
+    # Incoming-outcome filter for branched chains. ``fallback_on`` controls
+    # whether the current method may leave; ``enter_on`` controls whether
+    # this candidate is relevant (for example, repair only after HTTP_404).
+    # Empty preserves the ordinary linear-chain behavior.
+    enter_on: Mapped[list] = mapped_column(JSONB(), nullable=False, default=list)
+    fallback_on: Mapped[list] = mapped_column(JSONB(), nullable=False, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
+    proof_state: Mapped[StrategyMethodProofState] = enum_column(
+        StrategyMethodProofState,
+        nullable=False,
+        default=StrategyMethodProofState.CANDIDATE,
+    )
+    cooldown_until: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    next_canary_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    proof_sample_size: Mapped[int] = mapped_column(Integer(), nullable=False, default=0)
+    circuit_attempt_count: Mapped[int] = mapped_column(Integer(), nullable=False, default=0)
+    circuit_failure_count: Mapped[int] = mapped_column(Integer(), nullable=False, default=0)
+    consecutive_failure_count: Mapped[int] = mapped_column(Integer(), nullable=False, default=0)
+    supersedes_method_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
 
 class StrategyAttemptStats(Base, TimestampMixin):
@@ -151,21 +250,39 @@ class StrategyAttemptStats(Base, TimestampMixin):
 
     __tablename__ = "strategy_attempt_stats"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_sas_profile_method_type_name",
             "domain_strategy_profile_id",
             "method_type",
             "method_name",
-            name="uq_sas_profile_method_type_name",
+            unique=True,
+            postgresql_where=text("strategy_method_id IS NULL"),
+        ),
+        Index(
+            "uq_sas_strategy_method_type",
+            "strategy_method_id",
+            "method_type",
+            unique=True,
+            postgresql_where=text("strategy_method_id IS NOT NULL"),
         ),
         ForeignKeyConstraint(
             ["domain_strategy_profile_id"],
             ["domain_strategy_profiles.id"],
             name="fk_sas_profile_id_domain_strategy_profiles",
         ),
+        ForeignKeyConstraint(
+            ["strategy_method_id"],
+            ["domain_strategy_methods.id"],
+            name="fk_sas_strategy_method_domain_strategy_methods",
+            ondelete="SET NULL",
+        ),
     )
 
     domain_strategy_profile_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), nullable=False, index=True
+    )
+    strategy_method_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
     )
     method_type: Mapped[MethodType] = enum_column(MethodType, nullable=False)
     method_name: Mapped[str] = mapped_column(Text(), nullable=False)

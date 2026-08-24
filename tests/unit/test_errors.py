@@ -224,3 +224,41 @@ def test_classify_exception_recognizes_limit_reached_via_error_code_attribute() 
     exc.error_code = ScrapeErrorCode.LIMIT_REACHED  # type: ignore[attr-defined]
 
     assert classify_exception(exc) == ScrapeErrorCode.LIMIT_REACHED
+
+
+class _CurlError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def test_classifies_curl_connect_tunnel_failure_as_proxy_failed() -> None:
+    exc = _CurlError(7, "Failed to connect: CONNECT tunnel returned HTTP 502 via proxy")
+    assert classify_exception(exc) == ScrapeErrorCode.PROXY_FAILED
+
+
+def test_classifies_curl_tls_close() -> None:
+    assert classify_exception(_CurlError(35, "TLS connect error")) == (
+        ScrapeErrorCode.TLS_CONNECTION_FAILED
+    )
+
+
+def test_classifies_curl_certificate_issuer_failure() -> None:
+    assert classify_exception(_CurlError(60, "SSL certificate issuer problem")) == (
+        ScrapeErrorCode.TLS_VERIFICATION_FAILED
+    )
+
+
+def test_classifies_curl_http2_protocol_failure() -> None:
+    assert classify_exception(_CurlError(16, "HTTP/2 SETTINGS protocol failure")) == (
+        ScrapeErrorCode.PROTOCOL_FAILED
+    )
+
+
+def test_classifies_twisted_connection_lost() -> None:
+    class ConnectionLost(Exception):
+        pass
+
+    assert classify_exception(ConnectionLost("peer closed connection")) == (
+        ScrapeErrorCode.CONNECTION_FAILED
+    )

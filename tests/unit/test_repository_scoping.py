@@ -22,7 +22,11 @@ from app_shared.models.observations import MatchCurrentPrice, PriceObservation, 
 from app_shared.models.outbox import OutboxMessage
 from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.rollups import VariantPriceDailyRollup
-from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.models.strategy import (
+    DomainStrategyMethod,
+    DomainStrategyProfile,
+    StrategyDiscoveryRun,
+)
 from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
@@ -69,6 +73,7 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             PriceAlertEvent,
             DomainAccessRule,
             DomainStrategyProfile,
+            DomainStrategyMethod,
             StrategyDiscoveryRun,
             RefreshRule,
             VariantPriceDailyRollup,

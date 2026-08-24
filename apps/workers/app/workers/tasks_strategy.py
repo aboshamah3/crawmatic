@@ -84,7 +84,11 @@ from app_shared.strategy.rediscovery import (
     evaluate_rediscovery,
 )
 from app_shared.outbox import write_outbox_message
-from app_shared.strategy.repository import resolve_profile, stats_for_profile
+from app_shared.strategy.repository import (
+    resolve_profile,
+    seed_versioned_method_from_discovery,
+    stats_for_profile,
+)
 from app_shared.strategy.seed import DiscoverySeedConfidences, seed_from_discovery, validate_sample_size
 from app_shared.strategy.stats_buffer import dirty_key, read_pending
 from app_shared.task_names import (
@@ -1008,6 +1012,14 @@ def run_discovery(
             winning_extraction=extraction_method,
             confidences=confidences,
             thresholds=thresholds,
+        )
+        session.flush()
+        seed_versioned_method_from_discovery(
+            session,
+            profile=profile,
+            winning_access=access_method,
+            winning_extraction=extraction_method,
+            proof_sample_size=confidences.access_qualifying_count,
         )
         session.flush()
         # 2026-08-15 runaway-rediscovery root fix, second half. Seeding

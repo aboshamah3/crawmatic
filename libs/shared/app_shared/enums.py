@@ -165,6 +165,8 @@ class AdapterKey(StrEnum):
     SELECTOR_ONLY = "selector_only"
     REGEX_ONLY = "regex_only"
     SHOPIFY_PRODUCT_JSON = "shopify_product_json"
+    PUBLIC_CATALOG_JSON = "public_catalog_json"
+    EXACT_ID_URL_REPAIR = "exact_id_url_repair"
     WOOCOMMERCE_STORE_API = "woocommerce_store_api"
     PLAYWRIGHT_RENDERED = "playwright_rendered"
     CUSTOM_ADAPTER = "custom_adapter"
@@ -192,6 +194,10 @@ class AccessMethod(StrEnum):
     DIRECT_HTTP = "DIRECT_HTTP"
     DIRECT_HTTP_RETRY = "DIRECT_HTTP_RETRY"
     PROXY_HTTP = "PROXY_HTTP"
+    # An unproxied browser is a distinct transport.  Keeping it separate
+    # from PLAYWRIGHT_PROXY makes method health and browser/proxy cost
+    # accounting reproducible.
+    PLAYWRIGHT_DIRECT = "PLAYWRIGHT_DIRECT"
     PLAYWRIGHT_PROXY = "PLAYWRIGHT_PROXY"
 
 
@@ -287,6 +293,13 @@ class ScrapeErrorCode(StrEnum):
     LOCKED_ALREADY_RUNNING = "LOCKED_ALREADY_RUNNING"
     LIMIT_REACHED = "LIMIT_REACHED"
     LEGAL_REVIEW_REQUIRED = "LEGAL_REVIEW_REQUIRED"
+    NOT_LISTED = "NOT_LISTED"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    POLICY_BLOCKED = "POLICY_BLOCKED"
+    CONNECTION_FAILED = "CONNECTION_FAILED"
+    TLS_CONNECTION_FAILED = "TLS_CONNECTION_FAILED"
+    TLS_VERIFICATION_FAILED = "TLS_VERIFICATION_FAILED"
+    PROTOCOL_FAILED = "PROTOCOL_FAILED"
 
 
 class ScrapeScope(StrEnum):
@@ -483,6 +496,15 @@ class StrategyStatus(StrEnum):
     LEARNING = "LEARNING"
     ACTIVE = "ACTIVE"
     DEGRADED = "DEGRADED"
+    DISABLED = "DISABLED"
+
+
+class StrategyMethodProofState(StrEnum):
+    """Evidence/lifecycle state for one versioned strategy method candidate."""
+
+    CANDIDATE = "CANDIDATE"
+    PROVEN = "PROVEN"
+    QUARANTINED = "QUARANTINED"
     DISABLED = "DISABLED"
 
 

@@ -32,6 +32,7 @@ _PROFILE_UPDATABLE_COLUMNS: tuple[str, ...] = (
     "name",
     "mode",
     "adapter_key",
+    "adapter_config",
     "jsonld_enabled",
     "platform_patterns_enabled",
     "embedded_json_enabled",
@@ -80,6 +81,7 @@ def build_profiles_upsert(rows: Sequence[Mapping[str, Any]]) -> Insert:
     """
     stmt = pg_insert(ScrapeProfile).values(list(rows))
     set_ = {col: stmt.excluded[col] for col in _PROFILE_UPDATABLE_COLUMNS}
+    set_["version"] = ScrapeProfile.version + 1
     set_["updated_at"] = func.now()
     return stmt.on_conflict_do_update(
         index_elements=["workspace_id", "name"],

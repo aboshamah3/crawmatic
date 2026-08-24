@@ -214,6 +214,7 @@ def test_errback_strips_lock_from_failed_result_and_reuses_it(
     results = _collect(spider.errback(failure))
 
     failed = results[0]
+    assert failed.chain_complete is False
     assert failed.match_lock_key is None
     assert failed.match_lock_token is None
     assert results[1] == "RETRY_REQUEST"
@@ -253,6 +254,7 @@ def test_errback_keeps_lock_on_result_when_no_retry(
     results = _collect(spider.errback(failure))
 
     assert len(results) == 1
+    assert results[0].chain_complete is True
     assert results[0].match_lock_key == "lk"
     assert results[0].match_lock_token == "lt"
 

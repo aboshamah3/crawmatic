@@ -22,7 +22,7 @@ from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session
 
 from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
-from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.models.scrape_profiles import ScrapeProfile, ScrapeProfileRevision
 
 # The reserved name of the terminal global default (research D6).
 GLOBAL_DEFAULT_PROFILE_NAME = "global_default"
@@ -48,6 +48,23 @@ def owned_profile_select(workspace_id: uuid.UUID | str) -> Select[tuple[ScrapePr
     through the tenant path (FR-021).
     """
     return select(ScrapeProfile).where(ScrapeProfile.workspace_id == workspace_id)
+
+
+def visible_profile_revisions_select(
+    workspace_id: uuid.UUID | str, profile_id: uuid.UUID | str
+) -> Select[tuple[ScrapeProfileRevision]]:
+    """Return one visible profile's immutable history, newest first."""
+    return (
+        select(ScrapeProfileRevision)
+        .where(
+            ScrapeProfileRevision.scrape_profile_id == profile_id,
+            or_(
+                ScrapeProfileRevision.workspace_id == workspace_id,
+                ScrapeProfileRevision.workspace_id.is_(None),
+            ),
+        )
+        .order_by(ScrapeProfileRevision.version.desc())
+    )
 
 
 def owned_profile_get(

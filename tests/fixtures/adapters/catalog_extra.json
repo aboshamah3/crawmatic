@@ -1,0 +1,8 @@
+{
+  "response": {
+    "products": [
+      {"uniqueId": "100200", "title": "Exact appliance", "salePrice": 0, "price": 2499, "currencyCode": "SAR", "available": false, "productUrl": "/en-sa/appliance-100200"},
+      {"uniqueId": "100201", "title": "Different appliance", "salePrice": 1999, "price": 2499, "available": true}
+    ]
+  }
+}

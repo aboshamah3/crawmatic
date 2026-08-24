@@ -34,7 +34,11 @@ from app_shared.models.observations import MatchCurrentPrice, PriceObservation, 
 from app_shared.models.outbox import OutboxMessage
 from app_shared.models.refresh_rules import RefreshRule
 from app_shared.models.rollups import VariantPriceDailyRollup
-from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.models.strategy import (
+    DomainStrategyMethod,
+    DomainStrategyProfile,
+    StrategyDiscoveryRun,
+)
 from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
@@ -81,6 +85,7 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         # app_shared.strategy.repository (the same dual-scope exclusion
         # precedent, applied to a no-workspace-column table).
         DomainStrategyProfile,
+        DomainStrategyMethod,
         StrategyDiscoveryRun,
         # SPEC-13: RefreshRule is workspace-owned (tenant-only, WorkspaceScopedBase).
         RefreshRule,

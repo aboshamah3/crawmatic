@@ -27,6 +27,7 @@ learned divergence lives in its ``domain_strategy_profiles`` rows.
 from __future__ import annotations
 
 from sqlalchemy import Index, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.enums import AccessMethod, enum_column
@@ -56,6 +57,11 @@ class DomainPlaybook(Base, TimestampMixin):
     #: creation; ``NULL`` = the resolution chain's defaults apply.
     #: Informational for now — policy resolution is name-based already.
     access_policy_name: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Generic ordered candidate templates consumed when a workspace/domain
+    #: strategy is first materialized. Data, not runtime domain branches:
+    #: each entry may name an access method, reusable profile/adapter config,
+    #: fallback outcomes, proof state, and cooldown/canary policy.
+    method_templates: Mapped[list] = mapped_column(JSONB(), nullable=False, default=list)
     #: Operator notes (why this method, e.g. "TLS-fingerprint blocked,
     #: needs residential proxy" / "rate-limits direct at >10 rpm").
     notes: Mapped[str | None] = mapped_column(Text(), nullable=True)

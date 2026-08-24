@@ -30,7 +30,10 @@ network call (FR-021, contracts/robots-middleware.md "Testability").
 
 from __future__ import annotations
 
+import inspect
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
@@ -46,7 +49,13 @@ __all__ = ["RobotsPolicyMiddleware", "RobotsBlockedError", "default_robots_fetch
 
 logger = logging.getLogger(__name__)
 
-RobotsFetcher = Callable[[str], "str | None"]
+RobotsFetcher = Callable[..., "str | None"]
+
+
+@dataclass(frozen=True)
+class _CachedRobots:
+    parser: RobotFileParser | None
+    fetched_at: float
 
 
 class RobotsBlockedError(IgnoreRequest):
@@ -57,7 +66,7 @@ class RobotsBlockedError(IgnoreRequest):
         self.error_code = ROBOTS_BLOCKED_ERROR_CODE
 
 
-def default_robots_fetcher(robots_url: str) -> str | None:
+def default_robots_fetcher(robots_url: str, user_agent: str = "price_monitor") -> str | None:
     """Best-effort robots.txt fetch for real (non-fixture) runs.
 
     Never called by unit tests (a fixture-backed fetcher is always
@@ -70,7 +79,11 @@ def default_robots_fetcher(robots_url: str) -> str | None:
     import urllib.request
 
     try:
-        with urllib.request.urlopen(robots_url, timeout=5) as response:  # noqa: S310
+        request = urllib.request.Request(  # noqa: S310
+            robots_url,
+            headers={"User-Agent": user_agent},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
             return response.read().decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001 - best-effort only, never raise from here
         return None
@@ -83,15 +96,20 @@ class RobotsPolicyMiddleware:
         self,
         robots_fetcher: RobotsFetcher | None = None,
         user_agent: str = "price_monitor",
+        cache_ttl_seconds: float = 900.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._robots_fetcher: RobotsFetcher = robots_fetcher or default_robots_fetcher
         self._user_agent = user_agent
-        self._cache: dict[str, RobotFileParser | None] = {}
+        self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._clock = clock
+        self._cache: dict[tuple[str, str], _CachedRobots] = {}
 
     @classmethod
     def from_crawler(cls, crawler: Any) -> "RobotsPolicyMiddleware":
         user_agent = crawler.settings.get("USER_AGENT") or "price_monitor"
-        return cls(user_agent=user_agent)
+        ttl = crawler.settings.getfloat("ROBOTS_CACHE_TTL_SECONDS", 900.0)
+        return cls(user_agent=user_agent, cache_ttl_seconds=ttl)
 
     def process_request(self, request: Any, spider: Any) -> Any:
         policy = request.meta.get("robots_policy", RobotsPolicy.RESPECT)
@@ -108,28 +126,69 @@ class RobotsPolicyMiddleware:
 
         # RESPECT: may require a robots.txt fetch (cache miss) -> offload
         # off the reactor thread through the established run_in_thread seam.
-        return run_in_thread(self._decide_respect, request.url, self._user_agent)
+        # A repaired/canonical product path can be supplied by the strategy
+        # adapter.  Robots is evaluated against that exact path instead of a
+        # stale tracking/slug URL, while remaining completely domain-generic.
+        canonical_url = request.meta.get("robots_canonical_url") or request.meta.get(
+            "canonical_url"
+        )
+        return run_in_thread(
+            self._decide_respect,
+            request.url,
+            self._user_agent,
+            canonical_url,
+        )
 
-    def _decide_respect(self, url: str, user_agent: str) -> None:
+    def _decide_respect(
+        self,
+        url: str,
+        user_agent: str,
+        canonical_url: str | None = None,
+    ) -> None:
         """Pure decision core for `RESPECT` -- cache-aware, synchronous.
 
         Safe to call directly (bypassing `run_in_thread`) in unit tests:
         with an injected fixture `robots_fetcher` there is no real IO, so
         no reactor is needed to exercise this logic.
         """
-        parsed = urlsplit(url)
+        evaluation_url = canonical_url or url
+        parsed = urlsplit(evaluation_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
+        cache_key = (origin, user_agent)
+        now = self._clock()
 
-        if origin not in self._cache:
-            body = self._robots_fetcher(f"{origin}/robots.txt")
-            self._cache[origin] = self._parse(body)
+        cached = self._cache.get(cache_key)
+        if cached is None or now - cached.fetched_at >= self._cache_ttl_seconds:
+            body = self._fetch_robots(f"{origin}/robots.txt", user_agent)
+            cached = _CachedRobots(parser=self._parse(body), fetched_at=now)
+            self._cache[cache_key] = cached
 
-        parser = self._cache[origin]
-        if parser is not None and not parser.can_fetch(user_agent, url):
+        parser = cached.parser
+        if parser is not None and not parser.can_fetch(user_agent, evaluation_url):
             raise RobotsBlockedError(
-                f"robots_policy=RESPECT: disallowed by robots.txt: {url}"
+                "robots_policy=RESPECT: disallowed by robots.txt: "
+                f"{evaluation_url}"
             )
         return None
+
+    def _fetch_robots(self, robots_url: str, user_agent: str) -> str | None:
+        """Invoke new two-argument fetchers while preserving fixture/custom fetchers.
+
+        Older deployments commonly inject ``Callable[[str], str | None]``.
+        Signature inspection keeps those working without catching a TypeError
+        raised *inside* a fetcher and accidentally issuing the request twice.
+        """
+        try:
+            parameters = inspect.signature(self._robots_fetcher).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        accepts_two = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters) or sum(
+            p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for p in parameters
+        ) >= 2
+        if accepts_two:
+            return self._robots_fetcher(robots_url, user_agent)
+        return self._robots_fetcher(robots_url)
 
     @staticmethod
     def _parse(body: str | None) -> RobotFileParser | None:

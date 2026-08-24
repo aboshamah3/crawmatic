@@ -119,7 +119,7 @@ def test_unparseable_credentials_degrade_to_the_bare_proxy() -> None:
         (5, "Could not resolve proxy: gw.dataimpulse.com", ScrapeErrorCode.PROXY_FAILED),
         (97, "Proxy CONNECT aborted", ScrapeErrorCode.PROXY_FAILED),
         (6, "Could not resolve host: noon.com", ScrapeErrorCode.DNS_ERROR),
-        (92, "HTTP/2 stream 1 reset by server", ScrapeErrorCode.UNKNOWN_ERROR),
+        (92, "HTTP/2 stream 1 reset by server", ScrapeErrorCode.PROTOCOL_FAILED),
     ],
 )
 def test_curl_errors_classify_through_the_existing_ladder(

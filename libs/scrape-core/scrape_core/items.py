@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from app_shared.enums import AccessMethod, ExtractionMethod, ScrapeErrorCode, StockStatus
+from app_shared.enums import AdapterKey, AccessMethod, ExtractionMethod, ScrapeErrorCode, StockStatus
 
 __all__ = ["ScrapeResult"]
 
@@ -94,6 +94,21 @@ class ScrapeResult:
     # tests) that never threads it through.
     domain_strategy_profile_id: uuid.UUID | None = None
 
+    # Versioned strategy/profile/adapter audit.  These values reproduce the
+    # exact runnable candidate even after an operator reorders or revises the
+    # profile, and carry a durable cross-node handoff when one exists.
+    strategy_method_id: uuid.UUID | None = None
+    scrape_profile_id: uuid.UUID | None = None
+    scrape_profile_version: int | None = None
+    adapter_key: AdapterKey | None = None
+    final_url: str | None = None
+    identity_validation_result: str | None = None
+    terminal_for_target: bool = True
+    next_strategy_method_id: uuid.UUID | None = None
+    strategy_attempt_ordinal: int = 0
+    chain_token: uuid.UUID | None = None
+    canonical_url: str | None = None
+
     # --- 2026-08-02: "this failure must NOT terminalize the target" ---
     # A failed attempt whose *next* attempt was rate-ceiling-gated is not a
     # terminal outcome -- the target is going back to `scrape_dispatch` to
@@ -104,3 +119,16 @@ class ScrapeResult:
     # terminal-fail 79 of 96 links in the Cohort B run). The observation/
     # attempt rows themselves are written exactly as any other failure.
     defer_target: bool = False
+
+    # --- 2026-08-24: strategy-chain lifecycle ownership ---
+    # Every attempt is persisted, but a failed attempt may be followed by
+    # another access/extraction candidate.  Only the owner of that chain can
+    # know whether this is its final outcome, so the persistence pipeline
+    # must not infer terminality merely from ``success is False``.
+    #
+    # ``True`` is the compatibility default for hand-built items and
+    # single-attempt producers.  Multi-attempt spiders explicitly set it to
+    # ``False`` while a retry/fallback remains.  Successful results complete
+    # the target regardless of this flag; ``defer_target`` remains the
+    # separate, explicit hand-back-to-dispatch signal.
+    chain_complete: bool = True

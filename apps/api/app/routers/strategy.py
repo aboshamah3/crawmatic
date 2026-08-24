@@ -35,7 +35,11 @@ from app_shared.models.competitors_matches import Competitor
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
-from app_shared.strategy.repository import list_profiles_select, stats_for_profile
+from app_shared.strategy.repository import (
+    list_profiles_select,
+    methods_for_profile,
+    stats_for_profile,
+)
 
 from app.deps import Principal, require_scopes
 from app.schemas.strategy import (
@@ -43,6 +47,7 @@ from app.schemas.strategy import (
     DiscoveryRunListResponse,
     DiscoveryRunResponse,
     StrategyMethodStatsResponse,
+    StrategyMethodResponse,
     StrategyProfileDetailResponse,
     StrategyProfileListResponse,
     StrategyProfileResponse,
@@ -177,8 +182,10 @@ def get_profile_endpoint(
         raise _not_found("Strategy profile not found.")
 
     stats = stats_for_profile(session, ws, profile_id)
+    methods = methods_for_profile(session, ws, profile_id)
     detail = StrategyProfileDetailResponse.model_validate(profile)
     detail.stats = [StrategyMethodStatsResponse.model_validate(s) for s in stats]
+    detail.methods = [StrategyMethodResponse.model_validate(m) for m in methods]
     return detail
 
 

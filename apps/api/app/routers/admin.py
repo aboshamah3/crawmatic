@@ -35,6 +35,7 @@ operator-only.
 from __future__ import annotations
 
 import uuid
+import logging
 from collections.abc import Iterator
 from datetime import datetime, timezone
 
@@ -45,6 +46,7 @@ from sqlalchemy.orm import Session
 
 from app_shared.database import get_auth_session
 from app_shared.enums import ApiKeyStatus, WorkspaceStatus
+from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.models.identity import ApiKey, Workspace
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.api_keys import generate_api_key
@@ -60,6 +62,8 @@ from app.schemas.admin import (
     ConnectorKeyCreateResponse,
     UsageListResponse,
     UsageRow,
+    TargetReconciliationRequest,
+    TargetReconciliationResponse,
     WorkspaceArchiveResponse,
     WorkspaceProvisionRequest,
     WorkspaceProvisionResponse,
@@ -81,6 +85,7 @@ from app.services.admin_usage import (
 router = APIRouter(
     prefix="/v1/admin", tags=["admin"], dependencies=[Depends(require_service_token)]
 )
+logger = logging.getLogger(__name__)
 
 #: Tenant scopes granted to a bootstrap key. Deliberately excludes
 #: `proxy_providers:*` and `access_policies:*` — those configure what we
@@ -343,6 +348,57 @@ def archive_workspace(
     return WorkspaceArchiveResponse(
         workspace_id=workspace.id, status=str(workspace.status)
     )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/scrape-jobs/{scrape_job_id}/reconcile-false-failures",
+    response_model=TargetReconciliationResponse,
+)
+def reconcile_false_failed_targets(
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    payload: TargetReconciliationRequest,
+    session: Session = Depends(get_admin_session),
+) -> TargetReconciliationResponse:
+    """Preview or apply the reviewed 2026-08-24 lifecycle reconciliation.
+
+    Apply calls must repeat the exact candidate IDs returned by a dry run and
+    name the requesting operator.  The service locks and rechecks that set, so
+    this endpoint cannot turn a stale preview into a broader mutation.
+    """
+    if not payload.dry_run and not payload.requested_by:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "REQUESTED_BY_REQUIRED",
+                    "message": "requested_by is required when applying reconciliation.",
+                }
+            },
+        )
+    try:
+        report = reconcile_successful_failed_targets(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            dry_run=payload.dry_run,
+            expected_match_ids=payload.expected_match_ids,
+        )
+    except LookupError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"code": "RECONCILIATION_PREVIEW_STALE", "message": str(exc)}},
+        ) from exc
+
+    response = TargetReconciliationResponse.model_validate(report.as_dict())
+    logger.info(
+        "admin_target_reconciliation requested_by=%s report=%s",
+        payload.requested_by,
+        response.model_dump(mode="json"),
+    )
+    return response
 
 
 @router.post(

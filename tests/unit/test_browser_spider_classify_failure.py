@@ -49,10 +49,10 @@ def test_ssrf_rejected_error_classifies_as_blocked() -> None:
     assert classify_browser_failure(exc, "shop.example.com") == ScrapeErrorCode.BLOCKED
 
 
-def test_robots_blocked_error_classifies_as_blocked() -> None:
+def test_robots_blocked_error_classifies_as_policy_blocked() -> None:
     exc = RobotsBlockedError("robots_policy=RESPECT: disallowed")
 
-    assert classify_browser_failure(exc, "shop.example.com") == ScrapeErrorCode.BLOCKED
+    assert classify_browser_failure(exc, "shop.example.com") == ScrapeErrorCode.POLICY_BLOCKED
 
 
 def test_playwright_abort_rejection_registry_hit_classifies_as_blocked() -> None:

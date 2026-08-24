@@ -40,11 +40,17 @@ def build_scrape_result(
     error_message: str | None = None,
     comparable: bool = True,
     price: Decimal | None = None,
+    old_price: Decimal | None = None,
     candidate_extras: Any = None,
     stock_status: StockStatus | None = None,
     match_lock_key: str | None = None,
     match_lock_token: str | None = None,
     defer_target: bool = False,
+    chain_complete: bool = True,
+    next_strategy_method_id: uuid.UUID | None = None,
+    final_url: str | None = None,
+    identity_validation_result: str | None = None,
+    canonical_url: str | None = None,
 ) -> ScrapeResult:
     """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034; extracted SPEC-14 T007).
 
@@ -128,6 +134,7 @@ def build_scrape_result(
         response_time_ms=response_time_ms,
         scraped_at=scraped_at,
         price=price,
+        old_price=old_price,
         success=success,
         comparable=comparable,
         error_code=error_code,
@@ -135,6 +142,24 @@ def build_scrape_result(
         match_lock_key=match_lock_key,
         match_lock_token=match_lock_token,
         domain_strategy_profile_id=target.domain_strategy_profile_id,
+        strategy_method_id=getattr(target, "strategy_method_id", None),
+        scrape_profile_id=(
+            getattr(getattr(target, "profile", None), "id", None)
+        ),
+        scrape_profile_version=(
+            getattr(getattr(target, "profile", None), "version", None)
+        ),
+        adapter_key=(
+            getattr(getattr(target, "profile", None), "adapter_key", None)
+        ),
+        final_url=final_url or url,
+        identity_validation_result=identity_validation_result,
+        terminal_for_target=(success or chain_complete),
+        next_strategy_method_id=next_strategy_method_id,
+        strategy_attempt_ordinal=getattr(target, "strategy_attempt_ordinal", 0),
+        chain_token=getattr(target, "chain_token", None),
+        canonical_url=canonical_url,
         defer_target=defer_target,
+        chain_complete=chain_complete,
         **kwargs,
     )

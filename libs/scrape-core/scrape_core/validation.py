@@ -38,7 +38,13 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from scrape_core.extraction.result import ExtractionCandidate
 from scrape_core.money_text import normalize_price_text
 
-__all__ = ["Accepted", "Rejected", "ValidationOutcome", "validate_candidate"]
+__all__ = [
+    "Accepted",
+    "Rejected",
+    "ValidationOutcome",
+    "parse_optional_old_price",
+    "validate_candidate",
+]
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,21 @@ class Rejected:
 
 
 ValidationOutcome = Accepted | Rejected
+
+
+def parse_optional_old_price(raw_value: Any, *, current_price: Decimal) -> Decimal | None:
+    """Parse an adapter's optional list price through the §19 money boundary.
+
+    A malformed, non-positive, or current-price-equal list value is discarded;
+    it never turns an otherwise valid current offer into a failure.
+    """
+    if raw_value is None:
+        return None
+    try:
+        old_price = parse_money(normalize_price_text(str(raw_value)))
+    except (TypeError, ValueError):
+        return None
+    return old_price if old_price > 0 and old_price != current_price else None
 
 
 def validate_candidate(

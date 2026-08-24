@@ -19,7 +19,14 @@ from collections.abc import Sequence
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
+from app_shared.enums import (
+    AccessMethod,
+    ExtractionMethod,
+    StrategyMethodProofState,
+    StrategyStatus,
+)
 from app_shared.models.strategy import (
+    DomainStrategyMethod,
     DomainStrategyProfile,
     StrategyAttemptStats,
     StrategyDiscoveryRun,
@@ -103,3 +110,108 @@ def stats_for_profile(
         StrategyAttemptStats.domain_strategy_profile_id == profile.id
     )
     return session.execute(stmt).scalars().all()
+
+
+def methods_for_profile(
+    session: Session, workspace_id: uuid.UUID | str, profile_id: uuid.UUID | str
+) -> Sequence[DomainStrategyMethod]:
+    """Return the complete candidate/version history for one scoped parent.
+
+    Active rows sort by their operator priority; retired revisions remain
+    visible immediately afterwards and are never silently discarded.
+    """
+    profile = get_profile(session, profile_id, workspace_id)
+    if profile is None:
+        return []
+    stmt = (
+        select(DomainStrategyMethod)
+        .where(
+            DomainStrategyMethod.workspace_id == workspace_id,
+            DomainStrategyMethod.domain_strategy_profile_id == profile.id,
+        )
+        .order_by(
+            DomainStrategyMethod.retired_at.asc().nulls_first(),
+            DomainStrategyMethod.priority,
+            DomainStrategyMethod.method_version.desc(),
+        )
+    )
+    return session.execute(stmt).scalars().all()
+
+
+def seed_versioned_method_from_discovery(
+    session: Session,
+    *,
+    profile: DomainStrategyProfile,
+    winning_access: AccessMethod,
+    winning_extraction: ExtractionMethod | None,
+    proof_sample_size: int,
+) -> DomainStrategyMethod:
+    """Retain a discovery winner as a method for any customer or domain.
+
+    A null scrape-profile reference means “use the target's normally
+    resolved profile”, so unfamiliar products and competitors do not need a
+    curated global playbook. Previous methods stay present and measurable.
+    """
+    rows = list(
+        session.execute(
+            scoped_select(DomainStrategyMethod, profile.workspace_id).where(
+                DomainStrategyMethod.domain_strategy_profile_id == profile.id,
+                DomainStrategyMethod.retired_at.is_(None),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    method = next(
+        (
+            row
+            for row in rows
+            if row.access_method is winning_access
+            and row.extraction_method is winning_extraction
+        ),
+        None,
+    )
+    proof_state = (
+        StrategyMethodProofState.PROVEN
+        if profile.status is StrategyStatus.ACTIVE
+        else StrategyMethodProofState.CANDIDATE
+    )
+    if method is None:
+        method = DomainStrategyMethod(
+            workspace_id=profile.workspace_id,
+            domain_strategy_profile_id=profile.id,
+            scrape_profile_id=None,
+            scrape_profile_version=None,
+            access_method=winning_access,
+            extraction_method=winning_extraction,
+            priority=max((row.priority for row in rows), default=-1) + 1,
+            method_version=1,
+            enter_on=[],
+            fallback_on=[
+                "PRICE_NOT_FOUND",
+                "SELECTOR_BROKEN",
+                "HTTP_403",
+                "HTTP_429",
+                "BLOCKED",
+                "TIMEOUT",
+                "PROXY_FAILED",
+                "CONNECTION_FAILED",
+                "TLS_CONNECTION_FAILED",
+                "TLS_VERIFICATION_FAILED",
+                "PROTOCOL_FAILED",
+                "PLAYWRIGHT_FAILED",
+            ],
+            enabled=True,
+            proof_state=proof_state,
+            proof_sample_size=max(0, proof_sample_size),
+        )
+        session.add(method)
+        session.flush()
+    else:
+        method.enabled = True
+        method.proof_state = proof_state
+        method.proof_sample_size = max(method.proof_sample_size or 0, proof_sample_size)
+        method.cooldown_until = None
+        method.next_canary_at = None
+    profile.preferred_method_id = method.id
+    return method

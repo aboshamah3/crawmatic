@@ -24,6 +24,7 @@ from app_shared.enums import (
     DiscoveryRunStatus,
     ExtractionMethod,
     MethodType,
+    StrategyMethodProofState,
     StrategyStatus,
 )
 from app_shared.strategy.seed import validate_sample_size
@@ -98,6 +99,7 @@ class StrategyMethodStatsResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    strategy_method_id: uuid.UUID | None
     method_type: MethodType
     method_name: str
     attempt_count: int
@@ -123,6 +125,7 @@ class StrategyProfileResponse(BaseModel):
     status: StrategyStatus
     preferred_access_method: AccessMethod | None
     preferred_extraction_method: ExtractionMethod | None
+    preferred_method_id: uuid.UUID | None
     access_confidence: Decimal | None
     extraction_confidence: Decimal | None
     confirmed_success_count: int
@@ -138,6 +141,35 @@ class StrategyProfileDetailResponse(StrategyProfileResponse):
     """A single profile plus its per-method stats (`GET .../profiles/{id}`)."""
 
     stats: list[StrategyMethodStatsResponse] = []
+    methods: list["StrategyMethodResponse"] = []
+
+
+class StrategyMethodResponse(BaseModel):
+    """One retained ordered access/profile candidate revision."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    scrape_profile_id: uuid.UUID | None
+    scrape_profile_version: int | None
+    access_method: AccessMethod
+    extraction_method: ExtractionMethod | None
+    priority: int
+    method_version: int
+    enter_on: list[str]
+    fallback_on: list[str]
+    enabled: bool
+    proof_state: StrategyMethodProofState
+    cooldown_until: datetime | None
+    next_canary_at: datetime | None
+    proof_sample_size: int
+    circuit_attempt_count: int
+    circuit_failure_count: int
+    consecutive_failure_count: int
+    supersedes_method_id: uuid.UUID | None
+    retired_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class StrategyProfileListResponse(BaseModel):

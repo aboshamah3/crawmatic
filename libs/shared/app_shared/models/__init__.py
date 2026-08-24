@@ -54,7 +54,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 # `app_shared.repository.WORKSPACE_OWNED_MODELS` — see
 # `app_shared.profiles.repository` for the sanctioned dual-scope query
 # path.
-from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.models.scrape_profiles import ScrapeProfile, ScrapeProfileRevision
 
 # The SPEC-07 observation/current-price models — re-exported so
 # `Base.metadata` sees all three tables for Alembic autogenerate/offline-
@@ -102,6 +102,7 @@ from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvid
 # joined to its scoped parent profile via
 # `app_shared.strategy.repository`.
 from app_shared.models.strategy import (
+    DomainStrategyMethod,
     DomainStrategyProfile,
     StrategyAttemptStats,
     StrategyDiscoveryRun,
@@ -175,6 +176,7 @@ __all__ = [
     "Competitor",
     "CompetitorProductMatch",
     "ScrapeProfile",
+    "ScrapeProfileRevision",
     "PriceObservation",
     "RequestAttempt",
     "MatchCurrentPrice",
@@ -190,6 +192,7 @@ __all__ = [
     "emit_partition_rls_inheritance",
     "PARTITION_RLS_INHERITANCE_SQL",
     "DomainStrategyProfile",
+    "DomainStrategyMethod",
     "StrategyAttemptStats",
     "StrategyDiscoveryRun",
     "RefreshRule",

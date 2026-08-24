@@ -459,6 +459,9 @@ if t1.dispatched_at is None:
 if t3.dispatched_at is None or t3.dispatched_at == old_stamp:
     print("T3_NOT_RESTAMPED:" + str(t3.dispatched_at))
     sys.exit(1)
+if t3.status != ScrapeTargetStatus.PENDING:
+    print("T3_NOT_IN_FLIGHT_PENDING:" + str(t3.status))
+    sys.exit(1)
 if t2.dispatched_at != old_stamp:
     print("T2_STAMP_MUTATED:" + str(t2.dispatched_at))
     sys.exit(1)
