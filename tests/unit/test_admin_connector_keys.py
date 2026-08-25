@@ -2,7 +2,8 @@
 
 `POST /v1/admin/workspaces/{workspace_id}/connector-keys` mints a
 narrowly-scoped key (`CONNECTOR_SCOPES` -- read catalog, manage
-competitors and matches -- never the full `BOOTSTRAP_SCOPES`) for a
+price comparisons, competitors and matches -- never the full
+`BOOTSTRAP_SCOPES`) for a
 store connector that lives in WordPress. `POST
 /v1/admin/api-keys/{key_id}/revoke` revokes any admin-minted key by id.
 Follows `test_admin_api_keys.py`'s fixtures exactly: `TestClient(app)`,
@@ -88,6 +89,7 @@ def test_connector_key_minted_with_narrow_scopes(admin_client, session, workspac
     assert body["api_key"].startswith(body["key_prefix"])
     key = _get_api_key(session, body["key_id"])
     assert key.scopes == CONNECTOR_SCOPES
+    assert "alerts:read" in key.scopes
     assert "jobs:write" not in key.scopes
     assert "webhooks:write" not in key.scopes
 

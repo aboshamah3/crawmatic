@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Matcher agent output record (one product, all competitors). Links only — price capture was removed from scope 2026-07-21.",
+  "type": "object",
+  "required": ["product_id", "sku", "tier", "matches"],
+  "properties": {
+    "product_id": {"type": "integer"},
+    "sku": {"type": "string"},
+    "tier": {"enum": ["A", "B", "C"]},
+    "matches": {
+      "type": "array",
+      "description": "exactly one entry per competitor domain in matching/competitors.json, in that order",
+      "items": {
+        "type": "object",
+        "required": ["competitor", "status", "confidence", "strategies_tried"],
+        "properties": {
+          "competitor": {"type": "string", "description": "competitor domain exactly as listed in competitors.json"},
+          "status": {"enum": ["matched", "no_match", "ambiguous", "error_transient"]},
+          "competitor_url": {"type": "string", "description": "canonical form; required when status=matched"},
+          "competitor_variant_identifier": {"type": "string", "description": "ASIN / Noon N…V code / Jarir product id"},
+          "external_title": {"type": "string", "description": "title exactly as shown on the competitor page"},
+          "competitor_variant_options": {"type": "object", "description": "e.g. {\"color\": \"Silver\", \"storage\": \"512GB\"}"},
+          "confidence": {"enum": ["high", "medium", "low", "gap"]},
+          "confidence_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "evidence": {"type": "string", "description": "what confirmed the match, e.g. 'MPN CE505A shown in specs table' or 'EAN 4960999904665 matches'"},
+          "note": {"type": "string", "description": "spec differences, variant-selector caveats, second candidate URL for ambiguous"},
+          "candidates": {
+            "type": "array",
+            "description": "only when status=ambiguous: the competing URLs",
+            "items": {"type": "string"}
+          },
+          "strategies_tried": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1, "maximum": 6},
+            "description": "which lookup strategies (1-6) were attempted, in order"
+          }
+        }
+      }
+    }
+  }
+}

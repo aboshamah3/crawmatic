@@ -1,0 +1,19 @@
+# Local-only upload exclusions for `railway up` (CLI directory upload).
+# Written 2026-08-20 by the pre-launch deploy phase. Keeps developer junk and
+# secrets out of the build context; mirrors .dockerignore for the big items.
+.git
+.venv
+venv
+node_modules
+matching
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.uv-cache
+.env
+.env.*
+.claude
+.agents
+*.log

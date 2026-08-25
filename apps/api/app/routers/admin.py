@@ -114,8 +114,11 @@ BOOTSTRAP_SCOPES: list[str] = [
     "domain_rules:write",
 ]
 
-#: What a store connector actually does (audit P0.3): read catalog, manage
-#: competitors and matches. Everything else in BOOTSTRAP_SCOPES —
+#: What a store connector actually does (audit P0.3): read catalog and price
+#: comparisons, manage competitors and matches. Price comparison routes are
+#: deliberately gated by `alerts:read`, so omitting it makes the plugin's
+#: engine-price refresh fail 403 after an otherwise successful pairing.
+#: Everything else in BOOTSTRAP_SCOPES —
 #: jobs/refresh_rules/webhooks/scrape_profiles/domain_rules writes — is
 #: SaaS-worker business and never belongs on a key that lives in WordPress.
 CONNECTOR_SCOPES: list[str] = [
@@ -125,6 +128,7 @@ CONNECTOR_SCOPES: list[str] = [
     "competitors:write",
     "matches:read",
     "matches:write",
+    "alerts:read",
 ]
 
 

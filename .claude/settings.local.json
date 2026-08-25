@@ -8,7 +8,8 @@
       "Bash(specify init *)",
       "Bash(gh auth *)",
       "Read(//srv/crawmatic/**)",
-      "Bash(grep -nE '^#{1,3} ' /srv/crawmatic/PROJECT_SPEC.md)"
+      "Bash(grep -nE '^#{1,3} ' /srv/crawmatic/PROJECT_SPEC.md)",
+      "Bash(cat *)"
     ]
   }
 }
