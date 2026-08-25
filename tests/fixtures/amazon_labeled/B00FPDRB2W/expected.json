@@ -1,0 +1,20 @@
+{
+  "asin": "B00FPDRB2W",
+  "price": null,
+  "currency": null,
+  "title_contains": "HP 828A LaserJet Image Drum",
+  "availability_expected": "unknown",
+  "extraction_method_expected": "CSS",
+  "expect_no_price": true,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/-/en/dp/B00FPDRB2W",
+    "captured_at_utc": "2026-08-25T17:26:57Z",
+    "market_locale": "en (forced via /-/en/ URL prefix; amazon.sa Saudi Arabia storefront)",
+    "full_page_sha256": "8c84afd0c6c15c353f354764b3a85762355a0d582bec2e429b9986858bc0df8e",
+    "full_page_bytes": 1052588,
+    "fixture_file_sha256": "0fa778b032f76e25b714018e08283e8a57232f1f20e59488bb5afa2bb092735d",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv",
+    "canary_cross_reference": "scrape_job_id=101bb01c-08eb-4c66-9883-50dea7d315ce (2026-08-24 canary); this ASIN also appears in request_attempts.csv there"
+  }
+}

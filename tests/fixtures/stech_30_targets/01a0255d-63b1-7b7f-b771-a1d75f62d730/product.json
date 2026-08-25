@@ -1,0 +1,64 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T16:38:10+03:00",
+ "description": "",
+ "handle": "hp-toner-original-207a-w2212a-yellowm255-m28-m283-1",
+ "id": 9278034051367,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 36000,
+ "price_max": 36000,
+ "price_min": 36000,
+ "price_varies": false,
+ "published_at": "2024-05-12T16:38:09+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "inventory_increased"
+ ],
+ "title": "HP Toner Original 207A/W2212A YellowM255/M28/M283",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/hp-toner-original-207a-w2212a-yellowm255-m28-m283-1",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "W2212A",
+   "compare_at_price": null,
+   "id": 48394325393703,
+   "inventory_management": "shopify",
+   "name": "HP Toner Original 207A/W2212A YellowM255/M28/M283",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 36000,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "10412",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "HP"
+}

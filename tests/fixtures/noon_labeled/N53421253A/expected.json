@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-b1f7-7842-95b5-1e496dbb67f5",
+  "sku_query": "N53421253A",
+  "observed_sku": "N53421253A",
+  "price": "165",
+  "currency": "SAR",
+  "title_contains": "712 3ED69A 29-ml Genuine Ink Cartridge w",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N53421253A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:42.962629+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "20daf975feea36e35c1b3bf612e7e814adcc7d146ad08c108f581cb64825c3c2",
+    "full_response_bytes": 12663,
+    "fixture_file_sha256": "e42a2bf7657e007c71b83c71828053396a85a51a95e54752832ac7089b28c070",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-b1f7-7842-95b5-1e496dbb67f5"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-63ed-7737-b36d-3895a556ae77",
+  "sku_query": "N70015390V",
+  "observed_sku": "N70015390V",
+  "price": "198.98",
+  "currency": "SAR",
+  "title_contains": "Original HP 78A Black LaserJet Toner Car",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N70015390V&page=1",
+    "captured_at_utc": "2026-08-25T21:48:44.833528+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "5dcf38e7f0fdb1bf36124a6769eed3f5ef83d4e09309a88629c72bed33457ae6",
+    "full_response_bytes": 10967,
+    "fixture_file_sha256": "95589605cdfb8b782a866813fbcb67c826a906f62a3996ef88bb04e090424b5e",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-63ed-7737-b36d-3895a556ae77"
+  }
+}

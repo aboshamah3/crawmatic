@@ -126,6 +126,151 @@ jobs:
           RLS_TEST_DATABASE_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
         run: uv run pytest tests/integration/test_rls_cross_workspace.py -v
 
+  tenant-isolation:
+    # READY-007 / P0.5. The `rls` job above proves isolation on two
+    # hand-picked tables. This one proves it on EVERY relation the
+    # reviewed manifest (scripts/rls_table_manifest.txt) classifies as
+    # tenant-owned, and on every monthly partition of each of them —
+    # because isolation has never failed uniformly here. It failed on
+    # the relations nobody enumerated: the eight monthly partitions that
+    # carried `workspace_id` with no RLS at all (2026-08-20 review).
+    #
+    # MANDATORY, and deliberately not `continue-on-error`. The job
+    # provisions the three production roles FROM SCRATCH via
+    # `scripts/provision_db_roles.sql` against an empty database, so a
+    # provisioning script that stops being runnable fails here rather
+    # than during a deploy.
+    #
+    # postgres:18-alpine, not the 17.5 image the `rls` job uses:
+    # production runs PostgreSQL 18.x, and role attributes, FORCE RLS
+    # and partition policy inheritance are exactly the surface where a
+    # major-version difference between CI and production is worth not
+    # having.
+    name: tenant-isolation (roles provisioned from zero + negative suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: checks
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: crawmatic_owner
+          POSTGRES_PASSWORD: ownerpw
+          POSTGRES_DB: crawmatic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crawmatic_owner -d crawmatic"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      # NO `cp .env.example .env` step, unlike every other job here, and
+      # that omission is the point: this suite must never resolve a DSN
+      # from `.env`. It takes exactly one URL — the throwaway service
+      # container's owner role — and derives the runtime roles itself.
+      # If a future edit makes it read `.env`, this job fails.
+
+      - name: Provision the three DB roles from zero
+        env:
+          PROVISION_DB_ROLES_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
+          MIGRATION_DATABASE_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
+          CRAWMATIC_APP_DB_PASSWORD: ci-app-pw
+          CRAWMATIC_AUTH_DB_PASSWORD: ci-auth-pw
+          CRAWMATIC_MIGRATE_DB_PASSWORD: ci-migrate-pw
+        run: |
+          uv run alembic upgrade head
+          uv run python scripts/provision_db_roles.py --provision
+
+      # Read-only. Diffs the live catalog against the reviewed manifest
+      # in both directions, so a migration that adds a table without
+      # annotating it, or drops a policy, fails CI here.
+      - name: Verify role + RLS posture against the reviewed manifest
+        env:
+          PROVISION_DB_ROLES_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
+        run: uv run python scripts/provision_db_roles.py --verify
+
+      - name: Negative tenant-isolation suite (every manifest relation)
+        env:
+          TENANT_ISOLATION_TEST_DATABASE_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
+        run: uv run pytest tests/integration/test_tenant_isolation_roles.py -v
+
+  dispatch-integrity:
+    # READY-002/READY-003/READY-004 (Phase B gate-fix MED-2). Before this job,
+    # the B1-B3b dispatch-identity matrix, the domain-certification suite, and
+    # the dispatch-stamping guard ran only on a reviewer's own box — nothing
+    # enforced them on the canonical branch. Item 2 of
+    # tests/integration/test_dispatch_replay_matrix.py is the one item in that
+    # matrix that needs a real, isolated Postgres (it asserts
+    # `uq_dispatch_intents_identity_key` under two concurrent transactions,
+    # something the fake-session items cannot express); without a reachable
+    # `B3_SCRATCH_DATABASE_URL` that item skips rather than degrading to a
+    # fake, silently downgrading the matrix from 16 items to 15 on any box
+    # without the scratch DB — this job is what keeps it running for real.
+    #
+    # postgres:18-alpine, same version pin as `tenant-isolation` above, for
+    # the same reason: production runs PostgreSQL 18.x.
+    name: dispatch-integrity (dispatch identity, replay matrix, certification)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: checks
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: crawmatic_owner
+          POSTGRES_PASSWORD: ownerpw
+          POSTGRES_DB: crawmatic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crawmatic_owner -d crawmatic"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      # Same reason as `checks`/`rls`/`compose-smoke`: the dispatch-stamping
+      # and certification suites spawn `app.workers`/`app.api` subprocesses
+      # that construct `Settings(env_file=".env")`.
+      - name: Seed local env from .env.example
+        run: cp .env.example .env
+
+      # Item 2 of the replay matrix (`test_dispatch_replay_matrix.py`) is the
+      # only test here that touches a real database — it creates and drops
+      # its own `scrape_jobs`/`scrape_job_targets`/`dispatch_intents` tables
+      # from ORM metadata, so it must only ever reach a throwaway database.
+      # Point it at the service container's owner role, never at `.env`'s
+      # DSN.
+      - name: Dispatch identity, replay matrix and domain certification suites
+        env:
+          B3_SCRATCH_DATABASE_URL: postgresql+psycopg://crawmatic_owner:ownerpw@127.0.0.1:5432/crawmatic
+        run: |
+          uv run pytest tests/integration/test_dispatch_stamping.py tests/integration/test_dispatch_replay_matrix.py tests/integration/test_domain_certification.py -q
+
   images:
     name: images (build every Dockerfile docker-compose.yml references)
     runs-on: ubuntu-latest
@@ -206,3 +351,63 @@ jobs:
       # above) and asserts all 8 components reach running/healthy.
       - name: Compose smoke test
         run: uv run pytest tests/integration/test_compose_smoke.py -v
+
+  # ── Release gate: secret scanning + credential-file check ────────────────
+  # EPA task W5.4 (READY-010, P0.8). Before this job the repo had no
+  # automated secret detection: the 2026-08-25 residue scan (A3) was a
+  # one-off run of a binary downloaded by hand, which catches what exists
+  # today and nothing that lands tomorrow.
+  #
+  # gitleaks is pinned by version AND by sha256. An unpinned `curl | tar`
+  # in a job whose whole purpose is supply-chain hygiene would be a joke at
+  # its own expense; `gitleaks-action` is deliberately not used because it
+  # requires a licence key for organisation accounts.
+  #
+  # Historical findings are baselined in .gitleaksignore (fingerprints, no
+  # values). The tree scan is therefore green on arrival and any NEW finding
+  # is a real one. On pull requests the job additionally scans the commits
+  # the PR introduces, which catches a secret that was added and then
+  # deleted again within the branch — invisible to a tree scan.
+  security:
+    name: security (secret scan, credential-file gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          # Full history: the pull-request diff scan below needs the base
+          # commit, and a shallow clone does not have it.
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$asset" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          echo "${GITLEAKS_SHA256}  ${asset}" | sha256sum -c -
+          tar xzf "$asset" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Secret scan — working tree
+        run: |
+          gitleaks dir . --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+      - name: Secret scan — commits introduced by this pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          gitleaks git . --config .gitleaks.toml --redact --no-banner --exit-code 1 \
+            --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+
+      # Mode `tracked`, not `host`: actions/checkout rewrites every file to
+      # 0644, so a permission check on a CI checkout would flag the entire
+      # tree and prove nothing. The question CI *can* answer is whether a
+      # credential-shaped file is committed at all. The on-disk permission
+      # sweep runs on the ops host from /etc/cron.d/crawmatic-dr.
+      - name: Credential-file gate (tracked files)
+        run: ./scripts/security/check_file_permissions.sh --mode tracked --root .

@@ -1,0 +1,64 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T16:31:16+03:00",
+ "description": "",
+ "handle": "canon-toner-original-black-ep-27-lbp-3200",
+ "id": 9278023401767,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 26450,
+ "price_max": 26450,
+ "price_min": 26450,
+ "price_varies": false,
+ "published_at": "2024-05-12T16:31:14+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "inventory_increased"
+ ],
+ "title": "Canon Toner Original Black EP-27 LBP 3200",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/canon-toner-original-black-ep-27-lbp-3200",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "EP-27",
+   "compare_at_price": null,
+   "id": 48394286924071,
+   "inventory_management": "shopify",
+   "name": "Canon Toner Original Black EP-27 LBP 3200",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 26450,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "10269",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "Canon"
+}

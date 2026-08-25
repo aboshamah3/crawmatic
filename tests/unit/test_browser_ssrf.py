@@ -225,3 +225,50 @@ def test_safe_navigation_does_not_mark_the_rejection_registry() -> None:
 
     assert result is False
     assert was_recently_rejected("never-rejected-host.example.com") is False
+
+
+# --- domain_profile_registry wiring (EPA B6b) --------------------------------
+
+
+def test_subresource_uses_registered_domain_profile_to_allow_a_certified_type() -> None:
+    """A sub-resource `resource_type` the default policy would otherwise
+    block (image/media/font/stylesheet) passes once its host's real
+    profile -- recovered from `domain_profile_registry`, exactly as
+    `generic_browser_price_spider._browser_request_for` populates it at
+    dispatch time -- certifies that type."""
+    from types import SimpleNamespace
+
+    from scrape_core.browser.domain_profile_registry import (
+        clear_domain_profile,
+        set_domain_profile,
+    )
+
+    set_domain_profile(
+        "certified-host.example.com", SimpleNamespace(certified_resources={"image"})
+    )
+    try:
+        request = _FakeRequest(
+            "https://certified-host.example.com/hero.jpg",
+            is_navigation=False,
+            resource_type="image",
+        )
+        result = asyncio.run(abort_unsafe_request(request, resolver=_resolver([_PUBLIC_IP])))
+        assert result is False
+    finally:
+        clear_domain_profile("certified-host.example.com")
+
+
+def test_subresource_on_an_unregistered_host_still_uses_the_default_policy() -> None:
+    """A host with no `domain_profile_registry` entry at all (never
+    dispatched in this process) must fall back to the plain default
+    policy -- fail-closed to blocking, never to allowing -- exactly as it
+    did before B6b's wiring landed."""
+    request = _FakeRequest(
+        "https://unregistered-host.example.com/hero.jpg",
+        is_navigation=False,
+        resource_type="image",
+    )
+
+    result = asyncio.run(abort_unsafe_request(request, resolver=_resolver([_PUBLIC_IP])))
+
+    assert result is True  # image is still blocked by default -- no certification found

@@ -22,13 +22,19 @@ resolve, and the ``rejection_registry`` side-channel a real abort needs
 so the browser errback can still recognize *why* the fetch failed —
 see below).
 
-**Scope**: the SSRF re-validation applies only to navigation/document
-requests (``request.is_navigation_request()`` or
-``resource_type == "document"``) — SSRF-relevant fetches are the page
-navigations themselves, not their assets. Sub-resources are subject only
-to the cost guard: image/media/font/stylesheet requests are aborted so
-they never transit the paid proxy (``_COST_BLOCKED_RESOURCE_TYPES``);
-script/xhr/fetch and every other type pass untouched.
+**Scope**: the resolved-IP SSRF re-validation applies only to
+navigation/document requests (``request.is_navigation_request()`` or
+``resource_type == "document"``) — that check requires a live DNS
+resolve, which only the one navigation per hop can justify. Sub-resource
+requests (EPA B6, `app_shared.profiles.browser_resource_policy`) instead
+go through :func:`~app_shared.profiles.browser_resource_policy.evaluate_request`:
+a cheap, no-DNS URL/redirect safety check
+(``app_shared.url_safety.validate_competitor_url``) FIRST, then the
+versioned cost/category block policy (image/media/font/stylesheet by
+resource type; ads/analytics/social by host, regardless of type) —
+never the reverse, so a "certified" resource type can never launder an
+unsafe URL through. Neither check marks the rejection registry for a
+sub-resource (see below) — only a navigation abort does.
 
 **Off-event-loop-thread resolve**: ``abort_unsafe_request`` runs as a
 native coroutine inside the same asyncio loop scrapy-playwright/
@@ -61,8 +67,12 @@ import logging
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from app_shared.profiles.browser_resource_policy import BLOCKLIST_VERSION as RESOURCE_POLICY_VERSION
+from app_shared.profiles.browser_resource_policy import evaluate_request as evaluate_resource_request
 from app_shared.url_safety import UnsafeUrlError
 
+from scrape_core.browser.domain_profile_registry import get_domain_profile
+from scrape_core.observability import log_event
 from scrape_core.safety.fetch import Resolver, system_resolver, validate_resolved_target
 from scrape_core.safety.rejection_registry import mark_rejected
 
@@ -78,17 +88,25 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["abort_unsafe_request"]
 
-#: Sub-resource types aborted for cost, not safety (PLAN_AMAZON_NOON_PRICING
-#: Phase 2): every browser fetch rides a paid residential proxy, and letting
-#: Chromium download images/CSS/fonts made an Amazon page cost 6.15 MB of
-#: proxy traffic when its HTML is ~1.3 MB. Price extraction never needs any
-#: of these (CSS *selectors* work without CSS *files*; JSON-LD/regex read the
-#: HTML). Deliberately NOT `script`/`xhr`/`fetch` — Amazon's price block only
-#: renders with JavaScript, so JS and its data calls must keep loading.
-#: These aborts never touch `rejection_registry`: marking the hostname would
-#: make `classify_exception` misread an ordinary asset abort as BLOCKED.
-_COST_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font", "stylesheet"})
-
+# EPA B6: sub-resource type/host-category cost blocking now lives in
+# `app_shared.profiles.browser_resource_policy` (versioned, tested,
+# certifiable per domain) -- this module no longer hardcodes a resource
+# type set of its own. See `evaluate_resource_request` below and that
+# module's docstring for the current default blocklist and the
+# PLAN_AMAZON_NOON_PRICING Phase 2 origin of the image/media/font/
+# stylesheet cost finding. These aborts never touch `rejection_registry`
+# here either: marking the hostname would make `classify_exception`
+# misread an ordinary asset abort as BLOCKED.
+#
+# EPA B6b: the sub-resource request's own hostname is looked up in
+# `scrape_core.browser.domain_profile_registry` (see that module's
+# docstring for why a registry, not a direct argument, is the only
+# available seam here) to recover the real resolved `ScrapeProfile` the
+# spider dispatched for that domain -- `generic_browser_price_spider.
+# _browser_request_for` populates it right before dispatch. A registry
+# miss (domain never dispatched in this process, or genuinely
+# unresolvable) returns `None`, which is `should_block`'s documented
+# default-policy value -- fail-closed to blocking, never to allowing.
 
 #: Real (blocking) system DNS resolver — the production default. Lives in
 #: :mod:`scrape_core.safety.fetch` so the browser guard and the off-reactor
@@ -127,9 +145,12 @@ async def abort_unsafe_request(request: "PlaywrightRequest", *, resolver: Resolv
 
     Wired as ``PLAYWRIGHT_ABORT_REQUEST`` (T031); called by scrapy-playwright
     for **every** Playwright request on **every** navigation hop (including
-    each redirect Chromium follows internally). Only navigation/document
-    requests are checked (`_is_navigation_request`) -- every other resource
-    type returns `False` immediately, no resolve attempted.
+    each redirect Chromium follows internally). Navigation/document
+    requests (`_is_navigation_request`) get the DNS-resolving resolved-IP
+    SSRF check below; every other (sub-resource) request instead goes
+    through :func:`~app_shared.profiles.browser_resource_policy.evaluate_request`
+    (EPA B6) -- a no-DNS URL-safety check, then the versioned cost/category
+    block policy, in that order (never the reverse).
 
     `resolver` is an injectable seam (defaults to the real
     :func:`_system_resolver`) purely for unit testing -- production wiring
@@ -149,10 +170,33 @@ async def abort_unsafe_request(request: "PlaywrightRequest", *, resolver: Resolv
     non-navigation request, returns `False`.
     """
     if not _is_navigation_request(request):
-        # Cost guard, not a safety guard: heavy static assets are aborted so
-        # they never transit the paid proxy (see _COST_BLOCKED_RESOURCE_TYPES
-        # for scope and why the rejection registry is never marked here).
-        return getattr(request, "resource_type", None) in _COST_BLOCKED_RESOURCE_TYPES
+        # EPA B6: cost/category guard, not a safety guard -- but
+        # `evaluate_request` itself runs a (cheap, no-DNS) URL-safety
+        # check FIRST, so a sub-resource request now also gets basic
+        # SSRF coverage it never had before this change (previously only
+        # navigations were checked at all). EPA B6b: `domain_profile` is
+        # now the real resolved profile for this request's own hostname,
+        # recovered from `domain_profile_registry` (see module docstring
+        # above and that module's own docstring) -- a registry miss
+        # yields `None`, `should_block`'s documented default-policy
+        # value, so an unresolved domain still runs the plain default
+        # blocklist rather than allowing anything extra through. The
+        # rejection registry is never marked here (see module docstring)
+        # -- an ordinary asset abort must not make `classify_exception`
+        # misread the page as BLOCKED.
+        sub_resource_type = getattr(request, "resource_type", None)
+        sub_resource_host = urlsplit(request.url).hostname
+        domain_profile = get_domain_profile(sub_resource_host)
+        blocked = evaluate_resource_request(request.url, sub_resource_type, domain_profile)
+        if blocked:
+            log_event(
+                logger,
+                "browser.request_blocked",
+                url=request.url,
+                resource_type=sub_resource_type,
+                policy_version=RESOURCE_POLICY_VERSION,
+            )
+        return blocked
 
     url = request.url
     host = urlsplit(url).hostname

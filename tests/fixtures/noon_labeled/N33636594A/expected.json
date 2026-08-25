@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-b253-7a40-9042-6d358d4576e3",
+  "sku_query": "N33636594A",
+  "observed_sku": "N33636594A",
+  "price": "55",
+  "currency": "SAR",
+  "title_contains": "912 Cyan Original Ink Cartridge 3YL77AE ",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N33636594A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:39.961923+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "aa985675e3a031c9927840c58ad5ca2834b33920e3a3982a63d583cc1918b2b0",
+    "full_response_bytes": 12092,
+    "fixture_file_sha256": "bf53ae8a4ff007de95ae37224827852441c5fc0b8ee8d6691907a34ccc011e48",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-b253-7a40-9042-6d358d4576e3"
+  }
+}

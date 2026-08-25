@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-b259-7ef9-9ec2-cda7c0701735",
+  "sku_query": "N33636313A",
+  "observed_sku": "N33636313A",
+  "price": "55",
+  "currency": "SAR",
+  "title_contains": "912XL High Yield Original Ink Cartridge ",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N33636313A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:39.361749+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "eb580ae1bf29502e8390ffd07fe8b3884ae6f591a962b2f43678f987dda2882c",
+    "full_response_bytes": 13170,
+    "fixture_file_sha256": "521946ad87eb712b6dcd367cb68d48fea7fe5e0588eefb2db08cb1e0be21a283",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-b259-7ef9-9ec2-cda7c0701735"
+  }
+}

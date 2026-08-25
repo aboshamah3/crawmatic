@@ -222,6 +222,19 @@ class Settings(BaseSettings):
     # Phase 1). Doubles as the pacing floor: a still-deferred batch can
     # actually re-POST at most once per TTL window.
     SCRAPYD_DISPATCH_GUARD_TTL_SECONDS: int = 900
+    # EPA B1: pass the dispatch intent's id to Scrapyd as ``schedule.json``'s
+    # optional ``jobid`` field, so the remote run's identity equals our
+    # durable intent's and an interrupted dispatch can be reconciled by
+    # lookup rather than by listing a node and guessing. Capability-detected
+    # on purpose — support landed in Scrapyd 1.2 and some builds reject
+    # unknown form fields. B3 Step 0's live check (see
+    # ``app_shared.scrapyd.client._DETERMINISTIC_JOBID_SETTING``) proved the
+    # deployed Scrapyd 1.6.0 honours it verbatim, so this now defaults ON
+    # (EPA B3b): with it off, a run that has already started (left the
+    # pending queue) is uncorrelatable and `reconcile_inflight` can only
+    # answer AMBIGUOUS, not adopt it. A node that ignores the field simply
+    # answers with its own jobid, which is recorded exactly as before.
+    SCRAPYD_DETERMINISTIC_JOBID: bool = True
     # How many times one target may be handed back DEFERRED before it is
     # called a terminal FAILED (2026-08-03; consumed by the scraping
     # runtime's defer-budget helper). DEFERRED is non-terminal, so without
@@ -341,6 +354,32 @@ class Settings(BaseSettings):
     SCRAPE_MEMUSAGE_LIMIT_MB: int = 1024
     SCRAPE_MEMUSAGE_WARNING_MB: int = 512
     SCRAPE_MEMUSAGE_CHECK_INTERVAL_SECONDS: int = 30
+
+    # --- Per-response download bounds (READY-013-c response-bomb cap,
+    # Principle IV — env-tunable, never a hardcoded literal in the Scrapy
+    # settings modules). Scrapy applies DOWNLOAD_MAXSIZE in three places,
+    # so one knob closes all three response-bomb shapes at once:
+    #
+    #   * a declared ``Content-Length`` above the cap  -> refused before
+    #     a single body byte is fetched (``_ScrapyAgent``),
+    #   * a ``Content-Length`` that *lies* low, or a chunked stream that
+    #     never ends -> the connection is cancelled the moment the bytes
+    #     actually received cross the cap (``_ResponseReader``),
+    #   * a small gzip/br/deflate body that inflates without bound ->
+    #     aborted mid-inflate (``HttpCompressionMiddleware`` /
+    #     ``_DecompressionMaxSizeExceeded``), so the bomb is never
+    #     materialized in memory.
+    #
+    # Scrapy's own default is 1 GiB, which is not a bound for a price
+    # scraper: one hostile competitor page could exhaust the spider
+    # process. 8 MiB is ~20x the largest real product page observed
+    # (~400 KB) — heavy legitimate pages are never touched. The warn mark
+    # only logs, giving a signal before the cap ever bites.
+    SCRAPE_DOWNLOAD_MAXSIZE_BYTES: int = 8 * 1024 * 1024
+    SCRAPE_DOWNLOAD_WARNSIZE_BYTES: int = 2 * 1024 * 1024
+    # Wall-clock companion to the byte cap: a slow-loris body that stays
+    # under the cap forever is still an unbounded download without it.
+    SCRAPE_DOWNLOAD_TIMEOUT_SECONDS: int = 60
 
     # --- Price-analysis recompute dedup (SPEC-09 FR-012, FR-015, D4, D7 —
     # DB/env-tunable, never a hardcoded literal, Principle IV). TTL on the

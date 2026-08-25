@@ -210,6 +210,13 @@ def _adapter_error_code(outcome: AdapterOutcome) -> ScrapeErrorCode:
         return ScrapeErrorCode.NOT_LISTED
     if outcome is AdapterOutcome.IDENTITY_MISMATCH:
         return ScrapeErrorCode.IDENTITY_MISMATCH
+    # EPA B4: an otherwise valid product response whose variant identity
+    # could not be resolved (ambiguous, or the identifiers name another
+    # product). A FAILURE, deliberately not NOT_LISTED -- the match is
+    # flagged NEEDS_REVIEW in the A6 match_audit_classifications sidecar
+    # rather than being silently written off as delisted.
+    if outcome is AdapterOutcome.IDENTITY_UNRESOLVED:
+        return ScrapeErrorCode.IDENTITY_UNRESOLVED
     return ScrapeErrorCode.PRICE_NOT_FOUND
 
 # Re-exported so every pre-SPEC-14 import site (this module's own test
@@ -704,6 +711,13 @@ class GenericPriceSpider(scrapy.Spider):
                 ),
                 final_url=adapter_result.final_url,
                 identity_validation_result=adapter_result.identity.status.value,
+                # EPA B6 (folded-in item 2): carry a B4 adapter's
+                # Ambiguous/IdentityIncompatible needs_review flag through
+                # to the persistence pipeline's NEEDS_REVIEW sidecar
+                # upsert (`adapter_result.metadata` defaults to `{}` for
+                # every other outcome, so this is `False` unless the
+                # adapter explicitly set it).
+                needs_review=bool(adapter_result.metadata.get("needs_review", False)),
                 **_strategy_handoff_kwargs(
                     target,
                     error_code,

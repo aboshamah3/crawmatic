@@ -76,20 +76,26 @@ loses only its own batch, never blocks or wedges subsequent flushes.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from twisted.internet.defer import Deferred, DeferredList
 from twisted.internet.task import LoopingCall
 from twisted.python.failure import Failure
 
-from app_shared.catalog.upsert import dedup_last_wins
 from app_shared.config import get_settings
-from app_shared.enums import MethodType, ScrapeErrorCode, ScrapeTargetStatus, StockStatus
+from app_shared.enums import (
+    MatchClassificationState,
+    MethodType,
+    ScrapeErrorCode,
+    ScrapeTargetStatus,
+    StockStatus,
+)
 from app_shared.ids import new_uuid7
 from app_shared.jobs.cancellation import LATE_AFTER_CANCEL_REASON, cancelled_scrape_job_ids
 from app_shared.jobs.targets import mark_target
@@ -157,6 +163,168 @@ def _current_price_key(row: dict[str, Any]) -> tuple[Any, Any]:
     return (row["workspace_id"], row["match_id"])
 
 
+# READY-013-g. `match_current_prices` is a projection of the observation
+# stream, and jobs do not finish in the order they started: a slow
+# spider, a retried attempt or a re-queued batch routinely lands a result
+# *after* a newer scrape of the same match has already been projected.
+# Nothing below is about cancellation (that is the A2 fence, which
+# refuses a cancelled job's result outright) -- this is the ordinary,
+# never-cancelled straggler, and without a guard it wins the projection
+# purely by committing last, silently walking the customer-visible price
+# backwards in time.
+#
+# The guard is a compare-and-set evaluated by Postgres *inside* the
+# UPDATE, deliberately not a read-then-write in Python: two workers
+# flushing concurrently would both read the same stored row, both
+# conclude they are newer, and the later COMMIT would still win. As an
+# `ON CONFLICT ... DO UPDATE ... WHERE`, a losing writer's UPDATE simply
+# matches no row -- no error, no retry, no lost newer truth.
+#
+# Tie-break at an identical `scraped_at` (two attempts stamped the same
+# instant): the larger `observation_id` wins. Ids are uuid7, so that is
+# "the observation issued later", and it is total and deterministic
+# rather than statement-order-dependent. The out-of-stock statement
+# carries no `observation_id` (it must not overwrite that column,
+# FR-014), so `excluded.observation_id IS NOT NULL` makes it lose every
+# tie instead of comparing against NULL -- also deterministic, and in the
+# safe direction (the row keeps its last known price).
+def _monotonic_conflict_where(stmt: Any) -> Any:
+    excluded = stmt.excluded
+    return or_(
+        MatchCurrentPrice.scraped_at < excluded.scraped_at,
+        and_(
+            MatchCurrentPrice.scraped_at == excluded.scraped_at,
+            excluded.observation_id.isnot(None),
+            or_(
+                MatchCurrentPrice.observation_id.is_(None),
+                MatchCurrentPrice.observation_id < excluded.observation_id,
+            ),
+        ),
+    )
+
+
+def _observation_order(row: dict[str, Any]) -> tuple[Any, bool, Any]:
+    """Sort key mirroring `_monotonic_conflict_where`, for the batch-local collapse.
+
+    The same ordering has to be applied twice: once by Postgres, against
+    the row already stored, and once here, against the other rows in this
+    very batch (which never reach the conflict arbiter -- Postgres
+    rejects two rows hitting one arbiter inside a single statement, so
+    the batch must collapse to one row per match *before* it is sent).
+    Collapsing by list position instead would let a stale item that
+    merely sits later in the buffer beat a fresher one.
+    """
+    observation_id = row.get("observation_id")
+    return (row["scraped_at"], observation_id is not None, observation_id)
+
+
+def _dedup_newest_wins(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse to one row per match, keeping the newest observation.
+
+    Stable in first-appearance order (like ``dedup_last_wins``, which
+    this replaces here) so the emitted statement's row order stays
+    deterministic -- only *which* row survives each key changes.
+    """
+    position_by_key: dict[tuple[Any, Any], int] = {}
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        key = _current_price_key(row)
+        position = position_by_key.get(key)
+        if position is None:
+            position_by_key[key] = len(result)
+            result.append(row)
+        elif _observation_order(row) > _observation_order(result[position]):
+            result[position] = row
+    return result
+
+
+#: EPA B6 (folded-in item 2). Distinct from the offline batch classifier's
+#: own `scripts/classify_match_set.py::CLASSIFIER_VERSION` ("1") -- this
+#: writer's evidence is per-attempt and automatic, from the live scrape
+#: path, never a full-match-set audit run's evidence, so the two must
+#: never be silently conflated by sharing one version tag.
+_NEEDS_REVIEW_CLASSIFIER_VERSION = "live-scrape-b6-needs-review-1"
+
+
+def _write_needs_review_classifications(
+    session: Any, match_ids: list[Any], *, effective_at: datetime
+) -> None:
+    """Append-only NEEDS_REVIEW write for the live scrape path (EPA B4/B6).
+
+    B4's adapter sets `metadata={"needs_review": True}` on an
+    `Ambiguous`/`IdentityIncompatible` variant resolution
+    (`scrape_core.adapters.variant_resolution`), carried through as
+    `ScrapeResult.needs_review` by the spiders' `_build_result` ->
+    `build_scrape_result`. Nothing wrote it to the versioned
+    `match_audit_classifications` sidecar (A6, `b8f3d61c9e02`) on the
+    live scrape path until this function.
+
+    Mirrors A6's own writer, `scripts/classify_match_set.py::
+    apply_classifications`, exactly: bulk-supersede whichever row is
+    currently CURRENT for each affected match (`superseded_at IS
+    NULL`), then bulk-insert one fresh `NEEDS_REVIEW` row per match --
+    one batched SELECT, one batched UPDATE, one executemany-batched
+    INSERT, never a per-match round trip. Called from inside
+    `_flush_batch`'s existing `workspace_txn` transaction -- no second
+    `run_in_thread`/reactor hop, same as every other write in that
+    function.
+
+    Unconditional per match (never checks whether the current row is
+    already `NEEDS_REVIEW`): a second needs-review attempt is still a
+    new piece of evidence, and A6's model is append-only by design (see
+    `app_shared.models.match_audit.MatchAuditClassification`'s
+    docstring) -- superseding an identical-state row and inserting a
+    fresh one is the correct behavior, not redundant churn.
+
+    Does NOT reclassify a match back to `ACTIVE`/other states on a
+    later success -- that reconciliation is the offline batch
+    classifier's job (`scripts/classify_match_set.py`), deliberately
+    out of scope for this live, single-purpose writer.
+    """
+    existing_rows = session.execute(
+        text(
+            "SELECT match_id FROM match_audit_classifications "
+            "WHERE superseded_at IS NULL AND match_id = ANY(:match_ids)"
+        ),
+        {"match_ids": match_ids},
+    ).all()
+    to_supersede = [row.match_id for row in existing_rows]
+    if to_supersede:
+        session.execute(
+            text(
+                "UPDATE match_audit_classifications SET superseded_at = :now "
+                "WHERE superseded_at IS NULL AND match_id = ANY(:match_ids)"
+            ),
+            {"now": effective_at, "match_ids": to_supersede},
+        )
+
+    insert_params = [
+        {
+            "id": new_uuid7(),
+            "match_id": match_id,
+            "state": MatchClassificationState.NEEDS_REVIEW.value,
+            "classifier_version": _NEEDS_REVIEW_CLASSIFIER_VERSION,
+            "evidence": json.dumps({"source": "live_scrape_pipeline"}),
+            "reviewer": None,
+            "effective_at": effective_at,
+        }
+        for match_id in match_ids
+    ]
+    session.execute(
+        text(
+            """
+            INSERT INTO match_audit_classifications
+                (id, match_id, state, classifier_version, evidence, reviewer,
+                 effective_at, superseded_at)
+            VALUES
+                (:id, :match_id, :state, :classifier_version,
+                 CAST(:evidence AS jsonb), :reviewer, :effective_at, NULL)
+            """
+        ),
+        insert_params,
+    )
+
+
 def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     """Persist one batch in a single transaction (runs inside ``run_in_thread``).
 
@@ -213,9 +381,17 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     attempts: list[RequestAttempt] = []
     current_price_rows: list[dict[str, Any]] = []
     out_of_stock_rows: list[dict[str, Any]] = []
-    # Which of the two upserts a given (workspace_id, match_id) was last
-    # touched by, in batch order -- see the split just below the loop.
-    last_row_kind: dict[tuple[Any, Any], str] = {}
+    # Which of the two upserts owns a given (workspace_id, match_id) --
+    # decided by the NEWEST observation for that match (READY-013-g), not
+    # by batch order; see the split just below the loop.
+    winning_row_kind: dict[tuple[Any, Any], tuple[tuple[Any, bool, Any], str]] = {}
+
+    def _claim(row: dict[str, Any], kind: str) -> None:
+        key = _current_price_key(row)
+        order = _observation_order(row)
+        current = winning_row_kind.get(key)
+        if current is None or order > current[0]:
+            winning_row_kind[key] = (order, kind)
 
     for item in batch:
         observation_id = new_uuid7()
@@ -267,6 +443,11 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 success=item.success,
                 error_code=item.error_code,
                 error_message=item.error_message,
+                # EPA B6: transport-observed byte accounting -- both
+                # default `None` ("not measured for this attempt"), never
+                # coerced to 0 (see the columns' own docstrings).
+                main_document_bytes=item.main_document_bytes,
+                subresource_bytes=item.subresource_bytes,
             )
         )
         if item.success:
@@ -290,7 +471,7 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                     "scraped_at": moment,
                 }
             )
-            last_row_kind[(item.workspace_id, item.match_id)] = "success"
+            _claim(current_price_rows[-1], "success")
         elif item.stock_status == StockStatus.OUT_OF_STOCK:
             # 2026-08-09 (problem 4): a failure that knows *why* there was
             # no price -- the product is unavailable on the competitor's
@@ -315,22 +496,25 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                     "scraped_at": moment,
                 }
             )
-            last_row_kind[(item.workspace_id, item.match_id)] = "out_of_stock"
+            _claim(out_of_stock_rows[-1], "out_of_stock")
 
     # One match can produce both kinds within a single batch (a retried
     # attempt that finally found a price after an out-of-stock miss, or the
-    # reverse). `dedup_last_wins` only collapses *within* a list, so the
+    # reverse). The collapse below only works *within* a list, so the
     # loser kind is dropped here first -- otherwise the two INSERTs would
-    # both hit the same conflict arbiter and the second, possibly staler,
-    # one would win purely by statement order.
+    # both hit the same conflict arbiter and the second one would win
+    # purely by statement order. READY-013-g: the winner is the match's
+    # newest observation, not whichever kind appeared last in the batch.
     if current_price_rows and out_of_stock_rows:
         current_price_rows = [
-            row for row in current_price_rows if last_row_kind[_current_price_key(row)] == "success"
+            row
+            for row in current_price_rows
+            if winning_row_kind[_current_price_key(row)][1] == "success"
         ]
         out_of_stock_rows = [
             row
             for row in out_of_stock_rows
-            if last_row_kind[_current_price_key(row)] == "out_of_stock"
+            if winning_row_kind[_current_price_key(row)][1] == "out_of_stock"
         ]
 
     affected_job_ids: dict[Any, None] = {}  # insertion-ordered de-dup set
@@ -429,12 +613,15 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             # to the last-wins row per (workspace_id, match_id) so the single
             # multi-row INSERT never targets the same conflict arbiter twice
             # (Postgres rejects that within one statement).
-            deduped = dedup_last_wins(current_price_rows, key_fn=_current_price_key)
+            deduped = _dedup_newest_wins(current_price_rows)
             stmt = pg_insert(MatchCurrentPrice).values(list(deduped))
             set_ = {col: stmt.excluded[col] for col in _CURRENT_PRICE_UPDATABLE_COLUMNS}
             set_["updated_at"] = func.now()
             stmt = stmt.on_conflict_do_update(
-                index_elements=["workspace_id", "match_id"], set_=set_
+                index_elements=["workspace_id", "match_id"],
+                set_=set_,
+                # READY-013-g: a late job never overwrites newer truth.
+                where=_monotonic_conflict_where(stmt),
             )
             session.execute(stmt)
 
@@ -442,7 +629,7 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             # Same upsert shape as above, narrowed update set: an existing
             # row keeps its last known price and only learns that the
             # product is now unavailable (2026-08-09, problem 4).
-            deduped_oos = dedup_last_wins(out_of_stock_rows, key_fn=_current_price_key)
+            deduped_oos = _dedup_newest_wins(out_of_stock_rows)
             oos_stmt = pg_insert(MatchCurrentPrice).values(list(deduped_oos))
             oos_set = {
                 col: oos_stmt.excluded[col]
@@ -450,7 +637,11 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             }
             oos_set["updated_at"] = func.now()
             oos_stmt = oos_stmt.on_conflict_do_update(
-                index_elements=["workspace_id", "match_id"], set_=oos_set
+                index_elements=["workspace_id", "match_id"],
+                set_=oos_set,
+                # Same guard: a stale "unavailable" must not overwrite a
+                # newer in-stock observation's availability either.
+                where=_monotonic_conflict_where(oos_stmt),
             )
             session.execute(oos_stmt)
 
@@ -567,6 +758,20 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 error_code=None if item.success else item.error_code,
             )
             affected_job_ids[item.scrape_job_id] = None
+
+        # EPA B6 (folded-in item 2): live NEEDS_REVIEW sidecar wiring.
+        # A fenced (late-after-cancel) item wrote no observation and its
+        # attempt was rejected outright above -- it drives no
+        # classification either. Deduped via a plain dict-as-ordered-set
+        # (a batch can carry more than one attempt for the same match).
+        needs_review_match_ids: dict[Any, None] = {}
+        for index, item in enumerate(batch):
+            if item.needs_review and index not in fenced_items:
+                needs_review_match_ids[item.match_id] = None
+        if needs_review_match_ids:
+            _write_needs_review_classifications(
+                session, list(needs_review_match_ids), effective_at=datetime.now(UTC)
+            )
 
         # --- post-commit follow-ups, recorded IN this transaction --------
         #

@@ -1,0 +1,57 @@
+# gitleaks baseline — fingerprints of findings that existed BEFORE the secret
+# scanning gate was added (EPA task W5.4 / READY-010 step 4, 2026-08-25).
+#
+# A fingerprint is `file:rule-id:line`. NO SECRET VALUE IS RECORDED HERE, and
+# all scans that produced it ran with --redact.
+#
+# Every entry below was assessed in the 2026-08-25 secret residue scan
+# (/srv/crawmatic/evidence/secret-scan-2026-08-25.md, EPA task A3) and in the
+# W5.4 re-scan as one of:
+#   * scraped competitor HTML kept as a parser test fixture — the keys in it
+#     belong to the scraped site's own front-end JavaScript, not to Crawmatic;
+#   * a deliberately synthetic secret corpus used to TEST secret detection
+#     (e.g. app/src/security/secretsSweep.test.ts);
+#   * a documentation, plan or transcript file quoting a placeholder.
+#
+# This baseline was generated from TRACKED FILES ONLY. Untracked and ignored
+# files (a real local .env, for instance) are deliberately absent: baselining
+# one would mean the gate stayed silent if that file were ever committed.
+#
+# Adding a line here is a decision, not a chore. If a NEW finding appears,
+# fix it — do not append it.
+
+SCRAPER_BLOCKER_RESILIENCE_IMPLEMENTATION_REPORT_2026-08-24.md:generic-api-key:236
+specs/010-access-policies-proxies/plan.md:generic-api-key:91
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:2285
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:2360
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:3340
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:3413
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:3469
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:3530
+tests/fixtures/competitors/afaqalhasoob.com/product.html:gcp-api-key:4331
+tests/fixtures/competitors/alshamel.sa/product.html:gcp-api-key:836
+tests/fixtures/competitors/amwajest.com/product.html:gcp-api-key:1223
+tests/fixtures/competitors/extra.com/product.html:gcp-api-key:183
+tests/fixtures/competitors/extra.com/product.html:gcp-api-key:185
+tests/fixtures/competitors/extra.com/product.html:generic-api-key:268
+tests/fixtures/competitors/extra.com/product.html:generic-api-key:320
+tests/fixtures/competitors/extra.com/product.html:generic-api-key:356
+tests/fixtures/competitors/fqtoners.com/product.html:gcp-api-key:1570
+tests/fixtures/competitors/jarir.com/product.html:generic-api-key:646
+tests/fixtures/competitors/pcpalace.com.sa/product.html:gcp-api-key:2730
+tests/fixtures/competitors/pcpalace.com.sa/product.html:gcp-api-key:458
+tests/fixtures/competitors/pcpalace.com.sa/product.html:gcp-api-key:4618
+tests/fixtures/competitors/pcpalace.com.sa/product.html:gcp-api-key:4674
+tests/fixtures/competitors/pcpalace.com.sa/product.html:gcp-api-key:4735
+tests/fixtures/competitors/rawand.com.sa/product.html:generic-api-key:1964
+tests/fixtures/competitors/rawand.com.sa/product.html:generic-api-key:2995
+tests/fixtures/competitors/rawand.com.sa/product.html:generic-api-key:3426
+tests/fixtures/competitors/rawand.com.sa/product.html:generic-api-key:3482
+tests/fixtures/competitors/rawand.com.sa/product.html:generic-api-key:3543
+tests/fixtures/competitors/rowadalahbar.com/product.html:gcp-api-key:715
+tests/fixtures/competitors/stech.ink/product.html:generic-api-key:2023
+tests/fixtures/competitors/stech.ink/product.html:generic-api-key:216
+tests/fixtures/competitors/stech.ink/product.html:generic-api-key:2362
+tests/unit/test_api_key_security.py:generic-api-key:39
+tests/unit/test_impersonate_transport.py:dataimpulse-proxy-url-creds:88
+tests/unit/test_impersonate_transport.py:dataimpulse-sticky-username-with-secret:88

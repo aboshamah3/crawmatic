@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-63d6-798b-b468-4e953935e0c1",
+  "sku_query": "N70006961V",
+  "observed_sku": "N70006961V",
+  "price": "353.77",
+  "currency": "SAR",
+  "title_contains": "415A Original LaserJet Toner Cartridge (",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N70006961V&page=1",
+    "captured_at_utc": "2026-08-25T21:48:44.233360+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "e815e1b7bda61f249727d6d7072dce6984ffb38b49a00c9c85bd0ae63ada1c11",
+    "full_response_bytes": 11411,
+    "fixture_file_sha256": "59d909a6068c433303e7f4ddf3cce25ec78d1e72320ef02facee3944b4fdbc32",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-63d6-798b-b468-4e953935e0c1"
+  }
+}

@@ -1,0 +1,62 @@
+{
+ "available": false,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T16:28:17+03:00",
+ "description": "",
+ "handle": "canon-toner-original-ep-22-lbp200-250-350-800-810-lbp1110-1120-1100a-1101-3200",
+ "id": 9278018847015,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 25300,
+ "price_max": 25300,
+ "price_min": 25300,
+ "price_varies": false,
+ "published_at": "2024-05-12T16:28:16+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [],
+ "title": "Canon Toner Original EP-22 LBP200/250/350/800/810/LBP1110/1120/1100A/1101/3200",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/canon-toner-original-ep-22-lbp200-250-350-800-810-lbp1110-1120-1100a-1101-3200",
+ "variants": [
+  {
+   "available": false,
+   "barcode": "R94-2002-250",
+   "compare_at_price": null,
+   "id": 48394272014631,
+   "inventory_management": "shopify",
+   "name": "Canon Toner Original EP-22 LBP200/250/350/800/810/LBP1110/1120/1100A/1101/3200",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 25300,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "10205",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "Canon"
+}

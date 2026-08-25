@@ -1,0 +1,20 @@
+{
+  "asin": "B001E90EPM",
+  "price": null,
+  "currency": null,
+  "title_contains": "SCX-R6555A",
+  "availability_expected": "unknown",
+  "extraction_method_expected": "CSS",
+  "expect_no_price": true,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/-/en/dp/B001E90EPM",
+    "captured_at_utc": "2026-08-25T17:26:56Z",
+    "market_locale": "en (forced via /-/en/ URL prefix; amazon.sa Saudi Arabia storefront)",
+    "full_page_sha256": "481628c4be4edc922f25878d89d1b88eca83ebd1c6454784b92a5277c2f3a1d3",
+    "full_page_bytes": 309949,
+    "fixture_file_sha256": "955fbd6ff6427fe99a9e0fef82c0083aa52dbed9ece827021095761d61b5cb44",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv",
+    "canary_cross_reference": "scrape_job_id=101bb01c-08eb-4c66-9883-50dea7d315ce (2026-08-24 canary); this ASIN also appears in request_attempts.csv there"
+  }
+}

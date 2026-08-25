@@ -2,9 +2,30 @@
 
 ``POST /v1/auth/login`` / ``POST /v1/auth/refresh`` / ``POST /v1/auth/logout``.
 All failures use the uniform auth error (``app.errors``) — no factor
-disclosure (FR-006). Credential lookups on RLS'd tables (``users``) run
-through the BYPASSRLS ``get_auth_session()`` path (research D4) since they
-inherently occur before any workspace context exists.
+disclosure (FR-006). Credential lookups on RLS'd tables (``users``,
+``refresh_tokens``) run through the BYPASSRLS ``get_auth_session()`` path
+(research D4) since they inherently occur before any workspace context
+exists.
+
+READY-007 / P0.5 (EPA B8b): ``refresh_tokens`` gained transitive RLS
+through ``users.user_id`` at alembic head ``b6d94c2f1a70``, so the three
+statements this module issues against it — issue, rotate, revoke — moved
+off the ordinary ``get_session()`` app-role connection and onto the auth
+seam. None of them can run under a workspace context, and that is a
+property of the flows, not an oversight:
+
+* **rotate** (``POST /refresh``) and **revoke** (``POST /logout``) are
+  keyed by an unforgeable ``token_hash`` and resolve the principal — no
+  ``app.workspace_id`` exists yet to scope them with. Under the new
+  policy the app role would match zero rows and every refresh and logout
+  would fail closed as "wrong credentials".
+* **issue** (``_issue_pair``) knows the user, but a ``SUPER_ADMIN`` has
+  ``workspace_id IS NULL`` and therefore satisfies no policy context at
+  all — the INSERT's ``WITH CHECK`` could never pass for one.
+
+The RLS policy is thus a confinement of ``crawmatic_app`` (which now has
+no reason to touch this table) rather than a filter any auth path relies
+on.
 """
 
 from __future__ import annotations
@@ -16,7 +37,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 
 from app_shared.config import get_settings
-from app_shared.database import get_auth_session, get_session
+from app_shared.database import get_auth_session
 from app_shared.enums import UserStatus, WorkspaceStatus
 from app_shared.models import RefreshToken, User, Workspace
 from app_shared.redis_client import get_redis_client
@@ -74,10 +95,12 @@ def _issue_pair(*, user: User) -> TokenPairResponse:
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=settings.REFRESH_TOKEN_TTL_SECONDS)
 
-    # refresh_tokens carries NO RLS (reachable only by unforgeable
-    # token_hash) — the ordinary app-role session is sufficient, no
-    # workspace context needed for this insert.
-    with get_session() as session:
+    # refresh_tokens carries transitive RLS through users.user_id
+    # (b6d94c2f1a70). This INSERT runs with no workspace context — and
+    # cannot be given one, since a SUPER_ADMIN's `workspace_id` is NULL
+    # — so it goes through the sanctioned BYPASSRLS auth seam, like the
+    # credential lookups above it.
+    with get_auth_session() as session:  # noqa: workspace-scope
         session.add(
             RefreshToken(
                 user_id=user.id,
@@ -154,7 +177,14 @@ def refresh(payload: RefreshRequest) -> TokenPairResponse:
     # Atomic single-statement rotation (research D3): one row -> this
     # caller won the race; zero rows -> already rotated/expired/revoked
     # (covers FR-009/FR-010/FR-011) -> uniform 401.
-    with get_session() as session:
+    #
+    # PRE-AUTH: the presented hash is the only thing known about this
+    # request; no principal, and therefore no `app.workspace_id`, exists
+    # yet. Under refresh_tokens' transitive RLS (b6d94c2f1a70) the
+    # app-role session would match zero rows here and every refresh
+    # would fail closed as a bad token, so this runs on the BYPASSRLS
+    # auth seam — the same carve-out the login lookup uses.
+    with get_auth_session() as session:  # noqa: workspace-scope
         row = session.execute(
             text(ROTATE_REFRESH_TOKEN_SQL), {"token_hash": presented_hash}
         ).mappings().first()
@@ -183,7 +213,11 @@ def refresh(payload: RefreshRequest) -> TokenPairResponse:
 @router.post("/logout", status_code=204)
 def logout(payload: LogoutRequest) -> None:
     presented_hash = hash_token(payload.refresh_token)
-    with get_session() as session:
+    # Same pre-auth shape as the rotation above: keyed by token_hash
+    # alone, with no workspace context to scope it with -> auth seam.
+    # A logout that silently revoked nothing would leave a live token
+    # outstanding while answering 204.
+    with get_auth_session() as session:  # noqa: workspace-scope
         session.execute(text(REVOKE_REFRESH_TOKEN_SQL), {"token_hash": presented_hash})
         session.commit()
     # Idempotent: 0 rows affected (already revoked/unknown) still -> 204.

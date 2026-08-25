@@ -142,7 +142,7 @@ def test_api_keys_key_prefix_is_indexed() -> None:
     )
 
 
-# --- RefreshToken: user-owned, no RLS, created_at only -----------------
+# --- RefreshToken: user-owned, transitive RLS, created_at only ---------
 
 
 def test_refresh_tokens_table_name_and_columns() -> None:

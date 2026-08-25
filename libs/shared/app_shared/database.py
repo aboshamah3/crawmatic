@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -44,6 +44,45 @@ _auth_engine: Engine | None = None
 _auth_sessionmaker: sessionmaker[Session] | None = None
 _system_engine: Engine | None = None
 _system_sessionmaker: sessionmaker[Session] | None = None
+
+
+def _reset_workspace_context(dbapi_connection, connection_record, connection_proxy) -> None:
+    """Clear ``app.workspace_id`` as a connection leaves the pool for a caller.
+
+    READY-007 / P0.5. Every workspace context this codebase sets is
+    transaction-local (:func:`set_workspace_context` passes
+    ``is_local=true``), and a ``SET LOCAL`` cannot outlive its
+    transaction. That is the first line of defence and it holds today.
+
+    This is the second line, and it exists because the failure it
+    prevents is silent and total. A plain ``SET app.workspace_id`` —
+    one stray statement, in a migration helper, a debugging session, a
+    library — is **session**-scoped, and a session-scoped GUC survives
+    ``ROLLBACK``, which is exactly what SQLAlchemy's default
+    ``reset_on_return`` issues at check-in. The connection then goes
+    back to the pool still carrying one tenant's context and is handed
+    to the next request, which may be another tenant's. RLS would be
+    working perfectly and still return the wrong workspace's rows,
+    because the predicate is only ever as good as the GUC it reads.
+
+    ``RESET`` is issued on **checkout** rather than check-in on purpose:
+    check-in can run against a connection in a failed transaction (where
+    every statement errors), while checkout is guaranteed to hand back a
+    usable connection — and a reset that silently failed to run would be
+    worse than none, since it would look like protection.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("RESET app.workspace_id")
+    finally:
+        cursor.close()
+
+
+def install_workspace_context_reset(engine: Engine) -> Engine:
+    """Attach :func:`_reset_workspace_context` to ``engine``'s pool, once."""
+    if not event.contains(engine, "checkout", _reset_workspace_context):
+        event.listen(engine, "checkout", _reset_workspace_context)
+    return engine
 
 
 def get_engine() -> Engine:
@@ -63,6 +102,10 @@ def get_engine() -> Engine:
                 "prepare_threshold": None,
             },
         )
+        # READY-007: a pooled connection must never carry one tenant's
+        # workspace context into the next tenant's checkout. See
+        # `_reset_workspace_context`.
+        install_workspace_context_reset(_engine)
         # Audit C3: this is the ONE ordinary, RLS-confined connection.
         # Assert once, here, at engine construction (i.e. once per
         # process on first use — never per request) that the role behind
@@ -180,7 +223,7 @@ def get_auth_session() -> Iterator[Session]:
     (configuration) cause. Raising here instead surfaces the
     misconfiguration immediately and loudly, via :func:`get_auth_engine`.
 
-    Scope: two sanctioned users.
+    Scope: three sanctioned users.
 
     1. Credential resolution (the original, narrower purpose): finding a
        row by unique email / key prefix, pre-auth. Once a principal is
@@ -188,6 +231,15 @@ def get_auth_session() -> Iterator[Session]:
        through the ordinary :func:`get_session` engine with
        :func:`set_workspace_context` + RLS — never through this
        BYPASSRLS session.
+    1b. ``refresh_tokens`` in its entirety (READY-007 / P0.5, EPA B8b;
+       the table gained transitive RLS through ``users.user_id`` at
+       alembic head ``b6d94c2f1a70``). This is the same carve-out as
+       (1), not a widening of it: the rotation and the revocation are
+       keyed by an unforgeable ``token_hash`` and resolve the principal,
+       so no ``app.workspace_id`` exists yet to scope them; and the
+       issue INSERT is unscopeable in principle because a
+       ``SUPER_ADMIN``'s ``workspace_id`` is ``NULL`` and satisfies no
+       context. See ``apps/api/app/routers/auth.py``.
     2. The SaaS admin control plane (`apps/api/app/routers/admin.py`,
        PLAN §7.1–§7.2, guarded by `app.service_auth.require_service_token`
        rather than the workspace seam): provisioning, archiving, and the

@@ -1,0 +1,64 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2026-01-24T15:16:13+03:00",
+ "description": "",
+ "handle": "hp-ink-original-cyan-912-3yl77ae-cartridge",
+ "id": 10080265077031,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 4400,
+ "price_max": 4400,
+ "price_min": 4400,
+ "price_varies": false,
+ "published_at": "2026-01-24T15:16:12+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "HP"
+ ],
+ "title": "HP Ink Original Cyan 912/3YL77AE CARTRIDGE",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/hp-ink-original-cyan-912-3yl77ae-cartridge",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "13683495",
+   "compare_at_price": null,
+   "id": 50968613683495,
+   "inventory_management": "shopify",
+   "name": "HP Ink Original Cyan 912/3YL77AE CARTRIDGE",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 4400,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "13319",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "HP"
+}

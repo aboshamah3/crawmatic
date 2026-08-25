@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-3e02-773c-85de-660e07808e1e",
+  "sku_query": "N51490629A",
+  "observed_sku": "N51490629A",
+  "price": "778",
+  "currency": "SAR",
+  "title_contains": "Pack Of 4 205A Original Laser Jet Toner ",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N51490629A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:41.162130+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "2a1ffaf9d8896ec2d9b48b893e6e4f52c45dbbcb27e3f172564e627cd4577883",
+    "full_response_bytes": 11080,
+    "fixture_file_sha256": "ec2f8eb5c4e375e043f0d48f4617d1701712a8b3c443d84f846649a223813ef6",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-3e02-773c-85de-660e07808e1e"
+  }
+}

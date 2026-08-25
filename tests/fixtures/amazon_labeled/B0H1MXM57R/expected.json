@@ -1,0 +1,20 @@
+{
+  "asin": "B0H1MXM57R",
+  "price": "2399.00",
+  "currency": "SAR",
+  "title_contains": "HP ProOne 245 G10",
+  "availability_expected": "in_stock_or_available",
+  "extraction_method_expected": "CSS",
+  "expect_no_price": false,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/-/en/dp/B0H1MXM57R",
+    "captured_at_utc": "2026-08-25T17:26:15Z",
+    "market_locale": "en (forced via /-/en/ URL prefix; amazon.sa Saudi Arabia storefront)",
+    "full_page_sha256": "0973114342e5814df8162f024f8bd01bd0ed16ddc042248b3ee23040d93999f2",
+    "full_page_bytes": 970085,
+    "fixture_file_sha256": "8bc0f9696386f05d4d0bebf9634f54dd5aec7d9c91eeb2b12353e7fd54a90f60",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv",
+    "canary_cross_reference": "scrape_job_id=101bb01c-08eb-4c66-9883-50dea7d315ce (2026-08-24 canary); this ASIN also appears in request_attempts.csv there"
+  }
+}

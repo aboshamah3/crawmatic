@@ -132,3 +132,24 @@ class ScrapeResult:
     # the target regardless of this flag; ``defer_target`` remains the
     # separate, explicit hand-back-to-dispatch signal.
     chain_complete: bool = True
+
+    # --- EPA B6 (folded-in item 2): live NEEDS_REVIEW sidecar wiring ---
+    # Carries a B4 adapter's `AdapterResult.metadata["needs_review"]`
+    # (set on an `Ambiguous`/`IdentityIncompatible` variant resolution --
+    # see `scrape_core.adapters.variant_resolution`) through to
+    # `scrape_core.pipelines._flush_batch`, which upserts the match's
+    # `match_audit_classifications` sidecar (A6) to `NEEDS_REVIEW` when
+    # this is `True`. `False` (the default) leaves the sidecar untouched.
+    needs_review: bool = False
+
+    # --- EPA B6 (browser resource blocking policy): byte accounting ---
+    # Both TRANSPORT-OBSERVED figures (never provider-billed -- see
+    # ``request_attempts.main_document_bytes``/``subresource_bytes``'s own
+    # column docstrings, ``alembic/versions/
+    # d5e8a3c164f2_request_attempt_byte_accounting.py``, for why those are
+    # recorded as a DISTINCT fact reconciled only in C5). ``None`` means
+    # "not measured for this attempt" -- the compatibility default for
+    # every non-browser (HTTP) producer and any browser attempt this
+    # phase's spider does not yet instrument; never coerced to ``0``.
+    main_document_bytes: int | None = None
+    subresource_bytes: int | None = None

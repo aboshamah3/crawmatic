@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-8b5b-7566-84d6-0f892b818353",
+  "sku_query": "N11253415A",
+  "observed_sku": "N11253415A",
+  "price": "349.25",
+  "currency": "SAR",
+  "title_contains": "MLT-D111S Toner For SL-M2020W, SL-M2070W",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N11253415A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:33.354217+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "a39b2b4b646090c0d95d553b3f75dc408f439ae152eb1cfb1cce9b8f5b3ded35",
+    "full_response_bytes": 10713,
+    "fixture_file_sha256": "033f358798157fe843ba0aa0695fec3fbd9b7beb24f9c706b5ddd44c204113db",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-8b5b-7566-84d6-0f892b818353"
+  }
+}

@@ -1,0 +1,8 @@
+# Allowlist for scripts/security/check_file_permissions.sh (EPA task W5.4).
+# One glob per line, relative to the repository root. `#` starts a comment.
+#
+# A path belongs here ONLY if it provably holds no credential. "We know about
+# that one" is not a reason — that is what the FAIL line is for.
+#
+# EMPTY BY DESIGN: the tracked-file gate returned zero findings on this
+# repository on 2026-08-25, so every future finding here is a new one.

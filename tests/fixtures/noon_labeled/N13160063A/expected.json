@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-3cc5-7add-860a-0e19fe1ad0fb",
+  "sku_query": "N13160063A",
+  "observed_sku": "N13160063A",
+  "price": "205.45",
+  "currency": "SAR",
+  "title_contains": "Original Laserjet Toner Cartridge CF411A",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N13160063A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:33.954420+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "d4f251fac159866982dc4e0dbdf3f327723e7c27c04cc763cf96156dc0b662bc",
+    "full_response_bytes": 12071,
+    "fixture_file_sha256": "ea2e3f71405c45154c7b21e511c3bdec549297765d5e817947487ccf76cede45",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-3cc5-7add-860a-0e19fe1ad0fb"
+  }
+}

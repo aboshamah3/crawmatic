@@ -1,0 +1,185 @@
+{
+ "captured_at_utc": "2026-08-25T21:05:32Z",
+ "targets": [
+  {
+   "match_id": "01a0255c-eb29-7cfd-902e-c782117b2866",
+   "handle": "hp-ink-original-cyan-903xl-t6m03ae-officejet-1",
+   "variants": 1,
+   "sha256_product_json": "fc7a620a18517ed8b2b10233fc189afcd6ba1785682c9f6f3683bce96ebc98f3"
+  },
+  {
+   "match_id": "01a0255c-eb75-7a88-a41d-3c4978ed0b88",
+   "handle": "hp-ink-original-cyan-951xl-cn046ae-8610-8621",
+   "variants": 1,
+   "sha256_product_json": "f4a4b6a7fdb7907776475c69f9606ab9b7756a55bb6df890b74aa31731865949"
+  },
+  {
+   "match_id": "01a0255c-ec03-756c-96e8-6a7e5c5a2296",
+   "handle": "canon-ink-original-black-pg-445",
+   "variants": 1,
+   "sha256_product_json": "c0587d5bb5f0cc70550b20633dc6068cc88d839072ba523853b37b8362bc827d"
+  },
+  {
+   "match_id": "01a0255d-150f-7154-b60e-1d33c6a09a33",
+   "handle": "hp-toner-original-yellow-648ac-ce262a-cp4025white-box-1",
+   "variants": 1,
+   "sha256_product_json": "12221f7741adbdfed32404d7dd3ecdd9b7aee7a03726460dd356c6d7b6da5799"
+  },
+  {
+   "match_id": "01a0255d-15f8-778a-b1f2-844104e9d9bd",
+   "handle": "hp-toner-original-203a-cf542a-yellow-m254-m280-m281",
+   "variants": 1,
+   "sha256_product_json": "e4157b718882e7f0da2f10a7f8bac10b4044771218416d9dec04181d3ed24e46"
+  },
+  {
+   "match_id": "01a0255d-3cfb-73bd-8067-70e8b448687b",
+   "handle": "brother-toner-original-magenta-tn-261-hl-3150-3170-mfc-9140-9330cdw-1",
+   "variants": 1,
+   "sha256_product_json": "4e47ea4ab92eff1982f9ba1165edc5ef6a7d0940af2d8a177b77c9ab7603e9e4"
+  },
+  {
+   "match_id": "01a0255d-3db9-7c3d-b3fb-5f89de0fa818",
+   "handle": "epson-ink-original-yellow-t-6644-l100-l110-l120-l130-l132-l200-l210-l1455-l3050-l3060-l3070",
+   "variants": 1,
+   "sha256_product_json": "fb445e74fd8aa436451df379f74c240c088e74b7169de4b62825243c4c1ee0da"
+  },
+  {
+   "match_id": "01a0255d-3dfc-759e-b3d4-bb3da0c18ac3",
+   "handle": "hp-toner-original-multipack-131a-cf210a-cf211a-cf212a-cf213a-pro-200-m251-m276-1",
+   "variants": 1,
+   "sha256_product_json": "a9c5727841384a864fce3c488d0cf241397d1be8b0a1ca2365481fed3b86eaeb"
+  },
+  {
+   "match_id": "01a0255d-628c-7912-bdbe-37cde3255a8f",
+   "handle": "canon-toner-original-black-type-714-l-3000",
+   "variants": 1,
+   "sha256_product_json": "88a583f6acc706da2f84eab99ec7d0fcba7c9fd48dcbe6c27e79a57239122d9b"
+  },
+  {
+   "match_id": "01a0255d-62e0-790b-8ad4-4b1086d1ef96",
+   "handle": "hp-toner-original-222a-w2222a-yellow-3203-3288-mfp-3303-mfp-3388-yiled-1200-page",
+   "variants": 1,
+   "sha256_product_json": "712158bf8b40a02a756b5d015a37e6d1f33efa288334932733abba5ac5832524"
+  },
+  {
+   "match_id": "01a0255d-63ab-73b0-8913-2c6cedf13fb8",
+   "handle": "hp-toner-original-207a-w2211a-cyanm255-m28-m283-1",
+   "variants": 1,
+   "sha256_product_json": "186b7ec4af84c375a59b54d4da5b313c6ab9d90b606a9c1b19151b7979e63b34"
+  },
+  {
+   "match_id": "01a0255d-63b1-7b7f-b771-a1d75f62d730",
+   "handle": "hp-toner-original-207a-w2212a-yellowm255-m28-m283-1",
+   "variants": 1,
+   "sha256_product_json": "f38c50a8969c5b65581151f9af912302098e680d63ec6e060a84072f259b3d13"
+  },
+  {
+   "match_id": "01a0255d-63f5-7445-b2e2-881f2307dc97",
+   "handle": "hp-toner-original-black-658a-w2000a-laser-jet-m751-1",
+   "variants": 1,
+   "sha256_product_json": "61832d76a341033b23020a3b4b5a8fbe54d99d63498c826412de51f524a6bc87"
+  },
+  {
+   "match_id": "01a0255d-8b1c-71e6-b15f-01931ff8ad04",
+   "handle": "hp-ink-original-black-711-cz129a-t520-38ml-1",
+   "variants": 1,
+   "sha256_product_json": "db8fbf897b5120d232d485fc1559ae48c2698695cbf727850ec900182ba8df65"
+  },
+  {
+   "match_id": "01a0255d-8ba3-70d3-922b-8d8ab249b100",
+   "handle": "samsung-toner-original-black-mlt-d116s-m2625-2626-2675-2676-2825-2826-2875-2877",
+   "variants": 1,
+   "sha256_product_json": "dca9cea824c627c8d9dcc6601b62eb7f9ffab0bb2ff5fb6947651cf2183572b2"
+  },
+  {
+   "match_id": "01a0255d-8c20-788b-84f9-f68f5e13273b",
+   "handle": "canon-toner-original-ep-22-lbp200-250-350-800-810-lbp1110-1120-1100a-1101-3200",
+   "variants": 1,
+   "sha256_product_json": "8f2414109d99bdaa2c761101b4a632973aad5c546c5f1111a67736e1b62b7b29"
+  },
+  {
+   "match_id": "01a0255d-8c23-71ce-8af5-6ec203e976d3",
+   "handle": "canon-toner-original-black-ep-27-lbp-3200",
+   "variants": 1,
+   "sha256_product_json": "24935f18b3c32be7f9b793f49d61545947c82cfbff06e6ae49510ead0b58ed1b"
+  },
+  {
+   "match_id": "01a0255d-8c28-7d16-b16a-95bc779b3fae",
+   "handle": "canon-toner-original-black-c-exv-32-gpr-34-ir-2535-2545",
+   "variants": 1,
+   "sha256_product_json": "8d3d0e50b0a8da05b27981d51d692b8d4312a76c9b43be129f9e4703b0ea4bb1"
+  },
+  {
+   "match_id": "01a0255d-b1be-7f44-9b9c-ec46536ba75d",
+   "handle": "konica-minolta-toner-original-black-tn-217-284",
+   "variants": 1,
+   "sha256_product_json": "68cd0b7472b863676379754e47cbc6f98fb56f90c2abca4e3dfb1767bad17636"
+  },
+  {
+   "match_id": "01a0255d-b205-7906-a640-402cdd9ee2e9",
+   "handle": "hp-ink-original-magenta-730-p2v63a-plotter-t1700-130ml-1",
+   "variants": 1,
+   "sha256_product_json": "60f1c9f4e3af13ca278e76a2a771da7718f5c0e3ad6a1f1d519e999509b70480"
+  },
+  {
+   "match_id": "01a0255d-b255-7d67-8c14-47c1af262409",
+   "handle": "hp-ink-original-cyan-912-3yl77ae-cartridge",
+   "variants": 1,
+   "sha256_product_json": "4f5de2d47ecc6d32d17796f78536ab889de6f954abf0aee4e1972fd5011d6ed7"
+  },
+  {
+   "match_id": "01a0255d-b32e-70c7-a425-dd253f7bca93",
+   "handle": "ricoh-toner-original-yellow-imc-2000-2500-842312",
+   "variants": 1,
+   "sha256_product_json": "b0b0fdc5d78fae8dbb88127b43c6c18678019685426bf8af0f6ef72c59e4bab7"
+  },
+  {
+   "match_id": "01a0255d-dfb6-7388-9ad6-30b833329727",
+   "handle": "hp-printer-laserjet-tank-1502w-2r3e2a-w1540a",
+   "variants": 1,
+   "sha256_product_json": "03f88d81e56be157b3650781e15ee1838795e4c21cf7aae119d800c6cb694521"
+  },
+  {
+   "match_id": "01a0255e-0849-78b6-af8f-9471b0e763ec",
+   "handle": "brother-printer-ink-tank-dcp-t730dw-adf-wifi-wifi-direct-usb-speed-up-to-16-0-mono-15-5-color-1",
+   "variants": 1,
+   "sha256_product_json": "a8cafb69473f5cf8ada7740a82a74e93f3cb92ee0cf1a23f85a1bc0c1253cce0"
+  },
+  {
+   "match_id": "01a0255e-0885-78fd-98cb-8545b0f5809a",
+   "handle": "hp-color-laserjet-pro-4203dw-5hh48a",
+   "variants": 1,
+   "sha256_product_json": "7f2abca0e86e0f399c1e894700069db384e3065cd6bef1c5cb49826117c3a651"
+  },
+  {
+   "match_id": "01a0255e-08c3-72a0-b95f-7633f4778c1c",
+   "handle": "canon-copier-color-ir-c3226i-4909c005aa",
+   "variants": 1,
+   "sha256_product_json": "a7d63f74f6c9e91198d643a8043c7b7dd5e5110e23a8f2c5009e27b6017152e9"
+  },
+  {
+   "match_id": "01a0255e-0961-79a4-9493-6c42921529a0",
+   "handle": "hp-ink-original-yellow-925-4k0v8pa-hp-officejet-8120-8130",
+   "variants": 1,
+   "sha256_product_json": "9f670aa5a0251377fc5f6fd78a551ad0ae655be81dc857f818280d7d0b9c8973"
+  },
+  {
+   "match_id": "01a0255e-35c6-7174-99c7-4b468154772a",
+   "handle": "ugreen-dp-male-to-male-cable-2m-black-10211",
+   "variants": 1,
+   "sha256_product_json": "a40f131de2044d1ed84e2c510f08327a88541790990209232fb8244a21df2741"
+  },
+  {
+   "match_id": "01a0255e-6297-7450-ae6c-a21ea939d846",
+   "handle": "ugreen-cat-6-u-utp-pure-copper-ethernet-cable-2mnw101-50192",
+   "variants": 1,
+   "sha256_product_json": "ba45a3ef5c8a5588daa75b0a93337d2349a78789fb583dcd674e7cb0c1ff6d31"
+  },
+  {
+   "match_id": "01a0255e-62e9-7b5d-a125-cfd0df09103b",
+   "handle": "ugreen-usb-3-0-4-portmhub-0-25m-cm416-10915",
+   "variants": 1,
+   "sha256_product_json": "f9eb05a0397f0789ff50373a227cc140358bbd3fa317573ca24460d1650d36f1"
+  }
+ ]
+}

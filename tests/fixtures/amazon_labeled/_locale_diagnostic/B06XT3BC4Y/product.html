@@ -1,0 +1,35 @@
+<!--
+  PROVENANCE: REAL CAPTURE (not synthetic). DIAGNOSTIC FIXTURE -- NOT part
+  of the certified Amazon CSS pass rate (see FIXTURES.md and
+  test_domain_certification.py::test_amazon_locale_currency_known_limitation).
+  Source URL : https://www.amazon.sa/dp/B06XT3BC4Y  (no "/-/en/" prefix -- this
+               is the DEFAULT locale this host's IP gets from amazon.sa,
+               which resolved to lang="ar-ae", i.e. Arabic/UAE, not Saudi
+               English)
+  Captured   : 2026-08-25, via curl_cffi impersonate="chrome131" (direct,
+               no proxy).
+  Full page  : 837448 bytes, sha256=8611467fd1bd4a9fa420d68c0a29705dbbc8252b788366709be8665a763b20a6
+  Finding    : #corePrice_feature_div's price text parses correctly via
+               money_text.normalize_price_text() ("ريال1115.94"
+               -> "1115.94"), but .a-price-symbol's text is the Arabic word
+               "ريال" (Riyal), not the ISO code
+               "SAR" the rest of the system expects
+               (canary DB price_observations.currency = 'SAR' for every
+               successful amazon.sa row). Confirmed by a same-ASIN paired
+               capture: requesting the IDENTICAL product via the
+               "/-/en/" URL prefix (see ../B0H1MXM57R/product.html's
+               provenance) renders "SAR" cleanly. No "ريال"->"SAR" mapping
+               exists anywhere in this codebase (grepped app_shared.money,
+               scrape_core.money_text -- neither normalizes currency
+               symbols/words, only price digits).
+  Edits      : NONE to any value inside the kept containers. Trimmed to
+               #productTitle, #corePrice_feature_div, #availability only.
+-->
+<html><head></head><body>
+<span id="productTitle" class="a-size-large product-title-word-break">        خرطوشة حبر أصلية لطابعة ليزر جيت من اتش بي بلون أصفر 655A       </span>
+<div id="corePrice_feature_div" class="celwidget" data-feature-name="corePrice" data-csa-c-type="widget" data-csa-c-content-id="corePrice" data-csa-c-slot-id="corePrice_feature_div" data-csa-c-asin="B06XT3BC4Y" data-csa-c-is-in-initial-active-row="false">
+                                     <div data-csa-c-type="widget" data-csa-c-slot-id="apex_dp_offer_display" data-csa-c-content-id="apex_with_rio_cx">
+                                                       <div class="a-section a-spacing-micro">                                                  <div class="a-section apex-core-price-identifier">      <span class="a-price aok-align-center apex-pricetopay-value" data-a-size="xl" data-a-color="base"><span class="a-offscreen"><span dir="rtl">ريال</span>‎1,115.94‎</span><span aria-hidden="true" dir="ltr"><span class="a-price-symbol" dir="rtl">ريال</span>‎<span class="a-price-whole">1,115<span class="a-price-decimal" dir="ltr">.</span>‎</span><span class="a-price-fraction">94</span></span></span>‏        <span id="taxInclusiveMessage" class="a-size-mini a-color-base aok-align-center aok-nowrap">  </span>           </div>        </div>            </div>
+                                                        </div>
+<div id="availability" class="a-section a-spacing-base a-spacing-top-micro }">                          <span class="a-size-base a-color-price primary-availability-message a-text-bold"> تبقى 1 فقط - اطلبه الآن. </span>                 <br>        </div>
+</body></html>

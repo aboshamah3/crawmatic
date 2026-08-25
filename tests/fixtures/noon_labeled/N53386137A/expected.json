@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-dfb8-710e-954c-e2b11a4f3ee5",
+  "sku_query": "N53386137A",
+  "observed_sku": "N53386137A",
+  "price": "710",
+  "currency": "SAR",
+  "title_contains": "All-In-One LaserJet Tank 1502W Printer P",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N53386137A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:42.362427+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "6a68a0572978bc863e2823009574de8bb698a005cc12ba86f69a0c45ba60befc",
+    "full_response_bytes": 12124,
+    "fixture_file_sha256": "331b454182f04d82ef1d07870b24e861fc0a159989eb44a5d8c2aa2383c8dc7b",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-dfb8-710e-954c-e2b11a4f3ee5"
+  }
+}

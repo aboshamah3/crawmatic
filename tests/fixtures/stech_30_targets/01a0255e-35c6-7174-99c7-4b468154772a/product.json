@@ -1,0 +1,64 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2026-06-30T09:44:10+03:00",
+ "description": "",
+ "handle": "ugreen-dp-male-to-male-cable-2m-black-10211",
+ "id": 10262983737639,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 2990,
+ "price_max": 2990,
+ "price_min": 2990,
+ "price_varies": false,
+ "published_at": "2026-07-01T17:46:39+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "inventory_increased"
+ ],
+ "title": "UGREEN DP Male to Male Cable 2m - Black [10211]",
+ "type": "",
+ "url": "/products/ugreen-dp-male-to-male-cable-2m-black-10211",
+ "variants": [
+  {
+   "available": true,
+   "barcode": null,
+   "compare_at_price": null,
+   "id": 51550526210343,
+   "inventory_management": "shopify",
+   "name": "UGREEN DP Male to Male Cable 2m - Black [10211]",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 2990,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "18931",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "UGreen"
+}

@@ -1,0 +1,20 @@
+{
+  "asin": "B0DFZZHK6X",
+  "price": null,
+  "currency": null,
+  "title_contains": "LG 27GS75Q-B",
+  "availability_expected": "unknown",
+  "extraction_method_expected": "CSS",
+  "expect_no_price": true,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/-/en/dp/B0DFZZHK6X",
+    "captured_at_utc": "2026-08-25T17:26:58Z",
+    "market_locale": "en (forced via /-/en/ URL prefix; amazon.sa Saudi Arabia storefront)",
+    "full_page_sha256": "9f5040ea230afdf65be7e87b146805f067755b8291d3e27f3060c7bc371a743d",
+    "full_page_bytes": 304036,
+    "fixture_file_sha256": "dc99f043bf2888e251e799b42580987cf7c8cf99d2350c1f385f28e854545d5c",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv",
+    "canary_cross_reference": "scrape_job_id=101bb01c-08eb-4c66-9883-50dea7d315ce (2026-08-24 canary); this ASIN also appears in request_attempts.csv there"
+  }
+}

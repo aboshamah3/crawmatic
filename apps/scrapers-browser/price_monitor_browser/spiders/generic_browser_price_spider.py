@@ -56,6 +56,8 @@ from app_shared.models.access import ProxyProvider
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
+from scrape_core.browser.byte_capture import ByteAccumulator
+from scrape_core.browser.domain_profile_registry import set_domain_profile
 from scrape_core.browser.page import build_page_methods, effective_timeout
 from scrape_core.browser.variant import VariantConfigError
 from scrape_core.adapters import (
@@ -102,6 +104,23 @@ _DEFAULT_MODE = "BROWSER"
 __all__ = ["GenericBrowserPriceSpider", "classify_browser_failure"]
 
 
+def _byte_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """EPA B6b: the terminal ``main_document_bytes``/``subresource_bytes``
+    kwargs for `_build_result`, read back from this attempt's own
+    `ByteAccumulator` (stashed on `meta["_byte_accumulator"]` by
+    `_browser_request_for`). A meta dict with no accumulator at all (a
+    hand-built target/request in a unit test, or any future call site
+    that never dispatched through `_browser_request_for`) yields both
+    `None` -- `build_scrape_result`'s own "not measured" default -- never
+    raises.
+    """
+    accumulator = meta.get("_byte_accumulator")
+    if accumulator is None:
+        return {"main_document_bytes": None, "subresource_bytes": None}
+    main_document_bytes, subresource_bytes = accumulator.finalize()
+    return {"main_document_bytes": main_document_bytes, "subresource_bytes": subresource_bytes}
+
+
 def _strategy_handoff_kwargs(
     target: SpiderTarget,
     outcome: ScrapeErrorCode,
@@ -123,6 +142,13 @@ def _adapter_error_code(outcome: AdapterOutcome) -> ScrapeErrorCode:
         return ScrapeErrorCode.NOT_LISTED
     if outcome is AdapterOutcome.IDENTITY_MISMATCH:
         return ScrapeErrorCode.IDENTITY_MISMATCH
+    # EPA B4: an otherwise valid product response whose variant identity
+    # could not be resolved (ambiguous, or the identifiers name another
+    # product). A FAILURE, deliberately not NOT_LISTED -- the match is
+    # flagged NEEDS_REVIEW in the A6 match_audit_classifications sidecar
+    # rather than being silently written off as delisted.
+    if outcome is AdapterOutcome.IDENTITY_UNRESOLVED:
+        return ScrapeErrorCode.IDENTITY_UNRESOLVED
     return ScrapeErrorCode.PRICE_NOT_FOUND
 
 
@@ -472,6 +498,20 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             AdapterContext.from_target(target)
         )
 
+        # EPA B6b: record this target's resolved profile for its document
+        # hostname so `scrape_core.browser.ssrf.abort_unsafe_request`'s
+        # sub-resource interception (called by scrapy-playwright with only
+        # the bare Playwright request, no scrapy meta -- see
+        # `domain_profile_registry`'s module docstring for why this
+        # side-channel is the only available seam) sees the real
+        # `certified_resources` for this domain instead of always `None`.
+        # A target with no resolved profile (`target.profile is None`)
+        # records `None` too -- `should_block`'s documented default-policy
+        # value, so an unresolved profile still degrades to the plain
+        # default blocklist rather than leaving a stale unrelated entry
+        # in place.
+        set_domain_profile(urlsplit(adapter_request.url).hostname, target.profile)
+
         settings = get_settings()
         timeout_ms = effective_timeout(target, settings)
 
@@ -498,6 +538,21 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             "adapter_key": adapter_key,
             "adapter_requested_url": adapter_request.url,
         }
+        # EPA B6b (live byte capture): a fresh accumulator per attempt
+        # (never shared across dispatches -- each attempt gets its own
+        # page). `playwright_page_event_handlers` is scrapy-playwright's
+        # own seam for `page.on(event, handler)` registration
+        # (`scrapy_playwright.handler._attach_page_event_handlers`,
+        # called before `page.goto`), so every response Chromium produces
+        # for this attempt's page -- main document and every sub-resource
+        # that wasn't aborted by the resource-blocking policy -- reaches
+        # `byte_accumulator.handle_response`. `parse`/`errback` read the
+        # totals back via `_byte_kwargs_from_meta` once the attempt is
+        # terminal (`ByteAccumulator.finalize` -- see that class for why
+        # "nothing observed" and "observed, zero bytes" are kept distinct).
+        byte_accumulator = ByteAccumulator()
+        meta["_byte_accumulator"] = byte_accumulator
+        meta["playwright_page_event_handlers"] = {"response": byte_accumulator.handle_response}
         # Headless Chromium's default UA ("HeadlessChrome") gets a
         # bot-challenge page from amazon.sa with none of the product
         # markup, so every fetch carries the realistic UA. Set per
@@ -569,6 +624,11 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         target = self._targets_by_match_id[response.meta["match_id"]]
         now = datetime.now(UTC)
         attempt_kwargs = _attempt_kwargs_from_meta(response.meta)
+        # EPA B6b: the page has already closed by the time `parse` runs
+        # (`playwright_include_page: False`), so every response this
+        # attempt's page will ever produce has already reached the
+        # accumulator -- safe to finalize now.
+        attempt_kwargs.update(_byte_kwargs_from_meta(response.meta))
 
         adapter_key = response.meta.get("adapter_key", AdapterKey.PLAYWRIGHT_RENDERED)
         status_error_code = classify_http_status(response.status)
@@ -624,6 +684,13 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                 ),
                 final_url=adapter_result.final_url,
                 identity_validation_result=adapter_result.identity.status.value,
+                # EPA B6 (folded-in item 2): carry a B4 adapter's
+                # Ambiguous/IdentityIncompatible needs_review flag through
+                # to the persistence pipeline's NEEDS_REVIEW sidecar
+                # upsert (`adapter_result.metadata` defaults to `{}` for
+                # every other outcome, so this is `False` unless the
+                # adapter explicitly set it).
+                needs_review=bool(adapter_result.metadata.get("needs_review", False)),
                 **_strategy_handoff_kwargs(
                     target,
                     error_code,
@@ -714,6 +781,15 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             final_url=failure.request.url,
             **_strategy_handoff_kwargs(target, error_code),
             **_attempt_kwargs_from_meta(failure.request.meta),
+            # EPA B6b: whatever responses this attempt's page did see
+            # before the failure (e.g. a document response the extractor
+            # then failed to validate, or a timeout after some
+            # sub-resources already loaded) are still real
+            # transport-observed bytes -- `ByteAccumulator.finalize`
+            # returns `(None, None)` when nothing was ever measured, so a
+            # total pre-response failure (DNS/timeout before any bytes)
+            # still leaves both columns NULL, never a fabricated 0.
+            **_byte_kwargs_from_meta(failure.request.meta),
         )
         # The browser process still performs one fetch.  A configured next
         # method is handed back durably to dispatch rather than retried in

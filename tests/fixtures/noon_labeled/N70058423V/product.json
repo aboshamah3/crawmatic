@@ -1,0 +1,17 @@
+{
+  "hits": [
+    {
+      "sku": "N70058423V",
+      "catalog_sku": "N70058423V-1",
+      "sku_config": "N70058423V",
+      "offer_code": "b70c9636811b395b",
+      "brand": "Lexar",
+      "name": "NS100 512GB 2.5” (SATA 6Gb/s SSD,) Solid State Drive, Up to 550MB/s Read (LNS100-512RB) 512 GB",
+      "price": 530,
+      "sale_price": 299,
+      "is_buyable": true,
+      "url": "ns100-512gb-2-5-sata-6gb-s-ssd-solid-state-drive-up-to-550mb-s-read-lns100-512rb-512-gb"
+    }
+  ],
+  "nbHits": 1
+}

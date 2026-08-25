@@ -173,6 +173,66 @@ class MatchClassificationState(StrEnum):
     CONFIRMED_DELISTED = "CONFIRMED_DELISTED"
     INVALID_IDENTITY = "INVALID_IDENTITY"
     UNKNOWN = "UNKNOWN"
+    #: EPA B4 (2026-08-25). The match's competitor identity could not be
+    #: resolved against the fetched product JSON — an ``Ambiguous`` or
+    #: ``IdentityIncompatible`` variant resolution (see
+    #: the scrape-core adapters' variant-resolution module). A **match audit**
+    #: state, deliberately living here in the sidecar rather than as a
+    #: ``ScrapeTargetStatus``: the *target* simply ``FAILED`` with
+    #: ``failure_reason=IDENTITY_UNRESOLVED``; needing a human to look at
+    #: the identity is a fact about the match, not about one job's run.
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+
+
+class CompetitorIdentifierType(StrEnum):
+    """Type of one ``match_competitor_identifiers`` row's ``value`` (EPA B4).
+
+    The legacy ``competitor_product_matches.competitor_variant_identifier``
+    is a single **untyped** text column, and the Shopify adapter read it
+    as if it were always a ``variants[].id``. On S-Tech (``stech.ink``)
+    it in fact holds a product handle, a barcode, or a supplier SKU — so
+    26 of 30 canary targets were declared ``NOT_LISTED`` off a healthy
+    HTTP 200 product JSON (2026-08-24 canary,
+    ``PRODUCTION_READINESS_REPORT_2026-08-24.md``).
+
+    Typing is a **fact derived from evidence**, never from a regex or a
+    string length: a value is only ``SHOPIFY_VARIANT_ID`` because it was
+    found in ``variants[].id`` of a real fetched product JSON. A numeric
+    13-digit EAN looks exactly like a Shopify variant id; guessing by
+    shape is precisely how the original bug happened.
+
+    ``UNKNOWN`` is a first-class, honest member — a legacy value that
+    matched nothing in the store's JSON stays ``UNKNOWN`` and is
+    quarantined for review rather than being force-fitted into a type.
+    """
+
+    SHOPIFY_VARIANT_ID = "SHOPIFY_VARIANT_ID"
+    SKU = "SKU"
+    BARCODE = "BARCODE"
+    HANDLE = "HANDLE"
+    UNKNOWN = "UNKNOWN"
+
+
+class CompetitorIdentifierSource(StrEnum):
+    """Provenance of one ``match_competitor_identifiers`` row (EPA B4).
+
+    A match may simultaneously carry a handle, a SKU, a barcode **and** a
+    variant id, each with its own provenance and validity window, so
+    "where did this identifier come from and how much do we trust it" is
+    answerable per identifier rather than per match.
+
+    * ``LEGACY_BACKFILL`` — migrated from the untyped legacy column by
+      ``scripts/migrate_stech_identifiers.py``.
+    * ``PRODUCT_JSON`` — read directly out of a fetched storefront
+      product JSON (the strongest automatic evidence).
+    * ``MERCHANT_FEED`` — supplied by a merchant feed/import.
+    * ``MANUAL`` — entered or corrected by a human.
+    """
+
+    LEGACY_BACKFILL = "LEGACY_BACKFILL"
+    PRODUCT_JSON = "PRODUCT_JSON"
+    MERCHANT_FEED = "MERCHANT_FEED"
+    MANUAL = "MANUAL"
 
 
 class ScrapeProfileMode(StrEnum):
@@ -321,6 +381,19 @@ class ScrapeErrorCode(StrEnum):
     LEGAL_REVIEW_REQUIRED = "LEGAL_REVIEW_REQUIRED"
     NOT_LISTED = "NOT_LISTED"
     IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    #: EPA B4 (2026-08-25). The competitor identity could not be resolved
+    #: against an otherwise valid product response: an ``Ambiguous`` or
+    #: ``IdentityIncompatible`` variant resolution (see
+    #: the scrape-core adapters' variant-resolution module). Deliberately its own
+    #: code, distinct from both neighbours above: ``NOT_LISTED`` asserts
+    #: the store no longer lists the product (a terminal listing verdict
+    #: that must never be reached by guesswork), and
+    #: ``IDENTITY_MISMATCH`` asserts we proved we fetched a *different*
+    #: product. ``IDENTITY_UNRESOLVED`` asserts only "we do not know
+    #: which variant this is" — a retryable failure that flags the match
+    #: ``NEEDS_REVIEW`` instead of silently deleting a competitor price.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    IDENTITY_UNRESOLVED = "IDENTITY_UNRESOLVED"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     CONNECTION_FAILED = "CONNECTION_FAILED"
     TLS_CONNECTION_FAILED = "TLS_CONNECTION_FAILED"
@@ -385,6 +458,37 @@ class ScrapeJobStatus(StrEnum):
     PARTIAL_FAILED = "PARTIAL_FAILED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class DispatchIntentState(StrEnum):
+    """Lifecycle of one ``dispatch_intents`` row (EPA B1, READY-002).
+
+    The durable half of dispatch idempotency. Each member answers a
+    different operational question, which is why "posted" and "confirmed"
+    are not collapsed into one:
+
+    * ``PLANNED``   — the planner committed the intent alongside the
+      strategy-cursor advance. Nothing has been sent.
+    * ``POSTED``    — a ``schedule.json`` POST was issued. A row stuck
+      here is the only genuinely ambiguous state: the run may or may not
+      exist on the node, and that ambiguity is exactly what has to be
+      *recorded* rather than guessed at later.
+    * ``CONFIRMED`` — Scrapyd answered ``status=ok`` and its ``jobid`` is
+      on the row. This is what makes a re-POST unnecessary and what
+      cancellation reads to stop the remote run.
+    * ``FAILED``    — the POST failed before any confirmation. The Redis
+      claim is released so a legitimate retry proceeds; the row survives
+      so "tried and failed" stays distinguishable from "never tried".
+    * ``SUPERSEDED`` — a later planning generation replaced this intent.
+      Kept, never deleted: it is the evidence of what the job was asked
+      to do under the previous plan.
+    """
+
+    PLANNED = "PLANNED"
+    POSTED = "POSTED"
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class ScrapeJobSource(StrEnum):

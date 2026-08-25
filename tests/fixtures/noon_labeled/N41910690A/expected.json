@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-3dd1-7468-8061-a5a7e3924f77",
+  "sku_query": "N41910690A",
+  "observed_sku": "N41910690A",
+  "price": "49.22",
+  "currency": "SAR",
+  "title_contains": "T6734 Ink Bottle 70ml Yellow",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N41910690A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:40.562047+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "75741437fa489a8de8bdd9e66b4c4952106d56a59dbbeb46f276ae8054aab040",
+    "full_response_bytes": 10888,
+    "fixture_file_sha256": "b5b3dee893e1a52ee998e516f1909bc82662c0386a8b89d104cf7ba9e5f7f557",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-3dd1-7468-8061-a5a7e3924f77"
+  }
+}

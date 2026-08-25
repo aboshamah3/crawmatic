@@ -28,6 +28,12 @@ class IdentityStatus(StrEnum):
     UNVERIFIED = "UNVERIFIED"
     NOT_LISTED = "NOT_LISTED"
     MISMATCH = "MISMATCH"
+    #: EPA B4: the response is a valid product, but which variant it
+    #: refers to could not be established (ambiguous, or the identifiers
+    #: name another product). Distinct from ``NOT_LISTED`` (the store
+    #: says the product is gone) and from ``MISMATCH`` (we proved we
+    #: fetched a different product). Never allows extraction.
+    UNRESOLVED = "UNRESOLVED"
 
 
 class AdapterOutcome(StrEnum):
@@ -37,6 +43,11 @@ class AdapterOutcome(StrEnum):
     NOT_FOUND = "NOT_FOUND"
     NOT_LISTED = "NOT_LISTED"
     IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    #: EPA B4: identity could not be resolved on an otherwise valid
+    #: response. Maps to ``ScrapeErrorCode.IDENTITY_UNRESOLVED`` (target
+    #: outcome ``FAILED``), and flags the match ``NEEDS_REVIEW`` in the
+    #: A6 ``match_audit_classifications`` sidecar. Never ``NOT_LISTED``.
+    IDENTITY_UNRESOLVED = "IDENTITY_UNRESOLVED"
     INVALID_RESPONSE = "INVALID_RESPONSE"
     REPAIRED = "REPAIRED"
 

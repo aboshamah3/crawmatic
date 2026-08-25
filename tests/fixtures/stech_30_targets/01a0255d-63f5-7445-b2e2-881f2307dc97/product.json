@@ -1,0 +1,64 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T19:06:37+03:00",
+ "description": "",
+ "handle": "hp-toner-original-black-658a-w2000a-laser-jet-m751-1",
+ "id": 9278227743015,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 84000,
+ "price_max": 84000,
+ "price_min": 84000,
+ "price_varies": false,
+ "published_at": "2024-05-12T19:06:36+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "inventory_increased"
+ ],
+ "title": "HP Toner Original Black 658A/W2000A LASER JET/M751",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/hp-toner-original-black-658a-w2000a-laser-jet-m751-1",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "W2000A",
+   "compare_at_price": null,
+   "id": 48394655564071,
+   "inventory_management": "shopify",
+   "name": "HP Toner Original Black 658A/W2000A LASER JET/M751",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 84000,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "13467",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "HP"
+}

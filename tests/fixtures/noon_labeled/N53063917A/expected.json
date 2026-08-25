@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-b1ff-73a7-8081-c8945ea85706",
+  "sku_query": "N53063917A",
+  "observed_sku": "N53063917A",
+  "price": "24",
+  "currency": "SAR",
+  "title_contains": "47 Original Black Ultra Ink Advantage Ca",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N53063917A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:41.762291+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "f932ba997398b4fa9bd85e89f42cb466556b3f3ec1ed4bc1a8f1f4bd63e09c75",
+    "full_response_bytes": 13118,
+    "fixture_file_sha256": "0c7612b508829b8d35dc21a9d462f0e73f3f0e8697fcfb8de827a599663b7800",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-b1ff-73a7-8081-c8945ea85706"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255e-095f-7a21-98c2-b63e9cf212cc",
+  "sku_query": "N70050159V",
+  "observed_sku": "N70050159V",
+  "price": "78.25",
+  "currency": "SAR",
+  "title_contains": "925 Original Ink Cartridge Yellow",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N70050159V&page=1",
+    "captured_at_utc": "2026-08-25T21:48:45.433774+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "87a7df6c7e7ae2d925691d0cd4b032482e306dfd543ec1d1d42f63984fa58ee8",
+    "full_response_bytes": 12689,
+    "fixture_file_sha256": "1f05b1580ee389ee0289338d536ccbb963e2e02e294f2ed7d89cbdad49719b3d",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255e-095f-7a21-98c2-b63e9cf212cc"
+  }
+}

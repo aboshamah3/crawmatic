@@ -61,13 +61,41 @@ def test_offline_upgrade_head_renders_the_six_rls_statements() -> None:
     )
 
 
-def test_offline_upgrade_head_does_not_enable_rls_on_workspaces_or_refresh_tokens() -> None:
+def test_offline_upgrade_head_does_not_enable_rls_on_workspaces() -> None:
+    """`workspaces` is the TENANT_ROOT: the table every policy's context refers to.
+
+    `refresh_tokens` used to be asserted here too. It no longer belongs:
+    EPA B8b (head `b6d94c2f1a70`) closed that gap — see the test below.
+    """
     result = _run_alembic("upgrade", "head", "--sql")
     assert result.returncode == 0
     sql = result.stdout
 
     assert "ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY" not in sql
-    assert "ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY" not in sql
+
+
+def test_offline_upgrade_head_renders_transitive_rls_on_refresh_tokens() -> None:
+    """READY-007 / P0.5: refresh_tokens is scoped through `users.user_id`.
+
+    Rendered offline, so this proves the DDL the deploy actually applies
+    — not a policy some test fixture created for itself.
+    """
+    result = _run_alembic("upgrade", "head", "--sql")
+    assert result.returncode == 0
+    sql = result.stdout
+
+    assert "ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY" in sql
+    assert "ALTER TABLE refresh_tokens FORCE ROW LEVEL SECURITY" in sql
+    assert (
+        "CREATE POLICY refresh_tokens_workspace_isolation ON refresh_tokens" in sql
+    )
+    # The transitive predicate, verbatim: scoped through the parent row,
+    # and fail-closed on an unset GUC by the same NULLIF guard every
+    # other policy in this schema uses.
+    assert (
+        "EXISTS (SELECT 1 FROM users p WHERE p.id = refresh_tokens.user_id "
+        "AND p.workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid)"
+    ) in sql
 
 
 def test_alembic_heads_reports_exactly_one_head() -> None:

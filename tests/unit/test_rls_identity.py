@@ -1,19 +1,26 @@
 """RLS DDL render tests for the identity tables (SPEC-03 T040, FR-004/FR-019).
 
-Pure string assertions against `emit_rls_policy("users")` and
-`emit_rls_policy("api_keys")` — no database. Complements
-`tests/unit/test_rls_policy.py` (SPEC-02, generic renderer) by proving
-the two concrete identity applications each render ENABLE + FORCE + the
-fail-closed `NULLIF(current_setting('app.workspace_id', true), '')::uuid`
-predicate — exactly what the migration (`alembic/versions/
-55da7d6d939d_auth_identity_tables.py`) executes.
+Pure string assertions against `emit_rls_policy("users")`,
+`emit_rls_policy("api_keys")` and — since EPA B8b —
+`emit_fk_transitive_rls_policy("refresh_tokens", ...)`. No database.
+Complements `tests/unit/test_rls_policy.py` (SPEC-02, generic renderer)
+by proving the three concrete identity applications each render ENABLE +
+FORCE + the fail-closed `NULLIF(current_setting('app.workspace_id',
+true), '')::uuid` predicate — exactly what the migrations
+(`alembic/versions/55da7d6d939d_auth_identity_tables.py` and
+`alembic/versions/b6d94c2f1a70_refresh_tokens_transitive_rls.py`)
+execute.
+
+The third table is the one that differs in shape: `refresh_tokens` has
+no `workspace_id` column, so its predicate reaches the tenant through
+the `users` parent rather than filtering a column of its own.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from app_shared.models import emit_rls_policy
+from app_shared.models import emit_fk_transitive_rls_policy, emit_rls_policy
 
 FAIL_CLOSED_PREDICATE = (
     "workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid"
@@ -52,3 +59,39 @@ def test_all_six_statements_present_across_both_tables() -> None:
     """The migration executes exactly six RLS statements (3 per table)."""
     statements = list(emit_rls_policy("users")) + list(emit_rls_policy("api_keys"))
     assert len(statements) == 6
+
+
+# --- refresh_tokens: TRANSITIVE through users.user_id (EPA B8b) --------
+#
+# The third credential table. It carries no `workspace_id` of its own, so
+# `emit_rls_policy` would have nothing to filter on — isolation is
+# anchored through its real FK to `users`, the same shape
+# `match_audit_classifications` and `strategy_attempt_stats` use. These
+# assertions mirror what `alembic/versions/
+# b6d94c2f1a70_refresh_tokens_transitive_rls.py` executes.
+
+REFRESH_TOKENS_STATEMENTS = emit_fk_transitive_rls_policy(
+    "refresh_tokens", parent_table="users", fk_column="user_id"
+)
+
+
+def test_refresh_tokens_policy_enables_and_forces_rls() -> None:
+    enable_stmt, force_stmt, _ = REFRESH_TOKENS_STATEMENTS
+    assert "ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY" in enable_stmt
+    # FORCE matters more here than anywhere: without it the table owner
+    # is exempt, and the owner is the role migrations run as.
+    assert "ALTER TABLE refresh_tokens FORCE ROW LEVEL SECURITY" in force_stmt
+
+
+def test_refresh_tokens_policy_scopes_through_the_users_parent() -> None:
+    _, _, policy_stmt = REFRESH_TOKENS_STATEMENTS
+    assert "CREATE POLICY refresh_tokens_workspace_isolation ON refresh_tokens" in policy_stmt
+    assert "EXISTS (SELECT 1 FROM users p" in policy_stmt
+    assert "p.id = refresh_tokens.user_id" in policy_stmt
+    assert f"p.{FAIL_CLOSED_PREDICATE}" in policy_stmt
+
+
+def test_refresh_tokens_policy_never_filters_on_a_column_it_does_not_have() -> None:
+    """A `workspace_id = ...` predicate here would be DDL that cannot execute."""
+    _, _, policy_stmt = REFRESH_TOKENS_STATEMENTS
+    assert "refresh_tokens.workspace_id" not in policy_stmt

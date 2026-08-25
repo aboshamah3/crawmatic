@@ -1,0 +1,62 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T17:12:56+03:00",
+ "description": "",
+ "handle": "samsung-toner-original-black-mlt-d116s-m2625-2626-2675-2676-2825-2826-2875-2877",
+ "id": 9278082777383,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 19550,
+ "price_max": 19550,
+ "price_min": 19550,
+ "price_varies": false,
+ "published_at": "2024-05-12T17:12:54+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [],
+ "title": "Samsung Toner Original Black MLT-D116S M2625/2626/2675/2676/2825/2826/2875/2876",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/samsung-toner-original-black-mlt-d116s-m2625-2626-2675-2676-2825-2826-2875-2877",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "19077415",
+   "compare_at_price": null,
+   "id": 48394419077415,
+   "inventory_management": "shopify",
+   "name": "Samsung Toner Original Black MLT-D116S M2625/2626/2675/2676/2825/2826/2875/2876",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 19550,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "11113",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "Samsung"
+}

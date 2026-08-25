@@ -51,6 +51,9 @@ def build_scrape_result(
     final_url: str | None = None,
     identity_validation_result: str | None = None,
     canonical_url: str | None = None,
+    needs_review: bool = False,
+    main_document_bytes: int | None = None,
+    subresource_bytes: int | None = None,
 ) -> ScrapeResult:
     """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034; extracted SPEC-14 T007).
 
@@ -105,6 +108,19 @@ def build_scrape_result(
     test) -- so every `ScrapeResult` this function emits for a real
     dispatched target threads it through without a second query,
     ready for US5's off-reactor stats recorder.
+
+    ``needs_review`` (EPA B6, folded-in item 2) carries a B4 adapter's
+    ``AdapterResult.metadata["needs_review"]`` (set on an ``Ambiguous``/
+    ``IdentityIncompatible`` variant resolution) through to
+    `scrape_core.pipelines._flush_batch`, which upserts the match's
+    `match_audit_classifications` sidecar to ``NEEDS_REVIEW`` when it is
+    ``True``. Defaults ``False`` -- every ordinary result is unaffected.
+
+    ``main_document_bytes``/``subresource_bytes`` (EPA B6) are the
+    TRANSPORT-OBSERVED byte-accounting pair -- see
+    ``ScrapeResult``'s own field docstring and the migration that added
+    the matching `request_attempts` columns. Both default ``None``
+    ("not measured for this attempt").
     """
     kwargs: dict[str, Any] = {}
     if stock_status is not None:
@@ -161,5 +177,8 @@ def build_scrape_result(
         canonical_url=canonical_url,
         defer_target=defer_target,
         chain_complete=chain_complete,
+        needs_review=needs_review,
+        main_document_bytes=main_document_bytes,
+        subresource_bytes=subresource_bytes,
         **kwargs,
     )

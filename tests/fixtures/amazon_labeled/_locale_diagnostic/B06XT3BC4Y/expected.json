@@ -1,0 +1,20 @@
+{
+  "asin": "B06XT3BC4Y",
+  "price": "1115.94",
+  "currency_actually_extracted": "\u0631\u064a\u0627\u0644",
+  "currency_expected_iso": "SAR",
+  "title_contains": "HP 655A",
+  "extraction_method_expected": "CSS",
+  "known_limitation": "amazon.sa default (non-/-/en/) locale renders currency as an Arabic word, not an ISO code; no normalization exists in this codebase",
+  "certified": false,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/dp/B06XT3BC4Y",
+    "captured_at_utc": "2026-08-25",
+    "market_locale": "ar-ae (Arabic/UAE -- this host's default geo-resolved locale for amazon.sa, NOT forced to English)",
+    "full_page_sha256": "8611467fd1bd4a9fa420d68c0a29705dbbc8252b788366709be8665a763b20a6",
+    "full_page_bytes": 837448,
+    "fixture_file_sha256": "49bc3af062b27b4172a272ea27d9e827248199889f03815d0bd6d4fe3c2ee768",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv"
+  }
+}

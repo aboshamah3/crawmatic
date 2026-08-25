@@ -1,0 +1,17 @@
+{
+  "hits": [
+    {
+      "sku": "N13160063A",
+      "catalog_sku": "N13160063A",
+      "sku_config": "N13160063A",
+      "offer_code": "b2ce19a56f89ba6c",
+      "brand": "HP",
+      "name": "Original Laserjet Toner Cartridge CF411A Cyan",
+      "price": 619,
+      "sale_price": 205.45,
+      "is_buyable": true,
+      "url": "original-laserjet-toner-cartridge-cf411a-cyan"
+    }
+  ],
+  "nbHits": 1
+}

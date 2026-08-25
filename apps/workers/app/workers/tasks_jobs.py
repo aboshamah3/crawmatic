@@ -30,11 +30,18 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
+from app.workers.tasks_dispatch import DispatchedBatch, stamp_targets_dispatched
 from app_shared.config import get_settings
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetStatus
 from app_shared.ids import new_uuid7
-from app_shared.jobs.batching import ResolvedTarget, plan_batches
+from app_shared.jobs.batching import (
+    DEFAULT_STRATEGY_METHOD,
+    Batch,
+    ResolvedTarget,
+    plan_batches,
+)
+from app_shared.jobs.dispatch_intents import DispatchIntentStore
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.jobs.nodes import select_node
@@ -48,7 +55,11 @@ from app_shared.models.strategy import DomainStrategyMethod, DomainStrategyProfi
 from app_shared.outbox import write_outbox_message
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.strategy.methods import mode_for_access_method, resolve_method_candidate
-from app_shared.scrapyd import ScrapydDispatchClient
+from app_shared.scrapyd import (
+    DispatchIdentity,
+    ScrapydDispatchClient,
+    build_dispatch_identity,
+)
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     SCRAPE_DISPATCH_JOB,
@@ -184,12 +195,66 @@ _TERMINAL_TARGET_STATUSES = frozenset(
 )
 
 
+def _batch_route(batch: Batch, settings) -> tuple[str, str, list[str]]:
+    """The `(project, spider, node pool)` one batch is bound for.
+
+    Extracted from the two dispatch loops so the *planning* pass and the
+    *POST* pass cannot drift: the batch's node class is part of its
+    dispatch identity, so deriving it twice from two copies of this
+    branch would be a way to mint two identities for one batch.
+    """
+    if batch.mode == ScrapeProfileMode.BROWSER:
+        return (
+            _SCRAPYD_BROWSER_PROJECT,
+            _GENERIC_BROWSER_SPIDER,
+            settings.SCRAPYD_BROWSER_URLS,
+        )
+    return _SCRAPYD_PROJECT, _GENERIC_PRICE_SPIDER, settings.SCRAPYD_HTTP_URLS
+
+
+def _batch_identity(
+    scrape_job_id: uuid.UUID, batch: Batch, project: str, spider: str
+) -> DispatchIdentity:
+    """Name one batch canonically (EPA B1).
+
+    `node_class` is the `{project}:{spider}` **pool**, deliberately not
+    the selected node URL: `select_node` re-maps domains whenever the
+    pool's size changes, and a pool resize must not mint a new identity
+    for work already POSTed.
+    """
+    return build_dispatch_identity(
+        scrape_job_id=str(scrape_job_id),
+        planning_generation=batch.planning_generation,
+        strategy_method=batch.strategy_method,
+        domain=batch.domain,
+        mode=batch.mode,
+        node_class=f"{project}:{spider}",
+        match_ids=batch.match_ids,
+    )
+
+
+def _strategy_method_label(method: DomainStrategyMethod | None) -> str:
+    """A stable text name for one versioned strategy-chain rung (EPA B1).
+
+    Part of the dispatch identity, so it must be **stable across
+    processes and deliveries** and must change when — and only when — the
+    work genuinely changes rung. The method's UUID would be stable but
+    unreadable in a `dispatch_intents` row an operator is trying to
+    understand; the access/extraction/version triple is both.
+    """
+    if method is None:
+        return DEFAULT_STRATEGY_METHOD
+    access = getattr(method.access_method, "value", method.access_method)
+    extraction = getattr(method.extraction_method, "value", method.extraction_method)
+    return f"{access}/{extraction or '-'}/v{method.method_version}"
+
+
 def _resolve_domains_and_modes(
     session: Session,
     workspace_id: uuid.UUID | str,
     targets: list[ScrapeJobTarget],
-) -> list[ResolvedTarget]:
-    """Resolve each target's `competitor_domain` + `mode`, set-based.
+) -> tuple[list[ResolvedTarget], bool]:
+    """Resolve each target's `competitor_domain` + `mode` + strategy rung, set-based.
 
     One scoped read over the matches + one scoped read over the
     competitors (never a per-target query) — the scrape mode comes from
@@ -198,9 +263,18 @@ def _resolve_domains_and_modes(
     target whose match/competitor can no longer be resolved (soft ref —
     a match may be archived/deleted, `contracts/models-jobs.md`) is
     skipped rather than raising.
+
+    Returns `(resolved_targets, cursor_advanced)`. `cursor_advanced` is
+    True when this pass moved at least one target's durable strategy
+    cursor — i.e. when the caller is about to commit a genuinely new
+    plan. That flag, and nothing else, is what authorizes advancing
+    `scrape_jobs.planning_generation` (EPA B1): a task retry that
+    re-resolves identical cursors reports False and therefore reuses the
+    persisted generation, producing the same dispatch identity and one
+    POST rather than two.
     """
     if not targets:
-        return []
+        return [], False
 
     match_ids = [target.match_id for target in targets]
     matches = {
@@ -296,6 +370,7 @@ def _resolve_domains_and_modes(
             methods_by_profile.setdefault(method.domain_strategy_profile_id, []).append(method)
 
     resolved: list[ResolvedTarget] = []
+    cursor_advanced = False
     for target in targets:
         match = matches.get(target.match_id)
         if match is None:
@@ -324,6 +399,12 @@ def _resolve_domains_and_modes(
                     target.current_strategy_method_id = selected_method.id
                     target.strategy_attempt_ordinal = selection.attempt_ordinal
                     target.chain_token = target.chain_token or new_uuid7()
+                    # A durable, explicit strategy-chain transition — the
+                    # ONE thing that authorizes a new planning generation
+                    # (EPA B1). Recorded here rather than inferred from
+                    # `session.dirty` later so the reason is visible at
+                    # the point the cursor actually moves.
+                    cursor_advanced = True
 
         if selected_method is not None:
             mode = mode_for_access_method(selected_method.access_method)
@@ -334,10 +415,15 @@ def _resolve_domains_and_modes(
                 else ScrapeProfileMode.HTTP
             )
         resolved.append(
-            ResolvedTarget(match_id=target.match_id, competitor_domain=domain, mode=mode)
+            ResolvedTarget(
+                match_id=target.match_id,
+                competitor_domain=domain,
+                mode=mode,
+                strategy_method=_strategy_method_label(selected_method),
+            )
         )
 
-    return resolved
+    return resolved, cursor_advanced
 
 
 def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID, uuid.UUID]]:
@@ -429,30 +515,56 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             job.status = ScrapeJobStatus.RUNNING
             job.started_at = datetime.now(timezone.utc)
 
-        resolved_targets = _resolve_domains_and_modes(session, workspace_uuid, targets)
+        resolved_targets, cursor_advanced = _resolve_domains_and_modes(
+            session, workspace_uuid, targets
+        )
+
+        # --- the durable planning generation (EPA B1) -------------------------
+        # Read from `scrape_jobs.planning_generation`, advanced ONLY when
+        # this pass moved a strategy cursor -- i.e. when we are about to
+        # commit a genuinely new plan. A duplicate delivery, or a retry
+        # after a rollback, re-derives the SAME number and therefore the
+        # same dispatch identity, which is what turns an at-least-once
+        # delivery into exactly one POST. The write joins the very
+        # transaction that persists the cursor advance and the intents
+        # below, so the generation can never outlive the plan it names.
+        planning_generation = int(job.planning_generation or 0)
+        if cursor_advanced:
+            planning_generation += 1
+            job.planning_generation = planning_generation
+
         batches = plan_batches(
             resolved_targets,
             http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
             http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
             browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,
+            planning_generation=planning_generation,
         )
 
-        client = ScrapydDispatchClient(settings=settings)
+        # --- persist the intents, in THIS transaction ------------------------
+        # Before a single POST: the plan is durable, or it did not happen.
+        # Doing it as its own pass (rather than inline in the dispatch
+        # loop) is what makes "the intent row and the strategy cursor
+        # commit together" true even if the first POST blows up.
+        intents = DispatchIntentStore(
+            session,
+            workspace_id=workspace_uuid,
+            scrape_job_id=job.id,
+            authorized_cancellation_generation=job.cancellation_generation or 0,
+        )
+        planned: list[tuple[Batch, DispatchIdentity, str, str, str]] = []
+        for batch in batches:
+            project, spider, nodes = _batch_route(batch, settings)
+            node_url = select_node(batch.domain, nodes)
+            identity = _batch_identity(job.id, batch, project, spider)
+            intents.plan(
+                identity, match_ids=batch.match_ids, batch_index=batch.batch_index
+            )
+            planned.append((batch, identity, project, spider, node_url))
+
+        client = ScrapydDispatchClient(settings=settings, intents=intents)
         try:
-            for batch in batches:
-                if batch.mode == ScrapeProfileMode.BROWSER:
-                    project, spider, nodes = (
-                        _SCRAPYD_BROWSER_PROJECT,
-                        _GENERIC_BROWSER_SPIDER,
-                        settings.SCRAPYD_BROWSER_URLS,
-                    )
-                else:
-                    project, spider, nodes = (
-                        _SCRAPYD_PROJECT,
-                        _GENERIC_PRICE_SPIDER,
-                        settings.SCRAPYD_HTTP_URLS,
-                    )
-                node_url = select_node(batch.domain, nodes)
+            for batch, identity, project, spider, node_url in planned:
                 client.schedule(
                     project,
                     spider,
@@ -460,8 +572,11 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                     scrape_job_id=str(job.id),
                     match_ids=batch.match_ids,
                     mode=batch.mode,
+                    # Spider argument + traceability label ONLY -- the
+                    # idempotency decision is `identity`'s (EPA B1).
                     batch_index=batch.batch_index,
                     node_url=node_url,
+                    identity=identity,
                 )
                 # F-2 (2026-08-22): stamp the batch's targets the moment they
                 # leave here, so the next dispatch delivery cannot re-plan
@@ -469,21 +584,33 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 # dispatched too -- the POST that guard is standing in for did
                 # happen. One loop over the already-loaded `targets`, never an
                 # extra query.
+                #
+                # EPA B2: `stamp_targets_dispatched` is the SINGLE stamping
+                # path -- it re-derives proof from the same committed
+                # guard/intent `client.schedule()` just confirmed (or
+                # deduped against) before writing `dispatched_at` /
+                # `dispatch_intent_id`, so a target can never be marked
+                # dispatched without something proving THIS identity
+                # reached Scrapyd. `client._redis` is the exact Redis
+                # client `schedule()` just wrote the guard through --
+                # reusing it (rather than building a second one) is what
+                # makes the guard visible here in the same call.
                 dispatched_match_ids = set(batch.match_ids)
-                stamp = datetime.now(timezone.utc)
-                for target in targets:
-                    if target.match_id in dispatched_match_ids:
-                        # A DEFERRED row is a ready-to-dispatch handback. Once
-                        # this POST succeeds it becomes an ordinary in-flight
-                        # PENDING row carrying a stamp; duplicate task
-                        # deliveries then exclude it, while stall recovery can
-                        # still reclaim it if the scraper node dies. This also
-                        # makes durable cross-mode handoffs idempotent after
-                        # their chain cursor has advanced.
-                        if target.status is ScrapeTargetStatus.DEFERRED:
-                            target.status = ScrapeTargetStatus.PENDING
-                            target.error_code = None
-                        target.dispatched_at = stamp
+                stamp_targets_dispatched(
+                    session,
+                    client._redis,  # noqa: SLF001 - the same client just POSTed through
+                    batch=DispatchedBatch(
+                        workspace_id=workspace_uuid,
+                        scrape_job_id=job.id,
+                        identity=identity,
+                        targets=[
+                            target
+                            for target in targets
+                            if target.match_id in dispatched_match_ids
+                        ],
+                    ),
+                    stamp=datetime.now(timezone.utc),
+                )
         except Exception:
             # F-1 (2026-08-22 review): a stamp is only worth what it
             # survives. `get_session()` never commits in its `finally`, so
@@ -845,28 +972,47 @@ def recover_stalled_batches() -> None:
             if not stalled_targets:
                 continue
 
-            resolved_targets = _resolve_domains_and_modes(session, workspace_id, stalled_targets)
+            resolved_targets, _ = _resolve_domains_and_modes(
+                session, workspace_id, stalled_targets
+            )
+
+            # A stall re-plan IS a durable, explicit replan transition, so
+            # it advances the job's planning generation (EPA B1) — that is
+            # what makes the re-POST a genuinely new dispatch identity
+            # instead of one suppressed by the original batch's guard.
+            #
+            # It advances once per *pass that found stalled targets*, and
+            # every re-POSTed target's `dispatched_at` is re-stamped
+            # below, so a target cannot be found stalled again until a
+            # further `SCRAPE_STALL_TIMEOUT_SECONDS` has elapsed. The
+            # cadence is therefore identical to the `:r{stall_window}`
+            # key-bucketing this replaces — at most one re-POST per stall
+            # window — but expressed as durable state rather than as a
+            # clock-derived string smuggled through `batch_index`.
+            replan_generation = int(job.planning_generation or 0) + 1
+            job.planning_generation = replan_generation
             re_batches = plan_batches(
                 resolved_targets,
                 http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
                 http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
                 browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,
+                planning_generation=replan_generation,
             )
+            intents = DispatchIntentStore(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=job.id,
+                authorized_cancellation_generation=job.cancellation_generation or 0,
+            )
+            # A second client, bound to THIS job's intent store. The outer
+            # `client` stays the (stateless) node-liveness prober so one
+            # `daemonstatus.json` cache is shared across every job in the
+            # sweep, as before.
+            dispatch_client = ScrapydDispatchClient(settings=settings, intents=intents)
 
             try:
                 for batch in re_batches:
-                    if batch.mode == ScrapeProfileMode.BROWSER:
-                        project, spider, nodes = (
-                            _SCRAPYD_BROWSER_PROJECT,
-                            _GENERIC_BROWSER_SPIDER,
-                            settings.SCRAPYD_BROWSER_URLS,
-                        )
-                    else:
-                        project, spider, nodes = (
-                            _SCRAPYD_PROJECT,
-                            _GENERIC_PRICE_SPIDER,
-                            settings.SCRAPYD_HTTP_URLS,
-                        )
+                    project, spider, nodes = _batch_route(batch, settings)
                     node_url = select_node(batch.domain, nodes)
                     status_payload = node_status_cache.get(node_url, _UNPROBED)
                     if status_payload is _UNPROBED:
@@ -879,24 +1025,52 @@ def recover_stalled_batches() -> None:
                         # Node alive and working its queue: these targets are
                         # queued behind max_proc/rate limits, not stalled.
                         continue
-                    client.schedule(
+                    identity = _batch_identity(job.id, batch, project, spider)
+                    intents.plan(
+                        identity,
+                        match_ids=batch.match_ids,
+                        batch_index=f"{batch.batch_index}:r{window}",
+                    )
+                    dispatch_client.schedule(
                         project,
                         spider,
                         workspace_id=str(workspace_id),
                         scrape_job_id=str(job.id),
                         match_ids=batch.match_ids,
                         mode=batch.mode,
+                        # The `:r{stall_window}` suffix survives as a
+                        # spider/traceability label only; the advanced
+                        # planning generation is what now distinguishes a
+                        # recovery dispatch from the original (EPA B1).
                         batch_index=f"{batch.batch_index}:r{window}",
                         node_url=node_url,
+                        identity=identity,
                     )
                     # A re-POSTed target's stall clock restarts here — without
                     # a fresh stamp the very next sweep would reap it again,
                     # which is the feedback loop this whole fix removes.
-                    stamp = datetime.now(timezone.utc)
+                    #
+                    # EPA B2: `stamp_targets_dispatched` is the SINGLE
+                    # stamping path (see `dispatch_job`'s call site for the
+                    # full rationale) -- `dispatch_client._redis` is the
+                    # same Redis client `schedule()` just POSTed the guard
+                    # through.
                     batch_match_ids = set(batch.match_ids)
-                    for target in stalled_targets:
-                        if target.match_id in batch_match_ids:
-                            target.dispatched_at = stamp
+                    stamp_targets_dispatched(
+                        session,
+                        dispatch_client._redis,  # noqa: SLF001 - same client that just POSTed
+                        batch=DispatchedBatch(
+                            workspace_id=workspace_id,
+                            scrape_job_id=job.id,
+                            identity=identity,
+                            targets=[
+                                target
+                                for target in stalled_targets
+                                if target.match_id in batch_match_ids
+                            ],
+                        ),
+                        stamp=datetime.now(timezone.utc),
+                    )
             finally:
                 # F-1 (2026-08-22 review): commit THIS job's stamps before
                 # moving on. With one commit after the whole sweep, a

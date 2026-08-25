@@ -239,16 +239,60 @@ ON CONFLICT (scrape_profile_id, version) DO NOTHING;
 --    blocked, need the residential proxy), stech (rate-limits direct;
 --    proxy-first took it 0->100%). DIRECT_HTTP_RETRY where the learned
 --    profiles landed there; DIRECT_HTTP everywhere else.
+--
+-- 2026-08-25 EVIDENCE (Task B5, READY-004 part 1 -- amazon.sa/noon.com
+-- re-certification; full trace in tests/fixtures/{amazon,noon}_labeled/
+-- FIXTURES.md and /srv/crawmatic/evidence/b5-request-log-2026-08-25.csv,
+-- 50 logged direct requests, no proxy):
+--
+-- * amazon.sa DIAGNOSED (not yet applied here -- no live DB access from
+--   the EPA sandbox to verify/update the 'amazon.sa' scrape_profiles row
+--   safely; this is a finding for the release owner to apply): this
+--   host's amazon.sa requests resolve to lang="ar-ae" (Arabic/UAE) by
+--   default. On that render, the CSS currency node (`.a-price-symbol`)
+--   reads the Arabic word "ريال" (Riyal), not the ISO code "SAR" the
+--   rest of the system expects -- and no "ريال"->"SAR" mapping exists
+--   anywhere in this codebase (checked app_shared.money and
+--   scrape_core.money_text; both normalize price digits only). Forcing
+--   the "/-/en/" URL path segment on the SAME product (verified on ASIN
+--   B0H1MXM57R both ways) renders lang="en-ae" and `.a-price-symbol`
+--   reads "SAR" cleanly; price extraction itself (`.a-price
+--   .a-offscreen` -> `#corePrice_feature_div`) is correct in both
+--   locales via scrape_core.money_text.normalize_price_text. RECOMMENDED
+--   FIX: force "/-/en/" into every amazon.sa target URL at dispatch time
+--   (a targets/URL-construction change, out of scope for the
+--   scrape_profiles row this script touches) OR add a currency-symbol
+--   normalization table if the URL can't be forced. Until one of those
+--   lands, CSS-path currency on amazon.sa is locale-dependent and
+--   unreliable outside the "/-/en/" URL form.
+-- * noon.com CONFIRMED CORRECT, no change: 8 direct requests to
+--   noon.com this session (2 bare-curl robots.txt, 1 bare-curl catalog
+--   API, 5 curl_cffi impersonate="chrome131" catalog API -- the same
+--   Chrome-TLS-fingerprint transport that recovers amazon.sa reliably)
+--   were ALL rejected at the TLS/HTTP2 layer in 54-140ms (mean ~102ms;
+--   "HTTP/2 stream reset by server", curl error 92) -- a fast reset, not
+--   a slow timeout, and not fixed by fingerprint impersonation (points
+--   to an IP-reputation/network-layer block). Cross-referencing canary
+--   job 101bb01c-08eb-4c66-9883-50dea7d315ce: all 34 of its noon.com
+--   request_attempts already used PROXY_HTTP (direct was never
+--   attempted for Noon in production, matching this playbook's existing
+--   priority-0 PROXY_HTTP-only design with DIRECT_HTTP/PLAYWRIGHT_DIRECT
+--   correctly left QUARANTINED as canaries). The 2 observed TIMEOUT
+--   rows in that job hit exactly the configured 30000ms
+--   request_timeout_ms on the PROXY_HTTP hop itself (30307-30308ms) --
+--   a proxy-side stall, not a Noon-direct-connectivity problem. No
+--   profile change follows from this evidence; the existing
+--   PROXY_HTTP-first choice for noon.com is confirmed correct.
 INSERT INTO domain_playbooks
     (id, domain, preferred_access_method, scrape_profile_name, access_policy_name,
      method_templates, notes, created_at, updated_at)
 VALUES
     (gen_random_uuid(), 'amazon.sa', 'PROXY_HTTP', 'amazon.sa', NULL,
      '[{"priority":0,"access_method":"PROXY_HTTP","scrape_profile_name":"amazon.sa","proof_state":"PROVEN","fallback_on":["PRICE_NOT_FOUND","HTTP_403","BLOCKED","PROTOCOL_FAILED","TLS_CONNECTION_FAILED"]},{"priority":1,"access_method":"PLAYWRIGHT_DIRECT","scrape_profile_name":"resilience.amazon.rendered.v1","proof_state":"PROVEN","enter_on":["PRICE_NOT_FOUND","HTTP_403","BLOCKED","PROTOCOL_FAILED","TLS_CONNECTION_FAILED"],"fallback_on":["HTTP_403","BLOCKED","PRICE_NOT_FOUND","PLAYWRIGHT_FAILED"]},{"priority":2,"access_method":"PLAYWRIGHT_PROXY","scrape_profile_name":"resilience.amazon.rendered.v1","proof_state":"CANDIDATE","enter_on":["HTTP_403","BLOCKED","PRICE_NOT_FOUND","PLAYWRIGHT_FAILED"]}]'::jsonb,
-     'Raw candidates retained; rendered direct then proxy on configured outcomes', now(), now()),
+     '2026-08-25 (B5): CSS currency is locale-dependent -- "SAR" only via the "/-/en/" URL form, else the Arabic symbol "ريال" with no normalization in this codebase; see the evidence block above this INSERT. Raw candidates retained; rendered direct then proxy on configured outcomes', now(), now()),
     (gen_random_uuid(), 'noon.com', 'PROXY_HTTP', NULL, NULL,
      '[{"priority":0,"access_method":"PROXY_HTTP","scrape_profile_name":"resilience.noon.catalog-json.v1","extraction_method":"PLATFORM_JSON","proof_state":"PROVEN","proof_sample_size":40,"fallback_on":[]},{"priority":1,"access_method":"PROXY_HTTP","proof_state":"QUARANTINED","canary_after_seconds":600,"enter_on":["HTTP_403","TIMEOUT","PROTOCOL_FAILED"],"fallback_on":["HTTP_403","TIMEOUT","PROTOCOL_FAILED"]},{"priority":2,"access_method":"PLAYWRIGHT_DIRECT","proof_state":"QUARANTINED","canary_after_seconds":600,"enter_on":["HTTP_403","TIMEOUT","PROTOCOL_FAILED"],"fallback_on":["PROTOCOL_FAILED","PLAYWRIGHT_FAILED"]},{"priority":3,"access_method":"PLAYWRIGHT_PROXY","proof_state":"QUARANTINED","canary_after_seconds":600,"enter_on":["PROTOCOL_FAILED","PLAYWRIGHT_FAILED"]}]'::jsonb,
-     'Exact-SKU catalog primary; product-page transports retained as canaries', now(), now()),
+     '2026-08-25 (B5): direct access reconfirmed fully blocked (8/8 requests, TLS-impersonated included, all fast HTTP/2 resets, not timeouts) -- PROXY_HTTP-first is evidence-correct, no change. Exact-SKU catalog primary; product-page transports retained as canaries', now(), now()),
     (gen_random_uuid(), 'stech.ink', 'DIRECT_HTTP', NULL, NULL,
      '[{"priority":0,"access_method":"DIRECT_HTTP","scrape_profile_name":"resilience.shopify.product-json.v1","extraction_method":"PLATFORM_JSON","proof_state":"PROVEN","proof_sample_size":15,"fallback_on":["HTTP_403","TIMEOUT","CONNECTION_FAILED","PROXY_FAILED"]},{"priority":1,"access_method":"DIRECT_HTTP_RETRY","proof_state":"CANDIDATE","enter_on":["HTTP_403","TIMEOUT","CONNECTION_FAILED","PROXY_FAILED"],"fallback_on":["HTTP_403","TIMEOUT","CONNECTION_FAILED"]},{"priority":2,"access_method":"PROXY_HTTP","proof_state":"CANDIDATE","enter_on":["HTTP_403","TIMEOUT","CONNECTION_FAILED"]}]'::jsonb,
      'Direct Shopify JSON primary; HTML methods remain available', now(), now()),

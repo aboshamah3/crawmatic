@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-15bf-7dc0-aaef-89c356eb92e4",
+  "sku_query": "N22832361A",
+  "observed_sku": "N22832361A",
+  "price": "198.7",
+  "currency": "SAR",
+  "title_contains": "201A Original LaserJet Toner Cartridge B",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N22832361A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:36.355005+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "eba9c40aa84d91eb8c0fda0d6bc997420fce5b0e16923a24aab2012a80b62007",
+    "full_response_bytes": 11129,
+    "fixture_file_sha256": "e775fda47b9782a81293e4f5e94fe4835f7f7c8740b1c1afc4bf5e3305ec5ab9",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-15bf-7dc0-aaef-89c356eb92e4"
+  }
+}

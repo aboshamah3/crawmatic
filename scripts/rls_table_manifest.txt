@@ -1,0 +1,127 @@
+# scripts/rls_table_manifest.txt — the REVIEWED row-level-security
+# inventory (READY-007 / P0.5).
+#
+# Built from the DATABASE CATALOG of a database migrated to alembic head
+# d5e8a3c164f2 (branch epa/prod-readiness-2026-08-25, 2026-08-25) on
+# PostgreSQL 18.6, then annotated by hand. 40 non-partition relations.
+# Re-verified at head b6d94c2f1a70 (EPA B8b), which reclassified
+# `refresh_tokens` GAP -> TRANSITIVE. That head adds no relation, so the
+# count is unchanged.
+#
+# Format: <table><TAB><class><TAB><annotation>
+#
+# This file is the human half of the isolation contract.
+# `scripts/provision_db_roles.py --verify` reads the DATABASE CATALOG
+# (pg_class.relrowsecurity / pg_class.relforcerowsecurity / pg_policy /
+# the presence of a workspace_id column) and diffs it against these
+# declarations in BOTH directions:
+#
+#   * a catalog relation missing from this file FAILS the check — an
+#     unreviewed table is a table whose isolation nobody looked at;
+#   * a declaration that no longer matches the catalog FAILS — so a
+#     migration that drops a policy, or adds a workspace_id column to a
+#     table declared SYSTEM, cannot pass by leaving this file alone.
+#
+# The inventory is never derived by walking Python model subclasses. A
+# relation can exist in the database with no mapped class — every
+# monthly partition, `alembic_version`, `_smoke_foundation`, anything
+# created by hand during an incident — and those are precisely the
+# relations a subclass walk cannot see.
+#
+# PARTITION CHILDREN ARE NOT LISTED. They are derived from pg_inherits
+# at verify time and inherit their parent's class, so this file needs no
+# new line each month and reads identically against databases that have
+# materialised different numbers of monthly partitions (production had
+# more months than the scratch database this was generated from).
+# The derivation is not cosmetic: a partition is an independent relation
+# with its own policies, and `SELECT * FROM request_attempts_2026_08`
+# is checked against the CHILD's policies, not the parent's.
+#
+# CLASSES
+# -------
+#   WORKSPACE    Carries a `workspace_id` column: one workspace owns each
+#                row. Must have ENABLE + FORCE ROW LEVEL SECURITY and at
+#                least one policy, on the parent and on every partition.
+#
+#   TRANSITIVE   Holds tenant data but has NO `workspace_id` column of
+#                its own. Scoped through a parent row by an `EXISTS`
+#                policy. The annotation names the parent table and the
+#                join column, because that indirection is the whole
+#                reason the table looks unscoped to a column-based
+#                audit.
+#
+#   SYSTEM       No tenant data. RLS deliberately absent. The annotation
+#                says WHY the table is tenant-free — that claim is what
+#                a security reviewer is actually checking.
+#
+#   TENANT_ROOT  The workspace registry itself.
+#
+#   GAP          Holds tenant-LINKED data with NO row-level security.
+#                A KNOWN, ANNOTATED hole, not an exclusion. --verify
+#                reports every GAP on every run so it cannot go quiet,
+#                and flags it if RLS later appears (the annotation would
+#                then be stale).
+#
+# DUAL-SCOPE NOTE: four WORKSPACE tables carry TWO policies rather than
+# one (`emit_global_readable_rls_policy`): a `FOR SELECT` policy
+# admitting `workspace_id IS NULL` rows as platform-global defaults, and
+# a `FOR ALL` write policy that still requires `workspace_id = <ctx>` on
+# both USING and WITH CHECK. A global row is readable by every
+# workspace BY DESIGN and writable by none of them through the tenant
+# path. They are marked "dual-scope" below.
+
+# --- WORKSPACE ---
+access_policies	WORKSPACE	dual-scope: proxy/retry policy per workspace; NULL workspace_id rows are platform-default policies, readable by all, writable by none through the tenant path.
+api_keys	WORKSPACE	CREDENTIALS (P0.5). Hashed API keys per workspace. Pre-auth lookup by key prefix is the sanctioned BYPASSRLS seam (get_auth_session); every post-auth read is workspace-scoped.
+competitor_product_matches	WORKSPACE	Which competitor URL matches which of the workspace's variants — the core competitive-intelligence asset. Parent of two TRANSITIVE sidecars below.
+competitors	WORKSPACE	Competitor domains a workspace tracks.
+dispatch_intents	WORKSPACE	JOBS (P0.5). Planned dispatch units per scrape job; added at head e7b21f3a8c94.
+domain_access_rules	WORKSPACE	Per-domain crawl permissions and robots posture for a workspace.
+domain_strategy_methods	WORKSPACE	Versioned extraction methods per strategy profile; carries its own workspace_id (not transitive) so the column-based check covers it directly.
+domain_strategy_profiles	WORKSPACE	Per-domain scraping strategy state, incl. discovery cooldowns.
+match_current_prices	WORKSPACE	Latest observed competitor price per match — the read-hot pricing surface.
+outbox_messages	WORKSPACE	Transactional outbox for webhook/event delivery; each row carries the originating workspace.
+price_alert_events	WORKSPACE	ALERTS (P0.5). Partitioned monthly by created_at; partitions inherit this class.
+price_observations	WORKSPACE	Time series of observed competitor prices. Partitioned monthly by scraped_at; partitions inherit this class.
+product_group_items	WORKSPACE	Membership rows for product groups.
+product_groups	WORKSPACE	Workspace-defined groupings of products.
+product_variants	WORKSPACE	PRODUCTS (P0.5). The variant is the unit prices attach to.
+products	WORKSPACE	PRODUCTS (P0.5). The merchant's catalog — the asset tenant isolation exists to protect.
+proxy_providers	WORKSPACE	CREDENTIALS (P0.5). dual-scope: holds `password_encrypted` + key version. NULL workspace_id rows are shared platform providers. A cross-tenant read here leaks encrypted proxy credentials.
+refresh_rules	WORKSPACE	RULES (P0.5). Scheduled refresh cadence per workspace/product/variant/group/competitor/match. The scheduler's due-rule claim is the one sanctioned cross-tenant scan (get_system_session).
+request_attempts	WORKSPACE	ATTEMPTS (P0.5). Per-request scrape telemetry incl. proxy/cost attribution. Partitioned monthly by created_at; partitions inherit this class.
+scrape_job_targets	WORKSPACE	JOBS (P0.5). Per-target rows of a scrape job.
+scrape_jobs	WORKSPACE	JOBS (P0.5). Scrape job headers and lifecycle state.
+scrape_profile_revisions	WORKSPACE	dual-scope: immutable snapshots of a scrape profile version; NULL workspace_id revisions belong to platform-global profiles.
+scrape_profiles	WORKSPACE	dual-scope: extraction selectors/XPath/JSONPath per workspace; NULL workspace_id rows are the shipped platform profiles.
+strategy_discovery_runs	WORKSPACE	Audit of strategy-discovery executions and their cost.
+users	WORKSPACE	CREDENTIALS (P0.5). Password hashes and roles. Pre-auth lookup by email is the sanctioned BYPASSRLS seam (get_auth_session); everything after authentication is workspace-scoped.
+variant_alert_states	WORKSPACE	ALERTS (P0.5). Per-variant alert debounce/threshold state.
+variant_price_daily_rollups	WORKSPACE	EXPORTS (P0.5). Daily aggregated price history — the table the usage/analytics exports read.
+variant_price_states	WORKSPACE	Current own-price state per variant.
+webhook_endpoints	WORKSPACE	CREDENTIALS (P0.5). Customer webhook URLs and signing secrets.
+webhook_events	WORKSPACE	EXPORTS (P0.5). Outbound webhook delivery log. Partitioned monthly by created_at; partitions inherit this class.
+
+# --- TRANSITIVE ---
+match_audit_classifications	TRANSITIVE	No workspace_id of its own. Scoped through competitor_product_matches via match_id: policy is EXISTS(SELECT 1 FROM competitor_product_matches p WHERE p.id = match_id AND p.workspace_id = <ctx>). Deleting the parent match removes the only path to these rows.
+match_competitor_identifiers	TRANSITIVE	No workspace_id of its own. Scoped through competitor_product_matches via match_id, same EXISTS predicate as above. Added at head a3f5c81d7e46.
+refresh_tokens	TRANSITIVE	CREDENTIALS (P0.5). No workspace_id of its own. Scoped through users via user_id: policy is EXISTS(SELECT 1 FROM users p WHERE p.id = user_id AND p.workspace_id = <ctx>). Added at head b6d94c2f1a70 (EPA B8b), closing the GAP the B8 audit recorded here. A SUPER_ADMIN's users row has workspace_id IS NULL, so its tokens match no context at all — fail-closed, deliberately. The platform never reads this table through the tenant path: issue, rotate and revoke are all keyed by an unforgeable token_hash before any principal (and therefore any app.workspace_id) exists, so all three run on the sanctioned BYPASSRLS auth seam (get_auth_session), exactly like the pre-auth user-by-email lookup. The policy confines crawmatic_app, which otherwise reads every user's refresh-token hashes across every workspace via its blanket SELECT grant.
+strategy_attempt_stats	TRANSITIVE	No workspace_id of its own. Scoped through domain_strategy_profiles via domain_strategy_profile_id: EXISTS(SELECT 1 FROM domain_strategy_profiles p WHERE p.id = domain_strategy_profile_id AND p.workspace_id = <ctx>).
+
+# --- SYSTEM ---
+_smoke_foundation	SYSTEM	Non-domain fixture table created by migration 023a24e5717d to prove the migration/mixin foundation works. Its `group_key` is a synthetic grouping key, NOT a workspace id, and nothing writes tenant data to it. Carries no FK to workspaces.
+alembic_version	SYSTEM	Migration bookkeeping: one row, one column (version_num). Read by GET /version. Both runtime roles hold SELECT only; INSERT/UPDATE/DELETE are revoked so only crawmatic_migrate advances it.
+domain_playbooks	SYSTEM	Platform-wide scraping playbooks keyed by public domain (preferred access method, profile/policy names, method templates). Seeded by scripts/seed_domain_playbooks.sql, identical for every tenant, contains no customer data — knowing that amazon.ae is scraped with a given method reveals nothing about any workspace.
+maintenance_cadences	SYSTEM	Scheduler bookkeeping: one row per maintenance task key with its next_due_at/last_run_at. Fleet-wide by construction (the maintenance sweep runs once for the whole deployment, not once per tenant) and holds no tenant-identifying column.
+proxy_circuit_breakers	SYSTEM	Fleet-wide proxy kill switch keyed by scope_key (a provider/domain scope, not a workspace). Deliberately global: a breaker that tripped for one tenant must stop the burn for all of them.
+
+# --- TENANT_ROOT ---
+workspaces	TENANT_ROOT	The tenant registry itself. Deliberately carries no RLS: it is the root every policy's `app.workspace_id` refers to, admin provisioning creates a workspace BEFORE any context could apply to it, and the row holds only a name/slug/status. Confidentiality of the LIST of workspaces is a control-plane concern (the admin router's service token), not a row-level one.
+
+# --- GAP ---
+# EMPTY. The one entry this section ever held, `refresh_tokens`, was
+# closed by EPA B8b at alembic head b6d94c2f1a70 and now sits under
+# TRANSITIVE above. The section and its class are kept because the next
+# unreviewable hole needs somewhere to be written down where --verify
+# will read it out loud on every run — a gap with no home is a gap that
+# gets left out of the file.

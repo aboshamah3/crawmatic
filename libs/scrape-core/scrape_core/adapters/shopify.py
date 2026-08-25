@@ -21,9 +21,20 @@ from scrape_core.adapters.result import (
     IdentityEvidence,
     IdentityStatus,
 )
+from scrape_core.adapters.variant_resolution import (
+    AbsenceEvidence,
+    AbsentProven,
+    Ambiguous,
+    IdentityIncompatible,
+    Resolved,
+    TypedIdentifier,
+    identifiers_from_legacy_context,
+    outcome_for_resolution,
+    resolve_shopify_variant,
+)
 from scrape_core.extraction.result import ExtractionCandidate
 
-__all__ = ["ShopifyProductJsonAdapter", "shopify_json_url"]
+__all__ = ["ShopifyProductJsonAdapter", "shopify_json_url", "typed_identifiers_for"]
 
 
 _HANDLE_RE = re.compile(r"/products/(?P<handle>[^/?#]+)", flags=re.IGNORECASE)
@@ -51,6 +62,38 @@ def _positive_money(value: str | None) -> bool:
         return value is not None and Decimal(value) > 0
     except (InvalidOperation, ValueError):
         return False
+
+
+def typed_identifiers_for(context: AdapterContext) -> list[TypedIdentifier]:
+    """Typed identifiers for this target, preferring the B4 child table.
+
+    ``context.values["typed_identifiers"]`` carries
+    ``match_competitor_identifiers`` rows once the caller loads them
+    (``TypedIdentifier`` instances, or plain mappings of the same shape).
+    With nothing there we fall back to the legacy columns — where
+    ``competitor_variant_identifier`` is deliberately typed ``UNKNOWN``
+    rather than ``SHOPIFY_VARIANT_ID``: the column never carried a type,
+    and asserting one is exactly what produced 26 false ``NOT_LISTED``
+    verdicts on S-Tech in the 2026-08-24 canary.
+    """
+    raw = context.values.get("typed_identifiers") if context.values else None
+    typed: list[TypedIdentifier] = []
+    for item in raw or ():
+        if isinstance(item, TypedIdentifier):
+            typed.append(item)
+        elif isinstance(item, Mapping):
+            typed.append(TypedIdentifier(**dict(item)))
+    return identifiers_from_legacy_context(
+        context.variant_identifier, context.sku, typed=typed
+    )
+
+
+def _absence_evidence_for(context: AdapterContext) -> AbsenceEvidence:
+    """Prior validated-absence timestamps the caller has gathered, if any."""
+    raw = context.values.get("validated_absence_at") if context.values else None
+    if not raw:
+        return AbsenceEvidence()
+    return AbsenceEvidence(validated_absence_at=tuple(raw))
 
 
 class ShopifyProductJsonAdapter:
@@ -105,35 +148,51 @@ class ShopifyProductJsonAdapter:
                 evidence,
                 message="Shopify product has no variants",
             )
-        expected_variant = context.variant_identifier or context.sku
-        variant: Mapping[str, Any] | None = None
-        variant_paths = config.get("variant_identity_paths", ("id", "sku"))
-        variant_paths = (variant_paths,) if isinstance(variant_paths, str) else variant_paths
-        if expected_variant:
-            for candidate in variants:
-                if isinstance(candidate, Mapping):
-                    for path in variant_paths:
-                        observed = first_value(candidate, path)
-                        if observed is not None and _same(observed, expected_variant):
-                            variant = candidate
-                            break
-                    if variant is not None:
-                        break
-            if variant is None:
-                missing = IdentityEvidence(
-                    IdentityStatus.NOT_LISTED,
-                    str(expected_variant),
-                    source="shopify_variant",
-                    reason="Shopify response contains no exact variant identifier",
-                )
-                return AdapterResult(AdapterOutcome.NOT_LISTED, response.final_url, missing, message=missing.reason)
-        else:
-            variant = next(
-                (item for item in variants if isinstance(item, Mapping) and item.get("available") is True),
-                next((item for item in variants if isinstance(item, Mapping)), None),
+
+        # EPA B4: typed, evidence-based variant resolution. The previous
+        # code compared the untyped legacy identifier straight against
+        # `variants[].id`/`sku` and answered NOT_LISTED when nothing
+        # matched — which is how 26 of 30 healthy S-Tech products were
+        # declared delisted in the 2026-08-24 canary. NOT_LISTED is now
+        # reachable only from a repeatedly-validated absence.
+        identifiers = typed_identifiers_for(context)
+        resolution = resolve_shopify_variant(
+            product, identifiers, absence_evidence=_absence_evidence_for(context)
+        )
+        if isinstance(resolution, AbsentProven):
+            missing = IdentityEvidence(
+                IdentityStatus.NOT_LISTED,
+                identifiers[0].value if identifiers else None,
+                source="shopify_variant",
+                reason=resolution.reason,
             )
-        if variant is None:
-            return AdapterResult(AdapterOutcome.NOT_FOUND, response.final_url, evidence)
+            return AdapterResult(
+                AdapterOutcome.NOT_LISTED, response.final_url, missing, message=missing.reason
+            )
+        if isinstance(resolution, (Ambiguous, IdentityIncompatible)):
+            unresolved = IdentityEvidence(
+                IdentityStatus.UNRESOLVED,
+                resolution.identifier.value if resolution.identifier else None,
+                getattr(resolution, "observed_identity", None),
+                "shopify_variant",
+                resolution.reason,
+            )
+            return AdapterResult(
+                outcome_for_resolution(resolution),
+                response.final_url,
+                unresolved,
+                message=resolution.reason,
+                metadata={"needs_review": True, "resolution": type(resolution).__name__},
+            )
+        # LOW-6 (Phase B gate-fix): `assert` is stripped under `python -O`,
+        # which would turn an exhaustiveness bug into a silent fall-through
+        # instead of a loud failure. Every other member of the closed ADT
+        # (AbsentProven; Ambiguous/IdentityIncompatible) is handled above, so
+        # reaching here with anything but `Resolved` means the ADT gained a
+        # member this function was not updated for.
+        if not isinstance(resolution, Resolved):
+            raise TypeError(f"unhandled VariantResolution: {resolution!r}")
+        variant = resolution.variant
 
         fields = config.get("fields", {})
         fields = fields if isinstance(fields, Mapping) else {}

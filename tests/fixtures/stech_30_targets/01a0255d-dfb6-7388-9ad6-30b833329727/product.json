@@ -1,0 +1,65 @@
+{
+ "available": true,
+ "compare_at_price": 120000,
+ "compare_at_price_max": 120000,
+ "compare_at_price_min": 120000,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T20:06:39+03:00",
+ "description": "",
+ "handle": "hp-printer-laserjet-tank-1502w-2r3e2a-w1540a",
+ "id": 9278304026919,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 96400,
+ "price_max": 96400,
+ "price_min": 96400,
+ "price_varies": false,
+ "published_at": "2024-05-12T20:06:38+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "HP",
+  "inventory_increased"
+ ],
+ "title": "HP Printer LaserJet Tank 1502w/2R3E2A (W1540A)",
+ "type": "Printer",
+ "url": "/products/hp-printer-laserjet-tank-1502w-2r3e2a-w1540a",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "2R3E2A#B13",
+   "compare_at_price": 120000,
+   "id": 48394778050855,
+   "inventory_management": "shopify",
+   "name": "HP Printer LaserJet Tank 1502w/2R3E2A (W1540A)",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 96400,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "15033",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "HP"
+}

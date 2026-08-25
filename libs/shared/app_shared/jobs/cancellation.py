@@ -15,7 +15,9 @@ Cancelling a job touches four systems that cannot share a transaction:
 
 1. Postgres  — job status, target statuses, the durable event;
 2. Scrapyd   — runs already scheduled on remote nodes;
-3. Redis     — the ``dispatched:{job}:{batch}`` idempotency sentinels;
+3. Redis     — the ``dispatched:{job}:*`` idempotency sentinels (keyed on
+   the dispatch identity's digest since B1 rather than a batch position;
+   still job-prefixed, so step 3's scan still finds every one of them);
 4. the reservation ledger (C3, not built yet).
 
 Pretending those four commit atomically is how systems end up with a
@@ -106,6 +108,7 @@ from sqlalchemy.orm import Session
 
 from app_shared.enums import ScrapeJobStatus, ScrapeTargetStatus, WebhookEventType
 from app_shared.ids import new_uuid7
+from app_shared.jobs.dispatch_intents import iter_dispatch_scrapyd_job_ids
 from app_shared.jobs.targets import mark_target
 from app_shared.maintenance.scoping import workspace_context
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
@@ -174,24 +177,46 @@ class CancellationReport:
 def iter_known_scrapyd_job_ids(
     session: Session, scrape_job_id: uuid.UUID | str
 ) -> Sequence[str]:
-    """Scrapyd job ids recorded for ``scrape_job_id``. **Empty until B1.**
+    """Scrapyd job ids recorded for ``scrape_job_id`` (EPA B1: **real**).
 
-    B1 introduces the ``dispatch_intents`` table — the durable record of
-    "we POSTed this batch to node X and it answered with Scrapyd job id
-    Y". Until that table exists there is no way to know which remote runs
-    belong to a job, so this returns an empty sequence and step 2 of the
-    ordering protocol does nothing.
+    Reads ``dispatch_intents`` — the durable record of "we POSTed this
+    batch to node X and it answered with Scrapyd job id Y" that B1
+    introduced. Step 2 of the ordering protocol now actually asks those
+    runs to stop, where before B1 it iterated an empty sequence.
 
-    That is deliberately *not* a blocker for cancellation, because the
-    fence does not depend on it: a Scrapyd run that keeps going after a
-    cancel request (or never receives one at all) cannot corrupt
-    anything — its results are refused by the persistence-side fence
-    check. Cancelling the remote run is a cost optimization, not a
-    correctness requirement. When B1 lands, implement this against
-    ``dispatch_intents`` scoped to the job's workspace and the loop in
-    :func:`cancel_and_reconcile_job` starts working with no other change.
+    The workspace is resolved from the job (a single-column projection,
+    :func:`_job_workspace_id`) and then passed explicitly into a
+    ``scoped_select``, so the tenant boundary is asserted in the SQL
+    rather than left to the ``app.workspace_id`` GUC — the same posture
+    every other query in this module takes. A job that is not visible in
+    the caller's workspace yields nothing to cancel, which is the correct
+    (and safe) answer.
+
+    Fails **soft**: any lookup error is logged and reported as "no known
+    runs". Cancelling a remote run is a cost optimization, never a
+    correctness requirement — the fence already guarantees that whatever
+    those runs produce is refused by the persistence path — so a failure
+    here must not be able to break a committed cancellation.
     """
-    return ()
+    try:
+        job_uuid = (
+            scrape_job_id
+            if isinstance(scrape_job_id, uuid.UUID)
+            else uuid.UUID(str(scrape_job_id))
+        )
+        workspace_id = _job_workspace_id(session, job_uuid)
+        if workspace_id is None:
+            return ()
+        return iter_dispatch_scrapyd_job_ids(
+            session, workspace_id=workspace_id, scrape_job_id=job_uuid
+        )
+    except Exception:  # noqa: BLE001 - lookup must never fail a cancellation
+        logger.warning(
+            "job_cancel.scrapyd_job_id_lookup_failed scrape_job_id=%s",
+            scrape_job_id,
+            exc_info=True,
+        )
+        return ()
 
 
 def release_reservations_for_job(session: Session, scrape_job_id: uuid.UUID | str) -> int:
@@ -616,9 +641,9 @@ def _best_effort_scrapyd_cancel(
 ) -> None:
     """Step 2: ask Scrapyd to stop runs we know about. Best effort, always.
 
-    Currently a no-op in practice because
-    :func:`iter_known_scrapyd_job_ids` is empty until B1 lands. Kept as a
-    real loop rather than a TODO so B1 only has to implement the lookup.
+    Live since B1: :func:`iter_known_scrapyd_job_ids` now reads real
+    Scrapyd job ids out of ``dispatch_intents``, so this loop actually
+    POSTs ``cancel.json`` for each of them.
 
     A failure here is logged and swallowed on purpose: the fence already
     guarantees that whatever those runs produce will be refused, so an

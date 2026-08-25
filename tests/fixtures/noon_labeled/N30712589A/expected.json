@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255c-ebdc-7e6b-a6ed-db4ec5354e4a",
+  "sku_query": "N30712589A",
+  "observed_sku": "N30712589A",
+  "price": "215",
+  "currency": "SAR",
+  "title_contains": "054 Ink Toner Cartridge Cyan",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N30712589A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:36.955128+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "cbdf49cc967c914cd8ef509305c4616ca5e82efc8c930134ca1bb8191bc172db",
+    "full_response_bytes": 11413,
+    "fixture_file_sha256": "4576b64b52def5abe6f339a8e3805253afd11c06f5a3110226e76d91e69f9797",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255c-ebdc-7e6b-a6ed-db4ec5354e4a"
+  }
+}

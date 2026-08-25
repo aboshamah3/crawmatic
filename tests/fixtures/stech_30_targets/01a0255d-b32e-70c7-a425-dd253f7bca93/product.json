@@ -1,0 +1,64 @@
+{
+ "available": true,
+ "compare_at_price": 45000,
+ "compare_at_price_max": 45000,
+ "compare_at_price_min": 45000,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T17:08:38+03:00",
+ "description": "",
+ "handle": "ricoh-toner-original-yellow-imc-2000-2500-842312",
+ "id": 9278077010215,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 41850,
+ "price_max": 41850,
+ "price_min": 41850,
+ "price_varies": false,
+ "published_at": "2024-05-12T17:08:37+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "inventory_increased"
+ ],
+ "title": "Ricoh Toner Original Yellow IMC-2000/2500 842312",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/ricoh-toner-original-yellow-imc-2000-2500-842312",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "11344167",
+   "compare_at_price": 45000,
+   "id": 48394411344167,
+   "inventory_management": "shopify",
+   "name": "Ricoh Toner Original Yellow IMC-2000/2500 842312",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 41850,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "11027",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "Ricoh"
+}

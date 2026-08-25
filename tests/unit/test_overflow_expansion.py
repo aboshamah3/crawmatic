@@ -112,7 +112,7 @@ def fake_post(url, *, data, auth, timeout):
 fake_redis = FakeRedis()
 
 
-def client_factory(*, settings=None):
+def client_factory(*, settings=None, intents=None):
     http_session = requests.Session()
     http_session.post = fake_post
     return RealClient(settings=settings, redis_client=fake_redis, session=http_session)

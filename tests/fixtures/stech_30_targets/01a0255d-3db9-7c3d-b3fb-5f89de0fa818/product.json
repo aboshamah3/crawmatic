@@ -1,0 +1,65 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T19:12:16+03:00",
+ "description": "",
+ "handle": "epson-ink-original-yellow-t-6644-l100-l110-l120-l130-l132-l200-l210-l1455-l3050-l3060-l3070",
+ "id": 9278234853671,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 3500,
+ "price_max": 3500,
+ "price_min": 3500,
+ "price_varies": false,
+ "published_at": "2024-05-12T19:12:15+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "Epson",
+  "inventory_increased"
+ ],
+ "title": "EPSON Ink ORIGINAL YELLOW T-6644 L100/L110/L120/L130/L132/L200/L210/L1455/L3050/L3060/L3070",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/epson-ink-original-yellow-t-6644-l100-l110-l120-l130-l132-l200-l210-l1455-l3050-l3060-l3070",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "C13T66444A",
+   "compare_at_price": null,
+   "id": 48394667065639,
+   "inventory_management": "shopify",
+   "name": "EPSON Ink ORIGINAL YELLOW T-6644 L100/L110/L120/L130/L132/L200/L210/L1455/L3050/L3060/L3070",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 3500,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "13710",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "Epson"
+}

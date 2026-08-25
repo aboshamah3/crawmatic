@@ -1,0 +1,20 @@
+{
+  "asin": "B0FSGJZDNT",
+  "price": "6399.00",
+  "currency_actually_extracted": "\u0631\u064a\u0627\u0644",
+  "currency_expected_iso": "SAR",
+  "title_contains": "MSI",
+  "extraction_method_expected": "CSS",
+  "known_limitation": "amazon.sa default (non-/-/en/) locale renders currency as an Arabic word, not an ISO code; no normalization exists in this codebase",
+  "certified": false,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/dp/B0FSGJZDNT",
+    "captured_at_utc": "2026-08-25",
+    "market_locale": "ar-ae (Arabic/UAE -- this host's default geo-resolved locale for amazon.sa, NOT forced to English)",
+    "full_page_sha256": "53c2333f87eaef5f355fa4854c0e752169e7820c4496a0f2d0db65e505680828",
+    "full_page_bytes": 862028,
+    "fixture_file_sha256": "0b4e5b658802157bb5def481fd908f9916a67ddf136d68892d906630e6f8bbed",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv"
+  }
+}

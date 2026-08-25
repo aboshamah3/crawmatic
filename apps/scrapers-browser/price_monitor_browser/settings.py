@@ -29,6 +29,15 @@ concurrency/timeout/flush knobs read from `app_shared.config.get_settings()`
   request, including each redirect hop Chromium follows internally
   (bypassing `RedirectMiddleware`/`SsrfGuardMiddleware` entirely for that
   hop) -- see `scrape_core.browser.ssrf` module docstring.
+
+**Resource-blocking policy (EPA B6)**: the same `PLAYWRIGHT_ABORT_REQUEST`
+hook now also carries the sub-resource cost/category block policy
+(`app_shared.profiles.browser_resource_policy` -- default blocklist:
+image/media/font/stylesheet by type, ads/analytics/social by host,
+`document` never blocked) for every non-navigation Playwright request.
+No setting here changed to wire this in -- it lives inside
+`abort_unsafe_request` itself, strictly AFTER the URL-safety check for
+that request, never in place of it (that module's docstring).
 """
 
 from app_shared.config import get_settings
@@ -122,6 +131,15 @@ _settings = get_settings()
 CONCURRENT_REQUESTS = _settings.BROWSER_CONCURRENT_REQUESTS
 PLAYWRIGHT_MAX_CONTEXTS = _settings.BROWSER_MAX_CONTEXTS
 PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = _settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS
+
+# Per-response download bounds (READY-013-c, parity with
+# price_monitor/settings.py). Caps all three response-bomb shapes from
+# one knob -- an over-large declared Content-Length, a lying/unbounded
+# stream, and a decompression bomb -- plus the wall-clock companion.
+# Values from `Settings` (env-tunable), never hardcoded literals here.
+DOWNLOAD_MAXSIZE = _settings.SCRAPE_DOWNLOAD_MAXSIZE_BYTES
+DOWNLOAD_WARNSIZE = _settings.SCRAPE_DOWNLOAD_WARNSIZE_BYTES
+DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
 
 # Batched-flush thresholds (contracts/persistence-pipeline.md, parity with
 # price_monitor/settings.py) -- read from `Settings`/config, never

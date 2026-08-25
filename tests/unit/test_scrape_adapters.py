@@ -252,6 +252,15 @@ def test_shopify_rejects_cross_product_handle_and_fuzzy_variant() -> None:
     )
     assert mismatch.outcome == AdapterOutcome.IDENTITY_MISMATCH
 
+    # EPA B4 (2026-08-25): this assertion used to read `== NOT_LISTED`,
+    # and that expectation WAS the bug. "BLACK" is an untyped legacy
+    # value that matches no variant field on a two-variant product — the
+    # store is plainly serving the product, so the honest answer is "we
+    # cannot tell which variant", never "the competitor delisted it".
+    # Reading a failed string match as a delisting is what produced 26
+    # false NOT_LISTED verdicts on S-Tech in the 2026-08-24 canary; that
+    # verdict now requires repeatedly validated absence of the product
+    # itself (see scrape_core.adapters.variant_resolution).
     variant_context = AdapterContext(
         product_context.target_url, variant_identifier="BLACK", profile=_Profile({})
     )
@@ -259,7 +268,9 @@ def test_shopify_rejects_cross_product_handle_and_fuzzy_variant() -> None:
         AdapterResponse(_fixture("shopify_product.json"), "https://stech.example/products/universal-toner.js"),
         variant_context,
     )
-    assert missing.outcome == AdapterOutcome.NOT_LISTED
+    assert missing.outcome == AdapterOutcome.IDENTITY_UNRESOLVED
+    assert missing.outcome != AdapterOutcome.NOT_LISTED
+    assert missing.identity.status == IdentityStatus.UNRESOLVED
 
 
 def test_shopify_malformed_and_missing_price_are_safe() -> None:
@@ -275,10 +286,14 @@ def test_shopify_malformed_and_missing_price_are_safe() -> None:
     result = get_adapter(AdapterKey.SHOPIFY_PRODUCT_JSON).adapt(
         AdapterResponse(no_price, "https://stech.example/products/universal-toner.js"), context
     )
-    # With no selected ID and no available variant, the first product variant
-    # is retained deterministically; a missing price is never fabricated from
-    # a different unavailable variant.
-    assert result.outcome == AdapterOutcome.NOT_FOUND
+    # EPA B4 (2026-08-25): previously this fell back to "the first
+    # product variant, deterministically". A default variant is only ever
+    # legitimate when the product HAS one variant; on a two-variant
+    # product with no identifier at all, picking one is a guess, and a
+    # wrong price is worse than a missing one. The adapter now says so
+    # explicitly instead of silently choosing.
+    assert result.outcome == AdapterOutcome.IDENTITY_UNRESOLVED
+    assert result.candidate is None
 
 
 @pytest.mark.parametrize(

@@ -176,6 +176,18 @@ class CompetitorProductMatch(Base, WorkspaceScopedBase, TimestampMixin):
             name="fk_cpm_scrape_profile_id_scrape_profiles",
             ondelete="SET NULL",
         ),
+        # EPA B4: the selected typed identifier. `use_alter=True` because
+        # match_competitor_identifiers itself FKs back to this table —
+        # the pair is genuinely circular, so this constraint is emitted
+        # as a separate ALTER after both tables exist (which is exactly
+        # what the B4 migration does by hand).
+        ForeignKeyConstraint(
+            ["canonical_variant_ref"],
+            ["match_competitor_identifiers.id"],
+            name="fk_cpm_canonical_variant_ref_mci",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
     )
 
     product_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
@@ -185,8 +197,25 @@ class CompetitorProductMatch(Base, WorkspaceScopedBase, TimestampMixin):
     normalized_competitor_url: Mapped[str] = mapped_column(Text(), nullable=False)
     url_pattern: Mapped[str] = mapped_column(Text(), nullable=False)
     url_pattern_version: Mapped[int] = mapped_column(Integer(), nullable=False)
+    #: LEGACY, READ-ONLY as of EPA B4. One untyped text slot that the
+    #: Shopify adapter used to read as a ``variants[].id``; on S-Tech it
+    #: holds a handle/barcode/SKU, which is how 26 of 30 canary targets
+    #: were declared NOT_LISTED off healthy HTTP 200 JSON. Superseded by
+    #: the typed ``match_competitor_identifiers`` child table. Retained
+    #: (never dropped) as the rollback anchor and audit trail for
+    #: ``scripts/migrate_stech_identifiers.py``; nothing writes it now.
     competitor_variant_identifier: Mapped[str | None] = mapped_column(Text(), nullable=True)
     competitor_variant_sku: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: EPA B4: the ``match_competitor_identifiers`` row currently selected
+    #: as *the* variant identity for this match. Nullable on purpose —
+    #: "we do not yet know which identifier is canonical" is a real and
+    #: common state, and inventing one is precisely the bug the child
+    #: table exists to fix. ``ON DELETE SET NULL`` (declared in the
+    #: migration): closing/removing an identifier row must never delete
+    #: the match.
+    canonical_variant_ref: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
     competitor_variant_options: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
     external_title: Mapped[str | None] = mapped_column(Text(), nullable=True)
     scrape_profile_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)

@@ -41,6 +41,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     CHAR,
+    BigInteger,
     Boolean,
     ForeignKeyConstraint,
     Integer,
@@ -186,6 +187,27 @@ class RequestAttempt(Base, WorkspaceScopedBase):
         default=RequestOrigin.SCRAPE,
         server_default=RequestOrigin.SCRAPE.value,
     )
+
+    #: EPA B6 (2026-08-25, browser resource blocking policy). Both are
+    #: TRANSPORT-OBSERVED byte counts ONLY -- summed from what the
+    #: browser/HTTP client actually reported receiving on the wire for
+    #: this attempt. Provider-billed bytes are a DISTINCT fact
+    #: (compression, CONNECT/TLS overhead, redirects, service workers,
+    #: and provider-side accounting all diverge from what the transport
+    #: observed) -- reconciled against these two columns in C5, never
+    #: conflated with them here. Nullable, no `server_default`: every
+    #: pre-B6 row and every non-browser attempt legitimately has no
+    #: breakdown to report (NULL == "not measured", not zero).
+    #:
+    #: `main_document_bytes` -- the page's own top-level document
+    #: response (the one navigation the scraper actually wants).
+    main_document_bytes: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+    #: `subresource_bytes` -- every OTHER response the browser loaded
+    #: while rendering that document (images/media/fonts/XHR/ads/
+    #: analytics/...) -- exactly what
+    #: `app_shared.profiles.browser_resource_policy.should_block` decides
+    #: to block or let through.
+    subresource_bytes: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
 
 
 class MatchCurrentPrice(Base, WorkspaceScopedBase, TimestampMixin):

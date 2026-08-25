@@ -202,9 +202,19 @@ def test_get_engine_passes_prepare_threshold_none_connect_arg(
     """Capture the actual connect_args create_engine() is called with, without connecting."""
     captured: dict[str, object] = {}
 
-    def _fake_create_engine(url: str, **kwargs: object) -> SimpleNamespace:
+    # Delegates to the REAL create_engine after capturing the kwargs,
+    # rather than returning a stub. `create_engine` is lazy — no
+    # connection is attempted — and `get_engine` now attaches a pool
+    # event listener to what it builds (the READY-007 workspace-context
+    # reset), which a stub cannot accept. Capturing while still handing
+    # back a genuine Engine keeps this test measuring connect_args
+    # without also asserting, by accident, that get_engine never touches
+    # the engine it just made.
+    real_create_engine = database.create_engine
+
+    def _fake_create_engine(url: str, **kwargs: object) -> object:
         captured.update(kwargs)
-        return SimpleNamespace(dispose=lambda: None)
+        return real_create_engine(url, **kwargs)
 
     monkeypatch.setattr(database, "_engine", None, raising=False)
     monkeypatch.setattr(database, "_sessionmaker", None, raising=False)

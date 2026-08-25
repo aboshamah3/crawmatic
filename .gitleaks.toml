@@ -1,0 +1,89 @@
+# Gitleaks configuration — Crawmatic secret-scanning CI gate.
+#
+# EPA task W5.4 / READY-010 step 4. The four custom rules below were derived
+# during the 2026-08-25 secret residue scan (A3,
+# /srv/crawmatic/evidence/secret-scan-2026-08-25.md): gitleaks' default rule
+# set does not know the shape of a DataImpulse proxy credential or of a
+# Railway project/API token, and those are exactly the two credential families
+# this codebase handles most.
+#
+# This file is IDENTICAL in the engine, SaaS and plugin repositories on
+# purpose: three subtly different scanners produce three subtly different
+# blind spots. The canonical copy is crawmatic/.gitleaks.toml.
+#
+# Historical findings are baselined in `.gitleaksignore` (per repo), which
+# holds fingerprints, never secret values. The baseline exists so the gate is
+# GREEN today and therefore meaningful tomorrow — a gate that is red on
+# arrival is a gate that gets bypassed. Every baselined fingerprint was
+# assessed in A3 as a test fixture or documentation placeholder.
+
+title = "Crawmatic secret scanning"
+
+[extend]
+useDefault = true
+
+# ── DataImpulse proxy credentials ──────────────────────────────────────────
+# Shape taken from libs/scrape-core/scrape_core/targets.py (sticky_proxy_username)
+# and tests/unit/test_discovery_proxy_auth.py:
+#   http://<user>[__cr.<country>][;sessid.<hash>]:<password>@gw.dataimpulse.com:823
+
+[[rules]]
+id = "dataimpulse-proxy-url-creds"
+description = "DataImpulse proxy URL with inline credentials"
+regex = '''https?://[A-Za-z0-9._;-]{3,}:[^@\s/'"]{6,}@[a-z0-9.-]*dataimpulse\.com'''
+tags = ["proxy", "dataimpulse"]
+
+[[rules]]
+id = "dataimpulse-env-credential"
+description = "DataImpulse proxy credential assigned to a PROXY_* variable"
+regex = '''(?i)\b(PROXY_(PASSWORD|PASS|SECRET|USERNAME|USER)|DATAIMPULSE_[A-Z_]*)\s*[:=]\s*['"]?([A-Za-z0-9._;+/=-]{8,})['"]?'''
+secretGroup = 3
+tags = ["proxy", "dataimpulse"]
+
+[[rules]]
+id = "dataimpulse-sticky-username-with-secret"
+description = "DataImpulse sticky-session username carrying a session secret"
+regex = '''[A-Za-z0-9_-]{4,}(?:__cr\.[a-z]{2})?;sessid\.[A-Za-z0-9]{6,}:[^@\s'"]{6,}'''
+tags = ["proxy", "dataimpulse"]
+
+# ── Railway ────────────────────────────────────────────────────────────────
+# Railway project/API tokens are bare UUIDs, which cannot be matched on shape
+# alone without flooding the report; anchor on the variable name instead.
+
+[[rules]]
+id = "railway-token-generic"
+description = "Railway API/project token assigned to a variable"
+regex = '''(?i)\b(RAILWAY_(API_)?TOKEN[A-Z0-9_]*)\s*[:=]\s*['"]?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[A-Za-z0-9._-]{20,})['"]?'''
+secretGroup = 3
+tags = ["railway"]
+
+# ── Global allowlists ──────────────────────────────────────────────────────
+# Path- and value-level allowlists, kept deliberately narrow. Anything wider
+# than this belongs in .gitleaksignore as an explicit, assessed fingerprint.
+
+[[allowlists]]
+description = "Vendored dependencies, build output and lockfiles"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)\.wasp/''',
+  '''(^|/)vendor/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)__pycache__/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)graphify-out/''',
+  '''(^|/)uv\.lock$''',
+  '''(^|/)package-lock\.json$''',
+]
+
+[[allowlists]]
+description = "Self-referential: this config's own example patterns"
+paths = ['''(^|/)\.gitleaks\.toml$''']
+
+[[allowlists]]
+description = "Obvious placeholders — a gate that flags the word 'placeholder' trains people to ignore it"
+regexTarget = "match"
+regexes = [
+  '''(?i)(placeholder|example|dummy|changeme|your[-_]?(key|token|secret)|xxxx+|<[a-z_]+>|\bfake\b|\bsample\b)''',
+  '''(?i)^0{16,}$''',
+]

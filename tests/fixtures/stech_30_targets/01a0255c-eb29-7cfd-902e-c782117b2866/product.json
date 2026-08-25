@@ -1,0 +1,65 @@
+{
+ "available": true,
+ "compare_at_price": null,
+ "compare_at_price_max": 0,
+ "compare_at_price_min": 0,
+ "compare_at_price_varies": false,
+ "created_at": "2024-05-12T19:02:49+03:00",
+ "description": "",
+ "handle": "hp-ink-original-cyan-903xl-t6m03ae-officejet-1",
+ "id": 9278222926119,
+ "images": [],
+ "options": [
+  {
+   "name": "Title",
+   "position": 1,
+   "values": [
+    "Default Title"
+   ]
+  }
+ ],
+ "price": 9000,
+ "price_max": 9000,
+ "price_min": 9000,
+ "price_varies": false,
+ "published_at": "2024-05-12T19:02:48+03:00",
+ "requires_selling_plan": false,
+ "selling_plan_groups": [],
+ "tags": [
+  "HP",
+  "inventory_increased"
+ ],
+ "title": "HP Ink Original Cyan 903XL/T6M03AE OFFICEJET",
+ "type": "Toner, Inks and cartridges",
+ "url": "/products/hp-ink-original-cyan-903xl-t6m03ae-officejet-1",
+ "variants": [
+  {
+   "available": true,
+   "barcode": "T6M03AE",
+   "compare_at_price": null,
+   "id": 48394646913319,
+   "inventory_management": "shopify",
+   "name": "HP Ink Original Cyan 903XL/T6M03AE OFFICEJET",
+   "option1": "Default Title",
+   "option2": null,
+   "option3": null,
+   "options": [
+    "Default Title"
+   ],
+   "price": 9000,
+   "public_title": null,
+   "quantity_rule": {
+    "increment": 1,
+    "max": null,
+    "min": 1
+   },
+   "requires_selling_plan": false,
+   "requires_shipping": true,
+   "sku": "13389",
+   "taxable": true,
+   "title": "Default Title",
+   "weight": 0
+  }
+ ],
+ "vendor": "HP"
+}

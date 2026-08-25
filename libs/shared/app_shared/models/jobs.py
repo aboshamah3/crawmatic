@@ -123,6 +123,29 @@ class ScrapeJob(Base, WorkspaceScopedBase):
         Integer(), nullable=False, default=0, server_default=text("0")
     )
 
+    #: EPA B1 (READY-002). **The durable slot for the dispatch identity's
+    #: ``planning_generation``** — i.e. this job's strategy-chain plan
+    #: version. It advances ONLY inside the transaction that commits an
+    #: explicit planning state transition:
+    #:
+    #: * ``dispatch_job`` advancing a target's strategy cursor (a chain
+    #:   selection or fallback), and
+    #: * ``recover_stalled_batches`` re-planning a stalled batch.
+    #:
+    #: It is deliberately NOT bumped per task run, per delivery, or per
+    #: retry: a Celery replay re-reads this value and therefore rebuilds
+    #: the *same* :class:`~app_shared.scrapyd.identity.DispatchIdentity`,
+    #: which is the whole reason a duplicate delivery produces one POST
+    #: instead of two. Minting it per run would make every retry look like
+    #: new work.
+    #:
+    #: A rolled-back attempt takes its bump with it, so the retry
+    #: re-derives the identical generation — the counter measures
+    #: *committed* plans, not attempts. ``0`` == never planned.
+    planning_generation: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default=text("0")
+    )
+
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
 
 
@@ -156,6 +179,12 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
             name="fk_sjt_current_strategy_method_dsm",
             ondelete="SET NULL",
         ),
+        ForeignKeyConstraint(
+            ["dispatch_intent_id"],
+            ["dispatch_intents.intent_id"],
+            name="fk_sjt_dispatch_intent_id_dispatch_intents",
+            ondelete="SET NULL",
+        ),
     )
 
     scrape_job_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
@@ -174,6 +203,22 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
     locked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     # Last scrapyd POST for this target (F-2): dispatch selection + per-target stall aging key. NULL = never dispatched.
     dispatched_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: EPA B2 (2026-08-25). Set together with `dispatched_at`, by
+    #: `app.workers.tasks_dispatch.stamp_targets_dispatched` ONLY, from
+    #: the `intent_id` of the exact-identity-matching committed dispatch
+    #: (`app_shared.scrapyd.identity.get_committed_dispatch`, B1). NULL
+    #: for every target dispatched before B2 and for any target whose
+    #: committed dispatch carried no intent (the legacy Redis-only guard
+    #: shape). EPA B6 (2026-08-25) added the column + FK B2 could not:
+    #: B1's migration (`e7b21f3a8c94`) landed before this one because the
+    #: migration lane was held by a concurrent worker at the time; the FK
+    #: (`fk_sjt_dispatch_intent_id_dispatch_intents`, `ondelete="SET
+    #: NULL"`, mirroring `fk_sjt_current_strategy_method_dsm`) now exists,
+    #: added by
+    #: `alembic/versions/c9a271f5b6e8_scrape_job_targets_dispatch_intent_fk.py`.
+    dispatch_intent_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
     started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     error_code: Mapped[ScrapeErrorCode | None] = enum_column(ScrapeErrorCode, nullable=True)

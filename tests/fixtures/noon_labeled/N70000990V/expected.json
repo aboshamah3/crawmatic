@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-b221-727c-a86a-c695926fed29",
+  "sku_query": "N70000990V",
+  "observed_sku": "N70000990V",
+  "price": "999",
+  "currency": "SAR",
+  "title_contains": "130A Set | CF350A, CF351A, CF352A, CF353",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N70000990V&page=1",
+    "captured_at_utc": "2026-08-25T21:48:43.633179+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "1afe8582f8554929a1a2da0346893ba847fc9619d4bb5fc32cff82ee19d730a0",
+    "full_response_bytes": 11141,
+    "fixture_file_sha256": "33c178da21d8ce04ce9814907d62504b2667716423f78b2c4ae2847f8be55bd6",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-b221-727c-a86a-c695926fed29"
+  }
+}

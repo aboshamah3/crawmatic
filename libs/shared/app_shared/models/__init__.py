@@ -164,6 +164,24 @@ from app_shared.models.maintenance_cadence import MaintenanceCadence
 # (supersede, never overwrite) — see the model's module docstring.
 from app_shared.models.match_audit import MatchAuditClassification
 
+# EPA B1 (2026-08-25): the durable dispatch intent — the authority the
+# Redis `dispatched:*` guard was previously pretending to be. Workspace-
+# owned (own workspace_id + composite FK to its job, the ScrapeJobTarget
+# shape): registered in `app_shared.repository.WORKSPACE_OWNED_MODELS`,
+# RLS via the standard `emit_rls_policy` in its own migration. See the
+# model's module docstring for why it is NOT transitively scoped.
+from app_shared.models.dispatch import DispatchIntent
+
+# EPA B4 (2026-08-25): typed competitor identifiers — the child table
+# that replaces the single untyped
+# `competitor_product_matches.competitor_variant_identifier` slot (whose
+# misreading as a Shopify variant id produced 26 false NOT_LISTED
+# verdicts on S-Tech in the 2026-08-24 canary). No workspace_id column of
+# its own — same shape as MatchAuditClassification above; isolated
+# transitively via its FK to competitor_product_matches and deliberately
+# NOT added to `app_shared.repository.WORKSPACE_OWNED_MODELS`.
+from app_shared.models.competitor_identifiers import MatchCompetitorIdentifier
+
 __all__ = [
     "Base",
     "metadata",
@@ -214,4 +232,6 @@ __all__ = [
     "OutboxMessage",
     "MaintenanceCadence",
     "MatchAuditClassification",
+    "DispatchIntent",
+    "MatchCompetitorIdentifier",
 ]

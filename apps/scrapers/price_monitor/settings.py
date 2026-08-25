@@ -150,6 +150,20 @@ CONCURRENT_REQUESTS = 16
 CONCURRENT_REQUESTS_PER_DOMAIN = 4
 REACTOR_THREADPOOL_MAXSIZE = 20
 
+# Per-response download bounds (READY-013-c). Scrapy's DOWNLOAD_MAXSIZE
+# default is 1 GiB — not a bound for a price scraper, and the single
+# setting that caps all three response-bomb shapes: a declared
+# Content-Length over the cap (refused pre-download), a Content-Length
+# that lies low or a never-ending chunked stream (connection cancelled
+# once the received bytes cross the cap), and a compressed body that
+# inflates without bound (aborted mid-inflate by
+# HttpCompressionMiddleware). DOWNLOAD_TIMEOUT is the wall-clock
+# companion: a slow-loris body under the cap is still unbounded without
+# it. Values from `Settings` (env-tunable), never hardcoded literals.
+DOWNLOAD_MAXSIZE = _settings.SCRAPE_DOWNLOAD_MAXSIZE_BYTES
+DOWNLOAD_WARNSIZE = _settings.SCRAPE_DOWNLOAD_WARNSIZE_BYTES
+DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
+
 # Batched-flush thresholds (contracts/persistence-pipeline.md) — read from
 # `Settings`/config (env/DB-tunable), never hardcoded literals here.
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS

@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-8ab3-7a22-ba57-5fcc60c3b515",
+  "sku_query": "N32119760A",
+  "observed_sku": "N32119760A",
+  "price": "299.55",
+  "currency": "SAR",
+  "title_contains": "Jet Intelligence Toner Cartridge For HP ",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N32119760A&page=1",
+    "captured_at_utc": "2026-08-25T21:48:38.761528+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "b1ec265bb1b2933c3aad39e47ee32a79679efaf27ce4baa1f29509a8109605c6",
+    "full_response_bytes": 11080,
+    "fixture_file_sha256": "d42cf9d10173f9d200fc7084d7c9b7f0a8bce9c4ea15c4e95c323b2902ffa48d",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-8ab3-7a22-ba57-5fcc60c3b515"
+  }
+}

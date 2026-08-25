@@ -106,7 +106,7 @@ def fake_get(url, *, auth=None, timeout=None):
 fake_redis = FakeRedis()
 
 
-def client_factory(*, settings=None):
+def client_factory(*, settings=None, intents=None):
     http_session = requests.Session()
     http_session.post = fake_post
     http_session.get = fake_get
@@ -446,7 +446,7 @@ def fake_get(url, *, auth=None, timeout=None):
 fake_redis = FakeRedis()
 
 
-def client_factory(*, settings=None):
+def client_factory(*, settings=None, intents=None):
     http_session = requests.Session()
     http_session.post = fake_post
     http_session.get = fake_get

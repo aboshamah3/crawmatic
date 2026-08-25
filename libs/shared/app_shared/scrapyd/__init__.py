@@ -15,10 +15,28 @@ from app_shared.scrapyd.client import (
     ScrapydDispatchError,
     dispatch_key,
 )
+from app_shared.scrapyd.errors import StaleCancellationGenerationError
+from app_shared.scrapyd.identity import (
+    PENDING_SENTINEL,
+    CommittedDispatch,
+    DispatchIdentity,
+    DispatchIntentAuthority,
+    build_dispatch_identity,
+    get_committed_dispatch,
+)
+from app_shared.scrapyd.reconcile import reconcile_inflight
 
 __all__ = [
+    "PENDING_SENTINEL",
+    "CommittedDispatch",
+    "DispatchIdentity",
+    "DispatchIntentAuthority",
     "ScrapydAuthError",
     "ScrapydDispatchClient",
     "ScrapydDispatchError",
+    "StaleCancellationGenerationError",
+    "build_dispatch_identity",
     "dispatch_key",
+    "get_committed_dispatch",
+    "reconcile_inflight",
 ]

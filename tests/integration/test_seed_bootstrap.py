@@ -5,8 +5,9 @@ Exercises the full offline-authored-only path on a real database:
 1. `alembic upgrade head` (online, direct-to-Postgres via
    `MIGRATION_DATABASE_URL`) creates all four identity tables
    (`workspaces`, `users`, `refresh_tokens`, `api_keys`) with RLS
-   (`ENABLE`/`FORCE ROW LEVEL SECURITY`) enabled on `users` + `api_keys`
-   (contracts/migration-identity.md).
+   (`ENABLE`/`FORCE ROW LEVEL SECURITY`) enabled on `users` +
+   `api_keys` + `refresh_tokens` (contracts/migration-identity.md;
+   `refresh_tokens` since head b6d94c2f1a70, EPA B8b).
 2. `scripts/seed_bootstrap.py` (`BootstrapConfig` + `run_seed`, exercised
    directly rather than via subprocess so assertions can inspect the
    returned `SeedResult`) creates exactly one `workspaces` row and one
@@ -107,14 +108,20 @@ def migrated_engine():
         engine.dispose()
 
 
-def test_migration_creates_four_tables_with_rls_on_users_and_api_keys(migrated_engine) -> None:
+def test_migration_creates_four_tables_with_rls_on_the_credential_tables(
+    migrated_engine,
+) -> None:
     inspector = inspect(migrated_engine)
     table_names = set(inspector.get_table_names())
     for expected in ("workspaces", "users", "refresh_tokens", "api_keys"):
         assert expected in table_names
 
     with migrated_engine.connect() as conn:
-        for table in ("users", "api_keys"):
+        # `refresh_tokens` joined this list at head b6d94c2f1a70 (EPA
+        # B8b): it has no workspace_id of its own, so its policy is
+        # transitive through `users.user_id`, but ENABLE + FORCE are the
+        # same posture.
+        for table in ("users", "api_keys", "refresh_tokens"):
             row_security = conn.execute(
                 text("SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = :t"),
                 {"t": table},
@@ -123,7 +130,9 @@ def test_migration_creates_four_tables_with_rls_on_users_and_api_keys(migrated_e
             assert row_security[0] is True, f"{table} does not have RLS enabled"
             assert row_security[1] is True, f"{table} does not have RLS forced"
 
-        for table in ("workspaces", "refresh_tokens"):
+        # The TENANT_ROOT stays deliberately unprotected: it is the table
+        # every other policy's `app.workspace_id` refers to.
+        for table in ("workspaces",):
             row_security = conn.execute(
                 text("SELECT relrowsecurity FROM pg_class WHERE relname = :t"),
                 {"t": table},

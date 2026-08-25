@@ -13,6 +13,8 @@ stores a `competitor_url` — single create, update, and bulk-upsert
 from __future__ import annotations
 
 import ipaddress
+import re
+import string
 from urllib.parse import urlsplit
 
 from app_shared.enums import StrEnum
@@ -44,6 +46,20 @@ INTERNAL_HOST_SUFFIXES: tuple[str, ...] = (
 )
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# The only characters a normalized (IDNA-folded, lowercased) DNS host may
+# contain. Everything else — a backslash (`http://10.0.0.1\.evil.com/`,
+# where WHATWG clients read the host as `10.0.0.1` but `urlsplit` reads
+# the whole string), a percent escape (`http://%6c%6fcalhost/`), a raw
+# space or NUL — means this validator and the eventual HTTP client would
+# disagree about which host is being addressed, and a disagreement
+# between parsers is precisely the SSRF primitive. Underscore is allowed:
+# it appears in real sub-domains and creates no such ambiguity.
+_HOST_NAME_RE = re.compile(r"^[a-z0-9._-]+$")
+
+_HEX_DIGITS = frozenset(string.hexdigits)
+_OCTAL_DIGITS = frozenset("01234567")
+_DECIMAL_DIGITS = frozenset(string.digits)
 
 
 class UnsafeUrlReason(StrEnum):
@@ -77,6 +93,95 @@ def _is_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address |
         return None
 
 
+def _normalize_host(host: str) -> str | None:
+    """Fold `host` to the form a resolver would actually look up.
+
+    Two normalizations, both of which a naive validator skips and every
+    real resolver applies — so skipping them is a deny-list bypass, not a
+    nicety:
+
+    * **IDNA/nameprep.** A non-ASCII host is NFKC-mapped to ASCII before
+      the lookup, so `ⓛocalhost`, `localhost。` and `１２７.0.0.1` are
+      `localhost`, `localhost.` and `127.0.0.1` to the resolver
+      (verified: each resolves to 127.0.0.1 through the system
+      resolver).
+      Folding here makes the deny lists below see the same string the
+      resolver will.
+    * **The trailing root dot.** `localhost.` is the fully-qualified
+      spelling of `localhost` and resolves identically; without stripping
+      it, one keystroke walks past both `INTERNAL_HOSTNAMES` and the
+      IP-literal check.
+
+    Returns `None` when the host cannot be folded at all (an
+    over-long/empty IDNA label, or a host that is nothing but dots) —
+    the caller turns that into `INVALID_URL`, the safe direction.
+    """
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except (UnicodeError, UnicodeDecodeError):
+            return None
+
+    host = host.lower().rstrip(".")
+    return host or None
+
+
+def _parse_loose_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """Decode the non-dotted-quad IPv4 spellings `inet_aton` accepts.
+
+    `ipaddress.ip_address` deliberately only accepts the strict dotted
+    quad, so `2130706433`, `0x7f000001`, `017700000001`, `0177.0.0.1` and
+    `127.1` all fall out of its IP branch and look like ordinary DNS
+    names — while the system resolver (and therefore the actual fetch) resolves
+    every one of them to 127.0.0.1. That gap is a working SSRF bypass,
+    not a theoretical one, which is why this reimplements `inet_aton`'s
+    grammar rather than trusting the strict parser alone:
+
+    * 1–4 dot-separated parts;
+    * each part is hex (`0x…`), octal (leading `0`) or decimal;
+    * the **last** part absorbs all the bytes the earlier parts left
+      over (so `127.1` is `127.0.0.1`, and `10.1` is `10.0.0.1`).
+
+    Returns `None` for anything that is not such a literal — an ordinary
+    hostname like `3com.com` must never be mistaken for an address.
+    Pure arithmetic: no `socket`, no resolution (this module performs
+    neither, by contract).
+    """
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+
+    values: list[int] = []
+    for part in parts:
+        if not part:
+            return None
+        if part[:2] in ("0x", "0X"):
+            digits = part[2:]
+            if not digits or not set(digits) <= _HEX_DIGITS:
+                return None
+            values.append(int(digits, 16))
+        elif part[0] == "0" and len(part) > 1:
+            digits = part[1:]
+            if not set(digits) <= _OCTAL_DIGITS:
+                return None
+            values.append(int(digits, 8))
+        else:
+            if not set(part) <= _DECIMAL_DIGITS:
+                return None
+            values.append(int(part, 10))
+
+    *head, last = values
+    if any(value > 0xFF for value in head):
+        return None
+    if last >= 1 << (8 * (4 - len(head))):
+        return None
+
+    packed = last
+    for index, value in enumerate(head):
+        packed |= value << (8 * (3 - index))
+    return ipaddress.IPv4Address(packed)
+
+
 def _reject_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """True iff `ip` must be rejected (not a safe public address)."""
     return (
@@ -106,11 +211,20 @@ def validate_competitor_url(url: str) -> None:
        a missing host.
     3. Missing host (e.g. `http://`) is `INVALID_URL`.
     4. Reject embedded userinfo (`user:pass@host`).
-    5. Host classification: an IP literal (incl. bracketed IPv6) must be
-       `is_global` and none of loopback/private/link-local/reserved/
-       multicast/unspecified; a DNS name (lowercased) must not be in
-       `INTERNAL_HOSTNAMES` and must not end with an
-       `INTERNAL_HOST_SUFFIXES` entry.
+    5. Normalize the host to the form a resolver would look up
+       (`_normalize_host`: IDNA/NFKC fold + trailing-root-dot strip) —
+       an unfoldable host is `INVALID_URL`.
+    6. Host classification: an IP literal — strict dotted-quad/IPv6 **or**
+       an `inet_aton` decimal/hex/octal/short form (`_parse_loose_ipv4`) —
+       must be `is_global` and none of loopback/private/link-local/
+       reserved/multicast/unspecified; a DNS name must match
+       `_HOST_NAME_RE`, must not be in `INTERNAL_HOSTNAMES`, and must not
+       end with an `INTERNAL_HOST_SUFFIXES` entry.
+
+    Steps 5 and 6's loose-IPv4/IDNA/trailing-dot/host-charset handling
+    are the READY-013-c hardening: each closed a fixture-demonstrated
+    bypass (`tests/unit/test_url_safety_hostile.py`) where this validator
+    and the eventual HTTP client disagreed about which host a URL names.
 
     Returns `None` when safe. **No DNS resolution** is ever performed.
     """
@@ -145,8 +259,20 @@ def validate_competitor_url(url: str) -> None:
             "URL must not contain embedded credentials (user:pass@host)",
         )
 
-    host = host.lower()
-    ip = _is_ip_literal(host)
+    normalized = _normalize_host(host)
+    if normalized is None:
+        raise UnsafeUrlError(
+            UnsafeUrlReason.INVALID_URL,
+            f"URL host cannot be normalized to a resolvable name: {url!r}",
+        )
+    host = normalized
+
+    # An IP literal in *any* spelling the resolver would accept — the
+    # strict dotted-quad/IPv6 form first, then the `inet_aton` decimal/
+    # hex/octal/short forms. Both are judged by the address they denote,
+    # never by their notation, so a public address stays acceptable in
+    # either spelling and a private one is rejected in either.
+    ip = _is_ip_literal(host) or _parse_loose_ipv4(host)
     if ip is not None:
         if _reject_ip(ip):
             raise UnsafeUrlError(
@@ -154,6 +280,12 @@ def validate_competitor_url(url: str) -> None:
                 f"host {host!r} is a private/internal/reserved IP address",
             )
         return
+
+    if not _HOST_NAME_RE.match(host):
+        raise UnsafeUrlError(
+            UnsafeUrlReason.INVALID_URL,
+            f"URL host contains characters no resolvable hostname has: {url!r}",
+        )
 
     if host in INTERNAL_HOSTNAMES or host.endswith(INTERNAL_HOST_SUFFIXES):
         raise UnsafeUrlError(

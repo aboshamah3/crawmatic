@@ -7,16 +7,21 @@ Per ``data-model.md`` (SPEC-03) — four tables:
   ``workspace_id`` (a cross-workspace ``SUPER_ADMIN`` has no home
   workspace) — cannot use :class:`~app_shared.models.base.WorkspaceScopedBase`
   because that mixin's column is ``NOT NULL``.
-* :class:`RefreshToken` — user-owned, **no** RLS (reached only by an
-  unforgeable ``token_hash``, never enumerated/filtered by workspace).
+* :class:`RefreshToken` — user-owned, carries no ``workspace_id`` of its
+  own; isolated **transitively** through ``users.user_id`` (READY-007 /
+  P0.5, alembic head ``b6d94c2f1a70``). Every statement the platform
+  issues against it is pre-auth (keyed by an unforgeable ``token_hash``)
+  and runs on the BYPASSRLS auth seam, so the policy exists to confine
+  ``crawmatic_app``, which has no reason to read the table at all.
 * :class:`ApiKey` — workspace-owned, RLS, uses
   :class:`~app_shared.models.base.WorkspaceScopedBase` (mandatory
   ``NOT NULL`` ``workspace_id``); adds the FK to ``workspaces`` via
   ``__table_args__`` since SPEC-02's mixin predates this table.
 
-RLS itself (``emit_rls_policy("users")`` / ``emit_rls_policy("api_keys")``)
-is applied in the creating Alembic migration, not here — this module only
-declares ORM shape (FR-001…FR-004, §22, §32).
+RLS itself (``emit_rls_policy("users")`` / ``emit_rls_policy("api_keys")``,
+and ``emit_fk_transitive_rls_policy("refresh_tokens", ...)``) is applied
+in Alembic migrations, not here — this module only declares ORM shape
+(FR-001…FR-004, §22, §32).
 """
 
 from __future__ import annotations
@@ -86,7 +91,7 @@ class User(Base, TimestampMixin):
 
 
 class RefreshToken(Base):
-    """User-owned — NO RLS (reachable only by unforgeable ``token_hash``).
+    """User-owned — TRANSITIVE RLS through ``users.user_id`` (b6d94c2f1a70).
 
     Declares ``created_at`` directly as :class:`TZDateTime` rather than
     using :class:`TimestampMixin` — this table has no ``updated_at``

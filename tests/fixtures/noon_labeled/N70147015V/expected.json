@@ -1,0 +1,24 @@
+{
+  "match_id": "01a0255d-8c26-7e63-8c79-86848bdf7404",
+  "sku_query": "N70147015V",
+  "observed_sku": "N70147015V",
+  "price": "197.15",
+  "currency": "SAR",
+  "title_contains": "Toner C-EXV 14 Black 8,500 Pages yield /",
+  "is_buyable_expected": true,
+  "expect_no_price": false,
+  "extraction_method_expected": "PLATFORM_JSON",
+  "provenance": {
+    "method": "proxy-captured (DataImpulse residential, curl_cffi impersonate=chrome131, session tag epa-b5b, this session)",
+    "source_url": "https://www.noon.com/_svc/catalog/api/v3/u/search/?q=N70147015V&page=1",
+    "captured_at_utc": "2026-08-25T21:48:47.834401+00:00",
+    "market_locale": "SAR / Saudi Arabia storefront (__cr.sa proxy country targeting)",
+    "full_response_sha256": "2cf238bdbb166b52c184e55a411a81727d05aa2796db32bda1a22ca722e9f652",
+    "full_response_bytes": 10730,
+    "fixture_file_sha256": "34ea0f44c9fbc7547a4cd1324950467442da216900b8145fa63ac7d6c5f74554",
+    "request_log": "/srv/crawmatic/evidence/b5b-proxy-request-log-2026-08-25.csv",
+    "match_classification_state": "ACTIVE",
+    "match_classification_source": "/srv/crawmatic/evidence/match-classification-2026-08-25.csv (A6)",
+    "canary_cross_reference": "01a0255d-8c26-7e63-8c79-86848bdf7404"
+  }
+}

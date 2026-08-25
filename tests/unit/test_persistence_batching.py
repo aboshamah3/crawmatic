@@ -448,13 +448,13 @@ def test_flush_batch_mixed_batch_only_upserts_the_successful_rows(
     monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session))
 
     captured: dict[str, Any] = {}
-    original_dedup = pipelines_mod.dedup_last_wins
+    original_dedup = pipelines_mod._dedup_newest_wins
 
-    def _spy_dedup(rows: Any, *, key_fn: Any) -> Any:
+    def _spy_dedup(rows: Any) -> Any:
         captured["rows"] = list(rows)
-        return original_dedup(rows, key_fn=key_fn)
+        return original_dedup(rows)
 
-    monkeypatch.setattr(pipelines_mod, "dedup_last_wins", _spy_dedup)
+    monkeypatch.setattr(pipelines_mod, "_dedup_newest_wins", _spy_dedup)
 
     success_match_id = uuid.uuid4()
     failed_match_id = uuid.uuid4()
@@ -501,16 +501,16 @@ def _oos_result(*, match_id: uuid.UUID | None = None) -> ScrapeResult:
 
 
 def _spy_dedup(monkeypatch: Any) -> dict[str, Any]:
-    """Capture every row list handed to `dedup_last_wins`, in call order."""
+    """Capture every row list handed to `_dedup_newest_wins`, in call order."""
     captured: dict[str, Any] = {"calls": []}
-    original = pipelines_mod.dedup_last_wins
+    original = pipelines_mod._dedup_newest_wins
 
-    def _spy(rows: Any, *, key_fn: Any) -> Any:
+    def _spy(rows: Any) -> Any:
         rows = list(rows)
         captured["calls"].append(rows)
-        return original(rows, key_fn=key_fn)
+        return original(rows)
 
-    monkeypatch.setattr(pipelines_mod, "dedup_last_wins", _spy)
+    monkeypatch.setattr(pipelines_mod, "_dedup_newest_wins", _spy)
     return captured
 
 
@@ -604,12 +604,28 @@ def test_flush_batch_mixed_success_and_out_of_stock_run_two_statements(
     ]
 
 
-def test_flush_batch_same_match_both_ways_keeps_only_the_last_outcome(
+def test_flush_batch_same_match_both_ways_keeps_only_the_newest_outcome(
     monkeypatch: Any,
 ) -> None:
     """A retried match can produce both an out-of-stock and a successful
     item inside one batch; the two statements must never both target the
-    same conflict arbiter -- the LAST item in the batch wins."""
+    same conflict arbiter.
+
+    Which one survives is decided by the newer **observation**, not by
+    batch position (READY-013-g): a straggler that merely lands later in
+    the buffer must not overwrite a fresher observation of the same
+    match. Both orderings below carry the same timestamps, so the same
+    row must win either way.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    older = datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
+    newer = older + timedelta(minutes=5)
+
+    def _at(result: ScrapeResult, moment: Any) -> ScrapeResult:
+        result.scraped_at = moment
+        return result
+
     session = _FakeSession()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session))
     captured = _spy_dedup(monkeypatch)
@@ -617,25 +633,56 @@ def test_flush_batch_same_match_both_ways_keeps_only_the_last_outcome(
     match_id = uuid.uuid4()
     _flush_batch(
         WORKSPACE_ID,
-        [_oos_result(match_id=match_id), _make_result(success=True, match_id=match_id)],
+        [
+            _at(_oos_result(match_id=match_id), older),
+            _at(_make_result(success=True, match_id=match_id), newer),
+        ],
     )
 
-    # Only the success upsert runs -- the out-of-stock row was dropped.
+    # The newer success wins -- and only its upsert runs.
     assert len(session.executed) == 1
     assert len(captured["calls"]) == 1
     assert captured["calls"][0][0]["match_id"] == match_id
     assert captured["calls"][0][0]["price"] == Decimal("9.99")
 
+    # Same two observations, reversed in the buffer: the newer success
+    # still wins, because position is not what decides.
     session_reversed = _FakeSession()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(session_reversed))
     captured_reversed = _spy_dedup(monkeypatch)
 
     _flush_batch(
         WORKSPACE_ID,
-        [_make_result(success=True, match_id=match_id), _oos_result(match_id=match_id)],
+        [
+            _at(_make_result(success=True, match_id=match_id), newer),
+            _at(_oos_result(match_id=match_id), older),
+        ],
     )
 
-    # ... and the other way round: only the out-of-stock upsert runs.
     assert len(session_reversed.executed) == 1
     assert len(captured_reversed["calls"]) == 1
-    assert captured_reversed["calls"][0][0]["stock_status"] == StockStatus.OUT_OF_STOCK
+    assert captured_reversed["calls"][0][0]["price"] == Decimal("9.99")
+
+    # And when the out-of-stock observation is the newer one, it wins --
+    # in either buffer order.
+    for batch in (
+        [
+            _at(_make_result(success=True, match_id=match_id), older),
+            _at(_oos_result(match_id=match_id), newer),
+        ],
+        [
+            _at(_oos_result(match_id=match_id), newer),
+            _at(_make_result(success=True, match_id=match_id), older),
+        ],
+    ):
+        oos_session = _FakeSession()
+        monkeypatch.setattr(
+            pipelines_mod, "workspace_txn", _FakeWorkspaceTxn(oos_session)
+        )
+        oos_captured = _spy_dedup(monkeypatch)
+
+        _flush_batch(WORKSPACE_ID, batch)
+
+        assert len(oos_session.executed) == 1
+        assert len(oos_captured["calls"]) == 1
+        assert oos_captured["calls"][0][0]["stock_status"] == StockStatus.OUT_OF_STOCK

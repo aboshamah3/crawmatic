@@ -16,6 +16,7 @@ from app_shared.models.access import DomainAccessRule
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.catalog import Product, ProductGroup, ProductGroupItem, ProductVariant
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
@@ -84,6 +85,12 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             # its own scoped session, in the same transaction as the
             # domain data it accompanies.
             OutboxMessage,
+            # EPA B1 (READY-002): the durable dispatch intent is
+            # workspace-owned (tenant-only) — it carries its own
+            # workspace_id plus a composite FK to its parent job, the
+            # ScrapeJobTarget shape, so every read/write goes through
+            # scoped_select and stays visible to the CI scoping guard.
+            DispatchIntent,
         }
     )
 

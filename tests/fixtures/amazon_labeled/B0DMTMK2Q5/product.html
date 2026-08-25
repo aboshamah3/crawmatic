@@ -1,0 +1,53 @@
+<!--
+  PROVENANCE: REAL CAPTURE (not synthetic).
+  Source URL : https://www.amazon.sa/-/en/dp/B0DMTMK2Q5
+  Captured   : 2026-08-25T17:26:54Z, via curl_cffi impersonate="chrome131"
+               (Chrome-TLS-fingerprint direct fetch -- the same transport
+               scrape_core.impersonate.ImpersonatingDownloadHandler uses in
+               production; no proxy, no third-party relay, direct
+               connection to amazon.sa). Locale forced via the "/-/en/"
+               URL prefix -- see FIXTURES.md for why (Arabic-locale
+               "ريال" vs ISO "SAR" currency-text finding).
+  Full page  : 1111594 bytes, sha256=21f317723d973a22b49ce9b4bc37a0f8add0bd4a10082161badaaafe0461516e
+               (the untrimmed capture; not stored in the repo -- this file
+               keeps only the 3 containers below, byte-for-byte as served).
+  Edits      : NONE to any value inside the kept containers. TRIMMED to
+               #productTitle, #corePrice_feature_div, and
+               #availability only -- ~1111594 bytes of unrelated
+               boilerplate (nav, scripts, recommendations, footer) dropped.
+  Request log: /srv/crawmatic/evidence/b5-request-log-2026-08-25.csv
+               (elapsed_ms=1772.8, status=200, direct request, no proxy)
+-->
+<html><head></head><body>
+<span id="productTitle" class="a-size-large product-title-word-break">        CORSAIR RM750e (2025) Fully Modular Silent ATX Power Supply with 12V-2x6 Cable - ATX 3.1 and PCIe 5.1 Compatible, Cybenetics Gold Efficiency, 105°C-Rated Capacitors - Black       </span>
+<div id="availability" class="a-section a-spacing-base a-spacing-top-micro }">                        <div id="all-offers-display" class="a-section"> <div id="all-offers-display-spinner" class="a-spinner-wrapper aok-hidden"><span class="a-spinner a-spinner-medium"></span></div> <form method="get" action="" autocomplete="off" class="aok-hidden all-offers-display-params"> <input type="hidden" name="" value="true" id="all-offers-display-reload-param">  <input type="hidden" name="" id="all-offers-display-params" data-asin="B0DMTMK2Q5" data-m="" data-qid="" data-smid="" data-sourcecustomerorglistid="" data-sourcecustomerorglistitemid="" data-sr=""> </form> <input type="hidden" name="" value="false" id="aod-has-oas-offers" aria-hidden="true"> </div> <span class="a-declarative" data-action="close-all-offers-display" data-close-all-offers-display="{}"> <div id="aod-background" class="a-section aok-hidden aod-darken-background"> </div> </span>        <script type="application/javascript">
+    P.when("A", "load").execute("aod-assets-loaded", function(A){
+        function logAssetsNotLoaded() {
+            if (window.ueLogError) {
+                var customError = { message: 'Failed to load AOD assets for WDG: pc_display_on_website, Device: web' };
+                var additionalInfo = {
+                    logLevel : 'ERROR',
+                    attribution : 'aod_assets_not_loaded'
+                };
+                ueLogError (customError, additionalInfo);
+            }
+            if (window.ue && window.ue.count) {
+                window.ue.count("aod-assets-not-loaded", 1);
+            }
+        }
+
+        function verifyAssetsLoaded() {
+            var assetsLoadedPageState = A.state('aod:assetsLoaded');
+            var logAssetsNotLoadedState = A.state('aod:logAssetsNotLoaded');
+
+            if((assetsLoadedPageState == null || !assetsLoadedPageState.isAodAssetsLoaded)
+                && (logAssetsNotLoadedState == null || !logAssetsNotLoadedState.isAodAssetsNotLoadedLogged)) {
+                A.state('aod:logAssetsNotLoaded', {isAodAssetsNotLoadedLogged: true});
+                logAssetsNotLoaded();
+            }
+        }
+
+        setTimeout(verifyAssetsLoaded, 50000)
+    });
+</script>   <span class="a-declarative" data-action="show-all-offers-display" data-show-all-offers-display="{}">                 <span class="a-size-medium a-color-base primary-availability-message"> Currently unavailable. </span>      </span>              <br>We don't know when or if this item will be back in stock.        </div>
+</body></html>

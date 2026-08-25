@@ -46,3 +46,6 @@ Thumbs.db
 node_modules/
 package.json
 package-lock.json
+
+# graphify knowledge-graph output — local tooling artifact, never committed.
+graphify-out/

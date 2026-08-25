@@ -1,0 +1,20 @@
+{
+  "asin": "B0DMTMK2Q5",
+  "price": null,
+  "currency": null,
+  "title_contains": "CORSAIR RM750e",
+  "availability_expected": "unknown",
+  "extraction_method_expected": "CSS",
+  "expect_no_price": true,
+  "provenance": {
+    "method": "direct-captured (curl_cffi impersonate=chrome131, this session)",
+    "source_url": "https://www.amazon.sa/-/en/dp/B0DMTMK2Q5",
+    "captured_at_utc": "2026-08-25T17:26:54Z",
+    "market_locale": "en (forced via /-/en/ URL prefix; amazon.sa Saudi Arabia storefront)",
+    "full_page_sha256": "21f317723d973a22b49ce9b4bc37a0f8add0bd4a10082161badaaafe0461516e",
+    "full_page_bytes": 1111594,
+    "fixture_file_sha256": "8096d50b6be8146721e3a455b8c5723b1edceff662a12fc8e1e5b8c1d71f96f8",
+    "request_log": "/srv/crawmatic/evidence/b5-request-log-2026-08-25.csv",
+    "canary_cross_reference": "scrape_job_id=101bb01c-08eb-4c66-9883-50dea7d315ce (2026-08-24 canary); this ASIN also appears in request_attempts.csv there"
+  }
+}
