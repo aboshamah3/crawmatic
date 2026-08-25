@@ -9,6 +9,7 @@ idempotent single-batch dispatch.
 from __future__ import annotations
 
 from app.workers.celery_app import app
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.scrapyd import ScrapydDispatchClient
 
 # The Scrapy project + spider deployed to the Scrapyd HTTP node (apps/scrapers).
@@ -16,6 +17,7 @@ _SCRAPYD_PROJECT = "price_monitor"
 _GENERIC_PRICE_SPIDER = "generic_price_spider"
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name="dispatch.generic_price_spider")
 def dispatch_generic_price_spider(
     workspace_id: str,

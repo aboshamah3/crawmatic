@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app_shared.enums import (
     MatchPriority,
@@ -73,7 +73,16 @@ class JobResponse(BaseModel):
 
 
 class JobTargetResponse(BaseModel):
-    """One `scrape_job_targets` row, as returned by `GET /v1/jobs/{id}/results`."""
+    """One `scrape_job_targets` row, as returned by `GET /v1/jobs/{id}/results`.
+
+    `status` is the `ScrapeTargetStatus` vocabulary verbatim, so the
+    EPA A2 `CANCELLED` member surfaces here automatically. The three
+    cancellation columns are published alongside it: a client that sees
+    a target finish with no result must be able to tell "a human closed
+    this, here is who and why" from "the scraper gave up", and the status
+    string alone cannot carry that. All three are `None` for every target
+    that was never cancelled.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -84,6 +93,9 @@ class JobTargetResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     locked_at: datetime | None
+    cancelled_at: datetime | None = None
+    cancelled_by: str | None = None
+    cancelled_reason: str | None = None
 
 
 class JobResultsResponse(BaseModel):
@@ -91,3 +103,44 @@ class JobResultsResponse(BaseModel):
 
     items: list[JobTargetResponse]
     next_cursor: str | None = None
+
+
+class JobCancelRequest(BaseModel):
+    """`POST /v1/admin/jobs/{job_id}/cancel` request body (EPA A2).
+
+    Carries the *reason* and nothing else. There is deliberately no
+    ``actor``/``requested_by`` field: the actor is taken from the
+    authenticated principal, so it cannot be typed in — a
+    caller-suppliable actor is a signature anyone holding the key can
+    forge, which would make the audit trail worth exactly nothing.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "Why this job is being closed. Recorded on every cancelled target "
+            "row and in the scrape.job.cancelled event. Required: an "
+            "unexplained cancellation is not auditable."
+        ),
+    )
+
+
+class JobCancelResponse(BaseModel):
+    """`POST /v1/admin/jobs/{job_id}/cancel` response — a `CancellationReport`.
+
+    ``targets_cancelled`` counts only the rows *this* call moved, so a
+    replay answers ``0`` with ``idempotent_replay=true`` rather than
+    restating the job's shape. ``outbox_message_id`` is the durable
+    event this call recorded, and is ``null`` on a replay because exactly
+    one event exists per job cancellation.
+    """
+
+    job_id: uuid.UUID
+    targets_cancelled: int
+    targets_already_terminal: int
+    outbox_message_id: uuid.UUID | None = None
+    idempotent_replay: bool
+    actor: str

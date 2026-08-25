@@ -65,8 +65,16 @@ _ALERT_EVENT_TYPES: dict[AlertEventType, WebhookEventType] = {
 }
 
 # SPEC-08 ScrapeJobStatus (terminal only) -> webhook event_type
-# (contracts/events.md #2). CANCELLED is deliberately absent -- it is a
-# vocabulary member but is never produced by SPEC-08 `finalize_jobs` in v1.
+# (contracts/events.md #2).
+#
+# CANCELLED is deliberately absent, and must STAY absent. It is no longer
+# an unproduced vocabulary member -- since EPA A2 (2026-08-25)
+# `app_shared.jobs.cancellation.cancel_and_reconcile_job` emits
+# `WebhookEventType.SCRAPE_JOB_CANCELLED` itself, in the same transaction
+# as the cancellation fence. Adding CANCELLED to this map would make
+# `finalize_jobs` emit a *second* terminal event for the same job the
+# next time it swept one, so the mapping stays with the seam that
+# actually performs the transition.
 _JOB_EVENT_TYPES: dict[ScrapeJobStatus, WebhookEventType] = {
     ScrapeJobStatus.COMPLETED: WebhookEventType.SCRAPE_JOB_COMPLETED,
     ScrapeJobStatus.PARTIAL_FAILED: WebhookEventType.SCRAPE_JOB_PARTIAL,

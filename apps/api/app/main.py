@@ -150,6 +150,7 @@ from app.routers import (
     competitors,
     domain_access_rules,
     jobs,
+    jobs_admin,
     matches,
     ops_metrics,
     product_groups,
@@ -194,6 +195,11 @@ app.include_router(strategy.router)
 app.include_router(refresh_rules.router)
 app.include_router(webhooks.router)
 app.include_router(admin.router)
+# EPA A2: also under /v1/admin, but on the TENANT auth seam (scope-gated,
+# RLS-scoped session) rather than `admin.router`'s cross-workspace service
+# token — see `routers/jobs_admin.py`'s module docstring. No path is served
+# by both routers.
+app.include_router(jobs_admin.router)
 app.include_router(version.router)
 app.include_router(ready.router)
 app.include_router(ops_metrics.router)

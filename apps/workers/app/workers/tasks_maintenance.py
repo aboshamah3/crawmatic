@@ -45,6 +45,7 @@ from app_shared.maintenance.health import (
     EVENT_PARTITION_MISSING,
     find_missing_partitions,
 )
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
 from app_shared.maintenance.rollups import run_daily_rollup
@@ -94,6 +95,7 @@ def _system_session(task_name: str) -> Iterator[Session]:
         yield session
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=MAINTENANCE_PARTITION_CREATE)
 def partition_create() -> None:
     """`MAINTENANCE_PARTITION_CREATE` (`maintenance` queue,
@@ -149,6 +151,7 @@ def partition_create() -> None:
     )
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=MAINTENANCE_DAILY_ROLLUP)
 def daily_rollup(target_date: str | None = None) -> None:
     """`MAINTENANCE_DAILY_ROLLUP` (`maintenance` queue,
@@ -174,6 +177,7 @@ def daily_rollup(target_date: str | None = None) -> None:
     )
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=MAINTENANCE_RETENTION_DROP)
 def retention_drop() -> None:
     """`MAINTENANCE_RETENTION_DROP` (`maintenance` queue,

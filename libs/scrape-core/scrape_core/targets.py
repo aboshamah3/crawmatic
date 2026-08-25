@@ -484,8 +484,8 @@ def load_targets(
     F-2 belt-and-braces (2026-08-22 duplicate-runs incident): when
     ``scrape_job_id`` is given, any ``match_id`` whose
     ``scrape_job_targets`` row for that job has already reached a
-    terminal status (``COMPLETED``/``FAILED``/``SKIPPED``) is dropped
-    before any resolution/fetch work happens. Dispatch is supposed to
+    terminal status (``COMPLETED``/``FAILED``/``SKIPPED``/``CANCELLED``)
+    is dropped before any resolution/fetch work happens. Dispatch is supposed to
     never re-POST a finished target, but a duplicate spider run must not
     depend on dispatch getting that right -- this is the second,
     independent line of defense (one cheap scoped ``IN`` query kills the
@@ -512,6 +512,11 @@ def load_targets(
                                 ScrapeTargetStatus.COMPLETED,
                                 ScrapeTargetStatus.FAILED,
                                 ScrapeTargetStatus.SKIPPED,
+                                # EPA A2: a cancelled target must never be
+                                # fetched again — this is the load-side half
+                                # of the cancellation fence, dropping the
+                                # work before any money is spent on it.
+                                ScrapeTargetStatus.CANCELLED,
                             )
                         ),
                     )

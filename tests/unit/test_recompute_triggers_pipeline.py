@@ -63,12 +63,35 @@ def _make_result(
     )
 
 
+class _EmptyResult:
+    """What a real `Session.execute(select(...))` returns for zero rows.
+
+    Needed since EPA A2: `_flush_batch` opens with the cancellation-fence
+    read (`cancelled_scrape_job_ids`), which consumes its result via
+    `.scalars().all()`. No job in these fixtures is cancelled, so the
+    honest answer is "no rows" and every recompute trigger below fires
+    exactly as it did before the fence existed.
+    """
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def all(self) -> list[Any]:
+        return []
+
+    def first(self) -> None:
+        return None
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+
 class _FakeSession:
     def add_all(self, items: Any) -> None:
         pass
 
-    def execute(self, stmt: Any) -> None:
-        pass
+    def execute(self, stmt: Any) -> Any:
+        return _EmptyResult()
 
 
 class _FakeWorkspaceTxn:

@@ -23,7 +23,17 @@ def test_webhook_event_status_members_and_values() -> None:
     }
 
 
-def test_webhook_event_type_has_exactly_eight_members_with_expected_strings() -> None:
+def test_webhook_event_type_has_exactly_nine_members_with_expected_strings() -> None:
+    """The published event vocabulary, pinned member-for-member.
+
+    Grew from eight to nine on 2026-08-25 (EPA A2): `SCRAPE_JOB_CANCELLED`
+    /`scrape.job.cancelled` is the durable event
+    `app_shared.jobs.cancellation.cancel_and_reconcile_job` records when a
+    job is administratively closed. It is a *deliberate* vocabulary
+    addition, so the pin moves with it — which is exactly what this test
+    is for: an accidental rename or typo still fails here, while a real
+    addition has to be stated in one obvious place before it can ship.
+    """
     assert issubclass(WebhookEventType, StrEnum)
 
     expected = {
@@ -34,11 +44,12 @@ def test_webhook_event_type_has_exactly_eight_members_with_expected_strings() ->
         "SCRAPE_JOB_COMPLETED": "scrape.job.completed",
         "SCRAPE_JOB_PARTIAL": "scrape.job.partial_failed",
         "SCRAPE_JOB_FAILED": "scrape.job.failed",
+        "SCRAPE_JOB_CANCELLED": "scrape.job.cancelled",
         "DOMAIN_STRATEGY_UPDATED": "domain.strategy.updated",
     }
 
     members = list(WebhookEventType)
-    assert len(members) == 8
+    assert len(members) == 9
 
     actual = {member.name: member.value for member in members}
     assert actual == expected

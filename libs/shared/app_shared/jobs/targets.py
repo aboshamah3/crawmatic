@@ -39,11 +39,19 @@ __all__ = ["Counts", "aggregate_counts", "mark_target"]
 # back to Celery for re-dispatch (contracts/overflow-dispatch.md §1;
 # data-model.md §2.1), so a transition into it stamps neither
 # `completed_at` nor `started_at`.
+#
+# `CANCELLED` (EPA A2, 2026-08-25) IS a member: an administratively
+# cancelled target is finished for good. Its membership is what makes
+# cancellation idempotent for free -- a replayed cancellation finds the
+# target already terminal and returns without touching it -- and what
+# lets `finalize_jobs` converge on a cancelled job instead of waiting
+# forever for targets nothing will ever pick up.
 _TERMINAL_TARGET_STATUSES = frozenset(
     {
         ScrapeTargetStatus.COMPLETED,
         ScrapeTargetStatus.FAILED,
         ScrapeTargetStatus.SKIPPED,
+        ScrapeTargetStatus.CANCELLED,
     }
 )
 
@@ -56,6 +64,16 @@ class Counts:
     failure: int
     skipped: int
     total: int
+    #: EPA A2. Administratively cancelled targets. Deliberately its OWN
+    #: bucket with a default, not folded into `skipped`: a cancellation is
+    #: not a scraper outcome, and rolling it into any existing counter
+    #: would make a job that was closed by hand read back as though the
+    #: scraper had decided something. `scrape_jobs` has no matching
+    #: counter column, so nothing persists this — it exists so a reader
+    #: that wants the full picture (`success + failure + skipped +
+    #: cancelled` vs `total`) can get it from the one aggregate query
+    #: instead of re-scanning the target rows.
+    cancelled: int = 0
 
 
 def mark_target(
@@ -66,6 +84,8 @@ def mark_target(
     match_id: uuid.UUID | str,
     status: ScrapeTargetStatus,
     error_code: ScrapeErrorCode | None = None,
+    cancelled_by: str | None = None,
+    cancelled_reason: str | None = None,
 ) -> None:
     """Transition the target ``(workspace_id, scrape_job_id, match_id)``.
 
@@ -80,6 +100,18 @@ def mark_target(
     previously the gate only fired on ``status == FAILED``, silently
     dropping the code on ``SKIPPED``/``DEFERRED`` (analyze finding G1,
     FR-020/FR-021, SC-006, `contracts/overflow-dispatch.md` §2).
+
+    ``CANCELLED`` (EPA A2, 2026-08-25) is the administrative terminal
+    transition, and it is why this writer grew ``cancelled_by`` /
+    ``cancelled_reason``: closing a stranded job must record *who*
+    decided and *why*, on the row itself, so a target finished without a
+    result can never later be mistaken for a scraper outcome. Both are
+    stamped (together with ``cancelled_at``) **only** on a transition to
+    ``CANCELLED`` — passing them with any other status is ignored rather
+    than silently writing cancellation provenance onto a real result.
+    ``app_shared.jobs.cancellation`` is the only intended caller; it goes
+    through this function precisely so ``scrape_job_targets`` keeps
+    exactly one transition writer (no direct row updates anywhere).
 
     **A target already in a terminal status is never transitioned again**
     (2026-08-03) — see the inline note; this is what makes a job's
@@ -117,6 +149,15 @@ def mark_target(
         target.started_at = now
     if status in _TERMINAL_TARGET_STATUSES:
         target.completed_at = now
+    if status == ScrapeTargetStatus.CANCELLED:
+        # Provenance is stamped only here (EPA A2). `cancelled_at` is
+        # recorded alongside `completed_at` rather than instead of it:
+        # the target IS finished (every terminal-status reader must see
+        # that), and the cancellation columns say why it finished
+        # without a result.
+        target.cancelled_at = now
+        target.cancelled_by = cancelled_by
+        target.cancelled_reason = cancelled_reason
     if error_code is not None:
         target.error_code = error_code
 
@@ -145,5 +186,12 @@ def aggregate_counts(
     success = by_status.get(ScrapeTargetStatus.COMPLETED, 0)
     failure = by_status.get(ScrapeTargetStatus.FAILED, 0)
     skipped = by_status.get(ScrapeTargetStatus.SKIPPED, 0)
+    cancelled = by_status.get(ScrapeTargetStatus.CANCELLED, 0)
     total = sum(by_status.values())
-    return Counts(success=success, failure=failure, skipped=skipped, total=total)
+    return Counts(
+        success=success,
+        failure=failure,
+        skipped=skipped,
+        total=total,
+        cancelled=cancelled,
+    )

@@ -156,6 +156,14 @@ from app_shared.models.outbox import OutboxMessage
 # `domain_playbooks`/`proxy_circuit_breakers`.
 from app_shared.models.maintenance_cadence import MaintenanceCadence
 
+# EPA A6 (2026-08-25): match-audit-classification sidecar over
+# competitor_product_matches. No workspace_id column of its own — same
+# shape as StrategyAttemptStats above; isolated transitively via its FK
+# to competitor_product_matches and deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`. Append-only
+# (supersede, never overwrite) — see the model's module docstring.
+from app_shared.models.match_audit import MatchAuditClassification
+
 __all__ = [
     "Base",
     "metadata",
@@ -205,4 +213,5 @@ __all__ = [
     "ProxyCircuitBreaker",
     "OutboxMessage",
     "MaintenanceCadence",
+    "MatchAuditClassification",
 ]

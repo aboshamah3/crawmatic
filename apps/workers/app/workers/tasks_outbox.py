@@ -35,12 +35,14 @@ from datetime import datetime, timezone
 from app.workers.celery_app import app
 from app_shared.config import get_settings
 from app_shared.database import get_system_session, get_system_sessionmaker
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.outbox import drain_outbox, sweep_outbox
 from app_shared.task_names import OUTBOX_DRAIN, OUTBOX_RECONCILE
 
 logger = logging.getLogger("workers.outbox")
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=OUTBOX_DRAIN)
 def outbox_drain() -> None:
     """Publish up to ``OUTBOX_DRAIN_BATCH_LIMIT`` PENDING messages.
@@ -68,6 +70,7 @@ def outbox_drain() -> None:
         )
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=OUTBOX_RECONCILE)
 def outbox_reconcile() -> None:
     """Report outbox backlog/dead-letter health and apply retention.

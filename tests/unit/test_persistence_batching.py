@@ -30,6 +30,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from sqlalchemy import Select
 from twisted.internet.defer import Deferred, fail as defer_fail, succeed
 from twisted.python.failure import Failure
 
@@ -148,6 +149,27 @@ class _RecordingRunInThread:
         return succeed(None)
 
 
+class _EmptyResult:
+    """What a real ``Session.execute(select(...))`` returns for zero rows.
+
+    Needed since EPA A2: ``_flush_batch`` now opens with the cancellation
+    fence read, so ``execute`` can no longer answer every statement with
+    ``None`` (which is not a shape any real ``Session`` returns).
+    """
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def all(self) -> list[Any]:
+        return []
+
+    def first(self) -> None:
+        return None
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+
 class _FakeSession:
     """Records ``add_all``/``execute`` calls; no real DB anywhere."""
 
@@ -158,8 +180,17 @@ class _FakeSession:
     def add_all(self, items: Any) -> None:
         self.added.append(list(items))
 
-    def execute(self, stmt: Any) -> None:
+    def execute(self, stmt: Any) -> Any:
+        # EPA A2: the cancellation-fence read (`cancelled_scrape_job_ids`,
+        # a `select(ScrapeJob.id)`) is a READ, not one of the upserts this
+        # fake exists to count -- so it is answered with an empty result
+        # ("no job in this batch is cancelled") and deliberately kept OUT
+        # of `executed`, which stays exactly "the upsert statements this
+        # flush ran" for every assertion below.
+        if isinstance(stmt, Select):
+            return _EmptyResult()
         self.executed.append(stmt)
+        return None
 
 
 class _FakeWorkspaceTxn:

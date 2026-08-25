@@ -20,13 +20,46 @@ from app.main import app
 from app.routers import ready
 
 
-class _FakeSession:
-    def __init__(self, *, raises: Exception | None = None) -> None:
-        self._raises = raises
+#: The migration head both the fake database and the fake running code
+#: report, so "every dependency is up" also means "the schema matches the
+#: code" — see `_pin_code_migration_head` below.
+_HEAD = "test_head_0001"
 
-    def execute(self, *_args: object, **_kwargs: object) -> None:
+
+class _FakeRow:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def __getitem__(self, index: int) -> str:
+        assert index == 0
+        return self._value
+
+
+class _FakeResult:
+    def __init__(self, row: _FakeRow | None) -> None:
+        self._row = row
+
+    def first(self) -> _FakeRow | None:
+        return self._row
+
+
+class _FakeSession:
+    """Answers the `SELECT 1` connectivity probe with nothing, and the
+    `alembic_version` read (added to `/ready` by READY-001 / Task A5) with
+    `head`. Defaulting `head` to `_HEAD` keeps every pre-existing test in
+    this file meaning exactly what it always meant: an all-dependencies-up
+    fixture now also has a schema its code agrees with."""
+
+    def __init__(self, *, raises: Exception | None = None, head: str | None = _HEAD) -> None:
+        self._raises = raises
+        self._head = head
+
+    def execute(self, statement: object = None, *_args: object, **_kwargs: object) -> object:
         if self._raises is not None:
             raise self._raises
+        if "alembic_version" in str(statement):
+            return _FakeResult(_FakeRow(self._head) if self._head is not None else None)
+        return None
 
 
 class _FakeRedis:
@@ -67,6 +100,21 @@ class _HangingCallable:
 
         time.sleep(self._sleep_seconds)
         return True
+
+
+@pytest.fixture(autouse=True)
+def _pin_code_migration_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Decouple these tests from the repo's real, moving migration head — the
+    same decoupling `test_version_endpoint.py` does by monkeypatching
+    `version._code_migration_head`. Also ensures no heartbeat services are
+    declared, so `checks.heartbeats` reports its "not-configured" absence
+    rather than depending on this machine's environment."""
+    from app_shared import heartbeat as heartbeat_mod
+    from app_shared import release as release_mod
+
+    monkeypatch.setattr(release_mod, "code_migration_head", lambda: _HEAD)
+    monkeypatch.delenv(heartbeat_mod.REQUIRED_SERVICES_ENV, raising=False)
+    release_mod.reset_release_identity_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -114,13 +162,16 @@ def test_ready_all_deps_up_returns_200_and_ready_true(client: TestClient) -> Non
     body = resp.json()
 
     assert resp.status_code == 200
-    assert body == {
-        "ready": True,
-        "checks": {
-            "database": {"ok": True, "error": None},
-            "redis": {"ok": True, "error": None},
-        },
-    }
+    assert body["ready"] is True
+    # `checks` gained `migrations` and `heartbeats` in READY-001 / Task A5.
+    # Asserted key-by-key rather than as one exact dict so the next check
+    # this probe legitimately grows does not read as a regression here; what
+    # matters is that every check is present, passing, and error-free.
+    assert set(body["checks"]) == {"database", "redis", "migrations", "heartbeats"}
+    for name, check in body["checks"].items():
+        assert check["ok"] is True, name
+        assert check["error"] is None, name
+    assert body["checks"]["heartbeats"]["detail"] == "not-configured"
 
 
 def test_ready_database_down_returns_503(client: TestClient) -> None:

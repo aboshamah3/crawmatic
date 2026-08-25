@@ -63,6 +63,11 @@ from app_shared.enums import (
     RequestOrigin,
     StrategyStatus,
 )
+from app_shared.maintenance.scoping import (
+    MaintenanceScope,
+    maintenance_task,
+    workspace_context,
+)
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.observations import RequestAttempt
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
@@ -800,6 +805,7 @@ def _fail_run(session: Session, run: StrategyDiscoveryRun) -> None:
     session.commit()
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=STRATEGY_DISCOVERY_RUN)
 def run_discovery(
     workspace_id: str,
@@ -1155,6 +1161,7 @@ def _scan_active_profile_refs(*, limit: int) -> list[tuple[uuid.UUID, uuid.UUID]
         return list(session.execute(stmt).all())
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=STRATEGY_LIGHT_RECHECK)
 def light_recheck() -> None:
     """`STRATEGY_LIGHT_RECHECK` (`maintenance` queue, contracts/rediscovery.md
@@ -1170,56 +1177,101 @@ def light_recheck() -> None:
 
     SPEC-16 US3 (T035b, contracts/events.md #3): every profile whose
     `apply_rediscovery` call here actually returns `True` (a genuine
-    ACTIVE -> DEGRADED transition) is collected and, strictly AFTER the
-    single `session.commit()` below, enqueued as one `DOMAIN_STRATEGY_UPDATED`
-    webhook event via `_enqueue_strategy_transition` -- this is the one
-    rediscovery path `flush_profile`/`flush_stats` never sees on its own.
+    ACTIVE -> DEGRADED transition) is enqueued as one
+    `DOMAIN_STRATEGY_UPDATED` webhook event via
+    `_outbox_strategy_transition` -- this is the one rediscovery path
+    `flush_profile`/`flush_stats` never sees on its own.
+
+    ## Transaction shape (READY-007, 2026-08-25)
+
+    One workspace, one transaction -- `workspace_context(session,
+    workspace_id)`. This patrol carried the identical defect
+    `flush_stats` failed on in production: a cross-tenant batch running
+    in ONE transaction with the workspace GUC re-set per profile inside
+    the loop, and every outbox row written after it under whichever
+    workspace happened to be last. See `flush_stats` for the full
+    reasoning. A profile scanned here is scoped to its own transaction,
+    so the `DEGRADED` UPDATE and its outbox row commit together, under
+    that profile's own workspace, or not at all.
     """
     settings = get_settings()
     thresholds = _rediscovery_thresholds(settings)
     redis = get_redis_client()
-    transitions: list[StrategyTransition] = []
+    triggered_count = 0
+    failed_profiles = 0
+    first_error: BaseException | None = None
 
     with get_session() as session:
         for profile_id, workspace_id in _scan_active_profile_refs(
             limit=_LIGHT_RECHECK_BATCH_SIZE
         ):
-            set_workspace_context(session, workspace_id)
+            try:
+                with workspace_context(session, workspace_id):
+                    profile = scoped_get(
+                        session, DomainStrategyProfile, profile_id, workspace_id
+                    )
+                    if profile is None or profile.status != StrategyStatus.ACTIVE:
+                        continue
 
-            profile = scoped_get(session, DomainStrategyProfile, profile_id, workspace_id)
-            if profile is None or profile.status != StrategyStatus.ACTIVE:
+                    combined = _combined_stats_for_profile(session, redis, profile)
+                    recent_signals = build_recent_signals(session, profile)
+                    decision = evaluate_rediscovery(
+                        profile,
+                        combined,
+                        recent_signals,
+                        thresholds,
+                        scope=settings.STRATEGY_PROFILE_SCOPE,
+                    )
+
+                    if not apply_rediscovery(session, profile, decision):
+                        continue
+
+                    logger.info(
+                        "strategy_rediscovery_triggered profile_id=%s workspace_id=%s "
+                        "reason=%s source=LIGHT_RECHECK",
+                        profile.id,
+                        workspace_id,
+                        decision.reason,
+                    )
+                    # Same transaction, same workspace scope as the
+                    # `DEGRADED` transition it reports.
+                    _outbox_strategy_transition(
+                        session,
+                        StrategyTransition(
+                            profile_id=profile.id,
+                            workspace_id=workspace_id,
+                            domain=profile.domain,
+                            new_status=StrategyStatus.DEGRADED,
+                            change="REDISCOVERY_TRIGGERED",
+                            method=None,
+                        ),
+                    )
+                    triggered_count += 1
+            except Exception as exc:
+                # One profile's failure must not abandon the rest of the
+                # patrol batch; it is re-scanned next cycle. The error is
+                # kept and re-raised below so the task still fails.
+                failed_profiles += 1
+                if first_error is None:
+                    first_error = exc
+                logger.exception(
+                    "strategy_light_recheck: profile_id=%s workspace_id=%s failed; "
+                    "rolled back and skipped",
+                    profile_id,
+                    workspace_id,
+                )
                 continue
 
-            combined = _combined_stats_for_profile(session, redis, profile)
-            recent_signals = build_recent_signals(session, profile)
-            decision = evaluate_rediscovery(
-                profile, combined, recent_signals, thresholds, scope=settings.STRATEGY_PROFILE_SCOPE
-            )
+    logger.info(
+        "strategy_light_recheck_completed rediscovery_triggered=%d failed_profiles=%d",
+        triggered_count,
+        failed_profiles,
+    )
 
-            triggered = apply_rediscovery(session, profile, decision)
-            if triggered:
-                logger.info(
-                    "strategy_rediscovery_triggered profile_id=%s workspace_id=%s "
-                    "reason=%s source=LIGHT_RECHECK",
-                    profile.id,
-                    workspace_id,
-                    decision.reason,
-                )
-                transitions.append(
-                    StrategyTransition(
-                        profile_id=profile.id,
-                        workspace_id=workspace_id,
-                        domain=profile.domain,
-                        new_status=StrategyStatus.DEGRADED,
-                        change="REDISCOVERY_TRIGGERED",
-                        method=None,
-                    )
-                )
-
-        for transition in transitions:
-            _outbox_strategy_transition(session, transition)
-
-        session.commit()
+    if first_error is not None:
+        # See `flush_stats`: per-profile isolation is not permission to
+        # report success on a batch that dropped work.
+        raise first_error
 
 
 # --- STRATEGY_STATS_FLUSH (US5, contracts/stats-buffer.md §Flush, FR-023) --
@@ -1292,6 +1344,7 @@ def _outbox_strategy_transition(session: Session, transition: StrategyTransition
     )
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=STRATEGY_STATS_FLUSH)
 def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None = None) -> None:
     """`STRATEGY_STATS_FLUSH` (`maintenance` queue, contracts/stats-buffer.md
@@ -1319,26 +1372,48 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
     api-and-observability.md.
 
     SPEC-16 US3 (T035a, contracts/events.md #3): every genuine
-    promotion/rediscovery transition `flush_profile` surfaces across this
-    sweep is collected and, strictly AFTER the single `session.commit()`
-    below, enqueued as one webhook event each via `_enqueue_strategy_transition`
-    -- never pre-commit, never speculative (only transitions an `apply_*`
-    call already confirmed real).
+    promotion/rediscovery transition `flush_profile` surfaces is enqueued
+    as one webhook event via `_outbox_strategy_transition` -- never
+    speculative (only transitions an `apply_*` call already confirmed
+    real).
+
+    ## Transaction shape (READY-007, 2026-08-25)
+
+    One workspace, one transaction -- `workspace_context(session, ws)`.
+    This is a **fix**, not a refactor. The sweep used to run every
+    workspace inside a SINGLE transaction, calling `set_workspace_context`
+    per workspace inside the loop and writing every outbox row after it.
+    `SET LOCAL app.workspace_id` is transaction-local, so the last
+    workspace in the loop owned the GUC for the whole transaction and:
+
+    * every transition belonging to an EARLIER workspace was inserted
+      under the last workspace's scope, where `FORCE ROW LEVEL SECURITY`'s
+      WITH CHECK rejected it -- `new row violates row-level security
+      policy for table "outbox_messages"`, raised on every cycle in
+      production; and
+    * every pending ORM UPDATE for an earlier workspace (a promotion's
+      `status`, `last_success_at`, `recent_failure_count`) was flushed
+      under the wrong GUC, where RLS's USING clause matched it to zero
+      rows -- no error at all, just a promotion that never happened.
+
+    Scoping each workspace to its own transaction closes both. It also
+    bounds the blast radius: one workspace failing now rolls back only
+    that workspace's flush (logged, counted, and skipped) instead of
+    discarding the whole sweep.
     """
     redis = get_redis_client()
     dirty_profiles = 0
     keys_flushed = 0
-    transitions: list[StrategyTransition] = []
+    failed_workspaces = 0
+    first_error: BaseException | None = None
+
+    if workspace_id is not None:
+        ws_list = [uuid.UUID(str(workspace_id))]
+    else:
+        ws_list = _scan_workspace_refs_with_profiles()
 
     with get_session() as session:
-        if workspace_id is not None:
-            ws_list = [uuid.UUID(str(workspace_id))]
-        else:
-            ws_list = _scan_workspace_refs_with_profiles()
-
         for ws in ws_list:
-            set_workspace_context(session, ws)
-
             if workspace_id is not None and profile_ids is not None:
                 pending_ids = [uuid.UUID(str(pid)) for pid in profile_ids]
             else:
@@ -1352,22 +1427,83 @@ def flush_stats(workspace_id: str | None = None, profile_ids: list[str] | None =
                     )
                     continue
 
-            for profile_id in pending_ids:
-                dirty_profiles += 1
-                result = flush_profile(session, redis, profile_id)
-                keys_flushed += result.keys_flushed
-                transitions.extend(result.transitions)
+            if not pending_ids:
+                continue
 
-        for transition in transitions:
-            _outbox_strategy_transition(session, transition)
+            # Counted into the totals only once this workspace's
+            # transaction has actually committed -- a rolled-back
+            # workspace flushed nothing and must not report that it did.
+            ws_profiles = 0
+            ws_keys = 0
+            try:
+                with workspace_context(session, ws):
+                    for profile_id in pending_ids:
+                        ws_profiles += 1
+                        result = flush_profile(session, redis, profile_id)
+                        ws_keys += result.keys_flushed
+                        # Written inside this workspace's own scope, so
+                        # the outbox row's `workspace_id` always matches
+                        # the GUC the RLS WITH CHECK is evaluated against.
+                        for transition in result.transitions:
+                            _outbox_strategy_transition(session, transition)
+            except Exception as exc:
+                # One workspace's failure must not abandon every other
+                # workspace's pending deltas (the same posture the Redis
+                # read failure above already takes). Its transaction is
+                # rolled back and the sweep moves on -- but the error is
+                # kept and re-raised below, so the task still fails.
+                #
+                # Be precise about what a rollback costs here, because it
+                # is NOT "the profiles stay dirty and we retry next cycle"
+                # (EPA Phase A review F-7). `stats_buffer.drain` is an
+                # atomic Lua `HGETALL` + `DEL`: by the time the Postgres
+                # transaction rolls back, the counters this workspace
+                # drained are already gone from Redis. Those deltas are
+                # **lost**, not deferred -- the attempt/success/failure
+                # counts they carried never reach `strategy_attempt_stats`.
+                #
+                # This is a pre-existing property of the drain-then-commit
+                # dual write, not something the per-workspace scoping
+                # introduced (the old single-transaction shape lost the
+                # whole sweep's deltas the same way, and more of them).
+                # Making it survivable means re-buffering the drained
+                # delta on rollback, which needs `flush_profile` to hand
+                # back what it drained and `stats_buffer` to grow an
+                # additive re-buffer primitive -- a real change with its
+                # own concurrency questions (a re-buffer racing a live
+                # `HINCRBY`), deliberately not smuggled into this fix.
+                # Until then the honest mitigation is the one already
+                # here: fail loudly, page, and treat a flush failure as
+                # data loss rather than as a retry.
+                failed_workspaces += 1
+                if first_error is None:
+                    first_error = exc
+                logger.exception(
+                    "strategy_stats_flush: workspace_id=%s failed to flush; "
+                    "rolled back -- this workspace's drained deltas are LOST, "
+                    "not deferred (drain is an atomic HGETALL+DEL)",
+                    ws,
+                )
+                continue
 
-        session.commit()
+            dirty_profiles += ws_profiles
+            keys_flushed += ws_keys
 
     logger.info(
-        "strategy_stats_flushed dirty_profiles=%d keys_flushed=%d",
+        "strategy_stats_flushed dirty_profiles=%d keys_flushed=%d failed_workspaces=%d",
         dirty_profiles,
         keys_flushed,
+        failed_workspaces,
     )
+
+    if first_error is not None:
+        # Isolation is about the *other* workspaces still getting their
+        # turn -- it is NOT permission to report success. A sweep that
+        # dropped work must fail the task, or a systemic outbox/RLS
+        # failure becomes a log line nobody is paged for (the shape that
+        # let the 2026-08-21 finalization outage run for 6.5 h). Raised
+        # after the loop so every workspace was attempted first.
+        raise first_error
 
 
 # --- STRATEGY_PATTERN_BACKFILL (FR-005, D10, T041) ------------------------
@@ -1404,6 +1540,7 @@ def _scan_stale_pattern_profile_refs(*, limit: int) -> list[tuple[uuid.UUID, uui
         return list(session.execute(stmt).all())
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=STRATEGY_PATTERN_BACKFILL)
 def pattern_backfill() -> None:
     """`STRATEGY_PATTERN_BACKFILL` (`maintenance` queue, FR-005, §15
@@ -1425,74 +1562,115 @@ def pattern_backfill() -> None:
     Bounded (`_PATTERN_BACKFILL_BATCH_SIZE` per invocation) and idempotent:
     once every row is at the current version the scan is empty. Enqueued
     on-demand after an algorithm bump (there is no steady-state schedule).
+
+    ## Transaction shape (READY-007, 2026-08-25)
+
+    One workspace, one transaction -- `workspace_context(session,
+    workspace_id)`. Like `flush_stats` and `light_recheck` this walked a
+    cross-tenant scan inside a single transaction, re-setting the
+    transaction-local `app.workspace_id` GUC per profile; the last
+    profile's workspace therefore owned the scope under which every
+    earlier profile's pending UPDATE was flushed. It escaped the outbox
+    RLS violation only because its `write_outbox_message` call sits
+    inside the loop, but the lost-update half of the defect applied in
+    full. Per-profile transactions close it and make each re-stamp
+    commit with its own discovery message.
     """
+    rebuilt = 0
+    rediscovered = 0
+    failed = 0
+    first_error: BaseException | None = None
+
     with get_session() as session:
-        rebuilt = 0
-        rediscovered = 0
         for profile_id, workspace_id in _scan_stale_pattern_profile_refs(
             limit=_PATTERN_BACKFILL_BATCH_SIZE
         ):
-            set_workspace_context(session, workspace_id)
-            profile = scoped_get(session, DomainStrategyProfile, profile_id, workspace_id)
-            if profile is None or profile.url_pattern_version >= URL_PATTERN_ALGORITHM_VERSION:
+            try:
+                with workspace_context(session, workspace_id):
+                    profile = scoped_get(
+                        session, DomainStrategyProfile, profile_id, workspace_id
+                    )
+                    if (
+                        profile is None
+                        or profile.url_pattern_version >= URL_PATTERN_ALGORITHM_VERSION
+                    ):
+                        continue
+
+                    # A representative match currently grouped under this profile's
+                    # (competitor, pattern) -- its `competitor_url` is what the new
+                    # algorithm re-derives from. The competitor's single domain is
+                    # implied by `competitor_id`, so no domain filter is needed.
+                    sample = session.execute(
+                        scoped_select(CompetitorProductMatch, workspace_id)
+                        .where(
+                            CompetitorProductMatch.competitor_id == profile.competitor_id,
+                            CompetitorProductMatch.url_pattern == profile.url_pattern,
+                        )
+                        .limit(1)
+                    ).scalars().first()
+
+                    requeue = True
+                    if sample is not None:
+                        new_pattern = derive_url_pattern(sample.competitor_url)
+                        if new_pattern == profile.url_pattern:
+                            requeue = False
+                        else:
+                            profile.url_pattern = new_pattern
+
+                    profile.url_pattern_version = URL_PATTERN_ALGORITHM_VERSION
+                    if requeue:
+                        profile.status = StrategyStatus.DISCOVERY_REQUIRED
+                        # Audit H1: this was a *pre-commit* `enqueue` of PAID
+                        # work — if the backfill transaction rolled back, the
+                        # profile kept its old pattern/status while a discovery
+                        # run (whose PROXY_HTTP leg costs money per request)
+                        # still fired against the abandoned decision. Recorded in
+                        # the outbox instead, it commits with the decision or not
+                        # at all. `dedup_key` collapses repeat backfill passes
+                        # over the same profile into one pending run.
+                        write_outbox_message(
+                            session,
+                            workspace_id=workspace_id,
+                            task_name=STRATEGY_DISCOVERY_RUN,
+                            queue=_DISCOVERY_QUEUE,
+                            kwargs={
+                                "workspace_id": str(workspace_id),
+                                "competitor_id": str(profile.competitor_id),
+                                "domain": profile.domain,
+                                "url_pattern": profile.url_pattern,
+                                "sample_urls": [],
+                                "triggered_by": "AUTO",
+                            },
+                            dedup_key=f"discovery:backfill:{profile.id}",
+                        )
+                        rediscovered += 1
+                    else:
+                        rebuilt += 1
+            except Exception as exc:
+                # One profile's failure must not abandon the rest of the
+                # bounded batch; it is re-scanned on the next invocation
+                # (the scan predicate is "still at an older version").
+                failed += 1
+                if first_error is None:
+                    first_error = exc
+                logger.exception(
+                    "strategy_pattern_backfill: profile_id=%s workspace_id=%s failed; "
+                    "rolled back and skipped",
+                    profile_id,
+                    workspace_id,
+                )
                 continue
 
-            # A representative match currently grouped under this profile's
-            # (competitor, pattern) -- its `competitor_url` is what the new
-            # algorithm re-derives from. The competitor's single domain is
-            # implied by `competitor_id`, so no domain filter is needed.
-            sample = session.execute(
-                scoped_select(CompetitorProductMatch, workspace_id)
-                .where(
-                    CompetitorProductMatch.competitor_id == profile.competitor_id,
-                    CompetitorProductMatch.url_pattern == profile.url_pattern,
-                )
-                .limit(1)
-            ).scalars().first()
-
-            requeue = True
-            if sample is not None:
-                new_pattern = derive_url_pattern(sample.competitor_url)
-                if new_pattern == profile.url_pattern:
-                    requeue = False
-                else:
-                    profile.url_pattern = new_pattern
-
-            profile.url_pattern_version = URL_PATTERN_ALGORITHM_VERSION
-            if requeue:
-                profile.status = StrategyStatus.DISCOVERY_REQUIRED
-                # Audit H1: this was a *pre-commit* `enqueue` of PAID
-                # work — if the backfill transaction rolled back, the
-                # profile kept its old pattern/status while a discovery
-                # run (whose PROXY_HTTP leg costs money per request)
-                # still fired against the abandoned decision. Recorded in
-                # the outbox instead, it commits with the decision or not
-                # at all. `dedup_key` collapses repeat backfill passes
-                # over the same profile into one pending run.
-                write_outbox_message(
-                    session,
-                    workspace_id=workspace_id,
-                    task_name=STRATEGY_DISCOVERY_RUN,
-                    queue=_DISCOVERY_QUEUE,
-                    kwargs={
-                        "workspace_id": str(workspace_id),
-                        "competitor_id": str(profile.competitor_id),
-                        "domain": profile.domain,
-                        "url_pattern": profile.url_pattern,
-                        "sample_urls": [],
-                        "triggered_by": "AUTO",
-                    },
-                    dedup_key=f"discovery:backfill:{profile.id}",
-                )
-                rediscovered += 1
-            else:
-                rebuilt += 1
-
-        session.commit()
-
     logger.info(
-        "strategy_pattern_backfill relinked=%d rediscovery_enqueued=%d target_version=%d",
+        "strategy_pattern_backfill relinked=%d rediscovery_enqueued=%d "
+        "failed=%d target_version=%d",
         rebuilt,
         rediscovered,
+        failed,
         URL_PATTERN_ALGORITHM_VERSION,
     )
+
+    if first_error is not None:
+        # See `flush_stats`: per-profile isolation is not permission to
+        # report success on a batch that dropped work.
+        raise first_error

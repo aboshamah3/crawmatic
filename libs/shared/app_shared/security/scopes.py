@@ -48,6 +48,18 @@ class Scope(StrEnum):
     # left the whole strategy surface unreachable by anyone).
     STRATEGY_READ = "strategy:read"
     STRATEGY_WRITE = "strategy:write"
+    # EPA A2 (2026-08-25). Deliberately its OWN scope rather than a reuse
+    # of `jobs:write`. `jobs:write` is "start work"; `jobs:cancel` is
+    # "close work that is already running, without a result" -- the one
+    # operation in the jobs surface that terminalizes rows a human can
+    # never get back, and the only sanctioned way to close a stranded
+    # job (`app_shared.jobs.cancellation`). Every key that can *run* a
+    # job would inherit that power if it rode on `jobs:write`, including
+    # the store-connector key that lives in a WordPress install. Narrow
+    # and separately grantable is the same reasoning that produced
+    # `CONNECTOR_SCOPES` in `apps/api/app/routers/admin.py` (audit P0.3):
+    # a capability nobody asked for is a capability nobody should hold.
+    JOBS_CANCEL = "jobs:cancel"
 
 
 def validate_scopes(values: Iterable[str]) -> list[str]:

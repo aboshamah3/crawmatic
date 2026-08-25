@@ -37,12 +37,16 @@ FULL_VOCABULARY = {
     "refresh_rules:write",
     "strategy:read",
     "strategy:write",
+    # EPA A2 (2026-08-25): the audited job-cancellation surface
+    # (`POST /v1/admin/jobs/{id}/cancel`). Separate from `jobs:write` on
+    # purpose — see the note on `Scope.JOBS_CANCEL`.
+    "jobs:cancel",
 }
 
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 27
+    assert len(FULL_VOCABULARY) == 28
 
 
 def test_every_router_required_scope_is_in_the_vocabulary() -> None:

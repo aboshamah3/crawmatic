@@ -84,6 +84,40 @@ def _make_result(
     )
 
 
+class _FakeResult:
+    """A `Session.execute(select(...))` result: one row, or none.
+
+    Two consumers now share this fake session, and they read the result
+    differently, so it has to answer both ways:
+
+    * `mark_target`'s target lookup -> `.scalar_one_or_none()`, which
+      yields whatever `target_row` the test installed;
+    * the EPA A2 cancellation-fence read (`cancelled_scrape_job_ids`)
+      -> `.scalars().all()`, which is always empty here because no job
+      in these fixtures is cancelled -- so every result persists and
+      terminalizes exactly as it did before the fence existed.
+
+    Before A2 this fake could answer `None` for anything it did not
+    model; `None` is not a shape a real `Session` ever returns, and the
+    new read is what exposed that.
+    """
+
+    def __init__(self, scalar_one: Any = None) -> None:
+        self._scalar_one = scalar_one
+
+    def scalars(self) -> "_FakeResult":
+        return self
+
+    def all(self) -> list[Any]:
+        return []
+
+    def first(self) -> None:
+        return None
+
+    def scalar_one_or_none(self) -> Any:
+        return self._scalar_one
+
+
 class _FakeSession:
     """Records `add_all`/`execute` calls; no real DB anywhere."""
 
@@ -97,9 +131,7 @@ class _FakeSession:
 
     def execute(self, stmt: Any) -> Any:
         self.executed.append(stmt)
-        if self.target_row is not None:
-            return SimpleNamespace(scalar_one_or_none=lambda: self.target_row)
-        return None
+        return _FakeResult(self.target_row)
 
 
 class _FakeWorkspaceTxn:

@@ -45,7 +45,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKeyConstraint, Integer, Text, UniqueConstraint, Uuid
+from sqlalchemy import ForeignKeyConstraint, Integer, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.enums import (
@@ -110,6 +110,18 @@ class ScrapeJob(Base, WorkspaceScopedBase):
 
     started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+    #: EPA A2 cancellation fence. Bumped (and the status set to
+    #: ``CANCELLED``) FIRST, inside the cancellation transaction, before
+    #: any Redis/Scrapyd/reservation work is attempted. Dispatch (B1/B2)
+    #: and the result-persistence path treat a generation older than this
+    #: as "authorized before the cancellation" and reject the work, so a
+    #: crash anywhere in the out-of-band steps can never leave a late
+    #: result contradicting a committed ``CANCELLED``. ``0`` == never
+    #: cancelled.
+    cancellation_generation: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default=text("0")
+    )
 
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
 
@@ -180,5 +192,15 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
         Integer(), nullable=False, default=0
     )
     strategy_url_override: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    # EPA A2: the audit trail of an administrative cancellation. All three
+    # are written together (and only) by `mark_target` on the transition to
+    # `ScrapeTargetStatus.CANCELLED`; NULL means "this target was never
+    # cancelled". They exist so a target closed without a result is
+    # distinguishable from a real outcome by a recorded human decision,
+    # not just by its status string.
+    cancelled_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    cancelled_by: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)

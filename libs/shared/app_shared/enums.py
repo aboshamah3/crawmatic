@@ -149,6 +149,32 @@ class HealthStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class MatchClassificationState(StrEnum):
+    """Audit classification state of a ``match_audit_classifications`` row (EPA A6).
+
+    Distinct from :class:`MatchStatus` (the match's own operational
+    lifecycle) — this is the versioned, evidence-backed *identity/
+    listing* verdict produced by ``scripts/classify_match_set.py``, one
+    non-superseded row per match is the "current" classification, used
+    to exclude non-``ACTIVE`` matches from success-rate denominators.
+
+    * ``ACTIVE`` — a recent successful, comparable observation exists.
+    * ``CONFIRMED_DELISTED`` — at least two validated-absence fetches
+      (``NOT_LISTED``: correct market/locale, store online, product
+      JSON absent) at least 24h apart. Never emitted from one fetch.
+    * ``INVALID_IDENTITY`` — the competitor identifier used to build the
+      fetch is structurally wrong (e.g. an S-Tech handle/barcode
+      misread as a Shopify variant ID), not a real absence.
+    * ``UNKNOWN`` — no decisive signal yet, including a single
+      validated-absence fetch pending its 24h+ second look.
+    """
+
+    ACTIVE = "ACTIVE"
+    CONFIRMED_DELISTED = "CONFIRMED_DELISTED"
+    INVALID_IDENTITY = "INVALID_IDENTITY"
+    UNKNOWN = "UNKNOWN"
+
+
 class ScrapeProfileMode(StrEnum):
     """Extraction transport mode of a ``scrape_profiles`` row (SPEC-06 §22, FR-001)."""
 
@@ -338,8 +364,19 @@ class ScrapeJobStatus(StrEnum):
 
     ``PENDING`` at creation -> ``RUNNING`` (dispatch begins) -> a
     deterministic terminal status (``COMPLETED``/``PARTIAL_FAILED``/
-    ``FAILED``). ``CANCELLED`` is a vocabulary member but not produced by
-    this spec's endpoints.
+    ``FAILED``), written by ``finalize_jobs``.
+
+    ``CANCELLED`` (EPA A2, 2026-08-25) is the one terminal status the
+    scraper never produces: it is written **only** by
+    :func:`app_shared.jobs.cancellation.cancel_and_reconcile_job`, and
+    reached over HTTP by ``POST /v1/admin/jobs/{job_id}/cancel``. It is
+    also the *fence* — once a job reads ``CANCELLED``, the persistence
+    path refuses its in-flight results (``late_after_cancel``) and
+    ``finalize_jobs``/``redispatch_pending_jobs``/
+    ``recover_stalled_batches`` skip it as already terminal, so nothing
+    downstream can contradict it. (It was documented here as "a
+    vocabulary member but not produced by this spec's endpoints" until
+    A2 gave it a producer — EPA Phase A review F-8.)
     """
 
     PENDING = "PENDING"
@@ -377,6 +414,22 @@ class ScrapeTargetStatus(StrEnum):
     overflow hands the target back to Celery ``scrape_dispatch`` for
     later re-dispatch (``DEFERRED -> STARTED`` on re-pickup), so it is
     deliberately excluded from any terminal-status set.
+
+    ``CANCELLED`` (EPA A2, 2026-08-25) is a **terminal** administrative
+    outcome, written only by
+    :func:`app_shared.jobs.cancellation.cancel_and_reconcile_job` through
+    ``mark_target``. It is deliberately distinct from ``SKIPPED``: a
+    skipped target was passed over by the scraper for a domain reason
+    (lock collision, not listed, policy), whereas a cancelled target was
+    closed by a human decision recorded in ``cancelled_by`` /
+    ``cancelled_reason`` / ``cancelled_at``. Keeping them separate is
+    what stops a cancellation from being read back later as a scraper
+    outcome — and, above all, what stops the only way to close a
+    stranded job from having to invent a ``COMPLETED``.
+
+    Stored in a plain, app-validated ``VARCHAR(32)`` (see
+    :func:`enum_column`) — adding a member is a code-level change with no
+    ``ALTER TYPE``; see ``alembic/versions/c1d7a4e9b350_job_cancellation_fence.py``.
     """
 
     PENDING = "PENDING"
@@ -385,6 +438,7 @@ class ScrapeTargetStatus(StrEnum):
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
     DEFERRED = "DEFERRED"
+    CANCELLED = "CANCELLED"
 
 
 class AlertType(StrEnum):
@@ -615,6 +669,12 @@ class WebhookEventType(StrEnum):
     SCRAPE_JOB_COMPLETED = "scrape.job.completed"
     SCRAPE_JOB_PARTIAL = "scrape.job.partial_failed"
     SCRAPE_JOB_FAILED = "scrape.job.failed"
+    #: EPA A2 (2026-08-25). Emitted ONLY by
+    #: ``app_shared.jobs.cancellation.cancel_and_reconcile_job`` — never by
+    #: ``finalize_jobs``, whose ``_JOB_EVENT_TYPES`` map still deliberately
+    #: omits ``ScrapeJobStatus.CANCELLED`` so a cancelled job cannot emit a
+    #: second, contradictory terminal event when the finalizer later sweeps it.
+    SCRAPE_JOB_CANCELLED = "scrape.job.cancelled"
     DOMAIN_STRATEGY_UPDATED = "domain.strategy.updated"
 
 

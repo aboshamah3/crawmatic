@@ -605,11 +605,53 @@ import app.workers.tasks_strategy as tasks_strategy
     + """
 
 class _FakeSession:
+    # READY-007 (2026-08-25): the strategy sweeps now scope each
+    # workspace to its OWN transaction via
+    # `app_shared.maintenance.scoping.workspace_context`, so this double
+    # has to model a transaction boundary rather than a bare `commit()`.
+    # That makes the "commit together" assertions below stronger, not
+    # weaker: the rollback they rely on is now a real `__exit__` path
+    # rather than "the task simply never reached `commit()`".
     def __init__(self):
         self.committed = False
+        self.rolled_back = False
+        self.commit_count = 0
+        self.rollback_count = 0
+        self._in_transaction = False
+
+    def in_transaction(self):
+        return self._in_transaction
+
+    def begin(self):
+        session = self
+
+        class _Txn:
+            def __enter__(self):
+                session._in_transaction = True
+                return session
+
+            def __exit__(self, exc_type, exc, tb):
+                session._in_transaction = False
+                if exc_type is None:
+                    session.commit()
+                else:
+                    session.rollback()
+                return False
+
+        return _Txn()
+
+    def execute(self, *args, **kwargs):
+        # `workspace_context` issues the real `set_config('app.
+        # workspace_id', ..., true)`; there is no server here to run it.
+        return None
 
     def commit(self):
         self.committed = True
+        self.commit_count += 1
+
+    def rollback(self):
+        self.rolled_back = True
+        self.rollback_count += 1
 
 
 fake_session = _FakeSession()
@@ -833,11 +875,53 @@ import app.workers.tasks_strategy as tasks_strategy
     + """
 
 class _FakeSession:
+    # READY-007 (2026-08-25): the strategy sweeps now scope each
+    # workspace to its OWN transaction via
+    # `app_shared.maintenance.scoping.workspace_context`, so this double
+    # has to model a transaction boundary rather than a bare `commit()`.
+    # That makes the "commit together" assertions below stronger, not
+    # weaker: the rollback they rely on is now a real `__exit__` path
+    # rather than "the task simply never reached `commit()`".
     def __init__(self):
         self.committed = False
+        self.rolled_back = False
+        self.commit_count = 0
+        self.rollback_count = 0
+        self._in_transaction = False
+
+    def in_transaction(self):
+        return self._in_transaction
+
+    def begin(self):
+        session = self
+
+        class _Txn:
+            def __enter__(self):
+                session._in_transaction = True
+                return session
+
+            def __exit__(self, exc_type, exc, tb):
+                session._in_transaction = False
+                if exc_type is None:
+                    session.commit()
+                else:
+                    session.rollback()
+                return False
+
+        return _Txn()
+
+    def execute(self, *args, **kwargs):
+        # `workspace_context` issues the real `set_config('app.
+        # workspace_id', ..., true)`; there is no server here to run it.
+        return None
 
     def commit(self):
         self.committed = True
+        self.commit_count += 1
+
+    def rollback(self):
+        self.rolled_back = True
+        self.rollback_count += 1
 
 
 fake_session = _FakeSession()
@@ -998,7 +1082,16 @@ except RuntimeError:
 if not raised:
     print("OUTBOX_FAILURE_WAS_SWALLOWED")
     sys.exit(1)
-if fake_session.committed:
+# READY-007: the patrol now gives each profile its OWN transaction, so
+# "nothing was committed at all" is no longer the right question -- the
+# *second*, untriggered profile has a legitimately empty transaction that
+# commits. What must hold is that the profile whose outbox write failed
+# rolled its DEGRADED transition back: exactly one rollback (the
+# triggered profile) and exactly one commit (the untriggered one).
+if fake_session.rollback_count != 1:
+    print("EXPECTED_ONE_ROLLBACK:" + str(fake_session.rollback_count))
+    sys.exit(1)
+if fake_session.commit_count != 1:
     print("COMMITTED_DESPITE_FAILED_OUTBOX_WRITE")
     sys.exit(1)
 

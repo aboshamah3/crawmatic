@@ -91,6 +91,7 @@ from app_shared.catalog.upsert import dedup_last_wins
 from app_shared.config import get_settings
 from app_shared.enums import MethodType, ScrapeErrorCode, ScrapeTargetStatus, StockStatus
 from app_shared.ids import new_uuid7
+from app_shared.jobs.cancellation import LATE_AFTER_CANCEL_REASON, cancelled_scrape_job_ids
 from app_shared.jobs.targets import mark_target
 from app_shared.limiter.locks import release_match_lock
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
@@ -335,6 +336,90 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     affected_job_ids: dict[Any, None] = {}  # insertion-ordered de-dup set
 
     with workspace_txn(workspace_id) as session:
+        # --- EPA A2 cancellation fence, read side ------------------------
+        #
+        # A job can be cancelled while its spiders are still in flight.
+        # `cancel_and_reconcile_job` commits the fence (job status
+        # CANCELLED + a bumped `cancellation_generation`) BEFORE it
+        # touches Scrapyd or Redis, precisely so that a run it could not
+        # stop still cannot contradict it here.
+        #
+        # So: one scoped `IN` query for the whole batch, and every item
+        # belonging to a cancelled job is refused. Refused, not dropped —
+        # its `request_attempts` row is still written, carrying
+        # `late_after_cancel`, so the outcome is auditable and the money
+        # already spent on the fetch is still accounted for. What does
+        # NOT happen is the `price_observations` /
+        # `match_current_prices` write: a cancelled job must never
+        # produce prices, and a target that was closed by a human must
+        # never be re-opened by a straggler.
+        fenced_job_ids = cancelled_scrape_job_ids(
+            session, {item.scrape_job_id for item in batch if item.scrape_job_id is not None}
+        )
+        fenced_items: set[int] = set()
+        if fenced_job_ids:
+            fenced_match_keys: set[tuple[Any, Any]] = set()
+            for index, (item, attempt) in enumerate(zip(batch, attempts, strict=True)):
+                if item.scrape_job_id not in fenced_job_ids:
+                    continue
+                fenced_items.add(index)
+                fenced_match_keys.add((item.workspace_id, item.match_id))
+                # The rejection, recorded on the attempt itself.
+                #
+                # `success = False` because success on a `request_attempts`
+                # row means "this attempt produced the customer-visible
+                # outcome it was fetched for", and this one produced no
+                # observation and no link — which is also how
+                # `admin_usage.py`'s `link_ok`/`protected_ok` aggregate
+                # reads it. The billed credit is derived from
+                # `price_observations`, not from this flag, so nothing is
+                # mis-billed either way. `error_code` stays unset on
+                # purpose: this is a persistence refusal, not a scrape
+                # failure, and `LATE_AFTER_CANCEL_REASON` says so without
+                # polluting the `ScrapeErrorCode` vocabulary that the
+                # strategy/health statistics score.
+                #
+                # `terminal_for_target = False` because that flag is
+                # provenance — "this attempt is what closed the target" —
+                # and that is not what happened: the cancellation
+                # terminalized the target (as CANCELLED, through
+                # `mark_target`, before this batch was ever flushed) and
+                # this attempt merely arrived afterwards. It used to be
+                # forced to True here, which made a late straggler
+                # indistinguishable from the attempt that actually decided
+                # a target's outcome (EPA Phase A review F-6).
+                attempt.success = False
+                attempt.error_message = LATE_AFTER_CANCEL_REASON
+                attempt.terminal_for_target = False
+            observations = [
+                observation
+                for index, observation in enumerate(observations)
+                if index not in fenced_items
+            ]
+            # The current-price rows carry no job id, so they are filtered
+            # by (workspace_id, match_id) instead. In the theoretical case
+            # where one batch holds the same match for both a cancelled
+            # and a live job, this over-filters by one row — the safe
+            # direction: a price that is merely late is recoverable on the
+            # next scrape, a price written for a cancelled job is not.
+            current_price_rows = [
+                row
+                for row in current_price_rows
+                if _current_price_key(row) not in fenced_match_keys
+            ]
+            out_of_stock_rows = [
+                row
+                for row in out_of_stock_rows
+                if _current_price_key(row) not in fenced_match_keys
+            ]
+            log_event(
+                logger,
+                "persistence.late_after_cancel",
+                workspace_id=workspace_id,
+                rejected=len(fenced_items),
+                jobs=len(fenced_job_ids),
+            )
+
         session.add_all(observations)
         session.add_all(attempts)
 
@@ -375,8 +460,15 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
         # target STARTED and a later success may still complete it.  The
         # existing mark_target terminal-state guard continues to reject
         # genuinely late results after a real terminal outcome.
-        for item in batch:
+        for index, item in enumerate(batch):
             if item.scrape_job_id is None:
+                continue
+            if index in fenced_items:
+                # Its target is already CANCELLED — terminal. `mark_target`
+                # would refuse the transition anyway (terminal is terminal),
+                # so this is belt-and-braces; what it really buys is keeping
+                # the job out of `affected_job_ids` below, so a cancelled job
+                # never re-triggers finalization.
                 continue
             if item.success:
                 target_status = ScrapeTargetStatus.COMPLETED
@@ -519,7 +611,11 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
         # claim fails open, the message is durably recorded here.
         dedup_ttl = get_settings().PRICE_ANALYSIS_DEDUP_TTL_SECONDS
         seen_variant_jobs: set[tuple[Any, Any, Any]] = set()
-        for item in batch:
+        for index, item in enumerate(batch):
+            if index in fenced_items:
+                # No observation was persisted for this item, so there is
+                # nothing for the analyzer to recompute from.
+                continue
             key = (item.workspace_id, item.scrape_job_id, item.product_variant_id)
             if key in seen_variant_jobs:
                 continue

@@ -115,6 +115,15 @@ def reconcile_successful_failed_targets(
         .where(
             ScrapeJobTarget.workspace_id == workspace_uuid,
             ScrapeJobTarget.scrape_job_id == job_uuid,
+            # FAILED only — and, since EPA A2, pointedly NOT `CANCELLED`.
+            # This repair exists to correct a target the scraper wrongly
+            # recorded as failed when a successful observation proves
+            # otherwise. A cancelled target has no such contradiction to
+            # resolve: it was closed by a human decision, and a late
+            # observation cannot even exist for it (the persistence-side
+            # cancellation fence refuses to write one). Widening this
+            # filter to include CANCELLED would let a straggler silently
+            # re-open a job someone deliberately closed.
             ScrapeJobTarget.status == ScrapeTargetStatus.FAILED,
             successful_observation,
         )

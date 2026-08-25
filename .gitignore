@@ -11,6 +11,12 @@ build/
 # uv
 .uv-cache/
 
+# Release identity baked into an image at build time (READY-001 / Task A5,
+# `scripts/build_release_manifest.py --emit-identity`). Generated per build
+# and read back at runtime by `app_shared.release`; committing it would let a
+# stale bake ship silently in a later image.
+/release_identity.json
+
 # Env / secrets
 .env
 .env.*

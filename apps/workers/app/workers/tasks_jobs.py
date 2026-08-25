@@ -40,6 +40,7 @@ from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.jobs.nodes import select_node
 from app_shared.jobs.targets import Counts, aggregate_counts
 from app_shared.messaging import enqueue
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
@@ -99,6 +100,7 @@ _RUNNING_JOB_STATUSES = frozenset({ScrapeJobStatus.RUNNING})
 _UNPROBED = object()
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=SCRAPE_RECONCILE_FALSE_FAILURES)
 def reconcile_false_failed_targets(
     workspace_id: str,
@@ -167,11 +169,17 @@ def _queue_depth(status_payload: dict) -> int | None:
 # before finalizing; `recover_stalled_batches` requires a target to be
 # in NONE of these (still bare `PENDING`) before it is eligible for
 # re-dispatch.
+#
+# `CANCELLED` (EPA A2) is a member: an administratively cancelled target
+# is finished. Without it `finalize_jobs` would wait forever for targets
+# nothing will ever pick up, and `recover_stalled_batches` would keep
+# re-dispatching a job a human had explicitly closed.
 _TERMINAL_TARGET_STATUSES = frozenset(
     {
         ScrapeTargetStatus.COMPLETED,
         ScrapeTargetStatus.FAILED,
         ScrapeTargetStatus.SKIPPED,
+        ScrapeTargetStatus.CANCELLED,
     }
 )
 
@@ -352,6 +360,7 @@ def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID
         return list(session.execute(stmt).all())
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=SCRAPE_DISPATCH_JOB)
 def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
     """Expand `scrape_job_id`'s PENDING targets into domain/mode-grouped Scrapyd runs.
@@ -547,6 +556,7 @@ def _strategy_profile_ids_for_targets(
     return [row[0] for row in session.execute(stmt).all()]
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=SCRAPE_FINALIZE_JOBS)
 def finalize_jobs() -> None:
     """Aggregate counters and deterministically finalize non-terminal jobs.
@@ -677,6 +687,7 @@ def finalize_jobs() -> None:
         session.commit()
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=SCRAPE_REDISPATCH_JOBS)
 def redispatch_pending_jobs() -> None:
     """Re-enqueue `dispatch_job` for jobs whose targets nothing will pick up.
@@ -774,6 +785,7 @@ def redispatch_pending_jobs() -> None:
                 )
 
 
+@maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=SCRAPE_RECOVER_STALLED)
 def recover_stalled_batches() -> None:
     """Re-dispatch batches whose targets never left PENDING past the stall timeout.

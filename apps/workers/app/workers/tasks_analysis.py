@@ -44,6 +44,7 @@ from app_shared.enums import (
     AlertType,
     ScrapeErrorCode,
 )
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, VariantPriceState
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.observations import MatchCurrentPrice
@@ -285,6 +286,7 @@ def _upsert_alert_state(
     session.execute(stmt)
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=PRICE_ANALYSIS_RECOMPUTE)
 def recompute_variant(
     *,

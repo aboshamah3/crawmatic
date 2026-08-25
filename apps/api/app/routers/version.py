@@ -32,6 +32,34 @@ Reports:
 * ``db_migration_head`` — the live database's `alembic_version.version_num`.
 * ``migration_heads_match`` — ``True``/``False`` when both are known,
   ``null`` when either side couldn't be resolved (never a guess).
+
+Release identity (READY-001, Task A5)
+-------------------------------------
+
+`PRODUCTION_READINESS_IMPLEMENTATION_PLAN_2026-08-25.md` Task A5 extends this
+endpoint with the BUILD-TIME-BAKED release identity from
+`app_shared.release`: ``manifest_id``, ``source_digest``, ``image_digest``,
+``config_schema_version``, plus ``expected_db_migration`` /
+``live_db_migration`` as explicitly-named aliases of the two heads this
+endpoint has always reported.
+
+Everything already published here is **kept, not renamed**: ``git_sha``,
+``build_time``, ``code_migration_head``, ``db_migration_head``,
+``migration_heads_match`` and ``db_error`` all keep their existing names,
+types and meanings, because the deployed operator runbook and
+`docs/DEPLOY-ROLLBACK.md` already read them. A5 is additive.
+
+``expected_db_migration`` and ``code_migration_head`` are the same value
+(the running code's script-directory head) under two names; likewise
+``live_db_migration`` and ``db_migration_head``. The duplication is
+deliberate rather than a migration to new names: the plan's acceptance test
+asks for the explicit pair, and silently dropping the old pair would break a
+surface that is already deployed and already curl'd during incidents.
+
+``config_schema_version`` is a DIGEST over setting NAMES and TYPES, never
+values — this endpoint is unauthenticated, and `app_shared.release`
+deliberately reads `Settings.model_fields` (class declarations) rather than
+ever constructing a `Settings`.
 """
 
 from __future__ import annotations
@@ -46,6 +74,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app_shared.database import get_session
+from app_shared.release import get_release_identity
 
 router = APIRouter(tags=["version"])
 
@@ -69,12 +98,34 @@ def _get_db_session() -> Iterator[Session]:
 
 
 class VersionResponse(BaseModel):
+    # --- Fields published since audit §C2. Never rename or drop these. ---
     git_sha: str
     build_time: str | None
     code_migration_head: str | None
     db_migration_head: str | None
     migration_heads_match: bool | None
     db_error: str | None = None
+
+    # --- Release identity, added by READY-001 / Task A5. ---
+    #: `None` on an image with nothing baked — an honest absence, never a
+    #: placeholder, because a plausible-looking wrong digest is worse during
+    #: an incident than a visible gap.
+    manifest_id: str | None = None
+    source_digest: str | None = None
+    image_digest: str | None = None
+    #: Digest over setting NAMES and TYPES only — never any value.
+    config_schema_version: str | None = None
+    #: Explicitly-named aliases of `code_migration_head`/`db_migration_head`.
+    expected_db_migration: str | None = None
+    live_db_migration: str | None = None
+    #: `"baked"` | `"env"` | `"unavailable"` — where the four identity
+    #: digests above came from, so a reader never has to guess whether they
+    #: are looking at an artifact fact or a dashboard-typed one.
+    identity_source: str = "unavailable"
+    #: Identity fields whose mirroring environment variable disagrees with
+    #: the baked artifact. Non-empty means this deployment's environment has
+    #: drifted from the image it is running.
+    env_identity_mismatch: list[str] = []
 
 
 def _git_sha() -> str:
@@ -121,6 +172,15 @@ def version(session: Session = Depends(_get_db_session)) -> VersionResponse:
         None if (code_head is None or db_head is None) else code_head == db_head
     )
 
+    # `expected_db_migration=code_head` is passed explicitly rather than let
+    # `app_shared.release` re-resolve it: this router already resolved the
+    # head (and its tests monkeypatch `_code_migration_head`), so re-reading
+    # the script directory would be a second filesystem walk per request that
+    # could, in principle, disagree with the value reported one line above.
+    identity = get_release_identity(
+        live_db_migration=db_head, expected_db_migration=code_head
+    )
+
     return VersionResponse(
         git_sha=_git_sha(),
         build_time=_build_time(),
@@ -128,4 +188,12 @@ def version(session: Session = Depends(_get_db_session)) -> VersionResponse:
         db_migration_head=db_head,
         migration_heads_match=migration_heads_match,
         db_error=db_error,
+        manifest_id=identity.manifest_id,
+        source_digest=identity.source_digest,
+        image_digest=identity.image_digest,
+        config_schema_version=identity.config_schema_version,
+        expected_db_migration=identity.expected_db_migration,
+        live_db_migration=identity.live_db_migration,
+        identity_source=identity.identity_source,
+        env_identity_mismatch=list(identity.env_mismatches),
     )

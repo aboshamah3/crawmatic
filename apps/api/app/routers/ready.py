@@ -61,6 +61,54 @@ value. (If a future service made Redis genuinely optional, that branch
 would need to be added explicitly — see `checks.database` for the
 `DependencyCheck` shape it would reuse.)
 
+Two further checks, added by READY-001 / Task A5
+------------------------------------------------
+
+`PRODUCTION_READINESS_IMPLEMENTATION_PLAN_2026-08-25.md` Task A5 requires
+that "`/ready` returns 503 on mismatch" between the migration head the
+running code expects and the one the live database reports, and that
+"`/ready` aggregates per-instance freshness" of worker/scheduler heartbeats.
+
+* **`checks.migrations`** compares `app_shared.release.code_migration_head()`
+  (the running image's Alembic script directory) against
+  `alembic_version.version_num` read at request time. This is the same
+  comparison `/version` *reports*; the difference is that `/ready` *acts* on
+  it. An instance running code that expects a schema the database does not
+  have is not ready to serve, even though both Postgres and Redis answer
+  perfectly — which is exactly the failure `/version` alone could only
+  describe after someone thought to look.
+
+  It is **fail-closed on an unresolved head**: if either side cannot be
+  determined, the check fails with a distinct error name rather than passing.
+  "I cannot verify that my code matches the live schema" is not readiness,
+  and the two ways it can happen are both real defects worth surfacing — an
+  image built without `alembic/` (a build regression; `.dockerignore`
+  deliberately keeps it, and `apps/migrate/Dockerfile` documents needing it
+  at runtime), or an `alembic_version` table that the `migrate` job never
+  populated (a deploy-order violation — see `docs/DEPLOY-ROLLBACK.md`, where
+  "migrate first, always" is the whole first section). Note this cannot
+  strand a *healthy* deploy: whenever the database itself is unreachable the
+  `database` check has already failed the probe on its own.
+
+* **`checks.heartbeats`** aggregates `heartbeat:{service}:{instance_id}`
+  freshness via `app_shared.heartbeat`, per instance rather than as one
+  global per-service flag, with fencing so a zombie process cannot keep a
+  service looking healthy. See that module's docstring for why the naive
+  single-key design reports healthy in three different situations.
+
+  Unlike Redis, "not configured" IS a reachable state here: no service
+  publishes heartbeats until Task A5 Step 7's deploy wires
+  `READY_REQUIRED_HEARTBEAT_SERVICES`. That state is reported as a labelled
+  absence (`ok=True`, `detail="not-configured"`) rather than either a
+  failure — which would take every API instance out of rotation for a
+  monitoring feature that is not switched on yet — or a silent pass, which
+  would hide that the aggregation is doing nothing.
+
+`checks` therefore now carries four entries rather than two. `DependencyCheck`
+gains an optional `detail` field for the operator-readable summary the
+heartbeat aggregation produces; `error` keeps its exact previous meaning and
+discipline (an exception CLASS NAME, never a message).
+
 Timeboxing
 ----------
 
@@ -95,6 +143,8 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app_shared import heartbeat as heartbeat_mod
+from app_shared import release as release_mod
 from app_shared.database import get_session
 from app_shared.redis_client import get_redis_client
 
@@ -132,6 +182,11 @@ def _get_redis_dependency() -> Any:
 class DependencyCheck(BaseModel):
     ok: bool
     error: str | None = None
+    #: Operator-readable summary (A5). Built only from names and counts this
+    #: process produced — never from an exception message, a Redis value, or
+    #: a connection string. `error` keeps its original discipline: an
+    #: exception CLASS NAME and nothing else.
+    detail: str | None = None
 
 
 class ReadyResponse(BaseModel):
@@ -176,6 +231,31 @@ def _run_with_timeout(fn: Callable[[], None], *, timeout: float) -> DependencyCh
         pool.shutdown(wait=False)
 
 
+def _run_check_with_timeout(
+    fn: Callable[[], DependencyCheck], *, timeout: float
+) -> DependencyCheck:
+    """`_run_with_timeout` for a probe that builds its own `DependencyCheck`.
+
+    Same budget, same thread-pool discipline, same "class name only" failure
+    reporting; the difference is that these A5 probes have a verdict of their
+    own to report (a mismatch is not an exception) rather than signalling
+    success by simply not raising.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            return DependencyCheck(
+                ok=False, error=f"TimeoutError: exceeded {timeout}s budget"
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as class name only
+            return DependencyCheck(ok=False, error=exc.__class__.__name__)
+    finally:
+        pool.shutdown(wait=False)
+
+
 def _check_database(session: Session) -> None:
     """Schema-independent connectivity probe — same query `check_connection()`
     (`app_shared.database`) uses, run inline here so it can share this
@@ -187,12 +267,97 @@ def _check_redis(client: Any) -> None:
     client.ping()
 
 
+def _live_migration_head(session: Session) -> str | None:
+    """`alembic_version.version_num`, or ``None`` if it can't be read.
+
+    Reuses this request's already-open session (same reasoning as
+    `_check_database`), and asks exactly the question
+    `apps/api/app/routers/version.py` asks — one system table, never tenant
+    data, so no RLS GUC and no auth seam are involved.
+    """
+    row = session.execute(text("SELECT version_num FROM alembic_version")).first()
+    return row[0] if row else None
+
+
+def _check_migrations(session: Session) -> DependencyCheck:
+    """Fail-closed comparison of code-expected vs live migration head.
+
+    Never raises: any error becomes a failed check carrying the exception
+    CLASS NAME only, exactly as `_run_with_timeout` does for the
+    connectivity probes.
+    """
+    try:
+        live = _live_migration_head(session)
+    except Exception as exc:  # noqa: BLE001 - class name only, never the message
+        return DependencyCheck(
+            ok=False, error=exc.__class__.__name__, detail="live migration head unreadable"
+        )
+
+    identity = release_mod.get_release_identity(live_db_migration=live)
+    expected = identity.expected_db_migration
+
+    if expected is None:
+        return DependencyCheck(
+            ok=False,
+            error="ExpectedMigrationUnresolved",
+            detail="running code's alembic script directory could not be resolved",
+        )
+    if live is None:
+        return DependencyCheck(
+            ok=False,
+            error="LiveMigrationUnresolved",
+            detail="alembic_version is empty — has the migrate job run?",
+        )
+    if expected != live:
+        # Neither revision id is published here. They are not secrets, and
+        # `/version` prints both on purpose — but `/ready` is consumed by an
+        # orchestrator that acts on the status code, and keeping this body
+        # to fixed strings means no request-time value can ever reach it.
+        return DependencyCheck(
+            ok=False,
+            error="MigrationHeadMismatch",
+            detail="code-expected and live migration heads differ — see /version",
+        )
+    return DependencyCheck(ok=True, detail="code-expected and live migration heads match")
+
+
+def _check_heartbeats(client: Any) -> DependencyCheck:
+    """Per-instance freshness across every declared service.
+
+    "No services declared" is a labelled absence, not a pass and not a
+    failure — see this module's docstring.
+    """
+    services = heartbeat_mod.required_heartbeat_services()
+    if not services:
+        return DependencyCheck(ok=True, detail="not-configured")
+
+    fleet = heartbeat_mod.aggregate_fleet_freshness(
+        client, services, min_instances=heartbeat_mod.required_min_instances()
+    )
+    failing = [name for name, freshness in fleet.items() if not freshness.ok]
+    detail = "; ".join(
+        freshness.detail or name for name, freshness in sorted(fleet.items())
+    )
+    if failing:
+        first_error = next(
+            (fleet[name].error for name in failing if fleet[name].error), None
+        )
+        return DependencyCheck(
+            ok=False, error=first_error or "StaleHeartbeat", detail=detail
+        )
+    return DependencyCheck(ok=True, detail=detail)
+
+
 @router.get("/ready", response_model=ReadyResponse)
 def ready(
     response: Response,
     session: Session = Depends(_get_db_session),
     redis_client: Any = Depends(_get_redis_dependency),
 ) -> ReadyResponse:
+    # Every check is independently timeboxed by the same budget: the two new
+    # A5 checks each perform I/O (one system-table read, one Redis SCAN), so
+    # a hung dependency must not be able to delay the verdict through them
+    # any more than it can through the connectivity probes above.
     checks = {
         "database": _run_with_timeout(
             lambda: _check_database(session), timeout=_CHECK_TIMEOUT_SECONDS
@@ -201,6 +366,42 @@ def ready(
             lambda: _check_redis(redis_client), timeout=_CHECK_TIMEOUT_SECONDS
         ),
     }
+
+    # The two A5 checks reuse this request's session/client, and each check
+    # runs on its own worker thread — but strictly one at a time, because
+    # `_run_with_timeout` blocks on `future.result()` before the next check
+    # is submitted. The single exception is a TIMED-OUT check: `wait=False`
+    # deliberately leaves that worker running (see `_run_with_timeout`), so
+    # its `session` is still in use by another thread. A SQLAlchemy `Session`
+    # is not thread-safe, so `migrations` is short-circuited rather than
+    # allowed to touch a session a stuck thread still holds. Nothing is lost:
+    # a failed `database` check has already decided the verdict, and
+    # "database unreachable" is the more accurate thing to report than a
+    # derived migration error caused by it.
+    if checks["database"].ok:
+        checks["migrations"] = _run_check_with_timeout(
+            lambda: _check_migrations(session), timeout=_CHECK_TIMEOUT_SECONDS
+        )
+    else:
+        checks["migrations"] = DependencyCheck(
+            ok=False,
+            error="DatabaseUnavailable",
+            detail="not checked — the database check failed first",
+        )
+
+    # Redis has no equivalent hazard (`redis.Redis` is thread-safe and pools
+    # its own connections), but the same short-circuit is applied for the
+    # same readability reason: one root cause, reported once.
+    if checks["redis"].ok:
+        checks["heartbeats"] = _run_check_with_timeout(
+            lambda: _check_heartbeats(redis_client), timeout=_CHECK_TIMEOUT_SECONDS
+        )
+    else:
+        checks["heartbeats"] = DependencyCheck(
+            ok=False,
+            error="RedisUnavailable",
+            detail="not checked — the redis check failed first",
+        )
     ready_state = all(check.ok for check in checks.values())
     response.status_code = 200 if ready_state else 503
     return ReadyResponse(ready=ready_state, checks=checks)

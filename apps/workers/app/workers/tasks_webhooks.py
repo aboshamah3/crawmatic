@@ -27,6 +27,7 @@ from app.workers.celery_app import app
 from app_shared.database import get_session, set_workspace_context
 from app_shared.enums import WebhookEventStatus
 from app_shared.ids import new_uuid7
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.webhooks import WebhookEvent
 from app_shared.redis_client import get_redis_client
 from app_shared.task_names import CREATE_WEBHOOK_EVENT
@@ -61,6 +62,7 @@ def _claim_dedup_key(dedup_key: str) -> bool:
         return True
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=CREATE_WEBHOOK_EVENT)
 def create_webhook_event(
     *,
