@@ -88,6 +88,21 @@ class Thresholds:
     #: 2 days of lag means two consecutive runs were missed.
     rollup_stale_lag_days: int = 2
 
+    # --- cost: network-ledger rollup (EPA C6) -----------------------------
+    #: Same shape as ``rollup_stale_lag_days`` above: the cost rollup also
+    #: runs daily, so 2 days of watermark lag means two consecutive runs
+    #: were missed.
+    cost_rollup_watermark_stale_days: int = 2
+    #: NOT a measured production figure (no reconciled-cost history exists
+    #: yet to measure from, unlike most thresholds in this file) — a
+    #: conservative starting point pending real operator tuning once C5's
+    #: reconciliation has run for a while. Flagged here rather than
+    #: silently presented as derived.
+    cost_rollup_variance_critical_pct: float = 20.0
+    #: Same absolute figure as ``freshness_attempt_critical_seconds``: two
+    #: days with no closed network operation at all.
+    cost_rollup_ledger_freshness_critical_seconds: float = 172_800.0
+
     # --- outbox ----------------------------------------------------------
     outbox_pending_warning: int = 500
     outbox_pending_high: int = 5_000
@@ -377,6 +392,141 @@ def _r_rollup(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
             )
         ]
     return []
+
+
+# --------------------------------------------------------------------------
+# COST — the network-ledger cost rollup (EPA C6)
+# --------------------------------------------------------------------------
+
+_J_COST_ROLLUP = (
+    "EPA C6: GET /ops/metrics reads ONLY the durable cost-rollup tables "
+    "for spend health, by design, so it never runs a synchronous "
+    "high-cardinality aggregation on request. That means a missing or "
+    "stale rollup watermark does not show up as absent data -- it shows "
+    "up as SILENTLY FROZEN numbers that look like a healthy, unchanging "
+    "spend pattern. A rollup day with operations but zero reconciled "
+    "cost is the other half: every dollar reported is an ESTIMATE "
+    "nobody has checked against what the provider actually billed. Both "
+    "are CRITICAL, not merely 'unavailable', per this task's explicit "
+    "instruction."
+)
+
+
+def _r_cost_rollup(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    c = snapshot.cost_rollup
+    if not c.available:
+        return [
+            _alert(
+                "cost_rollup.unavailable",
+                Severity.CRITICAL,
+                Category.COST,
+                f"Cost-rollup health could not be read: {c.unavailable_reason}",
+                _J_COST_ROLLUP,
+            )
+        ]
+
+    out: list[Alert] = []
+
+    if not c.watermark_available:
+        out.append(
+            _alert(
+                "cost_rollup.watermark_store_missing",
+                Severity.CRITICAL,
+                Category.COST,
+                "rollup_watermarks is not available -- the network-cost-rollup "
+                "cursor cannot be tracked at all.",
+                _J_COST_ROLLUP,
+            )
+        )
+    elif c.watermark_last_complete_date is None:
+        out.append(
+            _alert(
+                "cost_rollup.watermark_never_seeded",
+                Severity.CRITICAL,
+                Category.COST,
+                "The network_cost_rollup watermark has never been seeded -- "
+                "the cost-rollup job has never run.",
+                _J_COST_ROLLUP,
+            )
+        )
+    elif (
+        c.watermark_age_days is not None
+        and c.watermark_age_days > t.cost_rollup_watermark_stale_days
+    ):
+        out.append(
+            _alert(
+                "cost_rollup.watermark_stale",
+                Severity.CRITICAL,
+                Category.COST,
+                f"Cost-rollup watermark is {c.watermark_age_days} day(s) stale "
+                f"(last complete: {c.watermark_last_complete_date}).",
+                _J_COST_ROLLUP,
+                observed={
+                    "watermark_age_days": c.watermark_age_days,
+                    "threshold_days": t.cost_rollup_watermark_stale_days,
+                },
+            )
+        )
+
+    if c.latest_rollup_date is None:
+        out.append(
+            _alert(
+                "cost_rollup.no_data",
+                Severity.CRITICAL,
+                Category.COST,
+                "No fleet cost-rollup rows exist yet.",
+                _J_COST_ROLLUP,
+            )
+        )
+    else:
+        if c.total_operation_count > 0 and c.reconciled_operation_count == 0:
+            out.append(
+                _alert(
+                    "cost_rollup.reconciliation_missing",
+                    Severity.CRITICAL,
+                    Category.COST,
+                    f"No reconciled cost for any of {c.total_operation_count} "
+                    f"operation(s) rolled up on {c.latest_rollup_date} -- every "
+                    "reported dollar is an unchecked estimate.",
+                    _J_COST_ROLLUP,
+                    observed={"total_operation_count": c.total_operation_count},
+                )
+            )
+        variance = c.estimated_vs_reconciled_variance_pct
+        if variance is not None and variance > t.cost_rollup_variance_critical_pct:
+            out.append(
+                _alert(
+                    "cost_rollup.variance_high",
+                    Severity.CRITICAL,
+                    Category.COST,
+                    f"Estimated vs. reconciled cost variance is {variance:.1f}% "
+                    f"on {c.latest_rollup_date}.",
+                    _J_COST_ROLLUP,
+                    observed={
+                        "variance_pct": round(variance, 2),
+                        "threshold_pct": t.cost_rollup_variance_critical_pct,
+                    },
+                )
+            )
+
+    age = c.ledger_freshness_seconds
+    if age is not None and age > t.cost_rollup_ledger_freshness_critical_seconds:
+        out.append(
+            _alert(
+                "cost_rollup.ledger_silent",
+                Severity.CRITICAL,
+                Category.COST,
+                f"No network operation has closed in {age / 3600:.1f} hours -- "
+                "the cost ledger itself is silent.",
+                _J_COST_ROLLUP,
+                observed={
+                    "seconds_since_last_close": round(age),
+                    "threshold_seconds": t.cost_rollup_ledger_freshness_critical_seconds,
+                },
+            )
+        )
+
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1367,6 +1517,13 @@ def _r_rls(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
 RULES: tuple[Rule, ...] = (
     Rule("partition.*", Category.DATA, "Partition existence", _J_PARTITION, _r_partition),
     Rule("rollup.*", Category.DATA, "Daily-rollup freshness", _J_ROLLUP, _r_rollup),
+    Rule(
+        "cost_rollup.*",
+        Category.COST,
+        "Network-ledger cost-rollup watermark/reconciliation health",
+        _J_COST_ROLLUP,
+        _r_cost_rollup,
+    ),
     Rule("outbox.*", Category.DELIVERY, "Outbox backlog/dead", _J_OUTBOX, _r_outbox),
     Rule(
         "cost.requests_per_url",

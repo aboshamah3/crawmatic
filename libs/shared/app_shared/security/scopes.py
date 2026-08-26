@@ -60,6 +60,17 @@ class Scope(StrEnum):
     # `CONNECTOR_SCOPES` in `apps/api/app/routers/admin.py` (audit P0.3):
     # a capability nobody asked for is a capability nobody should hold.
     JOBS_CANCEL = "jobs:cancel"
+    # EPA C6 (2026-08-26). Deliberately its OWN narrow scope, following
+    # the JOBS_CANCEL precedent immediately above: a tenant's own
+    # per-domain/method/profile-version cost breakdown
+    # (`network_cost_rollups`) is commercially sensitive in exactly the
+    # way `/ops/metrics`' fleet aggregates are, but for ONE workspace
+    # rather than every workspace, so it gets its own least-privilege
+    # scope rather than riding on `jobs:read`/`products:read` (a key
+    # that can list products has no obvious reason to see spend
+    # breakdowns too) or `strategy:read` (a different capability
+    # entirely). See `apps/api/app/routers/cost_rollups.py`.
+    COST_ROLLUPS_READ = "cost_rollups:read"
 
 
 def validate_scopes(values: Iterable[str]) -> list[str]:

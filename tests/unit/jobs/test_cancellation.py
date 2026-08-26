@@ -639,7 +639,17 @@ def test_scrapyd_job_ids_interface_is_empty_until_b1() -> None:
     assert list(iter_known_scrapyd_job_ids(_CancellationSession(), uuid.uuid4())) == []
 
 
-def test_reservation_release_is_a_named_no_op_until_c3() -> None:
+def test_reservation_release_returns_zero_when_the_job_holds_none() -> None:
+    """Step 4 is REAL as of EPA C3 — and still returns 0 with nothing to release.
+
+    Replaces the pre-C3 `..._is_a_named_no_op_until_c3` assertion. The
+    function now iterates the job's `RESERVED` `cost_reservations` rows
+    and compare-and-sets each to `RELEASED`; a job holding none (this
+    fake session seeds no reservations) releases none. The zero is now a
+    *result*, not a stub — which is also the idempotence property: a
+    second cancellation of the same job finds every row already terminal
+    and likewise reports 0.
+    """
     from app_shared.jobs.cancellation import release_reservations_for_job
 
     assert release_reservations_for_job(_CancellationSession(), uuid.uuid4()) == 0

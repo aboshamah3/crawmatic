@@ -780,6 +780,25 @@ class WebhookEventType(StrEnum):
     #: second, contradictory terminal event when the finalizer later sweeps it.
     SCRAPE_JOB_CANCELLED = "scrape.job.cancelled"
     DOMAIN_STRATEGY_UPDATED = "domain.strategy.updated"
+    #: EPA C3 (2026-08-25). A cost budget crossed one of its 50/75/90%
+    #: warning marks. Emitted ONLY by
+    #: ``app_shared.costauth.service.CostAuthorizationService``, through
+    #: the existing ``webhook_events.create_webhook_event`` consumer — C3
+    #: deliberately invents no new outbox task name (EPA B7's ruling: an
+    #: outbox row naming a task nothing consumes is a message that looks
+    #: delivered and never is). At most once per budget row per period;
+    #: the crossings already announced live on the budget row, so neither
+    #: a replay nor a drained outbox can produce a second one.
+    BUDGET_THRESHOLD_WARNING = "budget.threshold.warning"
+    #: EPA W4.2 (2026-08-25). A scheduler item (a ``refresh_rules`` row)
+    #: exhausted its bounded retries and was dead-lettered: the rule is
+    #: disabled and will not be scheduled again until it is replayed
+    #: (``apps/scheduler/app/scheduler/scheduler_app.py::
+    #: replay_dead_letters``). Emitted through the SAME existing
+    #: ``webhook_events.create_webhook_event`` consumer C3's budget
+    #: warning uses, for the same reason (EPA B7: no new, unregistered
+    #: outbox task name).
+    SCHEDULER_ITEM_DEAD_LETTERED = "scheduler.item.dead_lettered"
 
 
 class _AppValidatedEnumString(TypeDecorator[Any]):

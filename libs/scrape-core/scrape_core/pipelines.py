@@ -448,6 +448,11 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 # coerced to 0 (see the columns' own docstrings).
                 main_document_bytes=item.main_document_bytes,
                 subresource_bytes=item.subresource_bytes,
+                # EPA C4: the physical operation (C1's ledger) this
+                # logical attempt was carried by. `None` for a
+                # never-dispatched row -- nullable is not a coverage
+                # claim, it is the honest value when no socket opened.
+                network_operation_id=item.network_operation_id,
             )
         )
         if item.success:

@@ -34,12 +34,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
 from app_shared.config import get_settings
+from app_shared.costauth import sweep_expired_reservations
 from app_shared.database import get_system_session
 from app_shared.maintenance.health import (
     EVENT_PARTITION_MISSING,
@@ -50,9 +51,18 @@ from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
 from app_shared.maintenance.rollups import run_daily_rollup
 from app_shared.maintenance.soft_refs import count_tolerated_dangling_refs
+from app_shared.netledger.reconcile import (
+    ReconciliationPolicyError,
+    reconcile_window,
+    windows_pending_reconciliation,
+)
+from app_shared.netledger.rollups import run_cost_rollup
 from app_shared.task_names import (
+    COSTAUTH_RESERVATION_SWEEP,
+    MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
 )
 
@@ -225,4 +235,215 @@ def retention_drop() -> None:
         report.partitions_skipped_pending_rollups,
         report.rollup_rows_deleted,
         dangling_soft_refs_tolerated,
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=COSTAUTH_RESERVATION_SWEEP)
+def costauth_reservation_sweep() -> None:
+    """`COSTAUTH_RESERVATION_SWEEP` (`maintenance` queue, EPA C3, READY-006).
+
+    Reaps EXPIRED cost-authorization leases — the one failure mode the
+    dispatch paths' own `release()` calls cannot cover. A worker that is
+    killed between `authorize()` and its POST leaves a `RESERVED` row
+    holding budget with nobody left to release it; without this sweep
+    that money is held until an operator notices.
+
+    **It is not a TTL expiry.** For every expired lease the sweeper first
+    asks C1's ledger whether an operation opened under that
+    `authorization_id` is still open (`network_operations.closed_at IS
+    NULL`). If one is, the reservation stays `RESERVED` and its lease is
+    extended: an expired lease is evidence that a *heartbeat* stopped —
+    which happens whenever a worker is paused, throttled or merely slow —
+    and treating it as evidence that the *work* stopped is exactly how a
+    budget gets spent twice while its counters look healthy.
+
+    FLEET-scoped and run on the BYPASSRLS system session, because the
+    sweep is inherently cross-tenant (one pass must see every workspace's
+    expired reservations) and must additionally read
+    `network_operations`, which has no `workspace_id` to scope by at all.
+    Same seam, for the same reason, as C1's allocation writes and the
+    scheduler's due-rule claim.
+
+    Idempotent and no-arg: every release is a compare-and-set on the
+    reservation's own state, so a duplicate delivery releases nothing
+    twice and two sweepers running at once contend on nothing (the scan
+    takes `FOR UPDATE SKIP LOCKED`).
+    """
+    with _system_session("costauth_reservation_sweep") as session:
+        released, skipped_live = sweep_expired_reservations(
+            session, now=datetime.now(timezone.utc)
+        )
+
+    logger.info(
+        "maintenance_costauth_reservation_sweep released=%d skipped_live=%d",
+        released,
+        skipped_live,
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_RECONCILE_PROVIDER_USAGE)
+def reconcile_provider_usage(target_date: str | None = None, provider: str | None = None) -> None:
+    """`MAINTENANCE_RECONCILE_PROVIDER_USAGE` (`maintenance` queue, EPA C5,
+    READY-005 part 2).
+
+    Per provider/day/account: reconciles whatever provider usage has
+    ALREADY been imported (``scripts/import_dataimpulse_usage.py`` —
+    file-based, no network call, run by an operator once the owner
+    supplies an export) against C1's `network_operations` ledger for one
+    UTC day, appending `network_operation_settlements` versions where
+    bytes reconcile within tolerance (`app_shared.netledger.reconcile.
+    reconcile_window`). This task does not itself talk to any provider —
+    it only reads rows already sitting in `provider_usage_records`.
+
+    * **Cadence (no `target_date`)** — the scheduler's daily call.
+      Reconciles the PRIOR UTC day (`target_date - 1`), so a day's
+      provider export (typically pulled the following morning) has had a
+      full day to land before this task looks for it. Missing evidence
+      for a day is not an error here — `windows_pending_reconciliation`
+      simply returns nothing for a day nobody has imported yet, and the
+      next run (or a later explicit backfill call) picks it up once the
+      import exists.
+    * **One explicit day** (`target_date`, ISO `YYYY-MM-DD`) — a manual
+      backfill/replay call, e.g. once the owner finally supplies the
+      pending DataImpulse export for the 2026-08-24 canary window.
+    * **`provider`** (optional) narrows to one provider; omitted means
+      every provider with imported evidence for the day.
+
+    Each `(provider, provider_account, window)` triple found is
+    reconciled independently and NEVER lets one window's failure (a
+    `ReconciliationPolicyError` — e.g. a provider account whose rows
+    disagree on currency, see that module's policy) abort the others;
+    the failure is logged and counted, and every other window still
+    gets its chance. Idempotent by construction (`reconcile_window`
+    skips a settlement it would otherwise duplicate) — a retried or
+    doubly-scheduled run costs nothing extra.
+
+    Emits one structured run-report log line (FR-023 convention) —
+    `windows_reconciled`, `windows_passed`, `windows_failed_open_gap`
+    (a window whose report came back with unexplained usage — the
+    147-vs-70 canary shape) and `windows_errored` (a policy violation or
+    unexpected failure, named so an operator does not have to grep for
+    it among ordinary INFO lines, the same EVENT_SYSTEM_SESSION_UNAVAILABLE
+    lesson this module already learned once).
+    """
+    if target_date is not None:
+        parsed_date = date.fromisoformat(target_date)
+    else:
+        parsed_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+
+    with _system_session("reconcile_provider_usage") as session:
+        windows = windows_pending_reconciliation(
+            session, target_date=parsed_date, provider=provider
+        )
+
+    windows_passed = 0
+    windows_failed_open_gap = 0
+    windows_errored = 0
+    for window in windows:
+        try:
+            report = reconcile_window(window)
+        except ReconciliationPolicyError:
+            windows_errored += 1
+            logger.error(
+                "maintenance_reconcile_provider_usage_policy_error "
+                "window_id=%s provider=%s provider_account=%s",
+                window.id,
+                window.provider,
+                window.provider_account,
+                exc_info=True,
+            )
+            continue
+        except Exception:  # noqa: BLE001 - one bad window must not abort the rest
+            windows_errored += 1
+            logger.error(
+                "maintenance_reconcile_provider_usage_unexpected_error "
+                "window_id=%s provider=%s provider_account=%s",
+                window.id,
+                window.provider,
+                window.provider_account,
+                exc_info=True,
+            )
+            continue
+
+        if report.passed:
+            windows_passed += 1
+        else:
+            windows_failed_open_gap += 1
+            logger.warning(
+                "maintenance_reconcile_provider_usage_open_gap window_id=%s "
+                "provider=%s provider_account=%s app_requests=%d provider_requests=%d "
+                "app_bytes=%d provider_bytes=%d unexplained=%d",
+                window.id,
+                window.provider,
+                window.provider_account,
+                report.app_requests,
+                report.provider_requests,
+                report.app_bytes,
+                report.provider_bytes,
+                len(report.unexplained_operations),
+            )
+
+    logger.info(
+        "maintenance_reconcile_provider_usage target_date=%s provider=%s "
+        "windows_reconciled=%d windows_passed=%d windows_failed_open_gap=%d "
+        "windows_errored=%d",
+        parsed_date.isoformat(),
+        provider,
+        len(windows),
+        windows_passed,
+        windows_failed_open_gap,
+        windows_errored,
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_COST_ROLLUP)
+def cost_rollup(target_date: str | None = None) -> None:
+    """`MAINTENANCE_COST_ROLLUP` (`maintenance` queue, EPA C6).
+
+    Maintains the bounded, durable ``network_cost_rollups``/
+    ``fleet_network_cost_rollups`` tables
+    (`app_shared.netledger.rollups.run_cost_rollup`) that `GET
+    /ops/metrics`'s `cost_rollup` section and the tenant-scoped `GET
+    /v1/cost-rollups` both read — neither ever aggregates the raw
+    `network_operations`/`network_operation_allocations` ledger
+    synchronously on request.
+
+    * **Cadence (no `target_date`)** — durable-watermark catch-up
+      (mirrors `daily_rollup`'s own cadence path): every UTC day owed
+      since the `rollup_watermarks` cursor (key
+      `app_shared.netledger.rollups.WATERMARK_COST_ROLLUP`), oldest
+      first, bounded per call. `run_cost_rollup` commits each day's
+      upserts + watermark advance together internally
+      (`commit=True`, its default) — the same no-loss/no-double-count
+      ordering `run_rollup_catchup` uses, so this task issues no extra
+      commit of its own in this mode.
+    * **One explicit day** (`target_date`, ISO `YYYY-MM-DD`) — a manual
+      backfill/replay call. `run_cost_rollup` does not commit in this
+      mode (mirrors `run_daily_rollup`'s explicit-day mode), so this
+      task commits once, itself, after the call.
+
+    Emits one structured run-report log line (FR-023 convention) —
+    `days_processed`, `fleet_rows_upserted`, `tenant_rows_upserted`,
+    `watermark_store_available`, `watermark_advanced`.
+    """
+    parsed_date = date.fromisoformat(target_date) if target_date is not None else None
+
+    with _system_session("cost_rollup") as session:
+        report = run_cost_rollup(session, target_date=parsed_date)
+        if parsed_date is not None:
+            session.commit()
+
+    logger.info(
+        "maintenance_cost_rollup target_date=%s days_processed=%s "
+        "fleet_rows_upserted=%d tenant_rows_upserted=%d "
+        "watermark_store_available=%s watermark_advanced=%s",
+        target_date,
+        [d.isoformat() for d in report.days_processed],
+        report.fleet_rows_upserted,
+        report.tenant_rows_upserted,
+        report.watermark_store_available,
+        report.watermark_advanced,
     )

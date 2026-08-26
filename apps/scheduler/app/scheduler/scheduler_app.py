@@ -120,14 +120,19 @@ from app_shared.maintenance.cadence import (
 from app_shared.maintenance.health import check_maintenance_health, log_health_report
 from app_shared.messaging import enqueue
 from app_shared.models.maintenance_cadence import (
+    CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
     CADENCE_PARTITION_CREATE,
+    CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
 )
 from app_shared.opsmetrics import collect_snapshot, emit_snapshot
 from app_shared.task_names import (
+    COSTAUTH_RESERVATION_SWEEP,
+    MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -265,6 +270,42 @@ def _enqueue_daily_rollup() -> None:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_DAILY_ROLLUP)
 
 
+def _enqueue_reconcile_provider_usage() -> None:
+    """Fire-and-forget `MAINTENANCE_RECONCILE_PROVIDER_USAGE` on the
+    `maintenance` queue (EPA C5, READY-005 part 2) -- the owed wiring
+    this run closes. C5 registered the task
+    (`apps/workers/app/workers/tasks_maintenance.py::
+    reconcile_provider_usage`) and its Celery name but could not wire a
+    schedule entry (`apps/scheduler` was fenced then; it is free now).
+    No-arg call reconciles the PRIOR UTC day for every provider with
+    imported evidence -- see that task's own docstring. Errors are
+    logged and swallowed like every other maintenance enqueue: a missed
+    tick just means that day's reconciliation is retried on the next
+    interval, never a crashed scheduler process.
+    """
+    try:
+        enqueue(MAINTENANCE_RECONCILE_PROVIDER_USAGE, queue="maintenance")
+    except Exception:
+        logger.exception(
+            "scheduler: failed to enqueue %s", MAINTENANCE_RECONCILE_PROVIDER_USAGE
+        )
+
+
+def _enqueue_cost_rollup() -> None:
+    """Fire-and-forget `MAINTENANCE_COST_ROLLUP` on the `maintenance`
+    queue (EPA C6) -- maintains the bounded, durable cost-rollup tables
+    `GET /ops/metrics` and `GET /v1/cost-rollups` both read. No-arg call
+    runs the durable-watermark catch-up path -- see that task's own
+    docstring. Errors are logged and swallowed like every other
+    maintenance enqueue: a missed tick just means the rollup is retried
+    on the next interval, never a crashed scheduler process.
+    """
+    try:
+        enqueue(MAINTENANCE_COST_ROLLUP, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_COST_ROLLUP)
+
+
 def _enqueue_retention_drop() -> None:
     """Fire-and-forget `MAINTENANCE_RETENTION_DROP` on the `maintenance`
     queue (SPEC-15 US3, contracts/retention-drop.md) -- drops whole
@@ -316,6 +357,30 @@ def _enqueue_outbox_reconcile() -> None:
         logger.exception("scheduler: failed to enqueue %s", OUTBOX_RECONCILE)
 
 
+def _enqueue_costauth_reservation_sweep() -> None:
+    """Fire-and-forget `COSTAUTH_RESERVATION_SWEEP` on the `maintenance`
+    queue (EPA C3, READY-006) — reap expired cost-authorization leases
+    whose grant has no open operation in C1's ledger.
+
+    Reuses the existing 60s-class maintenance tick/knob rather than
+    introducing a cadence of its own, the same SPEC-12 precedent
+    `finalize_jobs`/`recover_stalled_batches`/`redispatch_pending_jobs`
+    already follow. That is the right cadence here too: reservation
+    leases are minutes long, so a daily durable cadence would be far too
+    slow, and the sweep is a cheap indexed scan
+    (`ix_cost_reservations_state_lease_expires_at`) that no-ops when
+    nothing has expired.
+
+    Errors are logged and swallowed like every other maintenance enqueue.
+    A missed tick loses nothing: the expired leases are still in
+    Postgres, and the next tick reaps them.
+    """
+    try:
+        enqueue(COSTAUTH_RESERVATION_SWEEP, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", COSTAUTH_RESERVATION_SWEEP)
+
+
 def _run_refresh_pass_tick(batch_limit: int) -> None:
     """Run one SPEC-13 refresh pass (`app.scheduler.refresh.run_refresh_pass`)
     on the BYPASSRLS system sessionmaker, claiming/firing up to
@@ -341,10 +406,31 @@ def _run_refresh_pass_tick(batch_limit: int) -> None:
 #: The durable daily cadences: ``(cadence_key, settings attribute holding
 #: the interval, enqueue callable)``. Driven by ``maintenance_cadences``
 #: deadlines, NOT by in-process accumulators — see the module docstring.
+#:
+#: The two EPA C5/C6 entries added 2026-08-26
+#: (``CADENCE_RECONCILE_PROVIDER_USAGE``/``CADENCE_COST_ROLLUP``)
+#: deliberately reuse ``DAILY_ROLLUP_INTERVAL_SECONDS`` rather than a
+#: `Settings` field of their own: `libs/shared/app_shared/config.py` is
+#: held by a concurrent worker for this run's duration (this task's HARD
+#: FENCES), and C5's own task docstring already describes this task as
+#: running "on the existing daily-cadence maintenance tick" — both are
+#: daily-shaped cadences, and each still gets its OWN
+#: ``maintenance_cadences`` row (own claim, own `last_run_at`, own
+#: observability), only the interval VALUE is shared.
+# TODO(config): promote RECONCILE_PROVIDER_USAGE_INTERVAL_SECONDS and
+# COST_ROLLUP_INTERVAL_SECONDS to real `Settings` fields once config.py
+# is free, so each cadence has its own independently-tunable interval
+# instead of borrowing the daily-rollup one.
 _DURABLE_CADENCES = (
     (CADENCE_PARTITION_CREATE, "PARTITION_CREATE_INTERVAL_SECONDS", _enqueue_partition_create),
     (CADENCE_DAILY_ROLLUP, "DAILY_ROLLUP_INTERVAL_SECONDS", _enqueue_daily_rollup),
     (CADENCE_RETENTION_DROP, "RETENTION_INTERVAL_SECONDS", _enqueue_retention_drop),
+    (
+        CADENCE_RECONCILE_PROVIDER_USAGE,
+        "DAILY_ROLLUP_INTERVAL_SECONDS",
+        _enqueue_reconcile_provider_usage,
+    ),
+    (CADENCE_COST_ROLLUP, "DAILY_ROLLUP_INTERVAL_SECONDS", _enqueue_cost_rollup),
 )
 
 
@@ -536,7 +622,8 @@ def main() -> None:
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush + "
-        "finalize_jobs + recover_stalled_batches every %ss; "
+        "finalize_jobs + recover_stalled_batches + costauth_reservation_sweep "
+        "every %ss; "
         "refresh pass every %ss; DURABLE cadences partition_create every %ss / "
         "daily_rollup every %ss / retention_drop every %ss polled every %ss from "
         "maintenance_cadences; outbox_drain every %ss; outbox_reconcile every %ss; "
@@ -595,6 +682,11 @@ def main() -> None:
             _enqueue_finalize_jobs()
             _enqueue_recover_stalled()
             _enqueue_redispatch_pending()
+            # Same tick/knob again (EPA C3): reap expired cost-
+            # authorization leases whose grant has no open operation in
+            # the ledger. Minutes-scale by nature, so it belongs here and
+            # not among the daily durable cadences.
+            _enqueue_costauth_reservation_sweep()
         if refresh_elapsed >= refresh_interval:
             refresh_elapsed = 0.0
             _run_refresh_pass_tick(refresh_batch_limit)

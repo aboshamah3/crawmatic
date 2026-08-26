@@ -44,7 +44,7 @@ THRESHOLDS = PromotionThresholds(
 
 # 1. full-sample DIRECT_HTTP qualifier => later legs never fetch
 fetch_log = []
-def fake_fetch(session, workspace_id, access_method, url):
+def fake_fetch(session, workspace_id, access_method, url, **kwargs):
     fetch_log.append(access_method)
     return PRICED_HTML
 tasks_strategy._fetch = fake_fetch
@@ -59,7 +59,7 @@ assert winner is not None and winner[0] is AccessMethod.DIRECT_HTTP
 
 # 2. partial qualifier => every leg still probed
 fetch_log.clear()
-def flaky_fetch(session, workspace_id, access_method, url):
+def flaky_fetch(session, workspace_id, access_method, url, **kwargs):
     fetch_log.append(access_method)
     return None if url.endswith("/p/0") else PRICED_HTML
 tasks_strategy._fetch = flaky_fetch

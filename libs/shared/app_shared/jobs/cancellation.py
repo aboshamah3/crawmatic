@@ -18,7 +18,8 @@ Cancelling a job touches four systems that cannot share a transaction:
 3. Redis     — the ``dispatched:{job}:*`` idempotency sentinels (keyed on
    the dispatch identity's digest since B1 rather than a batch position;
    still job-prefixed, so step 3's scan still finds every one of them);
-4. the reservation ledger (C3, not built yet).
+4. the C3 reservation ledger (``cost_reservations`` + the budget
+   counters it holds against).
 
 Pretending those four commit atomically is how systems end up with a
 job that the database calls ``CANCELLED`` while a spider is still
@@ -60,8 +61,11 @@ Ordering protocol (idempotent, resumable)
    only *because* step 1 already committed: with the fence in place a
    re-dispatch that races this delete is rejected on its stale
    generation, so removing the sentinels cannot resurrect the job.
-4. **Reservations** — :func:`release_reservations_for_job` (a named
-   no-op until C3).
+4. **Reservations** — :func:`release_reservations_for_job`, real as of
+   EPA C3: it releases every ``RESERVED`` ``cost_reservations`` row the
+   job holds, returning each hold to the tenant and fleet budget
+   counters. Idempotent by compare-and-set, so re-running a crashed
+   cancellation cannot double-credit a budget.
 
 Steps 2-4 are individually failure-tolerant and safe to re-run: calling
 :func:`cancel_and_reconcile_job` again on an already-cancelled job
@@ -220,21 +224,68 @@ def iter_known_scrapyd_job_ids(
 
 
 def release_reservations_for_job(session: Session, scrape_job_id: uuid.UUID | str) -> int:
-    """Release capacity reservations held by ``scrape_job_id``. **No-op until C3.**
+    """Release every live cost reservation held by ``scrape_job_id``.
 
-    C3 introduces the reservation ledger. Until then a cancelled job
-    holds no reservations to release and this returns ``0``.
+    Step 4 of the ordering protocol, and **real** as of EPA C3: it
+    iterates the job's ``RESERVED`` ``cost_reservations`` rows and
+    compare-and-sets each to ``RELEASED``, returning its whole hold to
+    the tenant and fleet budget counters. Returns how many rows this call
+    moved.
 
-    Named and called now, rather than left as a TODO, so the ordering
-    protocol is complete and auditable in one place: a reader of
-    :func:`cancel_and_reconcile_job` sees all four steps, and C3's author
-    has exactly one function to fill in. When implementing, note this
-    runs **after** the cancellation transaction has committed — it must
-    open its own workspace-scoped transaction (or reuse a caller's
-    still-open one) rather than assuming the fence transaction is still
-    available.
+    Idempotent, twice over. The CAS makes a second call a no-op on every
+    row it already released (so it returns ``0``), and each individual
+    release is a no-op on an already-terminal row — which is what makes
+    re-running a crashed cancellation safe, and what completes the
+    "supported" certification cancellation could not claim while this was
+    a stub.
+
+    **Transaction posture.** This runs AFTER the cancellation transaction
+    has committed (the module's ordering protocol requires the fence to be
+    durable before anything else happens), so it cannot assume a live
+    transaction and must not leave one open:
+
+    * handed a session already inside a transaction — the fake/scoped
+      posture — it joins it and lets the caller commit;
+    * handed an unscoped one, it resolves the job's workspace id (and
+      *only* the id) on the sanctioned BYPASSRLS system role and does the
+      work inside its own :func:`~app_shared.maintenance.scoping.
+      workspace_context`, which commits on the way out.
+
+    Fails **soft** on a workspace that cannot be resolved: a job whose
+    workspace is gone has no reservations anyone can scope to, and a
+    lookup failure must never be able to turn a committed cancellation
+    into an exception. The lease sweeper is the backstop — an unreleased
+    reservation's lease lapses and is reaped once the ledger confirms no
+    operation is open under it.
     """
-    return 0
+    from app_shared.costauth.service import release_reservations_for_scrape_job
+
+    job_uuid = (
+        scrape_job_id
+        if isinstance(scrape_job_id, uuid.UUID)
+        else uuid.UUID(str(scrape_job_id))
+    )
+
+    if session.in_transaction():
+        # Already scoped by the caller: the reservation rows are visible
+        # under the live `app.workspace_id`, and the workspace predicate
+        # is redundant-but-harmless, so it is left to the caller's scope.
+        return release_reservations_for_scrape_job(
+            session, workspace_id=None, scrape_job_id=job_uuid
+        )
+
+    try:
+        workspace_id = _resolve_workspace_id(session, job_uuid)
+    except LookupError:
+        logger.warning(
+            "job_cancel.reservation_release_unresolved scrape_job_id=%s", job_uuid
+        )
+        return 0
+
+    with workspace_context(session, workspace_id):
+        return release_reservations_for_scrape_job(
+            session, workspace_id=workspace_id, scrape_job_id=job_uuid
+        )
 
 
 def cancelled_scrape_job_ids(

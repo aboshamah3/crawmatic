@@ -137,6 +137,14 @@ class _FakeExecResult:
     def all(self) -> list[Any]:
         return list(self._items)
 
+    def first(self) -> Any | None:
+        # EPA W4.1: `app_shared.domains.state_lookup.get_domain_state`
+        # (now called from the dispatch loop before every batch) reads
+        # `session.execute(select(DomainPlaybook.state).where(...)).first()`
+        # directly on the exec result, not through `.scalars()` --
+        # mirrors `_FakeScalars.first()` above.
+        return self._items[0] if self._items else None
+
 
 class FakeOrmSession:
     """Minimal ORM-shaped ``Session`` double: real ``WHERE`` evaluation, no DB.

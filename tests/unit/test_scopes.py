@@ -41,12 +41,17 @@ FULL_VOCABULARY = {
     # (`POST /v1/admin/jobs/{id}/cancel`). Separate from `jobs:write` on
     # purpose — see the note on `Scope.JOBS_CANCEL`.
     "jobs:cancel",
+    # EPA C6 (2026-08-26): gates `GET /v1/cost-rollups`, a tenant's own
+    # per-domain/method/profile-version cost breakdown. Its own narrow
+    # scope rather than a reuse of `jobs:read`/`products:read`/
+    # `strategy:read` -- see the note on `Scope.COST_ROLLUPS_READ`.
+    "cost_rollups:read",
 }
 
 
 def test_full_vocabulary_matches_spec() -> None:
     assert {member.value for member in Scope} == FULL_VOCABULARY
-    assert len(FULL_VOCABULARY) == 28
+    assert len(FULL_VOCABULARY) == 29
 
 
 def test_every_router_required_scope_is_in_the_vocabulary() -> None:

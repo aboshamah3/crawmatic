@@ -23,16 +23,27 @@ def test_webhook_event_status_members_and_values() -> None:
     }
 
 
-def test_webhook_event_type_has_exactly_nine_members_with_expected_strings() -> None:
+def test_webhook_event_type_has_exactly_eleven_members_with_expected_strings() -> None:
     """The published event vocabulary, pinned member-for-member.
 
-    Grew from eight to nine on 2026-08-25 (EPA A2): `SCRAPE_JOB_CANCELLED`
-    /`scrape.job.cancelled` is the durable event
-    `app_shared.jobs.cancellation.cancel_and_reconcile_job` records when a
-    job is administratively closed. It is a *deliberate* vocabulary
-    addition, so the pin moves with it — which is exactly what this test
-    is for: an accidental rename or typo still fails here, while a real
-    addition has to be stated in one obvious place before it can ship.
+    Started at eight and has grown three times, each a *deliberate*
+    vocabulary addition that had to move this pin before it could ship —
+    which is exactly what this test is for: an accidental rename or typo
+    still fails here.
+
+    * `SCRAPE_JOB_CANCELLED` / `scrape.job.cancelled` (EPA A2,
+      2026-08-25) — the durable event
+      `app_shared.jobs.cancellation.cancel_and_reconcile_job` records
+      when a job is administratively closed.
+    * `BUDGET_THRESHOLD_WARNING` / `budget.threshold.warning` (EPA C3,
+      2026-08-25) — a cost budget crossed one of its 50/75/90% marks,
+      emitted only by `app_shared.costauth.service`.
+    * `SCHEDULER_ITEM_DEAD_LETTERED` / `scheduler.item.dead_lettered`
+      (EPA W4.2, 2026-08-25) — a `refresh_rules` row exhausted its
+      bounded retries and was disabled pending replay.
+
+    All three reuse the existing `webhook_events.create_webhook_event`
+    consumer (EPA B7's ruling: no new, unregistered outbox task names).
     """
     assert issubclass(WebhookEventType, StrEnum)
 
@@ -46,10 +57,12 @@ def test_webhook_event_type_has_exactly_nine_members_with_expected_strings() -> 
         "SCRAPE_JOB_FAILED": "scrape.job.failed",
         "SCRAPE_JOB_CANCELLED": "scrape.job.cancelled",
         "DOMAIN_STRATEGY_UPDATED": "domain.strategy.updated",
+        "BUDGET_THRESHOLD_WARNING": "budget.threshold.warning",
+        "SCHEDULER_ITEM_DEAD_LETTERED": "scheduler.item.dead_lettered",
     }
 
     members = list(WebhookEventType)
-    assert len(members) == 9
+    assert len(members) == 11
 
     actual = {member.name: member.value for member in members}
     assert actual == expected

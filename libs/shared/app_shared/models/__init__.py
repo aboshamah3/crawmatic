@@ -202,6 +202,56 @@ from app_shared.models.network_operations import (
     SettlementMethod,
 )
 
+# EPA C3 (2026-08-25): the cost-authorization store — reservations, the
+# tenant/fleet budget counters they lock, and the durable local
+# entitlement evidence the denial path reads. Re-exported so
+# `Base.metadata` sees all four tables for Alembic autogenerate/offline-
+# render (`target_metadata`); without that a later autogenerate would
+# read them as tables to DROP. `CostReservation`, `CostBudget` and
+# `WorkspaceEntitlement` are workspace-owned and RLS'd; `FleetCostBudget`
+# is global with no `workspace_id` at all (the `proxy_circuit_breakers`
+# shape — one shared provider balance, so every workspace's scrape path
+# must be able to read and decrement the same counter). Registering the
+# workspace-owned three in `app_shared.repository.WORKSPACE_OWNED_MODELS`
+# is deliberately NOT done here: every read/write goes through
+# `app_shared.costauth.service`, which asserts the workspace predicate in
+# its own SQL.
+from app_shared.models.cost_authorization import (
+    AuthorizationPurpose,
+    CostBudget,
+    CostReservation,
+    EntitlementState,
+    FleetCostBudget,
+    ReservationState,
+    WorkspaceEntitlement,
+)
+
+# EPA C5 (2026-08-26): raw provider usage evidence — the OTHER side of
+# reconciliation against C1's ledger. Re-exported so `Base.metadata` sees
+# the table for Alembic autogenerate/offline-render (`target_metadata`).
+# Fleet-owned like `NetworkOperation`/`NetworkOperationSettlement`: no
+# `workspace_id` at all, deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`. Filed GAP (not SYSTEM)
+# in `scripts/rls_table_manifest.txt` for the same reason
+# `network_operations` is GAP rather than SYSTEM — see that model's
+# module docstring for the contrast this mirrors.
+from app_shared.models.provider_usage import ProviderUsageGranularity, ProviderUsageRecord
+
+# EPA C6 (2026-08-26): the durable, bounded-cardinality cost rollups that
+# make `GET /ops/metrics` (and the new tenant-scoped `/v1/cost-rollups`
+# read) O(rollup rows) rather than a synchronous high-cardinality
+# aggregation over `network_operations`/`network_operation_allocations`
+# on every request. `FleetNetworkCostRollup` is global (no
+# `workspace_id`, no RLS) — the same shape as `network_operations` it
+# summarises, but SYSTEM rather than GAP in
+# `scripts/rls_table_manifest.txt` (see that model's own docstring for
+# why a fleet SUM is not tenant-linked the way a raw ledger row is).
+# `NetworkCostRollup` is workspace-owned and RLS'd, and IS registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS` below — unlike
+# `NetworkOperationAllocation`, this table's own read path
+# (`apps/api/app/routers/cost_rollups.py`) ships in this same change.
+from app_shared.models.network_cost_rollups import FleetNetworkCostRollup, NetworkCostRollup
+
 __all__ = [
     "Base",
     "metadata",
@@ -259,4 +309,15 @@ __all__ = [
     "NetworkOperationSettlement",
     "NetworkTransport",
     "SettlementMethod",
+    "AuthorizationPurpose",
+    "CostBudget",
+    "CostReservation",
+    "EntitlementState",
+    "FleetCostBudget",
+    "ReservationState",
+    "WorkspaceEntitlement",
+    "ProviderUsageRecord",
+    "ProviderUsageGranularity",
+    "FleetNetworkCostRollup",
+    "NetworkCostRollup",
 ]

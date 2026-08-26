@@ -38,13 +38,17 @@ from contextlib import contextmanager
 from app.scheduler import scheduler_app
 from app_shared.config import get_settings
 from app_shared.task_names import (
+    MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
 )
 from app_shared.models.maintenance_cadence import (
+    CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
     CADENCE_PARTITION_CREATE,
+    CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
 )
 
@@ -153,18 +157,62 @@ print("OK")
 
 
 def test_durable_cadences_cover_all_three_daily_tasks() -> None:
+    """The original three (2026-08-15 readiness cycle)."""
     _assert_ok(
         _run(
             """
 keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
 attrs = [c[1] for c in scheduler_app._DURABLE_CADENCES]
 
-assert keys == [CADENCE_PARTITION_CREATE, CADENCE_DAILY_ROLLUP, CADENCE_RETENTION_DROP], keys
-assert attrs == [
+assert keys[:3] == [CADENCE_PARTITION_CREATE, CADENCE_DAILY_ROLLUP, CADENCE_RETENTION_DROP], keys
+assert attrs[:3] == [
     "PARTITION_CREATE_INTERVAL_SECONDS",
     "DAILY_ROLLUP_INTERVAL_SECONDS",
     "RETENTION_INTERVAL_SECONDS",
 ], attrs
+print("OK")
+"""
+        )
+    )
+
+
+def test_durable_cadences_also_cover_the_epa_c5_c6_owed_wiring() -> None:
+    """EPA C5 registered `MAINTENANCE_RECONCILE_PROVIDER_USAGE` and
+    implemented the task but could not wire its schedule entry
+    (`apps/scheduler` was fenced then). EPA C6 closes that gap alongside
+    wiring its own `MAINTENANCE_COST_ROLLUP` cadence — additive entries,
+    the original three untouched (see the test above)."""
+    _assert_ok(
+        _run(
+            """
+keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
+fns = [c[2].__name__ for c in scheduler_app._DURABLE_CADENCES]
+
+assert CADENCE_RECONCILE_PROVIDER_USAGE in keys, keys
+assert CADENCE_COST_ROLLUP in keys, keys
+assert keys[-2:] == [CADENCE_RECONCILE_PROVIDER_USAGE, CADENCE_COST_ROLLUP], keys
+assert fns[-2:] == ["_enqueue_reconcile_provider_usage", "_enqueue_cost_rollup"], fns
+print("OK")
+"""
+        )
+    )
+
+
+def test_reconcile_provider_usage_and_cost_rollup_cadences_are_claimable_and_enqueue() -> None:
+    """Behavioral proof, not just a static list check: when claimed, each
+    new cadence enqueues its OWN task name."""
+    _assert_ok(
+        _run(
+            """
+enqueue, session = _install({CADENCE_RECONCILE_PROVIDER_USAGE, CADENCE_COST_ROLLUP})
+
+claimed = scheduler_app._run_durable_cadence_tick(get_settings())
+
+assert set(claimed) == {CADENCE_RECONCILE_PROVIDER_USAGE, CADENCE_COST_ROLLUP}, claimed
+assert set(enqueue.calls) == {
+    (MAINTENANCE_RECONCILE_PROVIDER_USAGE, "maintenance"),
+    (MAINTENANCE_COST_ROLLUP, "maintenance"),
+}, enqueue.calls
 print("OK")
 """
         )

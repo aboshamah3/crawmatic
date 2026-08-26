@@ -1361,6 +1361,12 @@ def _attempt_kwargs_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "response_time_ms": _elapsed_ms(meta.get("dispatch_monotonic")),
         "match_lock_key": meta.get("match_lock_key"),
         "match_lock_token": meta.get("match_lock_token"),
+        # EPA C4 (READY-005): the physical `network_operations` row this
+        # attempt was carried by, stamped onto `meta` by
+        # `scrape_core.netledger_middleware` BEFORE the socket opened.
+        # Absent -> `None` (a hand-built request in a unit test, or a
+        # crawl with `NETLEDGER_ENABLED = False`); never fabricated.
+        "network_operation_id": meta.get("network_request_id"),
     }
 
 

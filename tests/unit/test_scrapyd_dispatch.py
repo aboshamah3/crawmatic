@@ -189,6 +189,72 @@ def test_schedule_sends_basic_auth_and_args_returns_jobid() -> None:
     assert redis.get(dispatch_key(_ARGS["scrape_job_id"], _ARGS["batch_index"])) == "job-777"
 
 
+def test_schedule_forwards_authorization_id_when_given() -> None:
+    """EPA C4b: the caller's C3 grant is stamped onto the spider so its own
+    network-ledger boundary can trace every physical operation back to it."""
+    settings = _FakeSettings()
+    scrapyd = _FakeScrapyd(
+        expected_auth=(settings.SCRAPYD_USERNAME, settings.SCRAPYD_PASSWORD),
+        jobid="job-auth",
+    )
+    redis = _FakeRedis()
+    client = _make_client(scrapyd, redis, settings)
+    authorization_id = "55555555-5555-5555-5555-555555555555"
+
+    jobid = client.schedule(
+        "price_monitor",
+        "generic_price_spider",
+        **_ARGS,
+        authorization_id=authorization_id,
+    )
+
+    assert jobid == "job-auth"
+    assert scrapyd.calls[0]["data"]["authorization_id"] == authorization_id
+
+
+def test_schedule_forwards_authorization_id_as_a_string_when_given_a_uuid() -> None:
+    """A `uuid.UUID` grant id (what every real call site actually holds,
+    ``AuthorizationGrant.authorization_id``) must be stringified for the
+    POST form field, not sent as a `UUID` object `requests` cannot encode."""
+    import uuid
+
+    settings = _FakeSettings()
+    scrapyd = _FakeScrapyd(
+        expected_auth=(settings.SCRAPYD_USERNAME, settings.SCRAPYD_PASSWORD),
+        jobid="job-auth-uuid",
+    )
+    redis = _FakeRedis()
+    client = _make_client(scrapyd, redis, settings)
+    authorization_id = uuid.uuid4()
+
+    client.schedule(
+        "price_monitor",
+        "generic_price_spider",
+        **_ARGS,
+        authorization_id=authorization_id,
+    )
+
+    assert scrapyd.calls[0]["data"]["authorization_id"] == str(authorization_id)
+    assert isinstance(scrapyd.calls[0]["data"]["authorization_id"], str)
+
+
+def test_schedule_omits_authorization_id_when_none() -> None:
+    """The default (`None`, every pre-C4b caller) must send NO form field at
+    all -- never the literal string `"None"` -- exactly like the existing
+    conditional `jobid` field this mirrors."""
+    settings = _FakeSettings()
+    scrapyd = _FakeScrapyd(
+        expected_auth=(settings.SCRAPYD_USERNAME, settings.SCRAPYD_PASSWORD),
+        jobid="job-noauth",
+    )
+    redis = _FakeRedis()
+    client = _make_client(scrapyd, redis, settings)
+
+    client.schedule("price_monitor", "generic_price_spider", **_ARGS)
+
+    assert "authorization_id" not in scrapyd.calls[0]["data"]
+
+
 def test_every_dispatch_key_written_carries_a_ttl() -> None:
     """No key this client writes may live forever (pre-launch audit, LOW).
 

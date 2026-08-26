@@ -68,6 +68,21 @@ EPOCH_DUE = datetime(1970, 1, 1, tzinfo=timezone.utc)
 CADENCE_PARTITION_CREATE = "partition_create"
 CADENCE_DAILY_ROLLUP = "daily_rollup"
 CADENCE_RETENTION_DROP = "retention_drop"
+#: EPA C5 (owed wiring, closed 2026-08-26 by C6): the nightly provider-
+#: usage reconciliation pass (``apps/workers/app/workers/
+#: tasks_maintenance.py::reconcile_provider_usage``). C5 registered the
+#: task and its Celery name but could not wire the schedule entry
+#: (``apps/scheduler`` was fenced then). Its own cadence key rather than
+#: reusing ``CADENCE_DAILY_ROLLUP``'s row: independently claimable and
+#: independently observable in ``maintenance_cadences``, even though (see
+#: ``apps.scheduler.app.scheduler.scheduler_app._DURABLE_CADENCES``) it
+#: reuses that cadence's INTERVAL setting rather than a new one.
+CADENCE_RECONCILE_PROVIDER_USAGE = "reconcile_provider_usage"
+#: EPA C6: the durable, bounded network-cost rollup
+#: (``app_shared.netledger.rollups.run_cost_rollup``). Same reasoning as
+#: ``CADENCE_RECONCILE_PROVIDER_USAGE`` above — its own key, the daily
+#: rollup's existing interval setting.
+CADENCE_COST_ROLLUP = "cost_rollup"
 
 #: Every cadence the scheduler drives durably (the daily ones). The 60s
 #: cadences deliberately stay in-process — see
@@ -76,6 +91,8 @@ DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_PARTITION_CREATE,
     CADENCE_DAILY_ROLLUP,
     CADENCE_RETENTION_DROP,
+    CADENCE_RECONCILE_PROVIDER_USAGE,
+    CADENCE_COST_ROLLUP,
 )
 
 
@@ -109,8 +126,10 @@ class MaintenanceCadence(Base, TimestampMixin):
 
 
 __all__ = [
+    "CADENCE_COST_ROLLUP",
     "CADENCE_DAILY_ROLLUP",
     "CADENCE_PARTITION_CREATE",
+    "CADENCE_RECONCILE_PROVIDER_USAGE",
     "CADENCE_RETENTION_DROP",
     "DURABLE_CADENCE_KEYS",
     "EPOCH_DUE",

@@ -23,7 +23,17 @@ from typing import Any, Sequence
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
-from app_shared.enums import ScrapeTargetStatus
+from app_shared.costauth import (
+    FLEET_PROVIDER_BROWSER,
+    FLEET_PROVIDER_PROXY,
+    AuthorizationPurpose,
+    AuthorizationRequest,
+    CostAuthorizationDenied,
+    CostAuthorizationService,
+    estimate_bytes,
+    estimate_cost_minor_units,
+)
+from app_shared.enums import ScrapeProfileMode, ScrapeTargetStatus
 from app_shared.jobs.dispatch_intents import DispatchIntentStore
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.jobs import ScrapeJobTarget
@@ -54,6 +64,15 @@ _GENERIC_PRICE_SPIDER = "generic_price_spider"
 #: idempotency use the real planner (`tasks_jobs.dispatch_job`).
 _THIN_TASK_GENERATION = 0
 _THIN_TASK_STRATEGY_METHOD = "thin-dispatch-task"
+
+#: The domain this task authorizes against (EPA C3). It matches the `"-"`
+#: placeholder its dispatch identity already uses for the same reason:
+#: the thin task genuinely does not know which domain it is scraping, and
+#: naming one it cannot verify would be a false statement to the
+#: authorization gate. Under C2's rule table an unregistered domain is
+#: `UNKNOWN`, so this resolves to a denial by default — see the call
+#: site's comment for why that is the intended posture.
+_FALLBACK_DOMAIN = "-"
 
 
 def _match_id_list(match_ids: object) -> list[str]:
@@ -106,17 +125,93 @@ def dispatch_generic_price_spider(
         node_class=f"{_SCRAPYD_PROJECT}:{_GENERIC_PRICE_SPIDER}",
         match_ids=ids,
     )
+
+    # EPA C3, paid dispatch site 3 (FALLBACK). This task POSTs a real
+    # batch to Scrapyd, so it is a paid dispatch and must clear the gate
+    # exactly like the planner's own loop does.
+    #
+    # It is the ONE site that cannot name its domain: the thin task is
+    # handed a match list and resolves domains per-match inside the
+    # spider, which is why its dispatch identity already carries the
+    # `"-"` placeholder above. Authorizing against `_FALLBACK_DOMAIN`
+    # rather than inventing a domain keeps that honest, and it is
+    # deliberately fail-CLOSED under C2's rule table: an unregistered
+    # domain resolves to `UNKNOWN`, whose broad-crawl gate this FALLBACK
+    # purpose does not clear, so the thin task is denied unless an
+    # operator has explicitly certified the `-` scope. The planner-owned
+    # path (`tasks_jobs.dispatch_job`), which DOES know each batch's
+    # domain, is the sanctioned way to dispatch; this task is a legacy
+    # SPEC-07 seam and denying it by default is the correct posture, not
+    # a regression.
+    denial_detail = None
+    costauth = CostAuthorizationService(default_workspace_id=workspace_id)
+    is_browser = str(mode) == str(ScrapeProfileMode.BROWSER)
+    requests = max(1, len(ids))
+    try:
+        grant = costauth.authorize(
+            AuthorizationRequest(
+                workspace_id=uuid.UUID(str(workspace_id)),
+                domain=_FALLBACK_DOMAIN,
+                transport="BROWSER" if is_browser else "PROXY",
+                provider=FLEET_PROVIDER_BROWSER if is_browser else FLEET_PROVIDER_PROXY,
+                estimated_bytes=estimate_bytes(requests),
+                estimated_cost_minor_units=estimate_cost_minor_units(
+                    _FALLBACK_DOMAIN, requests
+                ),
+                purpose=AuthorizationPurpose.FALLBACK,
+                estimated_requests=requests,
+                estimated_browser_seconds=requests * 30 if is_browser else 0,
+                scrape_job_id=uuid.UUID(str(scrape_job_id)),
+                dedupe_key=identity.key,
+            )
+        )
+    except CostAuthorizationDenied as denial:
+        denial_detail = denial
+        grant = None
+
+    if grant is None:
+        logger.warning(
+            "cost_authorization.denied site=tasks_dispatch.dispatch_generic_price_spider "
+            "reason=%s workspace_id=%s scrape_job_id=%s detail=%s",
+            denial_detail.reason.value if denial_detail else "UNKNOWN",
+            workspace_id,
+            scrape_job_id,
+            denial_detail.detail if denial_detail else "",
+        )
+        # Raised, not swallowed: this task's caller receives a jobid and
+        # would read `None`/`""` as "scheduled". A denial is not a
+        # dispatch, and Celery's retry/alerting is the right place for it
+        # to land.
+        raise denial_detail if denial_detail is not None else RuntimeError(
+            "cost authorization denied"
+        )
+
     client = ScrapydDispatchClient()
-    return client.schedule(
-        _SCRAPYD_PROJECT,
-        _GENERIC_PRICE_SPIDER,
-        workspace_id=workspace_id,
-        scrape_job_id=scrape_job_id,
-        match_ids=match_ids,
-        mode=mode,
-        batch_index=batch_index,
-        identity=identity,
-    )
+    try:
+        return client.schedule(
+            _SCRAPYD_PROJECT,
+            _GENERIC_PRICE_SPIDER,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_ids=match_ids,
+            mode=mode,
+            batch_index=batch_index,
+            identity=identity,
+            # EPA C4b: stamp this dispatch's C3 grant onto the spider so
+            # its own network-ledger boundary can trace every physical
+            # operation back to it.
+            authorization_id=grant.authorization_id,
+            # EPA Phase C F3: and the three facts it decided on.
+            budget_decision_version=grant.budget_decision_version,
+            entitlement_version=grant.entitlement_version,
+            breaker_decision=grant.breaker_decision,
+        )
+    except Exception:
+        # Failure before dispatch: return the whole hold now rather than
+        # waiting out its lease. CAS-idempotent, so a Celery retry cannot
+        # double-credit the budget.
+        costauth.release(grant.authorization_id)
+        raise
 
 
 # --- EPA B2: the single dispatched_at/dispatch_intent_id stamping path -----

@@ -114,6 +114,13 @@ def client_factory(*, settings=None, intents=None):
 
 
 tasks_jobs.ScrapydDispatchClient = client_factory
+# EPA C3: the paid-dispatch sites authorize before they POST. That is a
+# real DB transaction (budget locks + breaker/entitlement/domain evidence),
+# so these DB-free tests stub it; the gate's own behaviour is proven in
+# tests/integration/test_cost_authorization.py. `stub_cost_authorization`
+# FAILS if the gate is missing, so this cannot hide a deleted gate.
+from _costauth_test_stub import stub_cost_authorization
+stub_cost_authorization(tasks_jobs)
 
 fake_session = FakeOrmSession()
 
@@ -454,6 +461,13 @@ def client_factory(*, settings=None, intents=None):
 
 
 tasks_jobs.ScrapydDispatchClient = client_factory
+# EPA C3: the paid-dispatch sites authorize before they POST. That is a
+# real DB transaction (budget locks + breaker/entitlement/domain evidence),
+# so these DB-free tests stub it; the gate's own behaviour is proven in
+# tests/integration/test_cost_authorization.py. `stub_cost_authorization`
+# FAILS if the gate is missing, so this cannot hide a deleted gate.
+from _costauth_test_stub import stub_cost_authorization
+stub_cost_authorization(tasks_jobs)
 
 fake_session = FakeOrmSession()
 
@@ -845,3 +859,433 @@ def test_reaper_commits_a_posted_batchs_stamp_before_a_later_failure() -> None:
     Redis guard TTL A got re-POSTed all over again — the 2.71x
     mechanism this phase exists to remove."""
     _run_reaper_check(_REAPER_STAMP_DURABILITY_CHECK)
+
+
+# --- EPA W4 gate review (2026-08-26): the UNSUPPORTED skip on the RETRY ---
+# path, not just the first dispatch ----------------------------------------
+#
+# `tests/unit/test_jobs_dispatch_task.py` pins the same skip for
+# `dispatch_job`. `recover_stalled_batches` is the path that matters more
+# for this rule: a stall recovery IS a retry, so a domain certified
+# UNSUPPORTED *after* its targets were first dispatched must be marked
+# SKIPPED/BLOCKED rather than re-POSTed -- otherwise "zero retries for an
+# unsupported domain" would hold only for domains certified before their
+# first dispatch. Same subprocess idiom and same fakes as the checks
+# above; the sibling target on an unremarkable (UNKNOWN) domain proves
+# the skip is per-domain, not sweep-wide.
+_UNSUPPORTED_STALL_CHECK = """
+import sys
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, "apps/workers")
+sys.path.insert(0, "tests/unit")
+
+import requests
+
+from _jobs_fake_session import FakeOrmSession
+from app_shared.enums import (
+    AccessMethod,
+    MatchPriority,
+    MatchStatus,
+    ScrapeErrorCode,
+    ScrapeJobSource,
+    ScrapeJobStatus,
+    ScrapeJobType,
+    ScrapeScope,
+    ScrapeTargetStatus,
+)
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.domain_playbooks import DomainPlaybook, DomainState
+from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+from app_shared.scrapyd.client import ScrapydDispatchClient as RealClient
+
+import app.workers.tasks_jobs as tasks_jobs
+
+
+class FakeRedis:
+    def __init__(self):
+        self.store = {}
+
+    def set(self, name, value, *, nx=False, ex=None):
+        if nx and name in self.store:
+            return None
+        self.store[name] = value
+        return True
+
+    def get(self, name):
+        return self.store.get(name)
+
+    def delete(self, *names):
+        removed = 0
+        for name in names:
+            if self.store.pop(name, None) is not None:
+                removed += 1
+        return removed
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+calls = []
+
+
+def fake_post(url, *, data, auth, timeout):
+    calls.append({"url": url, "data": dict(data)})
+    return FakeResponse(200, {"status": "ok", "jobid": "job-" + str(len(calls))})
+
+
+def fake_get(url, *, auth=None, timeout=None):
+    # Every node in this check is DEAD -- the one case the reaper exists
+    # for, so a NON-skipped batch definitely would be re-POSTed. That is
+    # what makes "no POST for the UNSUPPORTED batch" meaningful.
+    raise requests.ConnectionError("node down")
+
+
+fake_redis = FakeRedis()
+
+
+def client_factory(*, settings=None, intents=None):
+    http_session = requests.Session()
+    http_session.post = fake_post
+    http_session.get = fake_get
+    return RealClient(settings=settings, redis_client=fake_redis, session=http_session)
+
+
+tasks_jobs.ScrapydDispatchClient = client_factory
+from _costauth_test_stub import stub_cost_authorization
+stub_cost_authorization(tasks_jobs)
+
+fake_session = FakeOrmSession()
+
+
+@contextmanager
+def fake_get_session():
+    yield fake_session
+
+
+tasks_jobs.get_session = fake_get_session
+tasks_jobs.get_system_session = fake_get_session
+tasks_jobs.set_workspace_context = lambda session, workspace_id: None
+
+TIMEOUT = 900
+base_now = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+class _FakeDatetime(datetime):
+    _now = base_now
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._now
+
+
+tasks_jobs.datetime = _FakeDatetime
+
+# --- fixture data --------------------------------------------------------
+
+workspace_id = uuid.uuid4()
+job_id = uuid.uuid4()
+
+job = ScrapeJob(
+    workspace_id=workspace_id,
+    type=ScrapeJobType.MANUAL,
+    scope=ScrapeScope.MATCH,
+    status=ScrapeJobStatus.RUNNING,
+    total_targets=2,
+    source=ScrapeJobSource.API,
+    created_at=base_now - timedelta(seconds=TIMEOUT * 3),
+    started_at=base_now - timedelta(seconds=TIMEOUT * 2),
+)
+job.id = job_id
+fake_session.seed(job)
+
+competitor_ok_id = uuid.uuid4()
+competitor_ok = Competitor(workspace_id=workspace_id, name="OK", domain="ok.example.com")
+competitor_ok.id = competitor_ok_id
+competitor_blocked_id = uuid.uuid4()
+competitor_blocked = Competitor(
+    workspace_id=workspace_id, name="Blocked", domain="blocked.example.com"
+)
+competitor_blocked.id = competitor_blocked_id
+fake_session.seed(competitor_ok, competitor_blocked)
+
+
+def _match(competitor_id, domain):
+    match = CompetitorProductMatch(
+        workspace_id=workspace_id,
+        product_id=uuid.uuid4(),
+        product_variant_id=uuid.uuid4(),
+        competitor_id=competitor_id,
+        competitor_url="https://" + domain + "/p",
+        normalized_competitor_url="https://" + domain + "/p",
+        url_pattern="https://" + domain + "/p",
+        url_pattern_version=1,
+        priority=MatchPriority.NORMAL,
+        status=MatchStatus.ACTIVE,
+    )
+    match.id = uuid.uuid4()
+    return match
+
+
+match_ok = _match(competitor_ok_id, "ok.example.com")
+match_blocked = _match(competitor_blocked_id, "blocked.example.com")
+fake_session.seed(match_ok, match_blocked)
+
+# Certified UNSUPPORTED only AFTER the first dispatch -- which is exactly
+# the case the retry path has to catch. "ok.example.com" gets no
+# `domain_playbooks` row at all, so `get_domain_state` resolves it to its
+# documented UNKNOWN default (not UNSUPPORTED) and it dispatches normally.
+blocked_playbook = DomainPlaybook(
+    domain="blocked.example.com",
+    preferred_access_method=AccessMethod.DIRECT_HTTP,
+    method_templates=[],
+    state=DomainState.UNSUPPORTED,
+)
+fake_session.seed(blocked_playbook)
+
+
+def _stalled_target(match_id):
+    target = ScrapeJobTarget(
+        workspace_id=workspace_id,
+        scrape_job_id=job_id,
+        match_id=match_id,
+        status=ScrapeTargetStatus.PENDING,
+        created_at=base_now,
+        dispatched_at=base_now - timedelta(seconds=TIMEOUT * 2),
+    )
+    target.id = uuid.uuid4()
+    return target
+
+
+target_ok = _stalled_target(match_ok.id)
+target_blocked = _stalled_target(match_blocked.id)
+fake_session.seed(target_ok, target_blocked)
+
+# --- the recovery sweep --------------------------------------------------
+
+tasks_jobs.recover_stalled_batches()
+
+# 1. The UNSUPPORTED domain's batch is never re-POSTed; the sibling on an
+#    unremarkable domain still is.
+if len(calls) != 1:
+    print("EXPECTED_ONE_POST_GOT:" + str(len(calls)))
+    sys.exit(1)
+
+if calls[0]["data"]["match_ids"] != str(match_ok.id):
+    print("UNEXPECTED_REDISPATCHED_MATCH_IDS:" + str(calls[0]["data"]["match_ids"]))
+    sys.exit(1)
+
+# 2. The skipped target got the product-visible, terminal outcome from
+#    `unsupported_target_outcome()` via `mark_target` -- SKIPPED/BLOCKED.
+if target_blocked.status is not ScrapeTargetStatus.SKIPPED:
+    print("BLOCKED_TARGET_STATUS_NOT_SKIPPED:" + str(target_blocked.status))
+    sys.exit(1)
+
+if target_blocked.error_code is not ScrapeErrorCode.BLOCKED:
+    print("BLOCKED_TARGET_ERROR_CODE_WRONG:" + str(target_blocked.error_code))
+    sys.exit(1)
+
+# 3. It was never re-dispatched: its `dispatched_at` is still the ORIGINAL
+#    stamp, not a fresh one from this sweep.
+if target_blocked.dispatched_at != base_now - timedelta(seconds=TIMEOUT * 2):
+    print("BLOCKED_TARGET_DISPATCH_STAMP_REFRESHED:" + str(target_blocked.dispatched_at))
+    sys.exit(1)
+
+# --- a later sweep in a FRESH stall window must still not retry it -------
+#
+# SKIPPED is terminal, so the selection query never offers this target
+# again -- "zero retries" holds structurally, not because one window's
+# Redis SET NX guard happened to suppress it.
+
+_FakeDatetime._now = base_now + timedelta(seconds=TIMEOUT * 2)
+
+tasks_jobs.recover_stalled_batches()
+
+if any(call["data"]["match_ids"] == str(match_blocked.id) for call in calls):
+    print("UNSUPPORTED_TARGET_WAS_RETRIED_IN_A_LATER_WINDOW")
+    sys.exit(1)
+
+if target_blocked.status is not ScrapeTargetStatus.SKIPPED:
+    print("BLOCKED_TARGET_LEFT_TERMINAL_STATUS:" + str(target_blocked.status))
+    sys.exit(1)
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_recover_stalled_batches_skips_unsupported_domain_without_retry() -> None:
+    """EPA W4 gate-review follow-up F5: a stall recovery is a retry, so
+    `recover_stalled_batches` applies the same `DomainState.UNSUPPORTED`
+    skip `dispatch_job` does (`tests/unit/test_jobs_dispatch_task.py`'s
+    `test_dispatch_job_skips_unsupported_domain_target_without_dispatch_or_retry`).
+    A domain certified UNSUPPORTED after its targets were first dispatched
+    must be marked SKIPPED/BLOCKED instead of re-POSTed, must not have its
+    dispatch stamp refreshed, and must stay unretried in a later stall
+    window -- while a sibling target on an unremarkable (UNKNOWN) domain
+    in the SAME job is recovered normally."""
+    env = {**os.environ, **_STALL_RECOVERY_ENV}
+    result = subprocess.run(
+        [sys.executable, "-c", _UNSUPPORTED_STALL_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=None,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.stdout.strip() == "OK"
+
+
+# --- EPA Phase C F2 + F6: the grant, the denial, and the release ----------
+#
+# Three claims the phase's gate review found had no test at all. The
+# always-grant stub every dispatch test uses proved the happy path and
+# only the happy path, so a call site could ignore a denial, or drop the
+# grant on the floor, and every suite would stay green.
+
+# F2: the RETRY's grant must reach the POST. Without it the operations a
+# recovery batch opens are NULL-linked, C3's sweeper cannot see them in
+# C1's ledger, the lease lapses while the re-POSTed fetches are still
+# running, and the retry's spend is never settled against any budget.
+_STALL_THREADS_THE_GRANT_CHECK = _REAPER_PRELUDE + """
+daemon["payload"] = None
+
+job = new_job(7200)
+target = new_target(job, 7200)
+
+tasks_jobs.recover_stalled_batches()
+
+if len(calls) != 1:
+    fail("EXPECTED_ONE_RECOVERY_POST_GOT:" + str(len(calls)))
+
+posted = calls[0]["data"]
+if not posted.get("authorization_id"):
+    fail("RECOVERY_POST_CARRIED_NO_AUTHORIZATION_ID:" + str(sorted(posted)))
+
+# ...and the decision facts behind it (F3), so the operations it opens can
+# be audited without joining back to the reservation.
+for field in ("budget_decision_version", "entitlement_version", "breaker_decision"):
+    if not posted.get(field):
+        fail("RECOVERY_POST_MISSING_DECISION_FACT:" + field)
+
+print("OK")
+sys.exit(0)
+"""
+
+# F6: a DENIED recovery must leave the batch exactly as it found it --
+# still stalled, still unstamped, nothing POSTed. A denial that re-POSTs
+# anyway is the failure mode the gate exists to remove; a denial that
+# stamps the targets is worse, because it makes the work look dispatched
+# and no later sweep will ever offer it again.
+_STALL_DENIAL_CHECK = _REAPER_PRELUDE + """
+from _costauth_test_stub import DenyingCostAuthorizationService
+stub_cost_authorization(tasks_jobs, DenyingCostAuthorizationService)
+
+daemon["payload"] = None
+
+job = new_job(7200)
+target = new_target(job, 7200)
+stale_stamp = target.dispatched_at
+
+tasks_jobs.recover_stalled_batches()
+
+if calls:
+    fail("DENIED_RECOVERY_STILL_POSTED:" + str(len(calls)))
+
+if target.dispatched_at != stale_stamp:
+    fail("DENIED_RECOVERY_STAMPED_ITS_TARGETS:" + str(target.dispatched_at))
+
+if target.status is not ScrapeTargetStatus.PENDING:
+    fail("DENIED_RECOVERY_MOVED_THE_TARGET:" + str(target.status))
+
+# Still stalled, so a later sweep re-offers it once the denial clears.
+from _costauth_test_stub import AlwaysGrantCostAuthorizationService
+stub_cost_authorization(tasks_jobs, AlwaysGrantCostAuthorizationService)
+tasks_jobs.recover_stalled_batches()
+
+if len(calls) != 1:
+    fail("TARGET_WAS_NOT_RE_OFFERED_AFTER_THE_DENIAL_CLEARED:" + str(len(calls)))
+
+print("OK")
+sys.exit(0)
+"""
+
+# F6: a POST that BLOWS UP must return the hold immediately rather than
+# leaving it to the lease. Nothing was spent, so nothing is settled.
+_STALL_RELEASES_ON_POST_FAILURE_CHECK = _REAPER_PRELUDE + """
+from _costauth_test_stub import AlwaysGrantCostAuthorizationService
+
+released = []
+
+
+class _RecordingCostAuth(AlwaysGrantCostAuthorizationService):
+    def release(self, authorization_id, **kwargs):
+        released.append(authorization_id)
+
+
+stub_cost_authorization(tasks_jobs, _RecordingCostAuth)
+
+daemon["payload"] = None
+
+
+def exploding_post(url, *, data, auth, timeout):
+    raise requests.ConnectionError("scrapyd unreachable")
+
+
+def exploding_client_factory(*, settings=None, intents=None):
+    http_session = requests.Session()
+    http_session.post = exploding_post
+    http_session.get = fake_get
+    return RealClient(settings=settings, redis_client=fake_redis, session=http_session)
+
+
+tasks_jobs.ScrapydDispatchClient = exploding_client_factory
+
+job = new_job(7200)
+target = new_target(job, 7200)
+
+try:
+    tasks_jobs.recover_stalled_batches()
+except Exception:
+    pass
+
+if len(released) != 1:
+    fail("HOLD_WAS_NOT_RELEASED_AFTER_A_FAILED_POST:" + str(len(released)))
+
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_recovery_post_carries_the_retrys_own_grant() -> None:
+    """EPA Phase C F2: `recover_stalled_batches` authorized but did not
+    forward `authorization_id` to `schedule()`, so every RETRY operation
+    was NULL-linked — invisible to the sweeper's ledger-liveness check,
+    which then lapsed the lease and released the hold while the re-POSTed
+    fetches were still running."""
+    _run_reaper_check(_STALL_THREADS_THE_GRANT_CHECK)
+
+
+def test_a_denied_recovery_posts_nothing_and_leaves_the_batch_stalled() -> None:
+    """EPA Phase C F6: the denial branch of the reaper's gate, tested.
+
+    Denied means untouched: no POST, no stamp, no status change — and the
+    target is re-offered by the next sweep once the denial clears."""
+    _run_reaper_check(_STALL_DENIAL_CHECK)
+
+
+def test_a_failed_recovery_post_returns_the_hold_immediately() -> None:
+    """EPA Phase C F6: `costauth.release` on the `schedule()` exception
+    path. Nothing was spent, so the hold goes back now rather than after
+    a 900s lease — and `release` is CAS-idempotent, so a Celery retry
+    cannot double-credit the budget."""
+    _run_reaper_check(_STALL_RELEASES_ON_POST_FAILURE_CHECK)

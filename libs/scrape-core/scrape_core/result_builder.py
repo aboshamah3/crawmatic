@@ -54,6 +54,7 @@ def build_scrape_result(
     needs_review: bool = False,
     main_document_bytes: int | None = None,
     subresource_bytes: int | None = None,
+    network_operation_id: uuid.UUID | None = None,
 ) -> ScrapeResult:
     """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034; extracted SPEC-14 T007).
 
@@ -180,5 +181,9 @@ def build_scrape_result(
         needs_review=needs_review,
         main_document_bytes=main_document_bytes,
         subresource_bytes=subresource_bytes,
+        # EPA C4: the physical `network_operations` row this logical
+        # attempt was carried by. Every sibling of a deduplicated fetch
+        # gets the same value -- see `ScrapeResult.network_operation_id`.
+        network_operation_id=network_operation_id,
         **kwargs,
     )

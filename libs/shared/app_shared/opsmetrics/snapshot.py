@@ -132,6 +132,101 @@ class RollupHealth:
 
 
 @dataclass(frozen=True)
+class CostRollupHealth:
+    """Fleet-wide cost-rollup health (EPA C6).
+
+    Reads ONLY ``fleet_network_cost_rollups`` (bounded: at most
+    ``TOP_N_COST_ROLLUP_BUCKETS`` + a handful of currency "other" rows
+    for the latest rollup date) plus the ``rollup_watermarks`` cursor and
+    a bare indexed ``MAX(network_operations.closed_at)`` — never a
+    ``GROUP BY`` over the raw ledger. NEVER a tenant breakdown: this is
+    the fleet aggregate only (see
+    ``app_shared.netledger.rollups``' module docstring and
+    ``apps/api/app/routers/cost_rollups.py`` for the tenant-scoped,
+    scope-gated surface that lives elsewhere, never on this ops-shared
+    endpoint).
+
+    A missing/never-seeded/stale watermark, or a rollup day with
+    operations but zero reconciled cost, is a CRITICAL condition here —
+    not merely "unavailable" — per this task's explicit instruction: a
+    silently-frozen or entirely-unchecked cost signal is worse than a
+    loud one. See ``opsmetrics.rules._r_cost_rollup``.
+    """
+
+    available: bool
+    unavailable_reason: str | None = None
+    watermark_available: bool = False
+    watermark_last_complete_date: date_type | None = None
+    watermark_age_days: float | None = None
+    latest_rollup_date: date_type | None = None
+    fleet_bucket_rows: int = 0
+    #: Summed over every fleet bucket on ``latest_rollup_date``, keyed by
+    #: ISO-4217 currency (a rollup day may legitimately span more than
+    #: one currency).
+    estimated_cost_minor_units_by_currency: dict[str, int] = field(default_factory=dict)
+    #: Same, but only currencies where at least one bucket has a
+    #: reconciled figure at all.
+    reconciled_cost_minor_units_by_currency: dict[str, int] = field(default_factory=dict)
+    #: ``operation_count`` summed over buckets that HAVE a reconciled
+    #: figure, vs. every bucket's ``operation_count`` -- both for
+    #: ``latest_rollup_date``.
+    reconciled_operation_count: int = 0
+    total_operation_count: int = 0
+    #: Age of the ledger's own freshness clock (a bare ``MAX``, not the
+    #: rollup's).
+    ledger_freshness_seconds: float | None = None
+
+    @property
+    def _dominant_currency(self) -> str | None:
+        """The currency with the largest estimated total on
+        ``latest_rollup_date`` -- the one
+        :attr:`estimated_vs_reconciled_variance_pct` is computed for.
+
+        A single scalar variance figure cannot honestly represent a
+        multi-currency day; picking the dominant currency (by spend) is
+        a documented, conservative choice -- the full per-currency
+        breakdown remains available via
+        :attr:`estimated_cost_minor_units_by_currency`/
+        :attr:`reconciled_cost_minor_units_by_currency`.
+        """
+        if not self.estimated_cost_minor_units_by_currency:
+            return None
+        return max(
+            self.estimated_cost_minor_units_by_currency,
+            key=lambda c: self.estimated_cost_minor_units_by_currency[c],
+        )
+
+    @property
+    def estimated_vs_reconciled_variance_pct(self) -> float | None:
+        currency = self._dominant_currency
+        if currency is None:
+            return None
+        estimated = self.estimated_cost_minor_units_by_currency.get(currency, 0)
+        reconciled = self.reconciled_cost_minor_units_by_currency.get(currency)
+        if reconciled is None:
+            return None
+        if estimated == 0:
+            return 0.0 if reconciled == 0 else None
+        return abs(estimated - reconciled) / estimated * 100.0
+
+    @property
+    def reconciliation_coverage(self) -> float | None:
+        if self.total_operation_count == 0:
+            return None
+        return self.reconciled_operation_count / self.total_operation_count
+
+    def as_dict(self) -> dict[str, Any]:
+        out = asdict(self)
+        out.update(
+            estimated_vs_reconciled_variance_pct=_round(
+                self.estimated_vs_reconciled_variance_pct, 2
+            ),
+            reconciliation_coverage=_round(self.reconciliation_coverage, 4),
+        )
+        return out
+
+
+@dataclass(frozen=True)
 class OutboxHealth:
     """Transactional-outbox backlog (audit H1, durable async delivery)."""
 
@@ -591,6 +686,9 @@ class OpsSnapshot:
     partitions_available: bool = True
     partitions_unavailable_reason: str | None = None
     rollups: RollupHealth = field(default_factory=lambda: RollupHealth(available=False))
+    cost_rollup: CostRollupHealth = field(
+        default_factory=lambda: CostRollupHealth(available=False)
+    )
     outbox: OutboxHealth = field(default_factory=lambda: OutboxHealth(available=False))
     breaker: BreakerHealth = field(default_factory=lambda: BreakerHealth(available=False))
     queue: QueueHealth = field(default_factory=lambda: QueueHealth(available=False))
@@ -623,6 +721,7 @@ class OpsSnapshot:
                     "tables": [asdict(p) for p in self.partitions],
                 },
                 "rollups": _with_props(self.rollups),
+                "cost_rollup": self.cost_rollup.as_dict(),
                 "outbox": _with_props(self.outbox),
                 "breaker": _with_props(self.breaker),
                 "queue": _with_props(self.queue),
@@ -809,6 +908,11 @@ def collect_snapshot(
             lambda r: RollupHealth(available=False, unavailable_reason=r),
             session,
         ),
+        cost_rollup=_section(
+            lambda: _collect_cost_rollups(session, now),
+            lambda r: CostRollupHealth(available=False, unavailable_reason=r),
+            session,
+        ),
         outbox=_section(
             lambda: _collect_outbox(session, now),
             lambda r: OutboxHealth(available=False, unavailable_reason=r),
@@ -972,6 +1076,91 @@ def _collect_rollups(session: Any) -> RollupHealth:
         max_observation_at=max_obs,
         lag_days=lag_days,
         unrolled_observations=unrolled,
+    )
+
+
+def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
+    """Fleet cost-rollup health (EPA C6) — bounded reads only.
+
+    Three queries, all cheap and bounded: the ``rollup_watermarks``
+    cursor (a single-row lookup by key), every
+    ``fleet_network_cost_rollups`` row for the LATEST rollup date (at
+    most ``TOP_N_COST_ROLLUP_BUCKETS`` + a handful of currency "other"
+    rows — never the raw ledger), and a bare ``MAX(network_operations.
+    closed_at)`` for the ledger's own freshness clock. No ``GROUP BY``
+    over ``network_operations``/``network_operation_allocations`` here —
+    that is exactly what the rollup job
+    (``app_shared.netledger.rollups.run_cost_rollup``) exists to have
+    already done.
+    """
+    from sqlalchemy import func, select
+
+    from app_shared.maintenance.rollup_watermark import (
+        read_watermark,
+        watermark_store_available,
+    )
+    from app_shared.models.network_cost_rollups import FleetNetworkCostRollup
+    from app_shared.models.network_operations import NetworkOperation
+    from app_shared.netledger.rollups import WATERMARK_COST_ROLLUP
+
+    watermark_available = watermark_store_available(session)
+    watermark_date: date_type | None = None
+    watermark_age_days: float | None = None
+    if watermark_available:
+        watermark = read_watermark(session, key=WATERMARK_COST_ROLLUP)
+        if watermark is not None:
+            watermark_date = watermark.last_complete_date
+            watermark_age_days = (now.date() - watermark_date).days
+
+    latest_date = session.execute(
+        select(func.max(FleetNetworkCostRollup.rollup_date))
+    ).scalar_one_or_none()
+
+    fleet_rows = 0
+    estimated_by_currency: dict[str, int] = {}
+    reconciled_by_currency: dict[str, int] = {}
+    reconciled_operation_count = 0
+    total_operation_count = 0
+    if latest_date is not None:
+        buckets = (
+            session.execute(
+                select(FleetNetworkCostRollup).where(
+                    FleetNetworkCostRollup.rollup_date == latest_date
+                )
+            )
+            .scalars()
+            .all()
+        )
+        fleet_rows = len(buckets)
+        for bucket in buckets:
+            estimated_by_currency[bucket.currency] = (
+                estimated_by_currency.get(bucket.currency, 0)
+                + bucket.estimated_cost_minor_units
+            )
+            total_operation_count += bucket.operation_count
+            if bucket.reconciled_cost_minor_units is not None:
+                reconciled_by_currency[bucket.currency] = (
+                    reconciled_by_currency.get(bucket.currency, 0)
+                    + bucket.reconciled_cost_minor_units
+                )
+                reconciled_operation_count += bucket.operation_count
+
+    last_closed = session.execute(
+        select(func.max(NetworkOperation.closed_at))
+    ).scalar_one_or_none()
+
+    return CostRollupHealth(
+        available=True,
+        watermark_available=watermark_available,
+        watermark_last_complete_date=watermark_date,
+        watermark_age_days=watermark_age_days,
+        latest_rollup_date=latest_date,
+        fleet_bucket_rows=fleet_rows,
+        estimated_cost_minor_units_by_currency=estimated_by_currency,
+        reconciled_cost_minor_units_by_currency=reconciled_by_currency,
+        reconciled_operation_count=reconciled_operation_count,
+        total_operation_count=total_operation_count,
+        ledger_freshness_seconds=_age(now, last_closed),
     )
 
 

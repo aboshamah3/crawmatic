@@ -19,6 +19,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+from app_shared.models.network_cost_rollups import NetworkCostRollup
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.models.outbox import OutboxMessage
 from app_shared.models.refresh_rules import RefreshRule
@@ -91,6 +92,12 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             # ScrapeJobTarget shape, so every read/write goes through
             # scoped_select and stays visible to the CI scoping guard.
             DispatchIntent,
+            # EPA C6: workspace-owned (this workspace's own bounded cost
+            # rollup buckets). Its fleet-owned sibling
+            # FleetNetworkCostRollup has no workspace_id and is
+            # deliberately excluded, same shape as NetworkOperation vs
+            # NetworkOperationAllocation.
+            NetworkCostRollup,
         }
     )
 

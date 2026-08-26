@@ -107,6 +107,13 @@ def client_factory(*, settings=None, intents=None):
 
 
 tasks_jobs.ScrapydDispatchClient = client_factory
+# EPA C3: the paid-dispatch sites authorize before they POST. That is a
+# real DB transaction (budget locks + breaker/entitlement/domain evidence),
+# so these DB-free tests stub it; the gate's own behaviour is proven in
+# tests/integration/test_cost_authorization.py. `stub_cost_authorization`
+# FAILS if the gate is missing, so this cannot hide a deleted gate.
+from _costauth_test_stub import stub_cost_authorization
+stub_cost_authorization(tasks_jobs)
 tasks_jobs.set_workspace_context = lambda session, workspace_id: None
 
 fake_session = FakeOrmSession()

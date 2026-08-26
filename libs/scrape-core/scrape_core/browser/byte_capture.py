@@ -64,6 +64,16 @@ logger = logging.getLogger(__name__)
 __all__ = ["ByteAccumulator"]
 
 
+def _safe_attr(obj: Any, name: str) -> Any:
+    """``getattr`` that never raises out of a Playwright event callback."""
+    if obj is None:
+        return None
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - defensive, same posture as the class docstring
+        return None
+
+
 async def _measured_byte_count(response: Any) -> int | None:
     """``Content-Length`` header if present and parseable, else
     ``await response.body()``'s length, else ``None`` (module docstring
@@ -106,6 +116,15 @@ class ByteAccumulator:
 
     def __init__(self) -> None:
         self._observed: list[tuple[str, int]] = []
+        # EPA C4: the same measurements, kept at per-response granularity
+        # so the network-ledger boundary can write one CHILD operation row
+        # per sub-resource (`network_operations.parent_operation_id`).
+        # Deliberately a SEPARATE list: `_observed` — and therefore
+        # `finalize()`, B6b's contract — is never mutated by the ledger's
+        # draining, so the two consumers cannot disturb each other and the
+        # per-asset bytes summed here equal `finalize()`'s
+        # `subresource_bytes` exactly.
+        self._subresource_details: list[dict[str, Any]] = []
 
     async def handle_response(self, response: Any) -> None:
         try:
@@ -113,6 +132,7 @@ class ByteAccumulator:
             resource_type = getattr(request, "resource_type", None) or "other"
         except Exception:  # noqa: BLE001 - defensive; never let listener bookkeeping
             # crash the page/navigation it is merely observing.
+            request = None
             resource_type = "other"
 
         try:
@@ -124,6 +144,33 @@ class ByteAccumulator:
 
         if byte_count is not None and byte_count >= 0:
             self._observed.append((resource_type, byte_count))
+            if resource_type != "document":
+                # Only sub-resources become child ledger rows; the
+                # document response IS the parent operation the middleware
+                # already opened, and recording it twice would double-count
+                # the navigation.
+                self._subresource_details.append(
+                    {
+                        "url": _safe_attr(response, "url"),
+                        "status": _safe_attr(response, "status"),
+                        "method": _safe_attr(request, "method") or "GET",
+                        "resource_type": resource_type,
+                        "byte_count": byte_count,
+                    }
+                )
+
+    def drain_subresources(self) -> list[dict[str, Any]]:
+        """Hand the ledger every sub-resource seen so far, and forget them.
+
+        Draining is what makes a repeated call safe: the C4 boundary
+        buffers each drained batch durably before the next one is taken,
+        so a sub-resource is never written twice and never dropped between
+        the two consumers. ``finalize()`` is unaffected — see
+        ``__init__`` for why the two lists are kept separate.
+        """
+        drained = self._subresource_details
+        self._subresource_details = []
+        return drained
 
     def finalize(self) -> tuple[int | None, int | None]:
         """``(main_document_bytes, subresource_bytes)`` for the whole attempt.

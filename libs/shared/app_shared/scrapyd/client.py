@@ -13,8 +13,10 @@ that suppresses a later legitimate retry. Both are reconciled with a
 **reconcile -> claim -> POST -> commit -> release** sequence keyed on
 :attr:`~app_shared.scrapyd.identity.DispatchIdentity.key` — a digest over the
 identity's canonical payload, **never** the batch's position in the plan
-(EPA B1; ``batch_index`` survives only as a spider argument, see
-:mod:`app_shared.scrapyd.identity` for why the positional key was a wedge):
+(EPA B1; ``batch_index`` survives only as the legacy positional key's input
+and a traceability label on the call site — it is not itself POSTed to
+Scrapyd — see :mod:`app_shared.scrapyd.identity` for why the positional key
+was a wedge):
 
 0. **Reconcile the durable intent FIRST** — before touching Redis. The
    ``dispatch_intents`` row, not the guard, is the authority on whether this
@@ -81,6 +83,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -245,6 +248,10 @@ class ScrapydDispatchClient:
         batch_index: int | str,
         node_url: str | None = None,
         identity: DispatchIdentity | None = None,
+        authorization_id: str | uuid.UUID | None = None,
+        budget_decision_version: str | None = None,
+        entitlement_version: str | None = None,
+        breaker_decision: str | None = None,
     ) -> str:
         """Schedule ``spider`` in ``project`` on Scrapyd; return the ``jobid``.
 
@@ -258,13 +265,34 @@ class ScrapydDispatchClient:
         is optional only for the thin SPEC-07 task and pre-B1 callers;
         when it is ``None`` the legacy positional
         ``dispatched:{job}:{batch_index}`` key is used and the durable
-        intent is not consulted. ``batch_index`` is forwarded to the
-        spider either way and is **never** part of the idempotency
-        decision when an ``identity`` is given.
+        intent is not consulted. ``batch_index`` is used to build that
+        legacy key and survives as a traceability label on the call site
+        that names it — it is **never** itself POSTed to Scrapyd, and is
+        never part of the idempotency decision when an ``identity`` is
+        given.
 
         ``node_url`` (SPEC-08 FR-012, FR-014) targets a specific
         deterministically-selected Scrapyd node; when ``None`` this falls
         back to ``SCRAPYD_HTTP_URLS[0]``.
+
+        ``authorization_id`` (EPA C3/C4) is the caller's C3 grant for this
+        dispatch. Unlike ``batch_index`` it IS forwarded to the spider —
+        see :meth:`_post_schedule` — so every physical operation the
+        spider's own network-ledger boundary (C4's downloader middleware,
+        one layer up from this module — ``app_shared`` never names it by
+        dotted path, since that dependency runs one way only) opens can
+        be traced back to the grant it was authorized under. ``None``
+        (the default) omits the field from the POST entirely, exactly
+        like the conditional ``jobid`` field below — never sent as the
+        literal string ``"None"``.
+
+        ``budget_decision_version`` / ``entitlement_version`` /
+        ``breaker_decision`` (EPA Phase C F3) are the three DECISION
+        facts that grant was issued on, forwarded the same way and for
+        the same reason: C1 gave ``network_operations`` a column for each
+        and nothing populated them, so the ledger recorded which grant an
+        operation ran under but not what that grant had decided. All
+        three are optional and omitted when absent.
 
         Raises:
             StaleCancellationGenerationError: the durable intent was
@@ -361,6 +389,10 @@ class ScrapydDispatchClient:
                 node_url=node_url,
                 identity=identity,
                 intent_id=intent_id,
+                authorization_id=authorization_id,
+                budget_decision_version=budget_decision_version,
+                entitlement_version=entitlement_version,
+                breaker_decision=breaker_decision,
             )
         except BaseException as exc:
             # 4. release: never leave a poisoned key behind a failed
@@ -586,6 +618,10 @@ class ScrapydDispatchClient:
         node_url: str | None = None,
         identity: DispatchIdentity | None = None,
         intent_id: str | None = None,
+        authorization_id: str | uuid.UUID | None = None,
+        budget_decision_version: str | None = None,
+        entitlement_version: str | None = None,
+        breaker_decision: str | None = None,
     ) -> str:
         base = (node_url or self._settings.SCRAPYD_HTTP_URLS[0]).rstrip("/")
         url = f"{base}/schedule.json"
@@ -615,6 +651,25 @@ class ScrapydDispatchClient:
             self._settings, _DETERMINISTIC_JOBID_SETTING, False
         ):
             data["jobid"] = str(intent_id)
+        # EPA C4b: the caller's C3 grant, forwarded so the spider's own
+        # network-ledger boundary can stamp every physical operation with
+        # the authorization it was dispatched under. Omitted entirely when
+        # `None` (mirrors the conditional `jobid` field above) — an absent
+        # form field, never the literal string `"None"`.
+        if authorization_id is not None:
+            data["authorization_id"] = str(authorization_id)
+        # EPA Phase C F3: the three DECISION facts behind that grant, so
+        # C1's `network_operations.entitlement_version` /
+        # `budget_decision_version` / `breaker_decision` stop being NULL
+        # in production. Same conditional shape as `authorization_id`:
+        # omitted entirely when absent, never the string `"None"`.
+        for field, value in (
+            ("budget_decision_version", budget_decision_version),
+            ("entitlement_version", entitlement_version),
+            ("breaker_decision", breaker_decision),
+        ):
+            if value is not None:
+                data[field] = str(value)
 
         poster = self._session.post if self._session is not None else requests.post
         response = poster(url, data=data, auth=auth, timeout=self._timeout)

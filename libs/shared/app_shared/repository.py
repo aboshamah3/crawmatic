@@ -31,6 +31,7 @@ from app_shared.models.alerts import PriceAlertEvent, VariantAlertState, Variant
 from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.identity import ApiKey, User
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
+from app_shared.models.network_cost_rollups import NetworkCostRollup
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.models.outbox import OutboxMessage
 from app_shared.models.refresh_rules import RefreshRule
@@ -118,6 +119,13 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         # it carries its own workspace_id rather than being scoped
         # transitively like StrategyAttemptStats.
         DispatchIntent,
+        # EPA C6: NetworkCostRollup is workspace-owned (WorkspaceScopedBase)
+        # and RLS'd — unlike its fleet-owned sibling FleetNetworkCostRollup
+        # (no workspace_id at all, deliberately excluded here) and unlike
+        # NetworkOperationAllocation (left unregistered pending its own
+        # query path), this table's read path
+        # (apps/api/app/routers/cost_rollups.py) ships in this same change.
+        NetworkCostRollup,
     }
 )
 

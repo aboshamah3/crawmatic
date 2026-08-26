@@ -600,6 +600,70 @@ class Settings(BaseSettings):
     API_RATE_LIMIT_READ_PER_MINUTE: int = 60
     API_RATE_LIMIT_WRITE_PER_MINUTE: int = 10
 
+    # --- Scheduler two-plane limits + weighted fair queuing (EPA W4.2,
+    # report §6; `app_shared.scheduling.fair_queue`). ---
+    #
+    # Master switch, DEFAULT OFF. `False` keeps the SPEC-13 due-rule pass
+    # (`app.scheduler.refresh.run_refresh_pass`) exactly as it is, so a
+    # deploy that merely carries the W4.2 code changes no live scheduling
+    # behaviour. `True` swaps in the fair pass on the SAME
+    # `SCHEDULER_POLL_INTERVAL_SECONDS` cadence and the SAME
+    # `SCHEDULER_CLAIM_BATCH_LIMIT` ceiling -- no new interval knob.
+    SCHEDULER_FAIR_QUEUE_ENABLED: bool = False
+    # FLEET PLANE: simultaneous in-flight fetches ONE DOMAIN may receive
+    # from the whole fleet, counting every tenant. This is the number a
+    # merchant's WAF sees; the per-workspace cap it replaces multiplied it
+    # by the number of workspaces monitoring that merchant.
+    SCHEDULER_FAIR_QUEUE_DOMAIN_CONCURRENCY: int = 4
+    # FLEET PLANE: simultaneous in-flight fetches across every domain.
+    SCHEDULER_FAIR_QUEUE_FLEET_CONCURRENCY: int = 64
+    # Consecutive unexpected failures one scheduler item may accumulate
+    # before it is dead-lettered (rule disabled + `scheduler.item.
+    # dead_lettered` webhook event) instead of aborting the pass.
+    SCHEDULER_FAIR_QUEUE_MAX_ATTEMPTS: int = 3
+
+    # --- Same-URL job-planning coalescing (EPA W4.3, report §8;
+    # `app_shared.jobs.coalescing`). Single-workspace, Stage 1 only --
+    # cross-workspace coalescing is a separate, owner-gated decision and
+    # nothing here builds toward it (every caller resolves targets for
+    # exactly one workspace at a time already).
+    #
+    # Master switch, DEFAULT OFF. `False` means `cluster_for_coalescing`
+    # is never called and `plan_batches` receives targets in their
+    # original order -- byte-identical to pre-W4.3 planning. The OFF
+    # DEFAULT is pinned by `tests/unit/test_w4_flag_defaults.py`; the
+    # byte-identity of unreordered planning by the pre-existing,
+    # unmodified `tests/unit/test_jobs_batching.py`. (Neither is
+    # `tests/unit/test_jobs_batching_coalescing.py`, which this comment
+    # used to name -- that suite exercises the coalescing helpers and
+    # never reads `Settings`, so it could not have caught a flipped
+    # default. W4 gate review, 2026-08-26.) `True` reorders the
+    # targets handed to `plan_batches` so matches sharing a canonical URL
+    # (the SAME `canonical_url_hash` the network ledger groups on) land
+    # in the same dispatch chunk instead of splitting across one by
+    # accident of input order -- it never changes `plan_batches` itself,
+    # a batch's match_id cardinality, or cost authorization (still
+    # estimated off `len(batch.match_ids)`, unchanged).
+    #
+    # This flag is independent of the pre-existing `SCRAPE_URL_DEDUP`
+    # (2026-08-11 proxy-cost Fix 1, spider layer): that flag folds
+    # same-run identical-URL fetches onto one fetcher ONLY within
+    # whatever match_ids one spider run already received: this one makes
+    # sure same-URL matches actually reach the SAME spider run in the
+    # first place. Both must be enabled for a duplicate fetch to
+    # physically collapse; enabling only this one changes nothing
+    # observable on its own.
+    JOBS_COALESCING_ENABLED: bool = False
+    # The freshness-window bound a FUTURE cache-reuse pass would gate on
+    # (reusing a recent-enough COMPLETED fetch with no new fetch at all --
+    # see `app_shared.jobs.coalescing` module docstring for why that half
+    # of the plan is not wired into dispatch yet). Conservative default:
+    # short enough that reusing a fetch this old is unlikely to serve a
+    # stale price to a second match. Read only by
+    # `coalescing.is_within_freshness_window` today (unit-tested and
+    # exercised by the W4.3 canary script), not by any live dispatch path.
+    JOBS_COALESCING_FRESHNESS_SECONDS: int = 300
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:

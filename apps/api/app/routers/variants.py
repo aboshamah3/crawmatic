@@ -39,6 +39,7 @@ from app_shared.repository import scoped_get, scoped_select
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 
 from app.deps import Principal, require_scopes
+from app.routers.jobs import assert_workspace_entitled
 from app.limits import enforce_batch_cap
 from app.schemas.alerts import (
     CompetitorPriceListResponse,
@@ -477,6 +478,19 @@ def rescrape_variant(
             },
             headers={"Retry-After": str(retry_after)},
         )
+
+    # EPA C3 (READY-006): the account-level half of the cost-authorization
+    # gate. This route fans out across every ACTIVE match of the variant —
+    # several competitor domains — so per-domain authorization happens per
+    # batch inside `dispatch_job`, which knows each batch's domain and
+    # mode. What the plugin's "refresh prices" button still needs
+    # synchronously is the one denial that depends on no domain and that
+    # the merchant can act on: an inactive or unpaid account. Without it
+    # this answers 202 and then dispatches nothing.
+    #
+    # Placed AFTER the cooldown check and BEFORE the job is created, so a
+    # denial leaves no undispatchable job behind.
+    assert_workspace_entitled(ws)
 
     job_id, _status = create_scope_job(
         session,

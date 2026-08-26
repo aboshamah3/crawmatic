@@ -153,3 +153,17 @@ class ScrapeResult:
     # phase's spider does not yet instrument; never coerced to ``0``.
     main_document_bytes: int | None = None
     subresource_bytes: int | None = None
+
+    # --- EPA C4 (network boundary recording): the PHYSICAL operation ---
+    # The `network_operations.network_request_id` (C1) of the physical
+    # fetch that produced this logical result, stamped onto
+    # `request.meta` by `scrape_core.netledger_middleware` before the
+    # socket opened. `None` means "this result did not come from a
+    # recorded fetch" -- a never-dispatched skip/defer row, or a crawl
+    # with `NETLEDGER_ENABLED = False`; never coerced to a fabricated id.
+    #
+    # This is the field that makes a fan-out honest: five sibling matches
+    # riding ONE deduplicated fetch each get their own `RequestAttempt`
+    # row, and all five carry the SAME `network_operation_id` -- five
+    # logical attempts, one physical operation, one cost.
+    network_operation_id: uuid.UUID | None = None

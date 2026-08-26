@@ -36,6 +36,7 @@ here are safe and expected (Constitution V).
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,17 @@ from app.workers.celery_app import app
 from app_shared.access.breaker import log_denied, paid_requests_allowed
 from app_shared.access.repository import visible_providers_select
 from app_shared.config import Settings, get_settings
+from app_shared.costauth import (
+    FLEET_PROVIDER_DIRECT,
+    FLEET_PROVIDER_PROXY,
+    AuthorizationPurpose,
+    AuthorizationRequest,
+    CostAuthorizationService,
+    SettledCost,
+    authorize_or_none,
+    estimate_bytes,
+    estimate_cost_minor_units,
+)
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.ids import new_uuid7
 from app_shared.enums import (
@@ -67,6 +79,13 @@ from app_shared.maintenance.scoping import (
     MaintenanceScope,
     maintenance_task,
     workspace_context,
+)
+from app_shared.models.network_operations import NetworkTransport
+from app_shared.netledger.recorder import (
+    LedgerOpenError,
+    NetLedgerRecorder,
+    OperationIntent,
+    OperationOutcome,
 )
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.observations import RequestAttempt
@@ -131,6 +150,25 @@ _ACCESS_LADDER: tuple[AccessMethod, ...] = (
     AccessMethod.DIRECT_HTTP_RETRY,
     AccessMethod.PROXY_HTTP,
 )
+#: How many physical fetches one probed URL costs: every rung of the
+#: ladder is walked for every URL (`_probe_sample`'s loop is a full cross
+#: product, with no early exit between rungs), so a sample of N urls is
+#: N * len(_ACCESS_LADDER) requests, not N. EPA Phase C F5: authorizing N
+#: under-reserved the whole run by this factor, which is a ceiling that
+#: does not bind on exactly the path whose job is to touch UNCERTIFIED
+#: domains.
+_LADDER_RUNGS_PER_URL = len(_ACCESS_LADDER)
+
+#: ...but only the PROXY rung spends provider money; the two DIRECT rungs
+#: leave the fleet's own egress and are recorded with a NULL cost (see
+#: `_fetch`). So requests and bytes scale by the whole ladder while MONEY
+#: scales by the paid rungs only — over-reserving money 3x would deny work
+#: a real budget has room for, and this is the number that is actually
+#: true.
+_PAID_LADDER_RUNGS_PER_URL = sum(
+    1 for method in _ACCESS_LADDER if method is AccessMethod.PROXY_HTTP
+)
+
 _ACCESS_COST_ORDER: dict[AccessMethod, int] = {
     AccessMethod.DIRECT_HTTP: 0,
     AccessMethod.DIRECT_HTTP_RETRY: 1,
@@ -556,15 +594,148 @@ def _fetch_via_proxy(session: Session, workspace_id: uuid.UUID, url: str) -> str
     return response.text if response.ok else None
 
 
-def _fetch(session: Session, workspace_id: uuid.UUID, access_method: AccessMethod, url: str) -> str | None:
-    if access_method is AccessMethod.DIRECT_HTTP:
-        return _fetch_direct(url, retry=False)
-    if access_method is AccessMethod.DIRECT_HTTP_RETRY:
-        return _fetch_direct(url, retry=True)
-    if access_method is AccessMethod.PROXY_HTTP:
-        return _fetch_via_proxy(session, workspace_id, url)
-    # PLAYWRIGHT_PROXY is never in `_ACCESS_LADDER` -- unreachable (F2).
-    raise AssertionError(f"unexpected access method probed: {access_method!r}")  # pragma: no cover
+@dataclass
+class _ObservedSpend:
+    """What a ladder walk ACTUALLY consumed, accumulated rung by rung.
+
+    EPA Phase C F5: the discovery run used to settle its grant with the
+    RESERVED estimate, which makes settlement a no-op dressed as
+    accounting — the budget then records what we guessed, forever, and no
+    over- or under-run is ever visible. The recorder already computes each
+    rung's bytes and cost to write the ledger row; this collects the same
+    numbers on the way past so the run can settle the truth.
+
+    A rung that never opened a socket (a ledger-open failure) records
+    nothing, which is correct: it cost nothing.
+    """
+
+    requests: int = 0
+    bytes_used: int = 0
+    cost_minor_units: int = 0
+
+    def record(
+        self, *, bytes_used: int | None, cost_minor_units: int | None
+    ) -> None:
+        self.requests += 1
+        self.bytes_used += int(bytes_used or 0)
+        self.cost_minor_units += int(cost_minor_units or 0)
+
+
+def _fetch(
+    session: Session,
+    workspace_id: uuid.UUID,
+    access_method: AccessMethod,
+    url: str,
+    *,
+    authorization_id: uuid.UUID | None = None,
+    budget_decision_version: str | None = None,
+    entitlement_version: str | None = None,
+    breaker_decision: str | None = None,
+    observed: _ObservedSpend | None = None,
+) -> str | None:
+    """Dispatch one ladder rung, recording it at C1's network boundary.
+
+    EPA C4: `_probe_get` (the socket-opening call every rung eventually
+    reaches) had no ledger row -- discovery's own paid `PROXY_HTTP` leg
+    was invisible to `NetLedgerRecorder`, the ONE writer of C1's physical
+    ledger (`app_shared.netledger.recorder`). This funnel is the single
+    place that knows which rung is about to fire, so it is the correct
+    (and only) call site to open/close the ledger row around it -- mirrors
+    `scrape_core.netledger_middleware.NetLedgerMiddleware`'s
+    process_request/process_response bracket, just synchronous instead of
+    a Twisted downloader middleware.
+
+    A `LedgerOpenError` fails this rung CLOSED (no socket opens, `None`
+    returned) exactly like a refused SSRF target or an OPEN circuit
+    breaker -- `_probe_sample`'s caller already treats `None` as "no
+    qualifying observation for this combo/url" and moves on; the run
+    itself is never crashed by one unrecordable rung.
+
+    The run's own `costauth.settle(...)` (after the whole ladder walk,
+    `strategy_discovery_run`) is what terminates `authorization_id` --
+    `settle_authorization=False` here, so a rung accrues nothing against
+    the grant and the run settles the ladder's OBSERVED total once, from
+    the `observed` accumulator this function feeds. That is the same
+    "only the site that minted the grant may terminate it" rule the
+    batch-dispatch path follows; discovery differs only in that it CAN
+    see its work end, so it does not need the lease sweeper to close it.
+
+    `observed` (EPA Phase C F5) collects each rung's real bytes/cost --
+    the same numbers written to the ledger row, never a second
+    measurement.
+    """
+    transport = (
+        NetworkTransport.PROXY
+        if access_method is AccessMethod.PROXY_HTTP
+        else NetworkTransport.DIRECT
+    )
+    domain = (urlsplit(url).hostname or "").lower()
+    intent = OperationIntent(
+        url=url,
+        domain=domain,
+        transport=transport,
+        provider=(
+            FLEET_PROVIDER_PROXY if transport is NetworkTransport.PROXY else FLEET_PROVIDER_DIRECT
+        ),
+        workspace_id=workspace_id,
+        authorization_id=authorization_id,
+        # EPA Phase C F3: the decisions behind that grant, so discovery's
+        # operations carry the same audit trail the spider path does.
+        budget_decision_version=budget_decision_version,
+        entitlement_version=entitlement_version,
+        breaker_decision=breaker_decision,
+    )
+    recorder = NetLedgerRecorder()
+    try:
+        network_request_id = recorder.open(intent)
+    except LedgerOpenError:
+        logger.warning(
+            "strategy_discovery: ledger open failed -- skipping rung access_method=%s "
+            "url=%s",
+            access_method.value,
+            url,
+            exc_info=True,
+        )
+        return None
+
+    started = time.monotonic()
+    html: str | None = None
+    try:
+        if access_method is AccessMethod.DIRECT_HTTP:
+            html = _fetch_direct(url, retry=False)
+        elif access_method is AccessMethod.DIRECT_HTTP_RETRY:
+            html = _fetch_direct(url, retry=True)
+        elif access_method is AccessMethod.PROXY_HTTP:
+            html = _fetch_via_proxy(session, workspace_id, url)
+        else:
+            # PLAYWRIGHT_PROXY is never in `_ACCESS_LADDER` -- unreachable (F2).
+            raise AssertionError(  # pragma: no cover
+                f"unexpected access method probed: {access_method!r}"
+            )
+    finally:
+        rung_bytes = len(html.encode()) if html else None
+        rung_cost = (
+            estimate_cost_minor_units(domain, 1)
+            if transport is NetworkTransport.PROXY
+            else None
+        )
+        recorder.close(
+            network_request_id,
+            OperationOutcome(
+                bytes_compressed=rung_bytes,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                estimated_cost_minor_units=rung_cost,
+                currency="USD" if transport is NetworkTransport.PROXY else None,
+                billing_unit="REQUEST" if transport is NetworkTransport.PROXY else None,
+                # The run settles its own ladder-wide grant once, after the
+                # whole `_probe_sample` walk -- a per-rung close must never
+                # accrue against it as well.
+                settle_authorization=False,
+            ),
+        )
+        if observed is not None:
+            observed.record(bytes_used=rung_bytes, cost_minor_units=rung_cost)
+    return html
 
 
 def _probe_sample(
@@ -574,6 +745,11 @@ def _probe_sample(
     urls: list[str],
     thresholds: PromotionThresholds,
     competitor_id: uuid.UUID | None = None,
+    authorization_id: uuid.UUID | None = None,
+    budget_decision_version: str | None = None,
+    entitlement_version: str | None = None,
+    breaker_decision: str | None = None,
+    observed: _ObservedSpend | None = None,
 ) -> dict[tuple[AccessMethod, ExtractionMethod], _Tally]:
     """Drive `urls` through each candidate access method, then the reused
     extraction chain, tallying qualifying observations per `(access,
@@ -588,7 +764,19 @@ def _probe_sample(
     `origin=DISCOVERY` `RequestAttempt` row (`_record_probe_attempt`).
     `_fetch`/`_fetch_direct`/`_fetch_via_proxy` are never reached from
     anywhere else in this module, so this single write site covers all of
-    them without double-counting."""
+    them without double-counting.
+
+    `authorization_id` (EPA C4, optional/keyword so older callers/tests
+    keep working unmodified) is the run's C3 grant
+    (`strategy_discovery_run`'s `grant.authorization_id`), threaded down
+    to `_fetch` so every rung's ledger row names the grant it was
+    dispatched under; the three decision-version arguments beside it
+    carry WHAT that grant decided (EPA Phase C F3).
+
+    `observed` (EPA Phase C F5) is the run's spend accumulator: this loop
+    walks EVERY rung for EVERY url, so what the walk really costs is
+    `len(urls) * len(_ACCESS_LADDER)` fetches, and the run settles that
+    observed total rather than the estimate it reserved."""
     confidence_cfg = resolve_confidence_rules(
         {"min_accepted_confidence": float(thresholds.confidence_threshold)}
     )
@@ -611,7 +799,17 @@ def _probe_sample(
 
     for access_method in _ACCESS_LADDER:
         for url in urls:
-            html = _fetch(session, workspace_id, access_method, url)
+            html = _fetch(
+                session,
+                workspace_id,
+                access_method,
+                url,
+                authorization_id=authorization_id,
+                budget_decision_version=budget_decision_version,
+                entitlement_version=entitlement_version,
+                breaker_decision=breaker_decision,
+                observed=observed,
+            )
             _record_probe_attempt(
                 session,
                 workspace_id=workspace_id,
@@ -974,15 +1172,103 @@ def run_discovery(
             _fail_run(session, run)
             return
 
+        # --- EPA C3, paid dispatch site 4 (DISCOVERY) -------------------
+        # The point of spend: `_probe_sample` walks the access ladder over
+        # the whole sample and its PROXY leg costs real money per request.
+        # Authorize (and reserve) here, immediately before it, so a denial
+        # costs one indexed transaction rather than a sample's worth of
+        # paid fetches.
+        #
+        # Transport is DIRECT, and that is a decision, not a shortcut.
+        # C2's rule table denies broad crawl on an `UNKNOWN` domain while
+        # permitting "a tiny DIRECT canary" — and discovery is precisely
+        # what a domain needs in order to STOP being UNKNOWN. Authorizing
+        # this run at the canary gate is therefore the only reading under
+        # which the certification pipeline can start at all; naming PROXY
+        # here would make every uncertified domain permanently
+        # undiscoverable, which is a deadlock, not a safety property.
+        #
+        # The reservation is sized for the WHOLE LADDER WALK, which is
+        # what `_probe_sample` actually does: every rung, for every url.
+        # EPA Phase C F5 -- it used to reserve `len(safe_urls)` requests
+        # and bytes, i.e. one third of the fetches the walk makes, so the
+        # one ceiling standing between an unbounded discovery loop and the
+        # provider bill was short by the ladder factor. Requests and bytes
+        # therefore scale by `_LADDER_RUNGS_PER_URL`; money scales by
+        # `_PAID_LADDER_RUNGS_PER_URL`, because the two DIRECT rungs cost
+        # the fleet's own egress and nothing else (see `_fetch`), and
+        # reserving three times the money would deny runs a real budget
+        # has room for.
+        #
+        # One grant covers the whole walk (many operations), and the run
+        # settles it ONCE, at the end, with the OBSERVED total the
+        # `_ObservedSpend` accumulator collected -- the estimate is a
+        # ceiling to reserve against, never the number that gets recorded
+        # as spend.
+        costauth = CostAuthorizationService(default_workspace_id=ws)
+        ladder_requests = len(safe_urls) * _LADDER_RUNGS_PER_URL
+        paid_requests = len(safe_urls) * max(1, _PAID_LADDER_RUNGS_PER_URL)
+        grant = authorize_or_none(
+            costauth,
+            AuthorizationRequest(
+                workspace_id=ws,
+                domain=domain,
+                transport="DIRECT",
+                provider=FLEET_PROVIDER_PROXY,
+                estimated_bytes=estimate_bytes(ladder_requests),
+                estimated_cost_minor_units=estimate_cost_minor_units(
+                    domain, paid_requests
+                ),
+                purpose=AuthorizationPurpose.DISCOVERY,
+                estimated_requests=ladder_requests,
+                dedupe_key=f"discovery:{run.id}",
+            ),
+            site="tasks_strategy.run_discovery",
+        )
+        if grant is None:
+            # Denied: fail the run rather than probing unauthorized. The
+            # run row records the refusal, so the operator sees a FAILED
+            # discovery instead of a silent nothing.
+            _fail_run(session, run)
+            return
+
+        observed = _ObservedSpend()
         try:
             tallies = _probe_sample(
-                session, workspace_id=ws, urls=safe_urls, thresholds=thresholds, competitor_id=comp_id
+                session,
+                workspace_id=ws,
+                urls=safe_urls,
+                thresholds=thresholds,
+                competitor_id=comp_id,
+                authorization_id=grant.authorization_id if grant else None,
+                budget_decision_version=grant.budget_decision_version,
+                entitlement_version=grant.entitlement_version,
+                breaker_decision=grant.breaker_decision,
+                observed=observed,
             )
             winner = select_discovery_winner(tallies)
         except Exception:
             logger.exception("strategy_discovery: probe failed run_id=%s", run.id)
+            # Release returns the RESIDUAL hold. A walk that crashed
+            # half-way has already spent what it fetched; that part stays
+            # spent, because crediting it back would make a crash cheaper
+            # than a success.
+            costauth.release(grant.authorization_id)
             _fail_run(session, run)
             return
+
+        # The probe is done: replace the hold with what it ACTUALLY cost,
+        # rung by rung, as the ledger recorded it -- not with the estimate
+        # that was reserved (EPA Phase C F5). Terminal and idempotent, so
+        # a redelivery that somehow reaches here settles nothing twice.
+        costauth.settle(
+            grant.authorization_id,
+            SettledCost(
+                cost_minor_units=observed.cost_minor_units,
+                bytes_used=observed.bytes_used,
+                requests=observed.requests,
+            ),
+        )
 
         profile = _get_or_create_profile(
             session, workspace_id=ws, competitor_id=comp_id, domain=domain, url_pattern=url_pattern

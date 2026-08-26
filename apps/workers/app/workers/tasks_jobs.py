@@ -32,7 +32,19 @@ from sqlalchemy.orm import Session
 from app.workers.celery_app import app
 from app.workers.tasks_dispatch import DispatchedBatch, stamp_targets_dispatched
 from app_shared.config import get_settings
+from app_shared.costauth import (
+    FLEET_PROVIDER_BROWSER,
+    FLEET_PROVIDER_PROXY,
+    AuthorizationPurpose,
+    AuthorizationRequest,
+    CostAuthorizationService,
+    authorize_or_none,
+    estimate_bytes,
+    estimate_cost_minor_units,
+)
 from app_shared.database import get_session, get_system_session, set_workspace_context
+from app_shared.domains.lifecycle import unsupported_target_outcome
+from app_shared.domains.state_lookup import get_domain_state
 from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetStatus
 from app_shared.ids import new_uuid7
 from app_shared.jobs.batching import (
@@ -45,10 +57,11 @@ from app_shared.jobs.dispatch_intents import DispatchIntentStore
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.jobs.nodes import select_node
-from app_shared.jobs.targets import Counts, aggregate_counts
+from app_shared.jobs.targets import Counts, aggregate_counts, mark_target
 from app_shared.messaging import enqueue
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.domain_playbooks import DomainState
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.models.strategy import DomainStrategyMethod, DomainStrategyProfile
@@ -210,6 +223,108 @@ def _batch_route(batch: Batch, settings) -> tuple[str, str, list[str]]:
             settings.SCRAPYD_BROWSER_URLS,
         )
     return _SCRAPYD_PROJECT, _GENERIC_PRICE_SPIDER, settings.SCRAPYD_HTTP_URLS
+
+
+def _batch_authorization_request(
+    batch: Batch,
+    *,
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    purpose: AuthorizationPurpose,
+    identity: DispatchIdentity,
+) -> AuthorizationRequest:
+    """The C3 authorization one batch needs, derived from the plan (EPA C3).
+
+    Two things the planner genuinely knows are used, and nothing is
+    invented beyond them:
+
+    * **transport/provider** come from the batch's MODE. A ``BROWSER``
+      batch is a browser navigation (the expensive path, and the only one
+      that costs browser-seconds); everything else is authorized as
+      ``PROXY``. Authorizing an HTTP batch as paid even though its
+      strategy chain may resolve to a DIRECT step is the FAIL-CLOSED
+      choice: the planner cannot know which rung the spider will land on,
+      and over-reserving is corrected at settlement while under-reserving
+      is money spent outside any ceiling.
+    * **size** comes from the batch's own match count, priced with the
+      MEASURED per-domain rate (``app_shared.opsmetrics.cost``), not a
+      guess.
+
+    ``dedupe_key`` is the batch's dispatch identity key (EPA B1). That is
+    exactly the right grain: a duplicate/at-least-once delivery of the
+    same batch re-derives the same identity, so it collapses onto the
+    grant it already holds instead of reserving the budget twice — the
+    same property, on the money side, that the identity already gives the
+    POST side.
+    """
+    is_browser = batch.mode == ScrapeProfileMode.BROWSER
+    requests = max(1, len(batch.match_ids))
+    return AuthorizationRequest(
+        workspace_id=workspace_id,
+        domain=batch.domain,
+        transport="BROWSER" if is_browser else "PROXY",
+        provider=FLEET_PROVIDER_BROWSER if is_browser else FLEET_PROVIDER_PROXY,
+        estimated_bytes=estimate_bytes(requests),
+        estimated_cost_minor_units=estimate_cost_minor_units(batch.domain, requests),
+        purpose=purpose,
+        estimated_requests=requests,
+        estimated_browser_seconds=requests * 30 if is_browser else 0,
+        scrape_job_id=scrape_job_id,
+        dedupe_key=identity.key,
+    )
+
+
+def _skip_unsupported_batch(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    batch: Batch,
+) -> bool:
+    """EPA W4.1: never dispatch a target whose domain has been certified
+    ``DomainState.UNSUPPORTED`` -- and never let it look like something
+    worth retrying.
+
+    ``unsupported_target_outcome()`` (``app_shared.domains.lifecycle``)
+    is the product-visible, zero-retry outcome contract for this state:
+    it names the exact ``(status, error_code)`` pair --
+    ``SKIPPED``/``BLOCKED`` -- for ``mark_target`` (``app_shared.jobs
+    .targets``, the single writer of ``scrape_job_targets``). ``SKIPPED``
+    is TERMINAL, so ``mark_target``'s own "terminal is terminal"
+    (2026-08-03) rule is what makes "do not retry" true here for free --
+    no separate suppression bookkeeping is needed, and a later sweep
+    (``redispatch_pending_jobs``/``recover_stalled_batches``) will never
+    re-offer a target already in a terminal status.
+
+    Checked BEFORE C3's ``authorize_or_none`` -- cheaper (no reservation
+    spent on work that will never dispatch), and it composes rather than
+    duplicates: C3 already denies ``UNSUPPORTED`` at ``authorize()``
+    under its own ``DOMAIN_QUARANTINED``-family reasons (a *batch-level*
+    denial with no product-visible per-target outcome), so a batch this
+    function turns away here never even reaches that gate, and one that
+    somehow did would still be refused by it.
+    """
+    if get_domain_state(session, batch.domain) is not DomainState.UNSUPPORTED:
+        return False
+    status, error_code = unsupported_target_outcome()
+    for match_id in batch.match_ids:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=match_id,
+            status=status,
+            error_code=error_code,
+        )
+    logger.info(
+        "dispatch: domain=%s is UNSUPPORTED -- skipping %d target(s) instead of "
+        "dispatching workspace_id=%s scrape_job_id=%s",
+        batch.domain,
+        len(batch.match_ids),
+        workspace_id,
+        scrape_job_id,
+    )
+    return True
 
 
 def _batch_identity(
@@ -563,21 +678,85 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             planned.append((batch, identity, project, spider, node_url))
 
         client = ScrapydDispatchClient(settings=settings, intents=intents)
+        # EPA C3: the cost-authorization gate. One service per task
+        # invocation; it opens its own short transaction per grant, which
+        # is deliberate -- the reservation must be DURABLE before the POST
+        # for the same reason the dispatch intent is, and joining this
+        # task's long transaction would tie every workspace's budget row
+        # to the lifetime of one job's dispatch loop.
+        costauth = CostAuthorizationService(default_workspace_id=workspace_uuid)
         try:
             for batch, identity, project, spider, node_url in planned:
-                client.schedule(
-                    project,
-                    spider,
-                    workspace_id=str(workspace_uuid),
-                    scrape_job_id=str(job.id),
-                    match_ids=batch.match_ids,
-                    mode=batch.mode,
-                    # Spider argument + traceability label ONLY -- the
-                    # idempotency decision is `identity`'s (EPA B1).
-                    batch_index=batch.batch_index,
-                    node_url=node_url,
-                    identity=identity,
+                # EPA W4.1: a domain certified UNSUPPORTED is a
+                # product-visible, zero-retry skip -- checked before C3's
+                # gate (see `_skip_unsupported_batch`'s docstring for why
+                # the ordering is cheaper and still composes with C3's own
+                # batch-level UNSUPPORTED denial).
+                if _skip_unsupported_batch(
+                    session,
+                    workspace_id=workspace_uuid,
+                    scrape_job_id=job.id,
+                    batch=batch,
+                ):
+                    continue
+                # Paid dispatch site 1 (REFRESH) and site 2
+                # (BROWSER_ESCALATION) -- the same loop, distinguished by
+                # the batch's mode, because a browser batch is exactly the
+                # expensive escalation C2's DEGRADED rule denies and an
+                # HTTP batch is not.
+                purpose = (
+                    AuthorizationPurpose.BROWSER_ESCALATION
+                    if batch.mode == ScrapeProfileMode.BROWSER
+                    else AuthorizationPurpose.REFRESH
                 )
+                grant = authorize_or_none(
+                    costauth,
+                    _batch_authorization_request(
+                        batch,
+                        workspace_id=workspace_uuid,
+                        scrape_job_id=job.id,
+                        purpose=purpose,
+                        identity=identity,
+                    ),
+                    site="tasks_jobs.dispatch_job",
+                )
+                if grant is None:
+                    # Denied: do NOT POST and do NOT stamp. The targets
+                    # stay PENDING/unstamped, so `redispatch_pending_jobs`
+                    # will offer them again once whatever denied them
+                    # (budget, breaker, entitlement, domain state) clears.
+                    # A denial must never look like a dispatch.
+                    continue
+                try:
+                    client.schedule(
+                        project,
+                        spider,
+                        workspace_id=str(workspace_uuid),
+                        scrape_job_id=str(job.id),
+                        match_ids=batch.match_ids,
+                        mode=batch.mode,
+                        # Spider argument + traceability label ONLY -- the
+                        # idempotency decision is `identity`'s (EPA B1).
+                        batch_index=batch.batch_index,
+                        node_url=node_url,
+                        identity=identity,
+                        # EPA C4b: stamp this batch's C3 grant onto the
+                        # spider so its own network-ledger boundary can
+                        # trace every physical operation back to it.
+                        authorization_id=grant.authorization_id,
+                        # EPA Phase C F3: and WHAT that grant decided, so
+                        # C1's three decision columns stop being NULL.
+                        budget_decision_version=grant.budget_decision_version,
+                        entitlement_version=grant.entitlement_version,
+                        breaker_decision=grant.breaker_decision,
+                    )
+                except Exception:
+                    # Failure BEFORE dispatch: nothing was spent, so the
+                    # whole hold goes back immediately rather than waiting
+                    # out its lease. `release` is CAS-idempotent, so a
+                    # retry of this task cannot double-credit the budget.
+                    costauth.release(grant.authorization_id)
+                    raise
                 # F-2 (2026-08-22): stamp the batch's targets the moment they
                 # leave here, so the next dispatch delivery cannot re-plan
                 # them. A guard-deduped "already scheduled" return counts as
@@ -1009,9 +1188,25 @@ def recover_stalled_batches() -> None:
             # `daemonstatus.json` cache is shared across every job in the
             # sweep, as before.
             dispatch_client = ScrapydDispatchClient(settings=settings, intents=intents)
+            # EPA C3: one authorization service per JOB, pinned to that
+            # job's workspace. This sweep is FLEET-scoped, so a single
+            # service pinned to whichever workspace came first would
+            # resolve every later grant against the wrong tenant.
+            costauth = CostAuthorizationService(default_workspace_id=workspace_id)
 
             try:
                 for batch in re_batches:
+                    # EPA W4.1: same zero-retry skip as `dispatch_job` --
+                    # a stall recovery is itself a retry, so a domain that
+                    # has since been certified UNSUPPORTED must not be
+                    # re-POSTed either.
+                    if _skip_unsupported_batch(
+                        session,
+                        workspace_id=workspace_id,
+                        scrape_job_id=job.id,
+                        batch=batch,
+                    ):
+                        continue
                     project, spider, nodes = _batch_route(batch, settings)
                     node_url = select_node(batch.domain, nodes)
                     status_payload = node_status_cache.get(node_url, _UNPROBED)
@@ -1026,26 +1221,66 @@ def recover_stalled_batches() -> None:
                         # queued behind max_proc/rate limits, not stalled.
                         continue
                     identity = _batch_identity(job.id, batch, project, spider)
+                    # Paid dispatch site 6 (RETRY): a stall re-POST is a
+                    # SECOND physical fetch of work already paid for once,
+                    # so it must clear the gate on its own account. Its
+                    # dispatch identity carries the advanced planning
+                    # generation (EPA B1), so its dedupe key differs from
+                    # the original dispatch's — a retry gets its own grant
+                    # rather than silently reusing the first one's.
+                    grant = authorize_or_none(
+                        costauth,
+                        _batch_authorization_request(
+                            batch,
+                            workspace_id=workspace_id,
+                            scrape_job_id=job.id,
+                            purpose=AuthorizationPurpose.RETRY,
+                            identity=identity,
+                        ),
+                        site="tasks_jobs.recover_stalled_batches",
+                    )
+                    if grant is None:
+                        # Denied: leave the targets stalled and unstamped.
+                        # A later sweep re-offers them once the denial
+                        # clears; re-POSTing unauthorized is the failure
+                        # mode this whole gate exists to remove.
+                        continue
                     intents.plan(
                         identity,
                         match_ids=batch.match_ids,
                         batch_index=f"{batch.batch_index}:r{window}",
                     )
-                    dispatch_client.schedule(
-                        project,
-                        spider,
-                        workspace_id=str(workspace_id),
-                        scrape_job_id=str(job.id),
-                        match_ids=batch.match_ids,
-                        mode=batch.mode,
-                        # The `:r{stall_window}` suffix survives as a
-                        # spider/traceability label only; the advanced
-                        # planning generation is what now distinguishes a
-                        # recovery dispatch from the original (EPA B1).
-                        batch_index=f"{batch.batch_index}:r{window}",
-                        node_url=node_url,
-                        identity=identity,
-                    )
+                    try:
+                        dispatch_client.schedule(
+                            project,
+                            spider,
+                            workspace_id=str(workspace_id),
+                            scrape_job_id=str(job.id),
+                            match_ids=batch.match_ids,
+                            mode=batch.mode,
+                            # The `:r{stall_window}` suffix survives as a
+                            # spider/traceability label only; the advanced
+                            # planning generation is what now distinguishes a
+                            # recovery dispatch from the original (EPA B1).
+                            batch_index=f"{batch.batch_index}:r{window}",
+                            node_url=node_url,
+                            identity=identity,
+                            # EPA Phase C F2: the RETRY's own grant, threaded
+                            # through exactly as `dispatch_job` does. Omitting
+                            # it here left every recovery batch's operations
+                            # NULL-linked, so C3's sweeper could not see them
+                            # in the ledger, let the lease lapse, and released
+                            # a hold while the re-POSTed fetches were still
+                            # running — the retry's spend was then never
+                            # settled against any budget at all.
+                            authorization_id=grant.authorization_id,
+                            budget_decision_version=grant.budget_decision_version,
+                            entitlement_version=grant.entitlement_version,
+                            breaker_decision=grant.breaker_decision,
+                        )
+                    except Exception:
+                        costauth.release(grant.authorization_id)
+                        raise
                     # A re-POSTed target's stall clock restarts here — without
                     # a fresh stamp the very next sweep would reap it again,
                     # which is the feedback loop this whole fix removes.

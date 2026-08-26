@@ -27,6 +27,7 @@ from app_shared.opsmetrics.rules import (
 )
 from app_shared.opsmetrics.snapshot import (
     BreakerHealth,
+    CostRollupHealth,
     DatabaseRoleHealth,
     DomainDiscovery,
     DomainStats,
@@ -67,6 +68,19 @@ def healthy_snapshot(**overrides) -> OpsSnapshot:
             max_observation_at=NOW,
             lag_days=0,
             unrolled_observations=0,
+        ),
+        cost_rollup=CostRollupHealth(
+            available=True,
+            watermark_available=True,
+            watermark_last_complete_date=NOW.date() - timedelta(days=1),
+            watermark_age_days=1,
+            latest_rollup_date=NOW.date() - timedelta(days=1),
+            fleet_bucket_rows=6,
+            estimated_cost_minor_units_by_currency={"USD": 10_000},
+            reconciled_cost_minor_units_by_currency={"USD": 9_900},
+            reconciled_operation_count=500,
+            total_operation_count=500,
+            ledger_freshness_seconds=300.0,
         ),
         outbox=OutboxHealth(available=True, pending=3, dead=0, published=900),
         breaker=BreakerHealth(

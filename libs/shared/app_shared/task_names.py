@@ -64,3 +64,38 @@ CREATE_WEBHOOK_EVENT = "webhook_events.create_webhook_event"
 # health and ages out terminal rows.
 OUTBOX_DRAIN = "maintenance.outbox_drain"
 OUTBOX_RECONCILE = "maintenance.outbox_reconcile"
+
+# --- Cost authorization lease sweep (EPA C3, READY-006) ---
+# Enqueued by the scheduler on the existing 60s-class maintenance tick;
+# consumed by ``apps/workers/app/workers/tasks_maintenance.py`` on the
+# existing ``maintenance`` queue. Reaps EXPIRED reservation leases — but
+# only after confirming C1's ledger holds no open operation for the
+# grant, so a slow worker's money is never released out from under a
+# fetch that is still in flight. Without it a crashed worker's
+# reservation would hold budget until an operator noticed, which is the
+# one failure mode `release()` on the dispatch paths cannot cover.
+COSTAUTH_RESERVATION_SWEEP = "maintenance.costauth_reservation_sweep"
+
+# --- Provider usage reconciliation (EPA C5, READY-005 part 2) ---
+# Enqueued by the scheduler on the existing daily-cadence maintenance
+# tick; consumed by ``apps/workers/app/workers/tasks_maintenance.py`` on
+# the existing ``maintenance`` queue. Reconciles whatever provider usage
+# has already been IMPORTED (``scripts/import_dataimpulse_usage.py`` —
+# file-based, no network call, run by an operator/owner) against C1's
+# ledger for the prior UTC day, per (provider, provider_account) pair,
+# appending ``network_operation_settlements`` versions where bytes
+# reconcile. Does not itself import anything or talk to a provider API —
+# see ``app_shared.netledger.reconcile`` for why the import and the
+# reconciliation are deliberately separate steps.
+MAINTENANCE_RECONCILE_PROVIDER_USAGE = "maintenance.reconcile_provider_usage"
+
+# --- Network cost rollup (EPA C6) ---
+# Enqueued by the scheduler on a durable daily cadence
+# (``CADENCE_COST_ROLLUP``); consumed by ``apps/workers/app/workers/
+# tasks_maintenance.py`` on the existing ``maintenance`` queue. Maintains
+# the bounded, durable ``network_cost_rollups``/``fleet_network_cost_
+# rollups`` tables (``app_shared.netledger.rollups.run_cost_rollup``)
+# that ``GET /ops/metrics``'s ``cost_rollup`` section and the tenant-
+# scoped ``GET /v1/cost-rollups`` both read — neither ever aggregates the
+# raw ``network_operations`` ledger synchronously on request.
+MAINTENANCE_COST_ROLLUP = "maintenance.cost_rollup"

@@ -45,6 +45,16 @@ Consequences that are deliberate:
   password. Collector failures are reported as an exception class name
   plus its message, truncated, never a traceback.
 
+EPA C6 (2026-08-26): the snapshot's `cost_rollup` section is FLEET
+aggregate cost health only (durable rollup totals, watermark age,
+estimated-vs-reconciled variance, ledger freshness — see
+`app_shared.opsmetrics.snapshot.CostRollupHealth`). Nothing here is a
+tenant-level breakdown, and nothing tenant-level will ever be added to
+this router: a per-tenant cost breakdown belongs behind its own
+least-privilege scope on the ordinary tenant auth seam
+(`GET /v1/cost-rollups`, `apps/api/app/routers/cost_rollups.py`), never
+on this cross-workspace, service-token-gated, ops-shared surface.
+
 Response shapes
 ---------------
 

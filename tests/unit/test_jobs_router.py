@@ -26,6 +26,7 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+import app.routers.jobs as jobs_router
 import app_shared.jobs.service as service_module
 from app_shared.enums import (
     MatchPriority,
@@ -190,6 +191,75 @@ def _make_target(job: ScrapeJob, *, workspace_id: uuid.UUID = WORKSPACE_ID) -> S
 
 
 # --- POST /v1/jobs/run/match/{id} --------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def stub_manual_recheck_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub EPA C3's manual-recheck authorization for these DB-free tests.
+
+    `POST /v1/jobs/run/match/{id}` now authorizes before it creates a job
+    (READY-006, paid dispatch site 5). Authorization is a real database
+    transaction — budget row locks plus the durable breaker/entitlement/
+    domain evidence — which this fake-session router suite has no
+    Postgres for. These tests are about the ROUTE's contract (202, one
+    job, one target, one enqueue), so the gate is stubbed to a grant and
+    its own behaviour is proven against a real database in
+    `tests/integration/test_cost_authorization.py`.
+
+    `getattr(..., raising=True)` semantics matter here: monkeypatch fails
+    if the attribute is absent, so deleting the gate from the router
+    breaks this fixture instead of quietly making the suite greener.
+    `test_run_match_denied_by_cost_authorization_is_402` below then pins
+    that the route actually calls it.
+    """
+    monkeypatch.setattr(
+        jobs_router, "_authorize_manual_recheck", lambda session, **kwargs: None
+    )
+    # The fan-out route (`run_variant`) carries only the account-level
+    # half of the gate — see `assert_workspace_entitled`'s docstring for
+    # why per-domain authorization belongs to `dispatch_job` there.
+    monkeypatch.setattr(jobs_router, "assert_workspace_entitled", lambda ws: None)
+
+
+def test_run_match_denied_by_cost_authorization_is_402(
+    client: TestClient, fake_session: FakeOrmSession, fake_enqueue: _FakeEnqueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A C3 denial becomes an HTTP status — and creates NO job (EPA C3).
+
+    The point of authorizing on this route rather than leaving it to the
+    dispatcher: a human is waiting, so "202 accepted" for work the fleet
+    will refuse is worse than a clean refusal. This also pins that the
+    gate runs BEFORE `create_match_job`, since a denial that still
+    created the job would leave a permanently undispatchable row behind.
+    """
+    from app_shared.costauth import CostAuthorizationDenied, DenialReason
+
+    def _deny(session, **kwargs):
+        raise jobs_router.HTTPException(
+            status_code=402,
+            detail={
+                "error": {
+                    "code": DenialReason.ENTITLEMENT_INACTIVE.value,
+                    "message": "workspace entitlement state is CANCELLED",
+                }
+            },
+        ) from CostAuthorizationDenied(DenialReason.ENTITLEMENT_INACTIVE, "test")
+
+    monkeypatch.setattr(jobs_router, "_authorize_manual_recheck", _deny)
+
+    match = _make_match()
+    fake_session.seed(match)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["jobs:write"]
+    )
+
+    resp = client.post(f"/v1/jobs/run/match/{match.id}")
+
+    assert resp.status_code == 402
+    assert resp.json()["detail"]["error"]["code"] == "ENTITLEMENT_INACTIVE"
+    assert fake_session._rows.get(ScrapeJob, []) == []
+    assert fake_enqueue.calls == []
 
 
 def test_run_match_returns_202_with_one_job_and_one_target(

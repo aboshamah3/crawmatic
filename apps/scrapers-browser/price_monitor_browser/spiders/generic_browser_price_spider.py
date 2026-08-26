@@ -287,6 +287,10 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         scrape_job_id: str | None = None,
         match_ids: Any = None,
         mode: str | None = None,
+        authorization_id: str | None = None,
+        budget_decision_version: str | None = None,
+        entitlement_version: str | None = None,
+        breaker_decision: str | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -301,6 +305,25 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         self.scrape_job_id: uuid.UUID | None = uuid.UUID(str(scrape_job_id)) if scrape_job_id else None
         self.match_ids: list[uuid.UUID] = parsed_match_ids
         self.mode: str = mode or _DEFAULT_MODE
+        # EPA C4 (READY-005): the C3 grant this whole crawl was
+        # authorized under, read by `scrape_core.netledger_middleware`
+        # and stamped onto every `network_operations` row it opens (and
+        # settled from the same boundary at close). `None` means the
+        # dispatcher did not pass one -- the operation is still recorded,
+        # with a NULL `authorization_id`, because an unauthorized fetch
+        # that happened is a fact worth having, not a row to suppress.
+        self.authorization_id: uuid.UUID | None = (
+            uuid.UUID(str(authorization_id)) if authorization_id else None
+        )
+        # EPA Phase C F3: the three DECISION facts behind that grant,
+        # read by `scrape_core.netledger_middleware.operation_intent_for`
+        # and written to C1's `network_operations` columns of the same
+        # names. Plain strings, never parsed here -- they are opaque
+        # version tags whose only consumer is an auditor asking "what did
+        # the gate decide when it let this fetch happen".
+        self.budget_decision_version: str | None = budget_decision_version or None
+        self.entitlement_version: str | None = entitlement_version or None
+        self.breaker_decision: str | None = breaker_decision or None
         self._targets_by_match_id: dict[uuid.UUID, SpiderTarget] = {}
         self._requeue_state_by_match_id: dict[uuid.UUID, _RequeueState] = {}
         # Populated by `start()` from `load_targets`'s bounded-load result --

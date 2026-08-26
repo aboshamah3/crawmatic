@@ -53,6 +53,7 @@ from app_shared.task_names import SCRAPE_DISPATCH_JOB
 
 from app.deps import Principal, get_current_principal
 from app.main import app
+import app.routers.variants as variants_router
 from app.routers.variants import RESCRAPE_COOLDOWN
 
 from unit._jobs_fake_session import FakeOrmSession
@@ -186,6 +187,26 @@ def _seed_rescrapable_variant(
 
 
 # --- 202 success -------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def stub_rescrape_entitlement_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub EPA C3's account-level gate for this DB-free router suite.
+
+    `POST /v1/variants/{id}/rescrape` now calls `assert_workspace_entitled`
+    before creating the job (READY-006): the plugin's "refresh prices"
+    button must not answer 202 for an inactive account and then dispatch
+    nothing. That check reads the durable `workspace_entitlements`
+    evidence from Postgres, which this fake-session suite has none of.
+
+    These tests are about the ROUTE's contract (202/409/429, the cooldown,
+    the match count), so the gate is stubbed and its own behaviour is
+    proven against a real database in
+    `tests/integration/test_cost_authorization.py`. `monkeypatch.setattr`
+    raises if the attribute is absent, so deleting the gate from the route
+    breaks this fixture rather than quietly making the suite greener.
+    """
+    monkeypatch.setattr(variants_router, "assert_workspace_entitled", lambda ws: None)
 
 
 def test_rescrape_returns_202_with_job_id_and_match_count(
@@ -519,3 +540,53 @@ def test_rescrape_route_declares_jobs_write_scope() -> None:
     run), not like the catalog routes it shares a router with."""
     route = _route("/v1/variants/{variant_id}/rescrape", "POST")
     assert _required_scopes(route) == ("jobs:write",)
+
+
+# --- EPA Phase C F6: the entitlement gate's DENIAL branch --------------------
+
+
+def test_rescrape_is_402_when_the_workspace_is_not_entitled(
+    client: TestClient,
+    fake_session: FakeOrmSession,
+    fake_enqueue: _FakeEnqueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unentitled account gets 402 — no job, no enqueue, no 202.
+
+    EPA Phase C F6: the autouse fixture above stubs
+    `assert_workspace_entitled` to a no-op for every OTHER test in this
+    module, which is right (they are about the route's own 202/409/429
+    contract) but left the gate's actual PURPOSE untested here — a route
+    that answered 202 and then dispatched nothing is precisely the
+    looks-accepted-never-happens outcome C3 exists to remove.
+
+    So this test un-stubs it, and replaces it with the real denial->HTTP
+    mapping the route composes with: `ENTITLEMENT_INACTIVE` is in the
+    payment family, so it is 402 (the caller's account owner can fix it),
+    never 409.
+    """
+    from app.routers.jobs import cost_authorization_http_error
+    from app_shared.costauth import CostAuthorizationDenied, DenialReason
+
+    def deny(workspace_id):  # noqa: ANN001 - mirrors the real signature
+        denial = CostAuthorizationDenied(
+            DenialReason.ENTITLEMENT_INACTIVE,
+            f"workspace {workspace_id} entitlement state is CANCELLED",
+        )
+        raise cost_authorization_http_error(denial) from denial
+
+    monkeypatch.setattr(variants_router, "assert_workspace_entitled", deny)
+
+    variant, _matches = _seed_rescrapable_variant(fake_session)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        fake_session, scopes=["jobs:write"]
+    )
+
+    resp = client.post(f"/v1/variants/{variant.id}/rescrape")
+
+    assert resp.status_code == 402, resp.json()
+    assert resp.json()["detail"]["error"]["code"] == "ENTITLEMENT_INACTIVE"
+    # The gate runs BEFORE the job is created, so a denial leaves nothing
+    # behind for a later sweep to pick up and dispatch unauthorized.
+    assert fake_session._rows.get(ScrapeJob, []) == []
+    assert fake_enqueue.calls == []

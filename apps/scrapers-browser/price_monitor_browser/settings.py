@@ -122,7 +122,23 @@ DOWNLOADER_MIDDLEWARES = {
     # so here it simply surfaces as BLOCKED instead of a bogus
     # "no price on the page" (scrape_core.blocking).
     "scrape_core.blocking.BlockDetectionMiddleware": 120,
+    # EPA C4 (READY-005): the physical network-operation ledger boundary,
+    # at the same priority as the HTTP project for the same two reasons
+    # (see that settings module and the middleware's own docstring). On
+    # this node the middleware ALSO turns B6b's per-response
+    # sub-resource measurements into buffered CHILD operation rows
+    # (`parent_operation_id` = the navigation), which is what closes the
+    # canary's 68-recorded / 147-actual request-count gap. It never
+    # touches B6's resource-blocking policy: that runs on the Playwright
+    # request side (`PLAYWRIGHT_ABORT_REQUEST`, url-safety strictly
+    # first, then the block policy), and an aborted asset produces no
+    # response event for this middleware to account for.
+    "scrape_core.netledger_middleware.NetLedgerMiddleware": 130,
 }
+
+# EPA C4: see the HTTP project's settings for why this switch is
+# auditable rather than a silent degrade.
+NETLEDGER_ENABLED = True
 
 # Config-driven (env/DB-tunable, Principle IV) -- never a hardcoded
 # literal here. Low bounded browser concurrency (analyze A1): each

@@ -148,6 +148,7 @@ from app.routers import (
     api_keys,
     auth,
     competitors,
+    cost_rollups,
     domain_access_rules,
     jobs,
     jobs_admin,
@@ -193,6 +194,12 @@ app.include_router(access_policies.router)
 app.include_router(domain_access_rules.router)
 app.include_router(strategy.router)
 app.include_router(refresh_rules.router)
+# EPA C6: tenant-scoped, cost_rollups:read-gated read over the durable,
+# bounded network_cost_rollups table -- see routers/cost_rollups.py's
+# module docstring for why this is the opposite auth posture of
+# ops_metrics.router's fleet-only surface, never a tenant breakdown
+# added there.
+app.include_router(cost_rollups.router)
 app.include_router(webhooks.router)
 app.include_router(admin.router)
 # EPA A2: also under /v1/admin, but on the TENANT auth seam (scope-gated,

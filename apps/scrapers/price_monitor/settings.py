@@ -120,8 +120,26 @@ DOWNLOADER_MIDDLEWARES = {
     # so it inspects the DECODED body. Turns a bot interstitial served with
     # HTTP 200 into a retryable failure -- see scrape_core.blocking.
     "scrape_core.blocking.BlockDetectionMiddleware": 120,
+    # EPA C4 (READY-005): the physical network-operation ledger boundary.
+    # 130 is load-bearing in BOTH directions (see the middleware's own
+    # module docstring): on the request path it is strictly *after* the
+    # SSRF (100) and robots (110) guards, so a request they reject never
+    # leaves an operation row behind; on the response path -- which Scrapy
+    # walks in DESCENDING priority -- it is strictly *after* the built-in
+    # HttpCompressionMiddleware (590), which is the only position where
+    # `bytes_decompressed` is measurable at all. The compressed count is
+    # position-independent: it comes from Scrapy's `bytes_received`
+    # signal, the raw transport bytes.
+    "scrape_core.netledger_middleware.NetLedgerMiddleware": 130,
     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
 }
+
+# EPA C4: physical network accounting is ON by default and turning it off
+# is an AUDITABLE act -- the middleware logs a loud warning at spider
+# start rather than degrading quietly. There is deliberately no
+# "record if the database happens to be reachable" mode: a ledger-open
+# failure fails the paid operation closed (no socket without a row).
+NETLEDGER_ENABLED = True
 
 # Small per-process pool through PgBouncer (contracts/reactor-safe-db.md) —
 # a Scrapyd node runs many spiders per process; keep concurrency modest so

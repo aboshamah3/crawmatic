@@ -26,14 +26,54 @@ learned divergence lives in its ``domain_strategy_profiles`` rows.
 
 from __future__ import annotations
 
-from sqlalchemy import Index, Text
+from datetime import datetime
+
+from sqlalchemy import ForeignKeyConstraint, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app_shared.enums import AccessMethod, enum_column
-from app_shared.models.base import Base, TimestampMixin
+from app_shared.enums import AccessMethod, StrEnum, enum_column
+from app_shared.models.base import Base, TimestampMixin, TZDateTime
 
-__all__ = ["DomainPlaybook"]
+__all__ = ["DomainLifecycleAudit", "DomainPlaybook", "DomainState"]
+
+
+class DomainState(StrEnum):
+    """Minimum enforced domain lifecycle state (EPA C2, READY-004/READY-006
+    critical path for the C3 authorization service).
+
+    Declared **locally** rather than in ``app_shared.enums`` (the usual
+    home for ``StrEnum`` members, per ``enum_column``'s module docstring):
+    that module is concurrently owned by other in-flight EPA tasks and
+    must not be edited here to avoid a merge collision at the phase gate.
+
+    This is deliberately the MINIMUM subset needed for authorization, not
+    the full domain lifecycle machine — the approval workflow, transition
+    audit trail, and admin UI for moving a domain between these states all
+    remain W4.1 scope. ``app_shared.domains.state_lookup`` is the only
+    reader; see its ``authorization_rules_for_state`` for what each value
+    means to C3.
+    """
+
+    #: No certification signal yet (or the domain has no
+    #: ``domain_playbooks`` row at all) — the fail-safe default.
+    UNKNOWN = "UNKNOWN"
+    #: Early canary: a small volume of DIRECT (non-proxied) requests only.
+    DIRECT_CANARY = "DIRECT_CANARY"
+    #: Later canary: a small volume of requests through a specific
+    #: extraction/access profile, ahead of full certification.
+    PROFILE_CANARY = "PROFILE_CANARY"
+    #: Certified — Phase B5/B5b outcome (e.g. Amazon CSS-certified 5/5,
+    #: Noon proxy-certified 21/21). Full authorization.
+    ACTIVE = "ACTIVE"
+    #: Previously ACTIVE but showing enough failure signal that expensive
+    #: escalation should stop by default while cheaper paths keep running.
+    DEGRADED = "DEGRADED"
+    #: Operator-quarantined pending investigation — all paid work denied.
+    QUARANTINED = "QUARANTINED"
+    #: Determined not scrapeable by supported methods — all paid work
+    #: denied.
+    UNSUPPORTED = "UNSUPPORTED"
 
 
 class DomainPlaybook(Base, TimestampMixin):
@@ -65,3 +105,177 @@ class DomainPlaybook(Base, TimestampMixin):
     #: Operator notes (why this method, e.g. "TLS-fingerprint blocked,
     #: needs residential proxy" / "rate-limits direct at >10 rpm").
     notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Minimum enforced domain lifecycle state (EPA C2) consulted by C3's
+    #: authorization rule table via
+    #: ``app_shared.domains.state_lookup.get_domain_state``. Defaults
+    #: ``UNKNOWN`` — everything beyond this minimum subset (approvals,
+    #: transition audit trail, admin UI) is W4.1 scope.
+    state: Mapped[DomainState] = enum_column(DomainState, nullable=False, default=DomainState.UNKNOWN)
+
+    # ------------------------------------------------------------------
+    # W4.1 (EPA, 2026-08-26): the versioned certification profile.
+    #
+    # A "versioned domain profile" is NOT a new parallel config store --
+    # most of the fields the W4.1 plan text names are already reachable
+    # from this row's three existing pointers, which this migration
+    # deliberately does not duplicate:
+    #   * method sequence, fallback outcomes, proof state, cooldown/
+    #     canary policy -> ``method_templates`` (already on this row).
+    #   * selectors, adapter config, extraction version/rollback ->
+    #     ``scrape_profile_name`` -> ``ScrapeProfile``/``ScrapeProfileRevision``
+    #     (``version`` + immutable snapshots already exist there).
+    #   * provider/region eligibility, retry limits, concurrency/rate
+    #     ceilings -> ``access_policy_name`` -> ``AccessPolicy``
+    #     (``provider_id``, ``country_code``, ``max_retries``,
+    #     ``max_requests_per_*`` already exist there).
+    # What genuinely has no home yet -- legal/robots posture, URL
+    # patterns, canonicalization, identity evidence, expected bytes/
+    # latency/cost, fixtures, and an explicit rollback pointer -- is
+    # carried in ``profile_fields`` below rather than as a dozen new
+    # narrow columns, since none of them need to be individually
+    # indexed/queried yet and every value that materially changes this
+    # domain's certification already gets a durable, evidenced copy in
+    # the ``domain_lifecycle_audit`` row for that transition (see
+    # ``app_shared.domains.lifecycle.transition``) -- this column is a
+    # convenience *current* view, the audit trail is the source of truth.
+    #: Monotonic version counter for this domain's certification
+    #: profile. Bumped by every ``app_shared.domains.lifecycle.transition``
+    #: call (each transition IS a new evidenced profile version, exactly
+    #: like ``ScrapeProfile.version`` + ``ScrapeProfileRevision``, and
+    #: ``network_operation_settlements.settlement_version`` before it).
+    #: "Rollback version" is expressed as a value of this counter named
+    #: in a later transition's ``evidence`` (e.g.
+    #: ``{"rollback_to_profile_version": 3, ...}``) rather than an
+    #: in-place revert -- appending a new version that happens to match
+    #: an old one, never rewriting history, matching the append-only
+    #: audit trail this counter is versioned alongside.
+    profile_version: Mapped[int] = mapped_column(Integer(), nullable=False, default=1)
+    #: Accountable human/team for this domain's certification (e.g. an
+    #: email or team handle) — one of the required profile fields with
+    #: no existing home. Nullable: not every seeded/legacy row has one
+    #: yet (EPA C2's seed predates this column).
+    profile_owner: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Timestamp of the most recent canary run against this domain
+    #: (``DIRECT_CANARY``/``PROFILE_CANARY`` evidence), independent of
+    #: whether that canary passed. Nullable for domains never canaried.
+    last_canary_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: The remaining required profile fields with no existing column
+    #: home: legal/robots policy (e.g. ``{"robots_txt_respected": bool,
+    #: "tos_reviewed_at": ..., "notes": ...}``), ``url_patterns`` (list
+    #: of glob/regex strings this playbook applies to), ``canonicalization``
+    #: (URL-normalization rule reference), ``identity_evidence`` (the
+    #: proof-of-identity signal from the most recent certification —
+    #: mirrors the scraping runtime's identity-adapter status enum
+    #: without importing the scraping package here, same boundary rule
+    #: as ``ScrapeProfile.price_json_path``'s docstring), ``expected_bytes``/
+    #: ``expected_latency_ms``/``expected_cost_minor_units`` (certified
+    #: performance envelope), and ``fixtures`` (identifiers of the
+    #: recorded fixtures/golden pages a re-certification replays against).
+    #: All keys optional; unset keys mean "not yet captured for this
+    #: domain", not "known to be empty". Defaults to ``{}`` so every row
+    #: (including C2's seeded ones) starts from a valid, empty profile.
+    profile_fields: Mapped[dict] = mapped_column(JSONB(), nullable=False, default=dict)
+
+
+class DomainLifecycleAudit(Base):
+    """``domain_lifecycle_audit`` — append-only transition log for
+    ``domain_playbooks.state`` (EPA W4.1, report §6).
+
+    One row per call to ``app_shared.domains.lifecycle.transition``:
+    the ``(from_state, to_state)`` edge, the evidence that justified it,
+    the human approver (required for a transition into ``ACTIVE``, the
+    grant edge the task contract names; ``NULL`` for every other,
+    non-granting transition, including automatic ones like ``-> DEGRADED``
+    on failure signals), and the ``profile_version`` this row's domain
+    carried immediately after the transition.
+
+    **Append-only by construction, not by convention**: UPDATE and
+    DELETE are both rejected by ``DOMAIN_LIFECYCLE_AUDIT_APPEND_ONLY_SQL``'s
+    trigger (installed by the creating migration), the same pattern
+    ``network_operation_settlements`` uses — a correction is a new row,
+    never an edit of an old one. Uses plain ``Base`` (not
+    ``TimestampMixin``): an ``updated_at`` column would imply this row
+    is ever updated, which it structurally cannot be.
+
+    **No ``workspace_id``**: ``domain_playbooks`` is fleet-wide,
+    operator-curated reference data with no tenant column at all (see
+    this module's top docstring) — a transition of its certification
+    state is exactly as fleet-scoped as the row it transitions, so this
+    audit trail is filed ``SYSTEM`` in ``scripts/rls_table_manifest.txt``,
+    matching ``domain_playbooks``' own entry, not ``WORKSPACE``.
+
+    **Seeded states predate this trail** (EPA C2, 2026-08-26): the
+    migration that added ``domain_playbooks.state`` seeded
+    ``amazon.sa``/``noon.com``/``stech.ink`` directly to ``ACTIVE`` by
+    ``UPDATE``, not through ``transition`` — there is no audit row
+    explaining *why* those three domains started ``ACTIVE``, because
+    the audit trail did not exist yet. The first transition run against
+    any of those domains is therefore the FIRST row this table ever
+    gets for it, with ``from_state='ACTIVE'`` and nothing before it —
+    expected and documented, not a bug in either C2's migration or this
+    one.
+    """
+
+    __tablename__ = "domain_lifecycle_audit"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["domain"],
+            ["domain_playbooks.domain"],
+            name="fk_domain_lifecycle_audit_domain_domain_playbooks",
+        ),
+        Index("ix_domain_lifecycle_audit_domain", "domain"),
+    )
+
+    #: Bare domain, exactly as ``domain_playbooks.domain`` stores it —
+    #: FK'd to that column's unique index (``uq_domain_playbooks_domain``).
+    domain: Mapped[str] = mapped_column(Text(), nullable=False)
+    #: State immediately before this transition. Always populated (even
+    #: for the first-ever row of a seeded domain — see class docstring):
+    #: ``transition`` reads the row's *current* ``state`` before
+    #: mutating it, so there is always a "from".
+    from_state: Mapped[str] = mapped_column(String(length=32), nullable=False)
+    #: State this transition moved the domain to.
+    to_state: Mapped[str] = mapped_column(String(length=32), nullable=False)
+    #: Structured justification for this transition — canary results,
+    #: failure-signal counts, an approval ticket reference, whatever
+    #: ``transition``'s caller passed. Required (``nullable=False``):
+    #: the task contract states evidence is mandatory for every
+    #: transition, with no exceptions.
+    evidence: Mapped[dict] = mapped_column(JSONB(), nullable=False)
+    #: Identifier (email/handle) of the human who approved this
+    #: transition. ``NULL`` for every transition that does not grant
+    #: capability (denies, lateral canary moves, automatic degrades) —
+    #: ``transition`` refuses to write a row with ``approver IS NULL``
+    #: for a transition into ``ACTIVE``.
+    approver: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: ``domain_playbooks.profile_version`` immediately AFTER this
+    #: transition (i.e. the version this evidence certifies).
+    profile_version: Mapped[int] = mapped_column(Integer(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TZDateTime(), nullable=False, server_default=text("now()")
+    )
+
+
+# --- DDL emitted by the creating migration (W4.1) --------------------------
+#
+# Kept here, next to the model whose invariant it enforces — same
+# convention ``app_shared.models.network_operations`` established for
+# ``NETWORK_OPERATION_SETTLEMENTS_APPEND_ONLY_SQL``. No ``%`` or bare
+# ``:`` in the message text (psycopg3 scans for placeholders whenever a
+# statement is executed with parameters).
+DOMAIN_LIFECYCLE_AUDIT_APPEND_ONLY_SQL = """
+CREATE OR REPLACE FUNCTION domain_lifecycle_audit_reject_mutation()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = '23514',
+        MESSAGE = 'domain_lifecycle_audit is append-only',
+        DETAIL  = 'UPDATE and DELETE are rejected. A correction is a new '
+                  'transition row, written by app_shared.domains.lifecycle.transition.';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_domain_lifecycle_audit_append_only
+BEFORE UPDATE OR DELETE ON domain_lifecycle_audit
+FOR EACH ROW EXECUTE FUNCTION domain_lifecycle_audit_reject_mutation();
+"""
