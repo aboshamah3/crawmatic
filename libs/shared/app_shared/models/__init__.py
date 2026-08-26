@@ -231,6 +231,21 @@ from app_shared.models.cost_authorization import (
     WorkspaceEntitlement,
 )
 
+# EPA W5.5-L2 (2026-08-26): the durable rollup cursor and the durable
+# strategy-optimizer switch audit. Re-exported so `Base.metadata` sees
+# both tables for Alembic autogenerate/offline-render (`target_metadata`).
+# `RollupWatermark` is global, no workspace_id, no RLS — the
+# `maintenance_cadences` shape (deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`). `StrategyMethodSwitch`
+# is workspace-owned and RLS'd — registered in
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`. Neither model is used
+# by the runtime path, which reads/writes both tables via raw
+# `sqlalchemy.text` behind a `to_regclass` capability probe (see
+# `app_shared.maintenance.rollup_watermark` / `app_shared.strategy.
+# hysteresis`); these models exist solely for Alembic's target_metadata.
+from app_shared.models.rollup_watermarks import RollupWatermark
+from app_shared.models.strategy_switches import StrategyMethodSwitch
+
 # EPA C5 (2026-08-26): raw provider usage evidence — the OTHER side of
 # reconciliation against C1's ledger. Re-exported so `Base.metadata` sees
 # the table for Alembic autogenerate/offline-render (`target_metadata`).
@@ -256,6 +271,17 @@ from app_shared.models.provider_usage import ProviderUsageGranularity, ProviderU
 # `NetworkOperationAllocation`, this table's own read path
 # (`apps/api/app/routers/cost_rollups.py`) ships in this same change.
 from app_shared.models.network_cost_rollups import FleetNetworkCostRollup, NetworkCostRollup
+
+# EPA W5.5-L1 item 2 (2026-08-26): the fail-closed abuse-limit counter
+# store behind `apps/api/app/abuse_limit.py`. Re-exported so
+# `Base.metadata` sees the table for Alembic autogenerate/offline-render
+# (`target_metadata`). Global (no `workspace_id`, no RLS) -- the same
+# `rollup_watermarks` shape (deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`). Not used by the
+# runtime path, which reads/writes the table via raw `sqlalchemy.text`
+# behind a `to_regclass` capability probe (see `app.abuse_limit`); this
+# model exists solely for Alembic's target_metadata.
+from app_shared.models.api_abuse_limit_counters import ApiAbuseLimitCounter
 
 __all__ = [
     "Base",
@@ -322,8 +348,11 @@ __all__ = [
     "FleetCostBudget",
     "ReservationState",
     "WorkspaceEntitlement",
+    "RollupWatermark",
+    "StrategyMethodSwitch",
     "ProviderUsageRecord",
     "ProviderUsageGranularity",
     "FleetNetworkCostRollup",
     "NetworkCostRollup",
+    "ApiAbuseLimitCounter",
 ]

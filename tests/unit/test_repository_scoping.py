@@ -29,6 +29,7 @@ from app_shared.models.strategy import (
     DomainStrategyProfile,
     StrategyDiscoveryRun,
 )
+from app_shared.models.strategy_switches import StrategyMethodSwitch
 from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 from app_shared.repository import (
     WORKSPACE_OWNED_MODELS,
@@ -92,6 +93,9 @@ def test_workspace_owned_models_is_exactly_user_and_api_key() -> None:
             # ScrapeJobTarget shape, so every read/write goes through
             # scoped_select and stays visible to the CI scoping guard.
             DispatchIntent,
+            # EPA W5.5-L2: workspace-owned (copies workspace_id from its
+            # parent domain_strategy_profiles row at switch time).
+            StrategyMethodSwitch,
             # EPA C6: workspace-owned (this workspace's own bounded cost
             # rollup buckets). Its fleet-owned sibling
             # FleetNetworkCostRollup has no workspace_id and is

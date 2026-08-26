@@ -38,6 +38,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4.2.2
 
+      # ── W5.1 clean-tree guard (READY-001, P0.2) ──────────────────────────
+      # FIRST, before `uv sync` writes a `.venv` or any step touches the
+      # tree. Placed later it would only be measuring this job's own output.
+      #
+      # This is the guard that makes every artifact downstream mean
+      # something: the `images` job below tags by ${{ github.sha }} and the
+      # promotion job re-tags that digest WITHOUT rebuilding, so the claim
+      # "this image is that commit" rests entirely on the tree having been
+      # that commit when the build started.
+      - name: Guard — the checkout is exactly the commit
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree is not clean at checkout; refusing to build"
+            git status --porcelain
+            exit 1
+          fi
+          echo "clean at ${GITHUB_SHA}"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5.4.1
         with:
@@ -66,6 +85,63 @@ jobs:
 
       - name: Unit test suite
         run: uv run pytest tests/unit -q
+
+  # ── W5.1: the engine half of the engine/SaaS contract ───────────────────
+  # Its own job, not a step inside `checks`, because a contract breach is a
+  # CROSS-REPOSITORY failure: the fix is in the SaaS, or in a coordinated
+  # pair of commits, and that has to be legible from the job list rather
+  # than excavated from a 3,000-test run.
+  #
+  # `tests/integration/test_api_contract.py` needs NO database — it
+  # introspects the composed FastAPI app (routes, scope gates, response
+  # models, the pagination module, the error envelope). Every other file in
+  # tests/integration/ skips without live Postgres; this one must never
+  # skip, so it runs here on its own where a skip would be visible rather
+  # than buried among them.
+  #
+  # `-p no:randomly` is deliberate: this suite asserts a fixed vocabulary and
+  # must produce the same report every run, so a maintainer comparing two
+  # runs is comparing the contract and not the ordering.
+  contract:
+    name: contract (engine/SaaS API contract, no DB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      - name: Seed local env from .env.example
+        run: cp .env.example .env
+
+      # `--no-skip` has no pytest equivalent, so the skip check is explicit:
+      # the run must report zero skipped tests. A contract test that silently
+      # stopped running is worse than one that never existed, because the
+      # green check keeps being trusted.
+      - name: Engine/SaaS API contract (W5.1)
+        run: |
+          set -euo pipefail
+          uv run pytest tests/integration/test_api_contract.py -q -p no:randomly \
+            --junitxml=contract-results.xml
+          skipped=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          r = ET.parse('contract-results.xml').getroot()
+          s = r if r.tag == 'testsuite' else r.find('testsuite')
+          print(s.get('skipped', '0'))
+          ")
+          if [ "${skipped}" != "0" ]; then
+            echo "::error::${skipped} contract test(s) SKIPPED — a skipped contract test is not a passed one"
+            exit 1
+          fi
+          echo "contract: no tests skipped"
 
   rls:
     # Workspace isolation is the single control standing between one
@@ -271,11 +347,97 @@ jobs:
         run: |
           uv run pytest tests/integration/test_dispatch_stamping.py tests/integration/test_dispatch_replay_matrix.py tests/integration/test_domain_certification.py -q
 
+  # ── W5.5-GA item A: dependency audit (pip-audit, fail-critical/warn-rest) ──
+  # No CI runner exists to have run this before; it is new. `uv export
+  # --format cyclonedx1.5` is uv's own, ecosystem-native SBOM emitter (no
+  # third-party action needed for the Python side — verified locally
+  # 2026-08-26: 104 components from this exact `uv.lock`), so the same job
+  # also produces and uploads the CycloneDX SBOM for the locked dependency
+  # set. pip-audit's version is pinned (`uvx pip-audit==2.10.1`) for
+  # reproducibility — an unpinned "latest" audit tool is itself a supply-
+  # chain risk in a job whose purpose is supply-chain hygiene.
+  #
+  # Severity: pip-audit's OSV-backed JSON report has no reliable
+  # cross-ecosystem CVSS field (see scripts/security/pip_audit_gate.py's
+  # docstring), so the gate fails ONLY on an advisory id present in the
+  # owner-maintained `scripts/security/known_critical_advisories.txt`
+  # (seeded empty) and WARNS on everything else via the job summary — never
+  # silently dropped. Run against this repo's real locked deps on
+  # 2026-08-26 this surfaced 3 genuine, non-critical findings (cryptography
+  # 49.0.0, setuptools 80.10.2, pytest 8.4.2 — see the W5.5-GA task report);
+  # zero were critical, so the job is green today.
+  dependency-audit:
+    name: dependency-audit (pip-audit fail-critical/warn-rest + CycloneDX SBOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: checks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5.4.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync the whole workspace (locked, all packages)
+        run: uv sync --locked --all-packages
+
+      - name: Export locked dependencies (requirements + CycloneDX SBOM)
+        run: |
+          set -euo pipefail
+          mkdir -p dist/sbom
+          uv export --frozen --all-packages --format requirements.txt --no-hashes \
+            -o /tmp/requirements-audit.txt
+          uv export --frozen --all-packages --format cyclonedx1.5 \
+            -o dist/sbom/engine-python-deps.cdx.json
+
+      - name: Run pip-audit (OSV-backed, network required — CI-only)
+        # pip-audit exits 1 the moment it finds ANY vulnerability, which
+        # would abort the job before the JSON report (and this step's own
+        # exit) reaches the gate script below. `|| true` here is
+        # deliberate and safe: pass/fail is decided entirely by the gate
+        # script reading the JSON report next, which fails closed
+        # (exit 1) if the report is missing or empty — so a genuine
+        # pip-audit crash (vs. "found vulnerabilities") still fails the
+        # job, just one step later with a clearer error.
+        run: |
+          uvx pip-audit==2.10.1 -r /tmp/requirements-audit.txt \
+            -f json -o /tmp/pip-audit-report.json || true
+
+      - name: Gate on critical advisories, warn on the rest
+        run: |
+          uv run python scripts/security/pip_audit_gate.py \
+            --input /tmp/pip-audit-report.json \
+            --allowlist scripts/security/known_critical_advisories.txt \
+            --summary-out "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: sbom-engine-python-deps
+          path: dist/sbom/engine-python-deps.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
   images:
     name: images (build every Dockerfile docker-compose.yml references)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: checks
+    # ── W5.5-GA item A: provenance attestation needs OIDC + the
+    # attestations API, neither of which is a secret — `id-token: write`
+    # lets the runner mint a short-lived OIDC token and `attestations:
+    # write` lets `attest-build-provenance` publish to this repo's
+    # attestation store. No registry credential is used or required (this
+    # job still never pushes, per the `promote` job's own comment above);
+    # the attestation is over the local image tarball this job already
+    # exports.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -303,15 +465,170 @@ jobs:
       # needs the whole uv workspace to resolve — see apps/api/Dockerfile's
       # header comment) — matches `docker-compose.yml`'s `build.context: .`
       # for every service.
+      # ── W5.1: build ONCE, identify by digest, never rebuild to promote ────
+      # Before this, the job built each image, tagged it `:ci`, and threw it
+      # away — so whatever was later deployed had been built a SECOND time,
+      # somewhere else, from a tree nobody checked. Two builds of "the same
+      # commit" are not the same artifact: base images move, apt mirrors
+      # move, and a `pip`/`uv` resolution can differ by the hour.
+      #
+      # So the image is built once here, exported as a tarball, and its
+      # image id (the sha256 of its config, which fixes every layer) is
+      # recorded into a build manifest. The `promote` job below re-tags THAT
+      # artifact by digest and verifies the id is unchanged. Nothing
+      # downstream is permitted to rebuild.
+      #
+      # `outputs: type=docker,dest=` rather than `load: true` so the artifact
+      # is a FILE that can be uploaded and handed to the next job — a loaded
+      # image lives only in this runner's daemon and dies with it.
       - name: Build ${{ matrix.service }} image
+        id: build
         uses: docker/build-push-action@v6.13.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          tags: crawmatic-${{ matrix.service }}:ci
+          tags: crawmatic-${{ matrix.service }}:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/image-${{ matrix.service }}.tar
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Record ${{ matrix.service }} into the build manifest
+        run: |
+          set -euo pipefail
+          tar_sha="$(sha256sum "/tmp/image-${{ matrix.service }}.tar" | cut -d' ' -f1)"
+          cat > "/tmp/manifest-${{ matrix.service }}.json" <<EOF
+          {
+            "service": "${{ matrix.service }}",
+            "dockerfile": "${{ matrix.dockerfile }}",
+            "commit": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}",
+            "tag": "crawmatic-${{ matrix.service }}:${GITHUB_SHA}",
+            "image_id": "${{ steps.build.outputs.imageid }}",
+            "digest": "${{ steps.build.outputs.digest }}",
+            "artifact_sha256": "${tar_sha}",
+            "workflow_run": "${GITHUB_RUN_ID}"
+          }
+          EOF
+          cat "/tmp/manifest-${{ matrix.service }}.json"
+
+      # ── W5.5-GA item A: image SBOM (CycloneDX via syft) ────────────────
+      # Pinned by version AND sha256, same discipline as the `security`
+      # job's gitleaks install below — a supply-chain-hygiene step must
+      # not itself pull an unpinned "latest" binary. Scans the exported
+      # tarball directly via syft's `docker-archive:` scheme, so it needs
+      # neither a registry pull nor the image loaded into this runner's
+      # daemon (which `outputs: type=docker,dest=` deliberately avoids —
+      # see the build step's comment above).
+      - name: Install syft (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          asset="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$asset" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${asset}"
+          echo "${SYFT_SHA256}  ${asset}" | sha256sum -c -
+          tar xzf "$asset" syft
+          sudo install -m 0755 syft /usr/local/bin/syft
+          syft version
+        env:
+          SYFT_VERSION: "1.18.0"
+          SYFT_SHA256: "0b6fd1e0dd5b00b19585e5cde8e1c1f4ef60dc8fba8b41fab55f00852a2fbb8d"
+
+      - name: Generate CycloneDX SBOM for ${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          syft "docker-archive:/tmp/image-${{ matrix.service }}.tar" \
+            -o cyclonedx-json="/tmp/sbom-${{ matrix.service }}.cdx.json"
+
+      # ── W5.5-GA item A: build provenance attestation ────────────────────
+      # No registry credential needed or used (see job `permissions:`
+      # above) — this attests the local tarball via GitHub's OIDC-backed
+      # Sigstore instance, independent of any push. If Actions' OIDC issuer
+      # is ever unreachable this step fails loudly rather than silently
+      # skipping; unlike the SBOM step there is no local fallback for
+      # provenance (a provenance claim's whole value is coming from a
+      # trusted third party — this job — not from the tree being attested).
+      - name: Attest build provenance for ${{ matrix.service }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: /tmp/image-${{ matrix.service }}.tar
+
+      - name: Upload ${{ matrix.service }} image + manifest + SBOM
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: image-${{ matrix.service }}
+          path: |
+            /tmp/image-${{ matrix.service }}.tar
+            /tmp/manifest-${{ matrix.service }}.json
+            /tmp/sbom-${{ matrix.service }}.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── W5.1: promotion by digest ───────────────────────────────────────────
+  # This job is what "tested, then promoted, without rebuilding" means in
+  # practice. It NEVER runs `docker build`. It loads the exact tarball the
+  # `images` job produced, and fails if the loaded image's id differs by one
+  # character from what the manifest recorded.
+  #
+  # `needs: [images, checks, contract]` is the ordering that makes the claim
+  # true: an artifact is only promotable once the suite AND the cross-repo
+  # contract have passed on the same commit that produced it.
+  #
+  # No registry push happens here and none should: pushing needs a
+  # credential, and the credential-holding step belongs in a deploy workflow
+  # with its own approval, not in CI. What this job establishes is the
+  # property a deploy then relies on — that the bytes are identified, tested,
+  # and unchanged since the build.
+  promote:
+    name: promote (re-tag by digest, no rebuild)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [images, checks, contract]
+    steps:
+      - name: Download every built image
+        uses: actions/download-artifact@v4.1.8
+        with:
+          pattern: image-*
+          path: /tmp/artifacts
+
+      - name: Load each image and verify its identity is unchanged
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=0
+          for manifest in /tmp/artifacts/*/manifest-*.json; do
+            found=$((found + 1))
+            dir="$(dirname "$manifest")"
+            service="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['service'])" "$manifest")"
+            recorded_id="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['image_id'])" "$manifest")"
+            recorded_tar="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['artifact_sha256'])" "$manifest")"
+            tar="${dir}/image-${service}.tar"
+
+            echo "── ${service} ──"
+
+            # 1. The bytes are the bytes that were built.
+            echo "${recorded_tar}  ${tar}" | sha256sum -c -
+
+            # 2. Loading does not rebuild; it unpacks. If the id the daemon
+            #    reports differs from the recorded one, this is not that
+            #    artifact and must not be promoted.
+            loaded="$(docker load -q -i "$tar" | sed 's/^Loaded image: //')"
+            actual_id="$(docker image inspect --format '{{.Id}}' "$loaded")"
+            if [ "${actual_id}" != "${recorded_id}" ]; then
+              echo "::error::${service}: loaded image id ${actual_id} != recorded ${recorded_id}"
+              exit 1
+            fi
+
+            # 3. Promotion IS a re-tag. No build context, no Dockerfile.
+            docker tag "${actual_id}" "crawmatic-${service}:promoted-${GITHUB_SHA}"
+            echo "${service}: promoted ${actual_id} as crawmatic-${service}:promoted-${GITHUB_SHA}"
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no image manifests were downloaded — nothing to promote"
+            exit 1
+          fi
+          echo "promoted ${found} image(s) by digest, zero rebuilds"
 
   compose-smoke:
     name: compose-smoke (all 8 components reach running/healthy)

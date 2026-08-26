@@ -49,7 +49,11 @@ from app_shared.maintenance.health import (
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
-from app_shared.maintenance.rollups import run_daily_rollup
+from app_shared.maintenance.rollups import (
+    recompute_window,
+    run_daily_rollup,
+    run_rollup_catchup,
+)
 from app_shared.maintenance.soft_refs import count_tolerated_dangling_refs
 from app_shared.netledger.reconcile import (
     ReconciliationPolicyError,
@@ -163,25 +167,91 @@ def partition_create() -> None:
 
 @maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=MAINTENANCE_DAILY_ROLLUP)
-def daily_rollup(target_date: str | None = None) -> None:
+def daily_rollup(
+    target_date: str | None = None, recompute_through: str | None = None
+) -> None:
     """`MAINTENANCE_DAILY_ROLLUP` (`maintenance` queue,
     contracts/daily-rollup.md, FR-009/010/011/012/013/014).
 
-    Opens a BYPASSRLS system session, calls `run_daily_rollup` for
-    ``target_date`` (an ISO ``YYYY-MM-DD`` string, e.g. for an explicit
-    backfill day — defaults to yesterday UTC when omitted, the normal
-    scheduler-cadence call shape), commits, and emits one structured
-    run-report log line (FR-023) — `rollups_upserted` and
-    `variants_skipped_no_state` (a variant with observations that day but
-    no SPEC-09 `variant_price_states` row yet).
+    Opens a BYPASSRLS system session and takes one of three shapes:
+
+    * **Cadence (no arguments)** — the scheduler's call. Runs
+      `run_rollup_catchup` (EPA W5.5-L2 Item A): every UTC day owed since
+      the durable `rollup_watermarks` cursor, oldest first, in a bounded
+      batch of at most `ROLLUP_BACKFILL_MAX_DAYS`, each day's rollup and
+      its watermark advance committed together. This replaces "roll up
+      whatever yesterday happens to be", which silently skipped every day
+      the deployment was down — permanently, once retention dropped that
+      day's `price_observations` partition. When the `rollup_watermarks`
+      table is not migrated yet, the catch-up degrades (with one WARNING)
+      to exactly the previous single-day behaviour, and when
+      `ROLLUP_WATERMARK_ENABLED` is `False` it is not consulted at all.
+    * **One explicit day** (`target_date`, ISO `YYYY-MM-DD`) — unchanged:
+      `run_daily_rollup` for that day only, no cursor read or write.
+    * **Recompute a window** (`target_date` + `recompute_through`, both
+      ISO dates) — `recompute_window`: re-derives every day in the
+      inclusive range from `price_observations`, one committed
+      transaction per day. Idempotent and absolute (`ON CONFLICT ... DO
+      UPDATE`, never `count + delta`), so it is safe to run against live
+      rollups and cannot double-count; it never moves the cadence
+      watermark.
+
+    Emits one structured run-report log line (FR-023) — `rollups_upserted`
+    and `variants_skipped_no_state` (a variant with observations that day
+    but no SPEC-09 `variant_price_states` row yet), plus the cursor
+    fields on the cadence path.
     """
     parsed_date = date.fromisoformat(target_date) if target_date is not None else None
+    parsed_through = (
+        date.fromisoformat(recompute_through) if recompute_through is not None else None
+    )
+    if parsed_through is not None and parsed_date is None:
+        raise ValueError(
+            "daily_rollup: recompute_through requires target_date (the range start)"
+        )
+
+    settings = get_settings()
+
     with _system_session("daily_rollup") as session:
+        if parsed_through is not None:
+            recompute = recompute_window(session, parsed_date, parsed_through)
+            logger.info(
+                "maintenance_daily_rollup mode=recompute days_recomputed=%s "
+                "rollups_upserted=%s variants_skipped_no_state=%s",
+                recompute.days_recomputed,
+                recompute.rollups_upserted,
+                recompute.variants_skipped_no_state,
+            )
+            return
+
+        if parsed_date is None and settings.ROLLUP_WATERMARK_ENABLED:
+            catchup = run_rollup_catchup(
+                session,
+                max_days=settings.ROLLUP_BACKFILL_MAX_DAYS,
+                seed_lag_days=settings.ROLLUP_WATERMARK_SEED_LAG_DAYS,
+            )
+            logger.info(
+                "maintenance_daily_rollup mode=catchup days_processed=%s "
+                "rollups_upserted=%s variants_skipped_no_state=%s "
+                "watermark_available=%s watermark_before=%s watermark_after=%s "
+                "days_remaining=%s seeded=%s",
+                catchup.days_processed,
+                catchup.rollups_upserted,
+                catchup.variants_skipped_no_state,
+                catchup.watermark_available,
+                catchup.watermark_before,
+                catchup.watermark_after,
+                catchup.days_remaining,
+                catchup.seeded,
+            )
+            return
+
         report = run_daily_rollup(session, target_date=parsed_date)
         session.commit()
 
     logger.info(
-        "maintenance_daily_rollup rollups_upserted=%s variants_skipped_no_state=%s",
+        "maintenance_daily_rollup mode=single_day rollups_upserted=%s "
+        "variants_skipped_no_state=%s",
         report.rollups_upserted,
         report.variants_skipped_no_state,
     )

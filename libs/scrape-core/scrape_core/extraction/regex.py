@@ -51,6 +51,72 @@ _OUT_OF_STOCK_TOKENS = frozenset(
 _IN_STOCK_TOKENS = frozenset({"instock", "lowstock", "limitedavailability"})
 
 
+# ---------------------------------------------------------------------------
+# Customer-supplied regex CPU/memory bounds on the LIVE path (EPA W5.5-L1 §10)
+# ---------------------------------------------------------------------------
+#
+# `price_regex`/`old_price_regex`/`currency_regex`/`stock_regex` are
+# DB-supplied, learned, competitor-page-influenced text, and CPython's `re`
+# cannot be interrupted mid-match — no timeout, no signal, no thread stops a
+# catastrophic backtrack. `extraction/pipeline.py` already applies the W3.2
+# budget (`app_shared.strategy.candidate_ranking.search_bounded`) but ONLY on
+# the ranked path; every current production caller reaches
+# `extract_regex` -> `_first_regex_match` directly and is unbounded.
+#
+# This wires the same pre-flight into the live path, and it is DEFAULT OFF.
+# With the flag off, `_first_regex_match` is byte-for-byte the function it was
+# (the bounded helper is not even imported), so switching it on is the only
+# behaviour change and it is a single constant.
+#
+# Two bounds, matching `search_bounded`'s own two halves:
+#   1. PATTERN PRE-FLIGHT, run ONCE per pattern (not once per text node):
+#      a ReDoS-shaped or oversized pattern is refused outright and the rule
+#      finds nothing — FAIL CLOSED, never an exception that would cost the
+#      page its other readings, and never an unbounded scan.
+#   2. INPUT TRUNCATION: each text node is capped, and the total number of
+#      characters any one pattern is allowed to scan across all nodes is
+#      capped too. `_text_nodes` returns thousands of nodes on a real product
+#      page (6,932 on a live amazon.sa page, per the note above), so a
+#      per-node cap alone is not a budget.
+#
+#: Master switch. DEFAULT OFF — see the block above. Flip to True only after
+#: reading the stored-profile pre-flight report (EPA W5.5-L1 item 3), which
+#: found 0 of 12 stored production patterns would be refused.
+REGEX_BOUNDS_ENABLED = False
+
+#: Longest single text node any bounded pattern may see.
+REGEX_BOUNDS_MAX_NODE_CHARS = 65_536
+
+#: Total characters one bounded pattern may scan across every node on a page.
+REGEX_BOUNDS_MAX_TOTAL_CHARS = 1_048_576
+
+# TODO(config): promote `REGEX_BOUNDS_ENABLED` /
+# `REGEX_BOUNDS_MAX_NODE_CHARS` / `REGEX_BOUNDS_MAX_TOTAL_CHARS` to
+# `app_shared.config.Settings` fields
+# (`EXTRACTION_REGEX_BOUNDS_ENABLED` / `..._MAX_NODE_CHARS` /
+# `..._MAX_TOTAL_CHARS`). They are module constants rather than settings only
+# because `config.py` was held by a concurrent worker when this landed.
+
+
+def _pattern_refused(pattern: str) -> bool:
+    """Pre-flight ``pattern`` ONCE through the W3.2 bounded engine.
+
+    ``True`` means the pattern is refused (ReDoS shape, oversized, or
+    uncompilable) and must not be run at all. The import is deliberately
+    lazy: with ``REGEX_BOUNDS_ENABLED`` off this module never reaches into
+    ``app_shared.strategy`` at all, so the flag-off path costs nothing —
+    not even an import.
+
+    An empty subject string is passed on purpose: ``search_bounded``'s
+    refusal decision is made entirely from the pattern's parse tree, before
+    any scanning, so this buys the verdict without buying a scan.
+    """
+    from app_shared.strategy.candidate_ranking import search_bounded
+
+    _, refusal = search_bounded(pattern, "")
+    return refusal is not None
+
+
 def _text_nodes(html: str, *, exclude_tags: frozenset[str] = frozenset()) -> list[str]:
     """Every non-empty, stripped text node in document order.
 
@@ -98,15 +164,36 @@ def _text_nodes(html: str, *, exclude_tags: frozenset[str] = frozenset()) -> lis
 
 
 def _first_regex_match(nodes: list[str], pattern: str) -> tuple[str, str] | None:
-    """``(matched_group, matched_text_node)`` for the first node matching ``pattern``, else ``None``."""
+    """``(matched_group, matched_text_node)`` for the first node matching ``pattern``, else ``None``.
+
+    When ``REGEX_BOUNDS_ENABLED`` is on, the pattern is pre-flighted once
+    through the W3.2 bounded engine and the text it may scan is capped —
+    see the bounds block above. With the flag off this is the original,
+    unbounded function.
+    """
+    if REGEX_BOUNDS_ENABLED and _pattern_refused(pattern):
+        # Fail closed: a refused pattern finds nothing. Not an exception —
+        # the page's other four readings must still happen.
+        return None
     try:
         compiled = re.compile(pattern)
     except re.error:
         return None
+    budget = REGEX_BOUNDS_MAX_TOTAL_CHARS
     for node in nodes:
-        match = compiled.search(node)
+        if REGEX_BOUNDS_ENABLED:
+            if budget <= 0:
+                return None
+            subject = node[: min(REGEX_BOUNDS_MAX_NODE_CHARS, budget)]
+            budget -= len(subject)
+        else:
+            subject = node
+        match = compiled.search(subject)
         if match:
             value = match.group(1) if match.groups() else match.group(0)
+            # The FULL node is still the returned `matched_text`: it is
+            # evidence and downstream `reject_if_text_contains` context, and
+            # truncating it would change what a validation rule sees.
             return value, node
     return None
 

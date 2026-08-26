@@ -41,6 +41,7 @@ from app_shared.models.strategy import (
     DomainStrategyProfile,
     StrategyDiscoveryRun,
 )
+from app_shared.models.strategy_switches import StrategyMethodSwitch
 from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 
 # Widened (SPEC-04 research D9) from a closed TypeVar over the two
@@ -119,6 +120,13 @@ WORKSPACE_OWNED_MODELS: frozenset[type] = frozenset(
         # it carries its own workspace_id rather than being scoped
         # transitively like StrategyAttemptStats.
         DispatchIntent,
+        # EPA W5.5-L2 Item B: StrategyMethodSwitch is workspace-owned
+        # (WorkspaceScopedBase) -- unlike StrategyAttemptStats above, it
+        # carries its own workspace_id (copied from the profile at switch
+        # time) rather than being scoped transitively, so the column-based
+        # check covers it directly and the flush task's per-workspace
+        # transaction can insert it under the GUC it already set.
+        StrategyMethodSwitch,
         # EPA C6: NetworkCostRollup is workspace-owned (WorkspaceScopedBase)
         # and RLS'd — unlike its fleet-owned sibling FleetNetworkCostRollup
         # (no workspace_id at all, deliberately excluded here) and unlike

@@ -6,7 +6,45 @@
 # PostgreSQL 18.6, then annotated by hand. 40 non-partition relations.
 # Re-verified at head b6d94c2f1a70 (EPA B8b), which reclassified
 # `refresh_tokens` GAP -> TRANSITIVE. That head adds no relation, so the
-# count is unchanged.
+# count is unchanged. Head c4b19e7a2f08 (EPA C1) adds THREE relations —
+# the physical network-operation ledger — taking the count to 43: one
+# WORKSPACE (network_operation_allocations) and two deliberate,
+# annotated GAPs (network_operations, network_operation_settlements).
+# Head f1a7c02de5b4 (EPA C3) adds FOUR more — the cost-authorization
+# store — taking the count to 47: three WORKSPACE (cost_reservations,
+# cost_budgets, workspace_entitlements) and one SYSTEM
+# (fleet_cost_budgets, the fleet provider budget, which carries no
+# workspace column for the same reason proxy_circuit_breakers does not).
+# Head 9f24d748ba13 (EPA W4.1) adds ONE more relation — taking the count
+# to 48: domain_lifecycle_audit, filed SYSTEM (fleet-scoped, no
+# workspace_id) alongside its parent domain_playbooks, same annotation
+# style/reasoning as C2/C1's entries above — it is the append-only
+# transition-audit trail for domain_playbooks.state, carries no tenant
+# column, and reveals nothing about any workspace (knowing a domain's
+# certification history is exactly as non-tenant as knowing its current
+# state).
+# Head 05dfda7cdbb7 (EPA W5.5-L2) adds TWO more relations — taking the
+# count to 50: one WORKSPACE (strategy_method_switches, the durable
+# optimizer switch/rollback audit) and one SYSTEM (rollup_watermarks,
+# the daily-rollup crash-safe cursor — same shape and rationale as
+# maintenance_cadences).
+# Head 7c2b9e5a41d6 (EPA C5) adds ONE more relation — taking the count to
+# 51: provider_usage_records, filed GAP alongside its cousins
+# network_operations/network_operation_settlements (same reasoning: see
+# that GAP entry below, and provider_usage_records' own entry).
+# Head ccea48aab7b1 (EPA C6) adds TWO more relations — taking the count
+# to 53: one WORKSPACE (network_cost_rollups, the durable bounded
+# per-tenant cost-rollup surface) and one SYSTEM
+# (fleet_network_cost_rollups, its fleet-wide sibling — SYSTEM rather
+# than GAP because a fleet SUM is not tenant-linked evidence the way a
+# raw ledger row is).
+# Head e92029e9902c (EPA W5.5-L1 item 2) adds ONE more relation — taking
+# the count to 54: api_abuse_limit_counters, filed SYSTEM alongside
+# rollup_watermarks/maintenance_cadences — deliberately no workspace_id
+# and no RLS, because its bucket_key is a salted-free sha256 of a
+# credential (never a workspace) and the limiter must be able to count
+# an attempt from a caller whose workspace is not yet resolved (the
+# middleware runs before the auth seam).
 #
 # Format: <table><TAB><class><TAB><annotation>
 #
@@ -75,11 +113,15 @@ access_policies	WORKSPACE	dual-scope: proxy/retry policy per workspace; NULL wor
 api_keys	WORKSPACE	CREDENTIALS (P0.5). Hashed API keys per workspace. Pre-auth lookup by key prefix is the sanctioned BYPASSRLS seam (get_auth_session); every post-auth read is workspace-scoped.
 competitor_product_matches	WORKSPACE	Which competitor URL matches which of the workspace's variants — the core competitive-intelligence asset. Parent of two TRANSITIVE sidecars below.
 competitors	WORKSPACE	Competitor domains a workspace tracks.
+cost_budgets	WORKSPACE	COST (READY-006). The TENANT cost-budget counters, one row per (workspace_id, period_key): a nullable limit plus a reserved_* and a settled_* counter for each of the four dimensions (money in integer minor units, bytes, request count, browser-seconds). This is the AUTHORITATIVE store — not Redis: every C3 authorization takes SELECT ... FOR UPDATE on this row, which is what makes the hard ceiling a database property instead of a race the application hopes it wins. Written on the tenant seam by app_shared.costauth.service; also written cross-tenant by the lease sweeper on the sanctioned BYPASSRLS system seam (crawmatic_auth / get_system_session), which is inherently fleet-wide and must additionally read network_operations. Added at head f1a7c02de5b4.
+cost_reservations	WORKSPACE	COST (READY-006). One row per C3 authorization grant: the four reserved dimensions, the lease (lease_expires_at), and a state that moves exactly once, RESERVED -> SETTLED | RELEASED, by compare-and-set. Tenant-owned because a grant is a claim on ONE workspace's budget — deliberately unlike C1's network_operations, which is fleet-owned because a physical fetch can serve two workspaces. Written on the tenant seam by app_shared.costauth.service (authorize/heartbeat/settle/release) and cross-tenant by the lease sweeper on the sanctioned BYPASSRLS system seam. A partial unique index over (workspace_id, dedupe_key) WHERE state = 'RESERVED' collapses redelivered requests onto the live grant they already have. Added at head f1a7c02de5b4.
 dispatch_intents	WORKSPACE	JOBS (P0.5). Planned dispatch units per scrape job; added at head e7b21f3a8c94.
 domain_access_rules	WORKSPACE	Per-domain crawl permissions and robots posture for a workspace.
 domain_strategy_methods	WORKSPACE	Versioned extraction methods per strategy profile; carries its own workspace_id (not transitive) so the column-based check covers it directly.
 domain_strategy_profiles	WORKSPACE	Per-domain scraping strategy state, incl. discovery cooldowns.
 match_current_prices	WORKSPACE	Latest observed competitor price per match — the read-hot pricing surface.
+network_cost_rollups	WORKSPACE	COST (C6). Durable, bounded-cardinality per-tenant daily cost buckets — one row per (workspace_id, rollup_date, domain, http_method, profile_version), capped at TOP_N_COST_ROLLUP_BUCKETS+1 per (workspace, day) via a top-N + "other" collapse. Populated by app_shared.netledger.rollups.run_cost_rollup from network_operations/network_operation_allocations on a durable rollup_watermarks cursor (key "network_cost_rollup"), never computed synchronously on request. RLS in the SAME migration that creates the table. Read by the new tenant-scoped GET /v1/cost-rollups (scope-gated, never on the ops-shared surface) — registered in WORKSPACE_OWNED_MODELS because that read path ships in this same change, unlike its sibling network_operation_allocations above. Added at head ccea48aab7b1.
+network_operation_allocations	WORKSPACE	COST (P0.7). The tenant-visible half of the C1 physical network ledger: one row per (physical operation, workspace) carrying that workspace's exact scaled-integer fraction and its allocated cost in currency minor units. This is the ONLY RLS'd table of the three — its two fleet-owned siblings below have no workspace_id to scope by. A deferred constraint trigger re-checks at COMMIT that one operation's allocations sum exactly to the operation cost; it aggregates ACROSS workspaces and runs as the invoker, so an allocation SET must be written on the sanctioned BYPASSRLS system seam (crawmatic_auth / get_system_session) like the scheduler's due-rule claim. A tenant connection attempting a cross-tenant cost split sees only its own row and fails the check closed, which is the intended outcome. Added at head c4b19e7a2f08.
 outbox_messages	WORKSPACE	Transactional outbox for webhook/event delivery; each row carries the originating workspace.
 price_alert_events	WORKSPACE	ALERTS (P0.5). Partitioned monthly by created_at; partitions inherit this class.
 price_observations	WORKSPACE	Time series of observed competitor prices. Partitioned monthly by scraped_at; partitions inherit this class.
@@ -95,12 +137,14 @@ scrape_jobs	WORKSPACE	JOBS (P0.5). Scrape job headers and lifecycle state.
 scrape_profile_revisions	WORKSPACE	dual-scope: immutable snapshots of a scrape profile version; NULL workspace_id revisions belong to platform-global profiles.
 scrape_profiles	WORKSPACE	dual-scope: extraction selectors/XPath/JSONPath per workspace; NULL workspace_id rows are the shipped platform profiles.
 strategy_discovery_runs	WORKSPACE	Audit of strategy-discovery executions and their cost.
+strategy_method_switches	WORKSPACE	OPTIMIZER (W5.5-L2). Audit of every preferred-method change the strategy optimizer makes for one domain_strategy_profiles row, plus the rollback of a switch that degraded outcomes. Carries its own workspace_id (copied from the profile) rather than being transitively scoped, so the column-based check covers it directly and the flush task's per-workspace transaction can insert it under the GUC it already set. Added at head 05dfda7cdbb7.
 users	WORKSPACE	CREDENTIALS (P0.5). Password hashes and roles. Pre-auth lookup by email is the sanctioned BYPASSRLS seam (get_auth_session); everything after authentication is workspace-scoped.
 variant_alert_states	WORKSPACE	ALERTS (P0.5). Per-variant alert debounce/threshold state.
 variant_price_daily_rollups	WORKSPACE	EXPORTS (P0.5). Daily aggregated price history — the table the usage/analytics exports read.
 variant_price_states	WORKSPACE	Current own-price state per variant.
 webhook_endpoints	WORKSPACE	CREDENTIALS (P0.5). Customer webhook URLs and signing secrets.
 webhook_events	WORKSPACE	EXPORTS (P0.5). Outbound webhook delivery log. Partitioned monthly by created_at; partitions inherit this class.
+workspace_entitlements	WORKSPACE	ENTITLEMENT (READY-006). The engine's DURABLE LOCAL evidence of a workspace's billing entitlement — state, plan_code, evidence_version, and observed_at (the freshness clock; staleness is treated as inactive). It exists because C3's entitlement denial must work with the SaaS unreachable: a denial that has to ask the SaaS whether a workspace is still paying is an availability dependency on the exact system whose outage the requirement is about. Written by the W1.1 SaaS->engine billing replication; read only by app_shared.costauth.service. Added at head f1a7c02de5b4.
 
 # --- TRANSITIVE ---
 match_audit_classifications	TRANSITIVE	No workspace_id of its own. Scoped through competitor_product_matches via match_id: policy is EXISTS(SELECT 1 FROM competitor_product_matches p WHERE p.id = match_id AND p.workspace_id = <ctx>). Deleting the parent match removes the only path to these rows.
@@ -111,17 +155,29 @@ strategy_attempt_stats	TRANSITIVE	No workspace_id of its own. Scoped through dom
 # --- SYSTEM ---
 _smoke_foundation	SYSTEM	Non-domain fixture table created by migration 023a24e5717d to prove the migration/mixin foundation works. Its `group_key` is a synthetic grouping key, NOT a workspace id, and nothing writes tenant data to it. Carries no FK to workspaces.
 alembic_version	SYSTEM	Migration bookkeeping: one row, one column (version_num). Read by GET /version. Both runtime roles hold SELECT only; INSERT/UPDATE/DELETE are revoked so only crawmatic_migrate advances it.
+api_abuse_limit_counters	SYSTEM	EPA W5.5-L1 item 2. Fail-closed, Postgres-authoritative counter store behind app.abuse_limit's AbuseLimitMiddleware, guarding the abuse-able surfaces (discovery trigger, manual recheck, usage export, /v1/admin). Deliberately NOT row-level-secured: its only columns are a salted-free sha256 bucket key (`abuse:<surface>:<sha256(credential)[:32]>`, never a raw credential), a window timestamp and a counter — nothing identifies a workspace, and the limiter must be able to count an attempt made by a caller whose workspace is not yet resolved (the middleware runs BEFORE the auth seam, which is the entire point: an unknown credential must not be a free request). A policy keyed on app.workspace_id would make every counter write fail closed under FORCE RLS and 429 the API. UNIQUE PK on (bucket_key, window_starts_at) is load-bearing (see the migration docstring) — the limiter's increment is a single INSERT ... ON CONFLICT DO UPDATE ... RETURNING serialised on exactly this index. Rows expire by becoming unreachable as the window moves on, not by deletion; a sweep (DELETE ... WHERE window_starts_at < now() - interval '2 days') is owed to tasks_maintenance.py by a future task, per the migration's RETENTION note. Added at head e92029e9902c.
+domain_lifecycle_audit	SYSTEM	EPA W4.1. Append-only transition log for domain_playbooks.state (from_state/to_state/evidence/approver/profile_version per row) — one row per app_shared.domains.lifecycle.transition call. UPDATE and DELETE are both rejected by a trigger (same append-only pattern as network_operation_settlements), so "append-only" is a database property, not a convention. Fleet-scoped like its parent: no workspace_id, FK'd to domain_playbooks.domain (the existing unique index), and carries the same non-tenant reasoning domain_playbooks' own entry states — a domain's certification HISTORY is exactly as non-tenant as its current state. Seeded ACTIVE rows (amazon.sa/noon.com/stech.ink, migration d9a46612bcc8) predate this trail: their first transition() call produces this table's first row for that domain, not a gap. Added at head 9f24d748ba13.
 domain_playbooks	SYSTEM	Platform-wide scraping playbooks keyed by public domain (preferred access method, profile/policy names, method templates). Seeded by scripts/seed_domain_playbooks.sql, identical for every tenant, contains no customer data — knowing that amazon.ae is scraped with a given method reveals nothing about any workspace.
+fleet_cost_budgets	SYSTEM	COST (READY-006). The FLEET provider cost budget, keyed by scope_key (a provider/period scope, not a workspace) — the same counter block as cost_budgets above. Deliberately global with NO workspace_id and no RLS, exactly like proxy_circuit_breakers: the money is spent against one shared operator provider account, so one tenant's runaway loop spends everyone's budget and the ceiling must be readable AND decrementable from every workspace's scrape path. A tenant-scoped policy here would hide the fleet ceiling from precisely the connections it exists to stop. SYSTEM rather than GAP because the row names a provider and a month and carries no tenant-identifying column — contrast C1's network_operations, whose domain/canonical_url_hash/scrape_job_id are tenant-LINKED and which is therefore filed GAP. Added at head f1a7c02de5b4.
+fleet_network_cost_rollups	SYSTEM	COST (C6). Durable, bounded-cardinality FLEET-wide daily cost buckets — one row per (rollup_date, domain, http_method, profile_version, currency), summed across every tenant, capped at TOP_N_COST_ROLLUP_BUCKETS+1 per day via the same top-N + "other" collapse as network_cost_rollups above. SYSTEM rather than GAP (contrast network_operations/provider_usage_records, both GAP because a raw row's domain is tenant-linked): a fleet SUM across every workspace is not tenant-linked evidence — it reveals aggregate fleet spend on a domain, not any one tenant's usage of it, the same non-tenant reasoning fleet_cost_budgets/domain_playbooks use for their own SYSTEM filing. Read by GET /ops/metrics's cost_rollup section (fleet aggregate health only — tenant breakdowns are NEVER served from this table or from that surface; see network_cost_rollups above). Added at head ccea48aab7b1.
 maintenance_cadences	SYSTEM	Scheduler bookkeeping: one row per maintenance task key with its next_due_at/last_run_at. Fleet-wide by construction (the maintenance sweep runs once for the whole deployment, not once per tenant) and holds no tenant-identifying column.
 proxy_circuit_breakers	SYSTEM	Fleet-wide proxy kill switch keyed by scope_key (a provider/domain scope, not a workspace). Deliberately global: a breaker that tripped for one tenant must stop the burn for all of them.
+rollup_watermarks	SYSTEM	Rollup cursor bookkeeping: one row per rollup key with the highest UTC day fully aggregated. Fleet-wide by construction (one daily rollup window spans every tenant) and holds no tenant-identifying column — the same shape and rationale as maintenance_cadences. Added at head 05dfda7cdbb7.
 
 # --- TENANT_ROOT ---
 workspaces	TENANT_ROOT	The tenant registry itself. Deliberately carries no RLS: it is the root every policy's `app.workspace_id` refers to, admin provisioning creates a workspace BEFORE any context could apply to it, and the row holds only a name/slug/status. Confidentiality of the LIST of workspaces is a control-plane concern (the admin router's service token), not a row-level one.
 
 # --- GAP ---
-# EMPTY. The one entry this section ever held, `refresh_tokens`, was
-# closed by EPA B8b at alembic head b6d94c2f1a70 and now sits under
-# TRANSITIVE above. The section and its class are kept because the next
-# unreviewable hole needs somewhere to be written down where --verify
-# will read it out loud on every run — a gap with no home is a gap that
-# gets left out of the file.
+# `refresh_tokens`, the one entry this section held before, was closed by
+# EPA B8b at alembic head b6d94c2f1a70 and now sits under TRANSITIVE
+# above. The two entries below are NOT that kind of gap: they are a
+# deliberate design decision recorded here rather than a hole nobody has
+# gotten to. They are filed as GAP anyway — not SYSTEM — because SYSTEM
+# means "no tenant data", and a row naming a scrape_job_id, a domain and
+# a canonical URL hash is tenant-LINKED even though no single tenant owns
+# it. Filing them SYSTEM would make --verify go quiet about a real
+# read-side exposure; filing them GAP makes it say so on every run, which
+# is the whole point of the class.
+network_operations	GAP	COST (P0.7). The PHYSICAL network operation — one row per thing that happened on the wire. FLEET-owned BY DESIGN: it deliberately carries no workspace_id, because one browser navigation can serve two workspaces watching the same competitor URL and a subresource fetch belongs to no logical attempt at all; tenant ownership is a derived allocation, and lives in network_operation_allocations above. Not transitively scoped either: scrape_job_id is nullable by design (a fleet-side probe has no job), so an EXISTS-via-parent policy would hide exactly the fleet rows the ledger exists to record. The residual exposure is READ-side: crawmatic_app's blanket SELECT grant lets a tenant connection read every workspace's operation domains, canonical URL hashes and scrape_job_ids. Closing it means REVOKing tenant SELECT on this table once C3/C4 have established which reads actually need it — a grant change, not a policy, and deliberately out of C1's schema-only scope. Added at head c4b19e7a2f08.
+network_operation_settlements	GAP	COST (P0.7). Append-only provider reconciliation facts over network_operations (written by C5): a correction appends a higher settlement_version and UPDATE/DELETE are rejected by trigger, so the current reconciled cost is the latest version. Fleet-owned for the same reason as its parent above — a settlement restates the PHYSICAL cost, and re-deriving each tenant's share of a corrected total is an allocation concern. Carries no tenant identifier of its own beyond the operation_id it points at, so its exposure is strictly the parent's, with the same crawmatic_app SELECT-grant remedy. Added at head c4b19e7a2f08.
+provider_usage_records	GAP	COST (P0.7/C5). Raw provider usage evidence — one immutable row per line of an imported provider export (app_shared.netledger.reconcile.import_provider_usage / scripts/import_dataimpulse_usage.py), append-only via trigger (UPDATE/DELETE rejected, identical pattern to network_operation_settlements). FLEET-owned like network_operations: no workspace_id at all, because a provider bills a provider ACCOUNT, not a workspace. Filed GAP rather than SYSTEM for the SAME reason network_operations is GAP and not SYSTEM (contrast fleet_cost_budgets/domain_playbooks, which carry no tenant-identifying column whatsoever): target_host is a domain-shaped column, and a domain is tenant-linked evidence — it reveals what is being scraped and how heavily — even though no single row-level tenant owns it. The residual exposure is the identical READ-side one network_operations already carries (crawmatic_app's blanket SELECT grant), plus this table's sub_user/pool_identifier columns, which the DataImpulse export runbook flags as credential-ADJACENT (identifiers, never a password/token) — worth folding into the same future SELECT-grant remedy noted on network_operations, not a reason to weaken the classification here. Added at head 7c2b9e5a41d6.

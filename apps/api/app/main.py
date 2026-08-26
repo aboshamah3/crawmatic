@@ -138,6 +138,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 
 from app_shared.config_validation import assert_production_safe
 
+from app.abuse_limit import AbuseLimitMiddleware
 from app.error_envelope import register_error_handlers
 from app.openapi_public import build_public_openapi
 from app.rate_limit import RateLimitMiddleware
@@ -178,6 +179,14 @@ app = FastAPI(title="crawmatic-api", openapi_url=None, docs_url=None, redoc_url=
 register_error_handlers(app)
 
 app.add_middleware(RateLimitMiddleware)
+
+# EPA W5.5-L1 item 2: fail-CLOSED, Postgres-authoritative limits on the
+# abuse-able surfaces (discovery trigger, manual recheck, exports, the admin
+# control plane). Deliberately a SECOND middleware rather than a change to
+# `RateLimitMiddleware`: that one guards cost across the whole API and is
+# fail-OPEN on purpose, and merging the two would force one failure posture
+# onto both. Inert until its counter table exists — see the module docstring.
+app.add_middleware(AbuseLimitMiddleware)
 
 app.include_router(auth.router)
 app.include_router(api_keys.router)

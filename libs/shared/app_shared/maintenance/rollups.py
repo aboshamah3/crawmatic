@@ -32,6 +32,7 @@ Scraping-free (Constitution I/V) — SQLAlchemy + stdlib only.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import date as date_type
@@ -44,6 +45,14 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
+from app_shared.maintenance.rollup_watermark import (
+    EVENT_WATERMARK_STORE_ABSENT,
+    WATERMARK_DAILY_ROLLUP,
+    advance_watermark,
+    read_watermark,
+    seed_watermark,
+    watermark_store_available,
+)
 from app_shared.models.rollups import VariantPriceDailyRollup
 
 # `variant_price_daily_rollups.average_competitor_price` is `NUMERIC(18,4)`
@@ -58,6 +67,8 @@ from app_shared.models.rollups import VariantPriceDailyRollup
 # rounding a value that matters to a decision — there is no decision
 # here, only a fit-in-the-column requirement).
 _MONEY_QUANT = Decimal("0.0001")
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_today(now_utc: datetime) -> date_type:
@@ -355,5 +366,242 @@ def run_daily_rollup(
         # written) but no statement is ever sent -- the count below is
         # the only side effect.
         report.rollups_upserted += 1
+
+    return report
+
+
+# --- Durable watermark: bounded catch-up + recompute (EPA W5.5-L2 Item A) ---
+
+
+#: Conservative fallbacks used when a caller passes no ``Settings``
+#: (a pure unit test, a script). They mirror the shipped
+#: ``Settings.ROLLUP_*`` defaults -- see ``app_shared.config``.
+_DEFAULT_BACKFILL_MAX_DAYS = 7
+_DEFAULT_SEED_LAG_DAYS = 1
+
+
+def plan_backfill_days(
+    last_complete_date: date_type,
+    latest_complete_day: date_type,
+    max_days: int,
+) -> list[date_type]:
+    """The **bounded** list of UTC days still owed, oldest first.
+
+    ``[last_complete_date + 1 day, latest_complete_day]``, truncated to at
+    most ``max_days`` entries -- so a catch-up after arbitrarily long
+    downtime processes a bounded batch per invocation and makes bounded
+    progress on each subsequent one, instead of one unbounded scan that
+    grows with the outage and times out (or OOMs) forever after.
+
+    Pure: no session, no clock, no settings -- the entire stepping policy
+    in one testable function. Returns ``[]`` when the cursor is already at
+    (or past) ``latest_complete_day``, which is the steady state, and also
+    when ``max_days <= 0`` (a deliberate operator freeze).
+    """
+    if max_days <= 0:
+        return []
+    days: list[date_type] = []
+    cursor = last_complete_date + timedelta(days=1)
+    while cursor <= latest_complete_day and len(days) < max_days:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days
+
+
+@dataclass
+class CatchupReport:
+    """Structured summary of one :func:`run_rollup_catchup` invocation.
+
+    ``watermark_available`` is the capability flag: ``False`` means the
+    ``rollup_watermarks`` table is not migrated yet and this run fell back
+    to the pre-watermark behaviour (roll up ``latest_complete_day``, once).
+    ``days_remaining`` is how many owed days this run did NOT reach
+    because ``max_days`` capped the batch -- the operator's "am I still
+    behind?" number, and the thing that must trend to 0.
+    """
+
+    days_processed: list[str] = field(default_factory=list)
+    rollups_upserted: int = 0
+    variants_skipped_no_state: list[str] = field(default_factory=list)
+    watermark_available: bool = False
+    seeded: bool = False
+    days_remaining: int = 0
+    watermark_before: str | None = None
+    watermark_after: str | None = None
+
+
+def run_rollup_catchup(
+    session: Session,
+    *,
+    now_utc: datetime | None = None,
+    max_days: int | None = None,
+    seed_lag_days: int | None = None,
+    watermark_key: str = WATERMARK_DAILY_ROLLUP,
+    commit: bool = True,
+) -> CatchupReport:
+    """Roll up every UTC day owed since the durable watermark, in a bounded batch.
+
+    This is the crash-safe replacement for "call
+    :func:`run_daily_rollup` with no arguments and hope the wall clock
+    never moved on without us" (see
+    :mod:`app_shared.maintenance.rollup_watermark` for the failure mode).
+
+    Per owed day, in order, oldest first:
+
+    1. :func:`run_daily_rollup` for that day (the unchanged aggregation);
+    2. :func:`~app_shared.maintenance.rollup_watermark.advance_watermark`
+       for that day -- **in the same transaction**;
+    3. ``session.commit()`` (unless ``commit=False``, for tests that want
+       to inspect one transaction's statements).
+
+    That order is the whole no-loss/no-double-count property. A crash
+    anywhere before the commit leaves neither the day's rollup rows nor
+    the advance durable, so the day is re-planned on the next run; a
+    crash after it leaves both durable, so the day is not re-planned. And
+    because a re-run is idempotent by construction (``ON CONFLICT ... DO
+    UPDATE`` with absolute values, never ``count + delta``), even a
+    torn-looking retry converges on the same rows.
+
+    **Degraded mode.** When ``rollup_watermarks`` does not exist yet (the
+    migration is pending -- see the module docstring of
+    :mod:`app_shared.maintenance.rollup_watermark`), this logs
+    ``rollup_watermark_store_absent`` once and rolls up exactly
+    ``default_target_date(now_utc)``: byte-for-byte the behaviour every
+    caller has today, no better and no worse.
+
+    **First use.** A cursor that does not exist yet is seeded at
+    ``latest_complete_day - seed_lag_days`` (default 1), so the first run
+    after the migration does exactly one day rather than attempting to
+    walk the whole history. Deliberate historical backfill is
+    :func:`recompute_window`'s job, not a side effect of turning the
+    cursor on.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    latest_complete_day = default_target_date(now)
+    batch_cap = _DEFAULT_BACKFILL_MAX_DAYS if max_days is None else max_days
+    lag = _DEFAULT_SEED_LAG_DAYS if seed_lag_days is None else seed_lag_days
+
+    report = CatchupReport()
+
+    if not watermark_store_available(session):
+        logger.warning(
+            "%s table=rollup_watermarks target_date=%s remedy=%s",
+            EVENT_WATERMARK_STORE_ABSENT,
+            latest_complete_day.isoformat(),
+            "apply the pending rollup_watermarks migration; until then a daily "
+            "rollup missed during downtime is never re-attempted and its source "
+            "partition can be dropped by retention before it is ever aggregated",
+        )
+        day_report = run_daily_rollup(session, target_date=latest_complete_day)
+        if commit:
+            session.commit()
+        report.days_processed.append(latest_complete_day.isoformat())
+        report.rollups_upserted += day_report.rollups_upserted
+        report.variants_skipped_no_state.extend(day_report.variants_skipped_no_state)
+        return report
+
+    report.watermark_available = True
+
+    watermark = read_watermark(session, watermark_key)
+    if watermark is None:
+        seed_watermark(
+            session,
+            latest_complete_day - timedelta(days=max(0, lag)),
+            key=watermark_key,
+            now=now,
+        )
+        if commit:
+            session.commit()
+        report.seeded = True
+        watermark = read_watermark(session, watermark_key)
+        if watermark is None:  # pragma: no cover - only if the seed was rolled back
+            return report
+
+    report.watermark_before = watermark.last_complete_date.isoformat()
+    report.watermark_after = watermark.last_complete_date.isoformat()
+
+    owed = plan_backfill_days(watermark.last_complete_date, latest_complete_day, batch_cap)
+    total_owed = (latest_complete_day - watermark.last_complete_date).days
+    report.days_remaining = max(0, total_owed - len(owed))
+
+    for day in owed:
+        day_report = run_daily_rollup(session, target_date=day)
+        # Same transaction as the day's own upserts -- see the ordering
+        # contract in `app_shared.maintenance.rollup_watermark`.
+        advance_watermark(session, day, key=watermark_key, now=now)
+        if commit:
+            session.commit()
+        report.days_processed.append(day.isoformat())
+        report.rollups_upserted += day_report.rollups_upserted
+        report.variants_skipped_no_state.extend(day_report.variants_skipped_no_state)
+        report.watermark_after = day.isoformat()
+
+    return report
+
+
+@dataclass
+class RecomputeReport:
+    """Structured summary of one :func:`recompute_window` invocation."""
+
+    days_recomputed: list[str] = field(default_factory=list)
+    rollups_upserted: int = 0
+    variants_skipped_no_state: list[str] = field(default_factory=list)
+    dry_run: bool = False
+
+
+def recompute_window(
+    session: Session,
+    start_date: date_type,
+    end_date: date_type,
+    *,
+    dry_run: bool = False,
+    commit: bool = True,
+) -> RecomputeReport:
+    """Re-derive ``[start_date, end_date]`` (inclusive) from source observations.
+
+    The documented, tested recompute procedure. Safe to run against live
+    rollups while the normal cadence is running, because it is
+    **idempotent and absolute**, not additive: each day is re-aggregated
+    from ``price_observations`` and written with ``ON CONFLICT
+    (workspace_id, product_variant_id, date) DO UPDATE`` setting every
+    column to the freshly computed value. Re-running a day that the
+    cadence already rolled up -- or that a previous recompute already
+    rewrote -- overwrites the row in place. There is no counter to
+    double-count.
+
+    It deliberately **never advances or rewinds the watermark**. The
+    watermark means "the sweep has reached here", which is a statement
+    about the *cadence*, not about any one operator-initiated repair; and
+    the advance is ``GREATEST``-guarded anyway, so even a mistaken call
+    could not rewind the cadence's progress.
+
+    One transaction per day (committed as it completes, unless
+    ``commit=False``) so a long range makes durable partial progress and
+    an interruption costs at most the day in flight -- which, being
+    idempotent, is simply redone.
+
+    ``dry_run=True`` forwards to :func:`run_daily_rollup`'s own genuinely
+    read-only path (no write statement is ever sent), matching
+    ``scripts/backfill_daily_rollups.py``'s default posture.
+
+    Raises ``ValueError`` when ``end_date < start_date`` -- an inverted
+    range is a caller bug, not an empty repair.
+    """
+    if end_date < start_date:
+        raise ValueError(
+            f"recompute_window: end_date {end_date.isoformat()} precedes "
+            f"start_date {start_date.isoformat()}"
+        )
+
+    report = RecomputeReport(dry_run=dry_run)
+    day = start_date
+    while day <= end_date:
+        day_report = run_daily_rollup(session, target_date=day, dry_run=dry_run)
+        if commit and not dry_run:
+            session.commit()
+        report.days_recomputed.append(day.isoformat())
+        report.rollups_upserted += day_report.rollups_upserted
+        report.variants_skipped_no_state.extend(day_report.variants_skipped_no_state)
+        day += timedelta(days=1)
 
     return report

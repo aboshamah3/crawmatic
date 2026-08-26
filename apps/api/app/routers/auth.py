@@ -51,6 +51,7 @@ from app_shared.security.tokens import (
     hash_token,
 )
 
+from app.client_ip import client_ip
 from app.errors import auth_failed_exception, rate_limited_exception
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -77,7 +78,15 @@ class TokenPairResponse(BaseModel):
 
 
 def _client_ip(request: Request) -> str:
-    return request.client.host if request.client is not None else "unknown"
+    """The rate-limit source for this login attempt.
+
+    EPA W5.5-L1 item 1: this used to be the raw socket peer, which behind
+    Railway is the edge proxy — so the per-source half of
+    `check_and_increment_login` was one global counter for the entire
+    internet. `app.client_ip` honours the declared proxy depth instead, and
+    ignores an `X-Forwarded-For` that did not come through that chain.
+    """
+    return client_ip(request)
 
 
 def _issue_pair(*, user: User) -> TokenPairResponse:

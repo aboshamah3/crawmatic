@@ -1,0 +1,13 @@
+# Owner-maintained allowlist of advisory ids (CVE/GHSA/PYSEC/...) that
+# `scripts/security/pip_audit_gate.py` treats as CRITICAL — i.e. fails the
+# `dependency-audit` CI job. One id per line; `#` starts a comment.
+#
+# Deliberately seeded EMPTY (EPA W5.5-GA, item A, 2026-08-26). pip-audit's
+# OSV-backed JSON report carries no reliable cross-ecosystem severity field
+# (see pip_audit_gate.py's module docstring for why), so this gate cannot
+# auto-classify "critical" from the report alone. Every finding not listed
+# here surfaces as WARN in the job summary for manual triage — it is not
+# ignored, just not build-blocking until an owner adds its id here.
+#
+# Example line (do not uncomment — illustrative only):
+# GHSA-xxxx-xxxx-xxxx

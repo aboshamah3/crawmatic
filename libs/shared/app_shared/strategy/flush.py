@@ -16,6 +16,7 @@ context), never the spider/reactor thread.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -42,9 +43,10 @@ from app_shared.models.strategy import (
     StrategyAttemptStats,
 )
 from app_shared.repository import scoped_select
-from app_shared.strategy import stats_buffer
+from app_shared.strategy import hysteresis, stats_buffer
 from app_shared.strategy.promotion import (
     MethodStats,
+    PromotionDecision,
     PromotionThresholds,
     apply_promotion,
     evaluate_promotion,
@@ -64,6 +66,8 @@ __all__ = [
     "FlushResult",
     "StrategyTransition",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -304,6 +308,11 @@ def _upsert_stats(
         table.avg_response_time_ms,
         table.last_success_at,
         table.last_failed_at,
+        # W5.5-L2 Item B: the row's first-insert instant is how long this
+        # method has been under observation at all -- the "window" half of
+        # the optimizer's minimum-evidence bar
+        # (`app_shared.strategy.hysteresis.SwitchEvidence.window_seconds`).
+        table.created_at,
     )
 
     return session.execute(stmt).one()
@@ -467,6 +476,128 @@ def _combined_stats(session: Session, profile: DomainStrategyProfile) -> Combine
     )
 
 
+def _enum_value(raw: Any) -> str | None:
+    """`raw.value` for an enum member, the string itself otherwise, `None`
+    for `None` -- `preferred_access_method`/`preferred_extraction_method`
+    come back as enum members from the ORM but as plain strings from some
+    test doubles."""
+    if raw is None:
+        return None
+    return raw.value if hasattr(raw, "value") else str(raw)
+
+
+def _evidence_window_seconds(row: Any, now: datetime) -> float | None:
+    """How long this method's `strategy_attempt_stats` row has existed.
+
+    `None` when the caller's row cannot report it (a monkeypatched
+    `_upsert_stats` in a unit test), which
+    :func:`app_shared.strategy.hysteresis.evaluate_switch` treats as
+    "window not measurable" -- it skips the window check rather than
+    failing it, because an unmeasurable window is not evidence of a
+    too-short one.
+    """
+    created_at = getattr(row, "created_at", None)
+    if created_at is None:
+        return None
+    try:
+        return (now - created_at).total_seconds()
+    except TypeError:  # naive/aware mismatch from an exotic double
+        return None
+
+
+def _method_success_rate(
+    session: Session,
+    profile: DomainStrategyProfile,
+    method_type: MethodType,
+    method_name: str | None,
+) -> Decimal | None:
+    """One method's persisted lifetime `success_rate`, or `None`.
+
+    The baseline a switch is later judged against (W5.5-L2 Item B): what
+    the method being REPLACED was actually achieving at the moment it was
+    replaced.
+    """
+    if method_name is None:
+        return None
+    for row in stats_for_profile(session, profile.workspace_id, profile.id):
+        if row.method_type == method_type and row.method_name == method_name:
+            return row.success_rate
+    return None
+
+
+def _maybe_rollback_switch(
+    session: Session,
+    profile: DomainStrategyProfile,
+    method_type: MethodType,
+    thresholds: hysteresis.SwitchThresholds,
+    now: datetime,
+) -> bool:
+    """Revert one degraded preferred-method switch, exactly once (Item B).
+
+    Reads the most recent not-yet-rolled-back switch for this (profile,
+    method_type), isolates the outcomes recorded on the NEW method
+    strictly after it (current counters minus the readings stamped at
+    switch time -- a lifetime aggregate alone cannot answer "did this
+    switch make things worse"), and asks the pure evaluator. On a
+    rollback it stamps the audit row FIRST: the stamp's `WHERE
+    rolled_back_at IS NULL` is the exactly-once guard, so a concurrent
+    flush of the same profile loses the race there and does not also
+    revert the profile.
+
+    No-op (and no statement) when the durable switch audit is not
+    migrated yet.
+
+    Scope note: this reverts the NAME columns
+    (`preferred_access_method`/`preferred_extraction_method`), which are
+    what the switch audit records and what rediscovery's
+    `_combined_stats` reads. It deliberately does not touch
+    `preferred_method_id` (the versioned-`domain_strategy_methods`
+    pointer), whose own lifecycle is the per-method circuit breaker
+    (`_update_method_circuit` -> `proof_state`/`cooldown_until`), not
+    this one; conflating the two would let a rollback silently
+    un-quarantine a method the breaker had opened.
+    """
+    switch = hysteresis.latest_open_switch(session, profile.id, method_type.value)
+    if switch is None:
+        return False
+
+    rows = {
+        (row.method_type, row.method_name): row
+        for row in stats_for_profile(session, profile.workspace_id, profile.id)
+    }
+    current = rows.get((method_type, switch.to_method))
+    if current is None:
+        return False
+
+    verdict = hysteresis.evaluate_rollback(
+        hysteresis.RollbackEvidence(
+            from_method=switch.from_method,
+            to_method=switch.to_method,
+            baseline_success_rate=switch.baseline_success_rate,
+            post_switch_attempts=int(current.attempt_count or 0)
+            - int(switch.switch_attempt_count or 0),
+            post_switch_successes=int(current.success_count or 0)
+            - int(switch.switch_success_count or 0),
+            already_rolled_back=switch.rolled_back_at is not None,
+        ),
+        thresholds,
+    )
+    if not verdict.rollback:
+        return False
+
+    if not hysteresis.mark_rolled_back(
+        session, switch.id, reason=verdict.reason, now=now
+    ):
+        # A concurrent flush already claimed this rollback.
+        return False
+
+    if method_type is MethodType.ACCESS:
+        profile.preferred_access_method = AccessMethod(switch.from_method)
+    else:
+        profile.preferred_extraction_method = ExtractionMethod(switch.from_method)
+    return True
+
+
 def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> FlushResult:
     """Drain + upsert every dirty `(method_type, method_name)` key of one
     profile, then evaluate promotion (US1) and rediscovery (US4) against
@@ -498,6 +629,11 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
 
     settings = get_settings()
     promotion_thresholds = _promotion_thresholds(settings)
+    # W5.5-L2 Item B. `switch_guard_on=False`
+    # (`STRATEGY_SWITCH_HYSTERESIS_ENABLED=False`) restores byte-for-byte
+    # the pre-W5.5-L2 optimizer: no hold, no band, no rollback.
+    switch_guard_on = hysteresis.hysteresis_enabled(settings)
+    switch_thresholds = hysteresis.thresholds_from_settings(settings)
     now = datetime.now(timezone.utc)
 
     # Task 3.2 (2026-08-16): snapshotted once, before the promotion loop
@@ -611,6 +747,68 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
             confidence=row.avg_confidence,
         )
         decision = evaluate_promotion(combined, drained.distinct_urls, promotion_thresholds)
+
+        # --- W5.5-L2 Item B: hysteresis on a preferred-method CHANGE ---
+        #
+        # `evaluate_promotion` asks only "has this method cleared the bar
+        # a first-ever promotion clears" -- it has never looked at what
+        # the profile currently prefers. So three qualifying samples on a
+        # DEGRADED profile could repoint a domain away from the method
+        # that had been serving it, and the next three samples on the old
+        # method could point it straight back. The guard below runs ONLY
+        # when the decision would genuinely change the method (a
+        # first-ever assignment and a same-method re-affirmation both
+        # pass straight through, so the fqtoners.com DEGRADED dead-end
+        # this codebase already fixed stays fixed).
+        incumbent_name = _enum_value(
+            profile.preferred_access_method
+            if method_type is MethodType.ACCESS
+            else profile.preferred_extraction_method
+        )
+        is_method_change = (
+            decision.promote
+            and incumbent_name is not None
+            and method_name != incumbent_name
+        )
+        window_seconds = _evidence_window_seconds(row, now)
+
+        if switch_guard_on and is_method_change:
+            verdict = hysteresis.evaluate_switch(
+                hysteresis.SwitchEvidence(
+                    incumbent_method=incumbent_name,
+                    candidate_method=method_name,
+                    # The distinct-URL SET is cumulative -- it survives
+                    # every drain until the method actually promotes --
+                    # so it, not this cycle's delta, is the honest
+                    # running evidence total.
+                    sample_count=drained.distinct_urls,
+                    window_seconds=window_seconds,
+                    candidate_was_rolled_back=hysteresis.candidate_was_rolled_back(
+                        session, profile.id, method_type.value, method_name
+                    ),
+                ),
+                switch_thresholds,
+            )
+            if not verdict.allow:
+                logger.info(
+                    "%s profile_id=%s domain=%s method_type=%s from=%s to=%s reason=%s",
+                    hysteresis.EVENT_SWITCH_HELD,
+                    profile.id,
+                    profile.domain,
+                    method_type.value,
+                    incumbent_name,
+                    method_name,
+                    verdict.reason,
+                )
+                # Hold current: not a failure, not a degradation. The
+                # evidence is untouched and keeps accumulating.
+                decision = PromotionDecision(
+                    promote=False,
+                    confidence=decision.confidence,
+                    reason=f"held by hysteresis: {verdict.reason}",
+                )
+                is_method_change = False
+
         promoted = apply_promotion(
             session,
             profile.id,
@@ -618,6 +816,28 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
             method_name=method_name,
             decision=decision,
         )
+        if promoted and switch_guard_on and is_method_change:
+            # Durable, auditable record of the change -- written in this
+            # same transaction, so it commits with the switch it
+            # describes or disappears with it.
+            hysteresis.record_switch(
+                session,
+                workspace_id=profile.workspace_id,
+                profile_id=profile.id,
+                method_type=method_type.value,
+                from_method=incumbent_name,
+                to_method=method_name,
+                evidence_samples=drained.distinct_urls,
+                evidence_window_seconds=(
+                    None if window_seconds is None else int(window_seconds)
+                ),
+                baseline_success_rate=_method_success_rate(
+                    session, profile, method_type, incumbent_name
+                ),
+                switch_attempt_count=int(getattr(row, "attempt_count", 0) or 0),
+                switch_success_count=int(getattr(row, "success_count", 0) or 0),
+                now=now,
+            )
         if promoted:
             if strategy_method_id is not None:
                 profile.preferred_method_id = strategy_method_id
@@ -702,6 +922,18 @@ def flush_profile(session: Session, redis: Any, profile_id: uuid.UUID | str) -> 
         profile.last_success_at = now
     if any_failure:
         profile.last_failed_at = now
+
+    # W5.5-L2 Item B: a switch that DEGRADED outcomes is reverted to the
+    # method it replaced, exactly once, and the reversion is recorded.
+    # Evaluated after this cycle's counters are persisted (so the
+    # post-switch attempts it reads include everything just flushed) and
+    # BEFORE rediscovery below, so `_combined_stats` reasons about the
+    # method the profile actually ends this cycle preferring.
+    if switch_guard_on:
+        for switched_type in (MethodType.ACCESS, MethodType.EXTRACTION):
+            _maybe_rollback_switch(
+                session, profile, switched_type, switch_thresholds, now
+            )
 
     # Rediscovery (US4): persisted + pending (already merged above, FR-024)
     # combined counts, plus a freshly built recent_signals off the hot path.

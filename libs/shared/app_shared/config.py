@@ -440,6 +440,46 @@ class Settings(BaseSettings):
     STRATEGY_REDISCOVERY_SUCCESS_RATE_FLOOR: float = 0.80
     STRATEGY_REDISCOVERY_LOW_CONFIDENCE: float = 0.75
     STRATEGY_REDISCOVERY_CONSECUTIVE_FAILURES: int = 3
+    # --- Optimizer hysteresis (EPA W5.5-L2 Item B,
+    # `app_shared.strategy.hysteresis`). The promotion evaluator's bar for
+    # OVERWRITING a domain profile's preferred method was the same three
+    # samples that install the very first one, with no reference to the
+    # incumbent's track record, how long the candidate had been observed,
+    # or whether the two methods were simply trading the preference back
+    # and forth. These five knobs are the minimum-evidence hold, the
+    # anti-flap band and the degradation rollback. ---
+    #
+    # Master switch. `False` restores byte-for-byte the pre-W5.5-L2
+    # optimizer behaviour (no hold, no band, no rollback).
+    STRATEGY_SWITCH_HYSTERESIS_ENABLED: bool = True
+    # Distinct qualifying URLs a candidate must have accumulated before it
+    # may REPLACE an existing preferred method. 6 = double the 3 that
+    # installs a first-ever method: the incumbent's own track record is
+    # evidence, and three samples must not outweigh it. Below this the
+    # decision is downgraded to "hold current" -- the evidence is not
+    # discarded, it keeps accumulating (the distinct-URL SET survives
+    # every drain until a method actually promotes).
+    STRATEGY_SWITCH_MIN_EVIDENCE_SAMPLES: int = 6
+    # Minimum wall-clock span that evidence must cover, so a burst of
+    # successes inside one flush interval cannot repoint a domain. 1800s
+    # (30 min) is 30 x the 60s flush cadence.
+    STRATEGY_SWITCH_MIN_EVIDENCE_WINDOW_SECONDS: int = 1800
+    # WIDER band for switching BACK to a method a previous switch already
+    # rolled back: 2.0 x the sample requirement (6 -> 12). Asymmetry is
+    # the whole anti-flap mechanism -- returning costs more than leaving
+    # did, so alternating samples converge instead of oscillating.
+    STRATEGY_SWITCH_REVERT_EVIDENCE_MULTIPLIER: float = 2.0
+    # Attempts that must be recorded on the NEW method strictly after a
+    # switch before its outcome is judged at all -- never revert on one
+    # sample. Mirrors STRATEGY_METHOD_BREAKER_MIN_ATTEMPTS' 10.
+    STRATEGY_SWITCH_ROLLBACK_MIN_ATTEMPTS: int = 10
+    # How far BELOW the replaced method's success rate (measured at switch
+    # time) the new method must fall before the switch is treated as a
+    # degradation and reverted. A margin, not equality, so ordinary noise
+    # never triggers a revert; 0.20 is the same order as the 0.80
+    # rediscovery success-rate floor.
+    STRATEGY_SWITCH_ROLLBACK_DEGRADATION_MARGIN: float = 0.20
+
     STRATEGY_METHOD_BREAKER_MIN_ATTEMPTS: int = 10
     STRATEGY_METHOD_BREAKER_FAILURE_RATE: float = 0.80
     STRATEGY_METHOD_BREAKER_COOLDOWN_SECONDS: int = 1800
@@ -556,6 +596,34 @@ class Settings(BaseSettings):
     # empty partition is a catalog entry and an empty heap -- no rows, no
     # measurable planning cost at this table count).
     PARTITION_CREATE_LOOKAHEAD_MONTHS: int = 3
+
+    # --- Durable rollup watermark + bounded backfill (EPA W5.5-L2 Item A,
+    # `app_shared.maintenance.rollup_watermark`). The daily rollup used to
+    # target "yesterday UTC" computed fresh from the wall clock, with no
+    # record of which days had actually been aggregated -- so any day the
+    # deployment was down was never anybody's target again and was lost
+    # for good once retention dropped its `price_observations` partition
+    # (the 2026-07-11 -> 2026-08-12 backlog `scripts/backfill_daily_
+    # rollups.py` exists to repair). These three knobs govern the durable
+    # cursor that replaces the wall clock. ---
+    #
+    # Master switch. `False` restores the exact pre-watermark behaviour
+    # (roll up yesterday, once, no cursor read or write) without needing
+    # to revert the migration. Default `True` -- the guard is the point.
+    ROLLUP_WATERMARK_ENABLED: bool = True
+    # Bounded batch: the MAXIMUM number of owed UTC days one catch-up run
+    # will process. 7 covers a week-long outage in one run while keeping a
+    # single invocation's work bounded regardless of how long the gap
+    # actually is; a longer gap simply takes more runs, each of which makes
+    # bounded, durable progress. `0` freezes catch-up entirely (an
+    # operator escape hatch) without losing the cursor.
+    ROLLUP_BACKFILL_MAX_DAYS: int = 7
+    # How far behind "yesterday UTC" the cursor is born on its very first
+    # use. 1 means the first run after the migration does exactly the one
+    # day the current code already does -- turning the cursor on is not
+    # itself a historical backfill (that is `recompute_window`'s job, run
+    # deliberately). Raising this makes the first run walk further back.
+    ROLLUP_WATERMARK_SEED_LAG_DAYS: int = 1
 
     # --- Maintenance cadence durability + health assertions (2026-08-15
     # readiness cycle). `MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS` is how
