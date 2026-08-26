@@ -143,6 +143,17 @@ class RequestAttempt(Base, WorkspaceScopedBase):
             name="fk_request_attempts_scrape_profile_id_scrape_profiles",
             ondelete="SET NULL",
         ),
+        # EPA C1 (2026-08-25): the logical attempt's link to the PHYSICAL
+        # operation that carried it (`app_shared.models.network_operations`).
+        # Targets `network_request_id` — the identity generated BEFORE
+        # dispatch — not the operation's surrogate `id`, so a writer can
+        # stamp the link onto attempt telemetry without first
+        # round-tripping the operation insert.
+        ForeignKeyConstraint(
+            ["network_operation_id"],
+            ["network_operations.network_request_id"],
+            name="fk_request_attempts_network_operation_id_network_operations",
+        ),
         {"postgresql_partition_by": "RANGE (created_at)"},
     )
 
@@ -208,6 +219,17 @@ class RequestAttempt(Base, WorkspaceScopedBase):
     #: `app_shared.profiles.browser_resource_policy.should_block` decides
     #: to block or let through.
     subresource_bytes: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+
+    #: EPA C1 (2026-08-25, READY-005): the physical `network_operations`
+    #: row this logical attempt was carried by, keyed by that ledger's
+    #: pre-dispatch `network_request_id`. NULLABLE, and nullable is not a
+    #: coverage claim: every attempt written before C1 legitimately has
+    #: no operation, and "every new attempt HAS one" is an invariant
+    #: C3/C4 must establish at the write sites — this column only makes
+    #: the link expressible and referentially sound.
+    network_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
 
 
 class MatchCurrentPrice(Base, WorkspaceScopedBase, TimestampMixin):

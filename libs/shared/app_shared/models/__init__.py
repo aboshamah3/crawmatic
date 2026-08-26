@@ -182,6 +182,26 @@ from app_shared.models.dispatch import DispatchIntent
 # NOT added to `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.competitor_identifiers import MatchCompetitorIdentifier
 
+# EPA C1 (2026-08-25): the PHYSICAL network-operation ledger — three
+# separate append-only tables (operations / allocations / settlements),
+# not one mutable row. Re-exported so `Base.metadata` sees all three for
+# Alembic autogenerate/offline-render (`target_metadata`); without that,
+# a later autogenerate would read them as tables to DROP.
+# `NetworkOperation`/`NetworkOperationSettlement` are FLEET-owned and
+# carry NO `workspace_id` at all — deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`, and deliberately not
+# transitively scoped either (see the module docstring).
+# `NetworkOperationAllocation` IS workspace-owned and RLS'd; registering
+# it in `WORKSPACE_OWNED_MODELS` belongs with the C4 query paths that
+# will actually read it.
+from app_shared.models.network_operations import (
+    NetworkOperation,
+    NetworkOperationAllocation,
+    NetworkOperationSettlement,
+    NetworkTransport,
+    SettlementMethod,
+)
+
 __all__ = [
     "Base",
     "metadata",
@@ -234,4 +254,9 @@ __all__ = [
     "MatchAuditClassification",
     "DispatchIntent",
     "MatchCompetitorIdentifier",
+    "NetworkOperation",
+    "NetworkOperationAllocation",
+    "NetworkOperationSettlement",
+    "NetworkTransport",
+    "SettlementMethod",
 ]
