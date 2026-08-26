@@ -1,0 +1,78 @@
+{
+  "case_id": "stech_variant_match_by_sku",
+  "domain": "stech",
+  "category": "variant",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; 3 real variants, must resolve the exact SKU asked for, not the first one"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "HP Toner Multipack",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 10,
+          "sku": "SKU-A",
+          "barcode": "BAR-A",
+          "price": 5000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 11,
+          "sku": "SKU-B",
+          "barcode": "BAR-B",
+          "price": 6500,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 12,
+          "sku": "SKU-C",
+          "barcode": "BAR-C",
+          "price": 7200,
+          "compare_at_price": null,
+          "available": false,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    },
+    "variant_selector": {
+      "type": "sku",
+      "value": "SKU-B"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "SKU-B",
+      "title_contains": null
+    },
+    "current_price": "65.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

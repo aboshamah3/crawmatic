@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_baseline_compare_at_price_zero_treated_as_none",
+  "domain": "stech",
+  "category": "baseline",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; Shopify convention — compare_at_price of exactly 0 means 'not set', not a genuine old_price of 0.00 SAR"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Mouse Pad XL",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 2,
+          "sku": "MP-XL",
+          "barcode": "8801235",
+          "price": 1500,
+          "compare_at_price": 0,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "MP-XL",
+      "title_contains": null
+    },
+    "current_price": "15.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

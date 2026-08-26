@@ -1,0 +1,30 @@
+{
+  "case_id": "stech_real_hp_multipack_out_of_stock",
+  "domain": "stech",
+  "category": "baseline",
+  "synthetic": false,
+  "provenance": {
+    "source": "reused verbatim from Task B4 replay corpus (tests/fixtures/stech_30_targets/, 2026-08-25)",
+    "note": "genuinely available:false in the captured JSON — the 2026-08-24 canary's own NOT_LISTED label for this match_id is the pre-B4 bug this fixture regression-tests (B4 corrects it to 'resolved, out of stock', never a false delisting) — the sole variant is still resolvable and priced, just not purchasable"
+  },
+  "input": {
+    "kind": "shopify_json_file",
+    "path": "tests/fixtures/stech_30_targets/01a0255d-3dfc-759e-b3d4-bb3da0c18ac3/product.json"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "14636",
+      "title_contains": "HP Toner Original Multipack 131A"
+    },
+    "current_price": "1426.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "OUT_OF_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

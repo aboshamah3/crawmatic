@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_marketplace_vendor_field_is_not_seller",
+  "domain": "stech",
+  "category": "marketplace",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; the Shopify `vendor` field (brand, e.g. 'HP') is often mistaken for seller — on a single-merchant storefront like stech.ink, the seller is always the store itself, not the product vendor/brand"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "HP LaserJet Toner",
+      "handle": "hp-laserjet-toner",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 50,
+          "sku": "HP-TN-1",
+          "barcode": "HP-BAR-1",
+          "price": 8000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "HP-TN-1",
+      "title_contains": "HP LaserJet"
+    },
+    "current_price": "80.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

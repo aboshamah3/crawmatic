@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_baseline_discount_shown",
+  "domain": "amazon",
+  "category": "baseline",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; old_price is a real page fact the current CSS/JSON-LD extractors do not surface as a typed field (matched_text only) — expected non-None to document that 0% gap honestly"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Logitech MX Master 3S</title></head><body>\n<span id=\"productTitle\">Logitech MX Master 3S</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">349.00</span>\n<span class=\"a-price old-price a-text-price\" data-a-strike=\"true\"><span class=\"a-offscreen\">SAR 499.00</span></span>\n</div>\n<div id=\"availability\"><span>In Stock.</span></div>\n\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": "MX Master"
+    },
+    "current_price": "349.00",
+    "old_price": "499.00",
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

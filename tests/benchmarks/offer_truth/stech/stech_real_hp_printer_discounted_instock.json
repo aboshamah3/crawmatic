@@ -1,0 +1,30 @@
+{
+  "case_id": "stech_real_hp_printer_discounted_instock",
+  "domain": "stech",
+  "category": "baseline",
+  "synthetic": false,
+  "provenance": {
+    "source": "reused verbatim from Task B4 replay corpus (tests/fixtures/stech_30_targets/, 2026-08-25)",
+    "note": "real compare_at_price present — S-Tech is one of only two domains in this corpus (the other is Noon's sale_price/price pair) where old_price is a genuinely, correctly extractable field today"
+  },
+  "input": {
+    "kind": "shopify_json_file",
+    "path": "tests/fixtures/stech_30_targets/01a0255d-dfb6-7388-9ad6-30b833329727/product.json"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "15033",
+      "title_contains": "HP Printer LaserJet Tank"
+    },
+    "current_price": "964.00",
+    "old_price": "1200.00",
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

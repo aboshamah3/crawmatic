@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_adversarial_negative_price_rejected",
+  "domain": "stech",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, adversarial data corruption; a negative price must be rejected, never reported as negative SAR"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Corrupted Price Feed",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 110,
+          "sku": "NEG-1",
+          "barcode": "NEG-BAR",
+          "price": -5000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

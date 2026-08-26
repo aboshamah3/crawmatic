@@ -1,0 +1,30 @@
+{
+  "case_id": "noon_real_N13160063A_instock_discounted",
+  "domain": "noon",
+  "category": "baseline",
+  "synthetic": false,
+  "provenance": {
+    "source": "reused verbatim from Task B5b certification set (2026-08-25, proxy-captured); ground truth cross-checked against the fixture's own expected.json (price=205.45, currency=SAR, is_buyable_expected=true)"
+  },
+  "input": {
+    "kind": "platform_json_file",
+    "path": "tests/fixtures/noon_labeled/N13160063A/product.json",
+    "sku_query": "N13160063A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N13160063A",
+      "title_contains": "Original Laserjet Toner Cartridge CF411A"
+    },
+    "current_price": "205.45",
+    "old_price": "619.00",
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

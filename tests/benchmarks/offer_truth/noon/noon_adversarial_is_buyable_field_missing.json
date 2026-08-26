@@ -1,0 +1,45 @@
+{
+  "case_id": "noon_adversarial_is_buyable_field_missing",
+  "domain": "noon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; malformed/older payload shape omitting is_buyable entirely — stock must read UNKNOWN, never be guessed IN_STOCK by the field's absence"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000028A",
+          "catalog_sku": "N90000028A",
+          "sku_config": "N90000028A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Missing Buyable Flag",
+          "price": 75.0,
+          "sale_price": null,
+          "url": "missing-buyable-flag"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000028A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000028A",
+      "title_contains": null
+    },
+    "current_price": "75.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "UNKNOWN",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "case_id": "noon_baseline_not_listed",
+  "domain": "noon",
+  "category": "baseline",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; nbHits=0 — mirrors the real not_listed_reconfirmed.json pattern"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [],
+      "nbHits": 0
+    },
+    "sku_query": "N90000003A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "case_id": "noon_adversarial_price_missing_field_entirely",
+  "domain": "noon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, malformed payload; the price key is entirely absent from the hit (not null — absent) — must not KeyError, must decline rather than crash"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000032A",
+          "catalog_sku": "N90000032A",
+          "sku_config": "N90000032A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "No Price Key",
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "no-price-key"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000032A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

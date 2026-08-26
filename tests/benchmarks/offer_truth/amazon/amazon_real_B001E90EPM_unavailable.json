@@ -1,0 +1,37 @@
+{
+  "case_id": "amazon_real_B001E90EPM_unavailable",
+  "domain": "amazon",
+  "category": "baseline",
+  "synthetic": false,
+  "provenance": {
+    "source": "reused verbatim from Task B5 certification set (2026-08-25)",
+    "note": "real amazon.sa direct capture, genuinely unavailable; see tests/fixtures/amazon_labeled/FIXTURES.md"
+  },
+  "input": {
+    "kind": "html_file",
+    "path": "tests/fixtures/amazon_labeled/B001E90EPM/product.html",
+    "profile": {
+      "price_selector": "#corePrice_feature_div .a-offscreen",
+      "currency_selector": null,
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "B001E90EPM",
+      "title_contains": "SCX-R6555A"
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": "OUT_OF_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

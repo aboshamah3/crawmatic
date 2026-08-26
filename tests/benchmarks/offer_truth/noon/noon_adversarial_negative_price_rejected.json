@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_adversarial_negative_price_rejected",
+  "domain": "noon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, adversarial data corruption; a negative price must be rejected rather than reported as a negative SAR amount"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000029A",
+          "catalog_sku": "N90000029A",
+          "sku_config": "N90000029A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Corrupted Price Feed",
+          "price": -50.0,
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "corrupted-price-feed"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000029A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

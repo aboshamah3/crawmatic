@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_adversarial_price_shown_despite_oos_text",
+  "domain": "amazon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; conflicting page signals — a price node is still rendered while the availability text says unavailable (common on Amazon 'currently unavailable' pages that keep a cached price node) — stock must read OUT_OF_STOCK from its own selector regardless of the price node's presence"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Conflicting Signal Listing</title></head><body>\n<span id=\"productTitle\">Conflicting Signal Listing</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">129.00</span>\n\n</div>\n<div id=\"availability\"><span>Currently unavailable. We don't know when or if this item will be back in stock.</span></div>\n\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": "129.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "OUT_OF_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

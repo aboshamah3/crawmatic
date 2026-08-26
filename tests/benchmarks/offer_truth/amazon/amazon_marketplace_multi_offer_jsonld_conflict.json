@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_marketplace_multi_offer_jsonld_conflict",
+  "domain": "amazon",
+  "category": "marketplace",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; JSON-LD offers[] lists a 3rd-party marketplace offer priced far from the live buy-box CSS price the shopper actually sees — extract_jsonld only reads offers[0], so JSON-LD alone would silently report the wrong seller's price without ranking"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Bosch Cordless Drill</title><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"Product\", \"name\": \"Bosch Cordless Drill\", \"offers\": [{\"@type\": \"Offer\", \"price\": \"899.00\", \"priceCurrency\": \"SAR\", \"availability\": \"https://schema.org/InStock\", \"seller\": {\"name\": \"ThirdPartyReseller\"}}, {\"@type\": \"Offer\", \"price\": \"450.00\", \"priceCurrency\": \"SAR\", \"availability\": \"https://schema.org/InStock\", \"seller\": {\"name\": \"Amazon.sa\"}}]}</script></head><body>\n<span id=\"productTitle\">Bosch Cordless Drill</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">450.00</span>\n\n</div>\n<div id=\"availability\"><span>In Stock.</span></div>\n\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": true,
+    "expect_no_price": false
+  }
+}

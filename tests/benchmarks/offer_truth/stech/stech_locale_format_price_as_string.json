@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_locale_format_price_as_string",
+  "domain": "stech",
+  "category": "locale_format",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; some Shopify JSON endpoints serialize price as a numeric string rather than an int — the extractor must handle both"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "String Price Item",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 61,
+          "sku": "SP-1",
+          "barcode": "SP-BAR",
+          "price": "9000",
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "SP-1",
+      "title_contains": null
+    },
+    "current_price": "90.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

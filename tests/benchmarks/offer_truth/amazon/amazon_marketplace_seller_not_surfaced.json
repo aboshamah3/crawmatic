@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_marketplace_seller_not_surfaced",
+  "domain": "amazon",
+  "category": "marketplace",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; CSS and JSON-LD agree on price/identity so this is a clean Winner, but the page also states a 3rd-party seller name and a shipping fee which no current strategy surfaces as a typed field — documents real 0%-recall gaps for `seller`/`shipping`/`landed_total` (landed_total = item_price 899.00 + shipping 15.00 = 914.00, the OfferObservation-style computed rule applied to this case's own ground truth, not something the extraction path itself computes)"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Philips Air Fryer XXL</title><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"Product\", \"name\": \"Philips Air Fryer XXL\", \"offers\": {\"@type\": \"Offer\", \"price\": \"899.00\", \"priceCurrency\": \"SAR\", \"availability\": \"https://schema.org/InStock\"}}</script></head><body>\n<span id=\"productTitle\">Philips Air Fryer XXL</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">899.00</span>\n\n</div>\n<div id=\"availability\"><span>In Stock.</span></div>\n<div id=\"merchant-info\">Sold by: GulfElectronicsTrading, Fulfilled by Amazon</div>\n<div id=\"shipping-info\">+ SAR 15.00 shipping</div>\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": "Air Fryer"
+    },
+    "current_price": "899.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "GulfElectronicsTrading",
+    "shipping": "15.00",
+    "coupon": null,
+    "landed_total": "914.00",
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

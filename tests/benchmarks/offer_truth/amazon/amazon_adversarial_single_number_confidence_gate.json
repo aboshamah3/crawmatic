@@ -1,0 +1,32 @@
+{
+  "case_id": "amazon_adversarial_single_number_confidence_gate",
+  "domain": "amazon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; no CSS/JSON-LD signal at all, exactly one bare visible number on the page — regex's SINGLE_NUMBER heuristic (confidence 0.40) must be gated out by POLICY_V1.min_confidence (0.75), never promoted to a Winner"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><body><p>Item #129 — call for availability.</p></body></html>",
+    "profile": {
+      "price_selector": null
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

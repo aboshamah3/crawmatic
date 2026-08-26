@@ -1,0 +1,30 @@
+{
+  "case_id": "stech_real_hp_ink_cyan_instock",
+  "domain": "stech",
+  "category": "baseline",
+  "synthetic": false,
+  "provenance": {
+    "source": "reused verbatim from Task B4 replay corpus (tests/fixtures/stech_30_targets/, 2026-08-25)",
+    "note": "price 9000 minor units / 100 = 90.00 SAR; single variant, resolved via B4's sole-variant fallback rule"
+  },
+  "input": {
+    "kind": "shopify_json_file",
+    "path": "tests/fixtures/stech_30_targets/01a0255c-eb29-7cfd-902e-c782117b2866/product.json"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "13389",
+      "title_contains": "HP Ink Original Cyan 903XL"
+    },
+    "current_price": "90.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

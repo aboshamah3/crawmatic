@@ -1,0 +1,30 @@
+{
+  "case_id": "amazon_adversarial_redos_shaped_regex_refused",
+  "domain": "amazon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "exercises app_shared.strategy.candidate_ranking.search_bounded directly (not through extract_regex, which has no ReDoS guard of its own) — a nested-unbounded-repeat pattern must be refused, never actually run"
+  },
+  "input": {
+    "kind": "redos_direct",
+    "pattern": "(a+)+$",
+    "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

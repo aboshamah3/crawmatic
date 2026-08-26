@@ -51,6 +51,7 @@ from sqlalchemy import (
     Uuid,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.enums import (
@@ -114,6 +115,98 @@ class PriceObservation(Base, WorkspaceScopedBase):
         Numeric(precision=5, scale=4), nullable=True
     )
     selector_used: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    # --- EPA W3.1 (2026-08-26, READY-012): OfferObservation superset -----
+    # persisted alongside the SPEC-07 columns above, not replacing them.
+    # See `app_shared.observations.offer_observation.OfferObservation` for
+    # the pydantic contract these columns back; that model is the
+    # validation/serialization boundary, this table is the storage. All
+    # `offer_*` and never a bare name already used above so a reader of
+    # `\d price_observations` can tell which columns are the W3.1 addition
+    # at a glance. Every column is NULLABLE by design (§7: unknown = NULL,
+    # never 0/""): a pre-W3.1 row and any observation missing a fact are
+    # both legitimately absent here, not zero.
+    #
+    # Money fields reuse `app_shared.money.Money` (`NUMERIC(18,4)`, exact
+    # `Decimal`, never float) — the SAME contract `price`/`old_price`
+    # above already use — rather than the scaled-integer "minor units"
+    # convention `app_shared.models.network_operations` introduced for
+    # provider-cost accounting; see `offer_observation.py`'s
+    # `_MONEY_FIELD_NAMES` comment for why those are different contracts
+    # and this table deliberately doesn't mix them.
+    offer_source_url: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_canonical_url: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_domain: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_market: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_source_timezone: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    # Expected vs. observed product identity (IdentityFacet, JSON) —
+    # compound/optional-per-subfield, so JSONB (the codebase's existing
+    # convention for flexible sub-structures: `scrape_profiles.headers`,
+    # `webhook_events.payload`) rather than ~9 more scalar columns each.
+    offer_expected_identity: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
+    offer_observed_identity: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
+
+    offer_seller_name: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Free text, not `enum_column` — same "gain a value without a
+    #: migration" posture `network_operations.identity_confidence`/
+    #: `comparability` already use for this table's sibling ledger.
+    #: Validated against `OfferObservation`'s local `str` typing at the
+    #: pydantic boundary, not by a DB CHECK.
+    offer_seller_type: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_fulfillment: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_condition: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    offer_item_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    offer_list_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    offer_shipping_cost: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    offer_tax_included: Mapped[bool | None] = mapped_column(Boolean(), nullable=True)
+    offer_fees: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    offer_deposit: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    offer_unit_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    #: Computed by `OfferObservation`, never caller-supplied — see that
+    #: model's `_compute_landed_total`. Persisted so a reader of this
+    #: table doesn't have to re-derive it from the components above.
+    offer_landed_total: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+
+    #: PromotionFacts, JSON — same JSONB rationale as the identity facets
+    #: above. Money sub-fields inside are serialized as exact decimal
+    #: strings (pydantic's default JSON encoding for `Decimal`), never as
+    #: a JSON float, so §19 holds inside the JSONB payload too.
+    offer_promotion_facts: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
+
+    #: Free text, validated against `app_shared.enums.AccessMethod` at the
+    #: pydantic boundary (reused for validation only — this table doesn't
+    #: gain a DB dependency on that enum's exact members).
+    offer_access_method: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_profile_version: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_parser_version: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Content hash resolvable through
+    #: `app_shared.observations.evidence_store.resolve_hash`/`replay`.
+    offer_raw_evidence_hash: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_strategy: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    # Confidence, broken out per dimension (§7) — `extraction_confidence`
+    # above already covers the `extraction` dimension; these three are
+    # the remaining dimensions, each `Numeric(5,4)` like it (a fraction
+    # in [0, 1], never Money).
+    offer_discovery_confidence: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=5, scale=4), nullable=True
+    )
+    offer_identity_confidence: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=5, scale=4), nullable=True
+    )
+    offer_comparability_confidence: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=5, scale=4), nullable=True
+    )
+    #: list[str], JSON — an ordered/repeatable set of reason codes, not a
+    #: single categorical value, so JSONB rather than Text.
+    offer_validation_reasons: Mapped[list | None] = mapped_column(JSONB(), nullable=True)
+
+    offer_expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    offer_comparability_class: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_rejection_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    offer_human_review_required: Mapped[bool | None] = mapped_column(Boolean(), nullable=True)
 
 
 class RequestAttempt(Base, WorkspaceScopedBase):

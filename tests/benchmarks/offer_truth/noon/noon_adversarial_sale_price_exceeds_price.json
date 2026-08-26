@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_adversarial_sale_price_exceeds_price",
+  "domain": "noon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, adversarial data quality; sale_price GREATER than price is nonsensical for a discount — the resolver treats this as an untrustworthy pairing and declines rather than reporting an inverted discount as fact"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000030A",
+          "catalog_sku": "N90000030A",
+          "sku_config": "N90000030A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Inverted Discount Feed",
+          "price": 50.0,
+          "sale_price": 75.0,
+          "is_buyable": true,
+          "url": "inverted-discount-feed"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000030A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": true,
+    "expect_no_price": false
+  }
+}

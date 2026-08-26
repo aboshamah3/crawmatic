@@ -1,0 +1,58 @@
+{
+  "case_id": "noon_variant_ambiguous_generic_query",
+  "domain": "noon",
+  "category": "variant",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; the query names the base catalog_sku, which matches BOTH variant sku_configs — genuinely ambiguous which variant was meant, must not guess"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000021A-S",
+          "catalog_sku": "N90000021A",
+          "sku_config": "N90000021A-S",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Adidas Hoodie (Small)",
+          "price": 249.0,
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "adidas-hoodie-(small)"
+        },
+        {
+          "sku": "N90000021A-L",
+          "catalog_sku": "N90000021A",
+          "sku_config": "N90000021A-L",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Adidas Hoodie (Large)",
+          "price": 249.0,
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "adidas-hoodie-(large)"
+        }
+      ],
+      "nbHits": 2
+    },
+    "sku_query": "N90000021A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": true,
+    "expect_no_price": false
+  }
+}

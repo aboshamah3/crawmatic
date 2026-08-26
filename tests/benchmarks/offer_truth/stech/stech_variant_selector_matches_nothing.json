@@ -1,0 +1,68 @@
+{
+  "case_id": "stech_variant_selector_matches_nothing",
+  "domain": "stech",
+  "category": "variant",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a stale/legacy identifier that matches no current variant on a multi-variant product — must not fall back to any of them"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Router Model X (Color Variants)",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 40,
+          "sku": "RTR-BLK",
+          "barcode": "RTR-BAR-1",
+          "price": 25000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 41,
+          "sku": "RTR-WHT",
+          "barcode": "RTR-BAR-2",
+          "price": 25000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    },
+    "variant_selector": {
+      "type": "sku",
+      "value": "RTR-DISCONTINUED-2024"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": true,
+    "expect_no_price": false
+  }
+}

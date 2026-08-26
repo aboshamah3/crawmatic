@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_baseline_simple_instock",
+  "domain": "stech",
+  "category": "baseline",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; single variant, clean baseline"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "USB-C Cable 2m",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 1,
+          "sku": "U2M-001",
+          "barcode": "8801234",
+          "price": 2500,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "U2M-001",
+      "title_contains": "USB-C Cable"
+    },
+    "current_price": "25.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

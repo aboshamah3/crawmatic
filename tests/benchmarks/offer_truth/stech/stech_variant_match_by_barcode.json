@@ -1,0 +1,68 @@
+{
+  "case_id": "stech_variant_match_by_barcode",
+  "domain": "stech",
+  "category": "variant",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; resolve by barcode instead of sku — the identifier is TYPED, per B4, never guessed by shape"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Ink Cartridge Set",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 20,
+          "sku": "SKU-X",
+          "barcode": "EAN-1111",
+          "price": 3000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 21,
+          "sku": "SKU-Y",
+          "barcode": "EAN-2222",
+          "price": 3500,
+          "compare_at_price": null,
+          "available": false,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    },
+    "variant_selector": {
+      "type": "barcode",
+      "value": "EAN-2222"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "EAN-2222",
+      "title_contains": null
+    },
+    "current_price": "35.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "OUT_OF_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

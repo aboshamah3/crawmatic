@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_baseline_discount_active",
+  "domain": "noon",
+  "category": "baseline",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; sale_price present — this is the one extraction path in the whole corpus that CAN legitimately surface a real old_price (price) alongside the discounted current_price (sale_price)"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000001A",
+          "catalog_sku": "N90000001A",
+          "sku_config": "N90000001A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Nescafe Gold 200g",
+          "price": 45.0,
+          "sale_price": 32.5,
+          "is_buyable": true,
+          "url": "nescafe-gold-200g"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000001A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000001A",
+      "title_contains": "Nescafe"
+    },
+    "current_price": "32.50",
+    "old_price": "45.00",
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

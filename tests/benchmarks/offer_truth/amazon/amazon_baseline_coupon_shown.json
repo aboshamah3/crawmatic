@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_baseline_coupon_shown",
+  "domain": "amazon",
+  "category": "baseline",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a clean, agreeing CSS+JSON-LD Winner, but the page also carries a clip-coupon banner which no current strategy surfaces as a typed field — documents a real 0%-recall gap for `coupon`"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Braun Electric Shaver</title><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"Product\", \"name\": \"Braun Electric Shaver\", \"offers\": {\"@type\": \"Offer\", \"price\": \"299.00\", \"priceCurrency\": \"SAR\", \"availability\": \"https://schema.org/InStock\"}}</script></head><body>\n<span id=\"productTitle\">Braun Electric Shaver</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">299.00</span>\n</div>\n<div id=\"availability\"><span>In Stock.</span></div>\n<div id=\"coupon-banner\">Clip 10% off coupon, applies at checkout</div>\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": "Electric Shaver"
+    },
+    "current_price": "299.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": "10% off coupon",
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

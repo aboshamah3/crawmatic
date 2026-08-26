@@ -1,0 +1,68 @@
+{
+  "case_id": "stech_bundle_size_variant_correct_pack_selected",
+  "domain": "stech",
+  "category": "bundle",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; pack-size modeled as Shopify variants (Pack of 1 / Pack of 3) at different prices — a legitimate, non-ambiguous variant resolution when a real selector is supplied"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Ink Cartridge (Pack Options)",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 80,
+          "sku": "INK-1PK",
+          "barcode": "INK-BAR-1",
+          "price": 4000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Pack of 1",
+          "option1": "Default Title"
+        },
+        {
+          "id": 81,
+          "sku": "INK-3PK",
+          "barcode": "INK-BAR-3",
+          "price": 10500,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Pack of 3",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    },
+    "variant_selector": {
+      "type": "sku",
+      "value": "INK-3PK"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "INK-3PK",
+      "title_contains": null
+    },
+    "current_price": "105.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

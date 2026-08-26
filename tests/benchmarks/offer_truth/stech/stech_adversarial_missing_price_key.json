@@ -1,0 +1,53 @@
+{
+  "case_id": "stech_adversarial_missing_price_key",
+  "domain": "stech",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, malformed payload; the price key is entirely absent from the variant dict — must not KeyError, must decline"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "No Price Key",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 120,
+          "sku": "NPK-1",
+          "barcode": "NPK-BAR",
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

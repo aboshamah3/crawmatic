@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_adversarial_available_as_string_true",
+  "domain": "stech",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, adversarial data shape; available given as the STRING 'true' rather than a JSON boolean — must be interpreted correctly, not just truthy-checked (which would also (wrongly) accept the string 'false')"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "String Bool True",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 90,
+          "sku": "SB-TRUE",
+          "barcode": "SB-BAR-1",
+          "price": 2000,
+          "compare_at_price": null,
+          "available": "true",
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "SB-TRUE",
+      "title_contains": null
+    },
+    "current_price": "20.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

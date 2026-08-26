@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_adversarial_price_null_sale_price_only",
+  "domain": "noon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; price is null but sale_price is present — current_price must come from sale_price, and old_price must stay honestly None (the true original price is unknown, not the same number as sale_price)"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000027A",
+          "catalog_sku": "N90000027A",
+          "sku_config": "N90000027A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Null Price Field",
+          "price": null,
+          "sale_price": 59.0,
+          "is_buyable": true,
+          "url": "null-price-field"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000027A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000027A",
+      "title_contains": null
+    },
+    "current_price": "59.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

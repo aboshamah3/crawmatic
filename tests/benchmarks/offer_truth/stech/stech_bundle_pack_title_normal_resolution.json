@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_bundle_pack_title_normal_resolution",
+  "domain": "stech",
+  "category": "bundle",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a bundle-titled single-variant product — normal resolution, landed_total honestly left unclaimed"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "HP Toner Original Multipack (4-Color Set)",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 70,
+          "sku": "MULTI-4C",
+          "barcode": "MULTI-BAR",
+          "price": 18000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "MULTI-4C",
+      "title_contains": "Multipack"
+    },
+    "current_price": "180.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

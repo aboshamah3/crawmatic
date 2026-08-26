@@ -11,6 +11,25 @@ Public surface re-exported here (T042) so callers import from
 
 from __future__ import annotations
 
+from app_shared.strategy.candidate_ranking import (
+    POLICY_V1,
+    Candidate,
+    CandidateCollection,
+    CandidateIdentity,
+    Conflict,
+    FetchEnvelope,
+    NoValid,
+    RankedResult,
+    RankingPolicy,
+    Rejection,
+    RejectionReason,
+    SourceTier,
+    Winner,
+    collect_candidates,
+    enforce_fetch_limits,
+    rank,
+    search_bounded,
+)
 from app_shared.strategy.flush import (
     FlushResult,
     StrategyTransition,
@@ -61,6 +80,24 @@ from app_shared.strategy.stats_buffer import (
 )
 
 __all__ = [
+    # candidate collection + ranking (W3.2, READY-012)
+    "POLICY_V1",
+    "Candidate",
+    "CandidateCollection",
+    "CandidateIdentity",
+    "Conflict",
+    "FetchEnvelope",
+    "NoValid",
+    "RankedResult",
+    "RankingPolicy",
+    "Rejection",
+    "RejectionReason",
+    "SourceTier",
+    "Winner",
+    "collect_candidates",
+    "enforce_fetch_limits",
+    "rank",
+    "search_bounded",
     # promotion
     "MethodStats",
     "PromotionDecision",

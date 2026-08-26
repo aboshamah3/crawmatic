@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_stale_structured_data_nonmaterial_rounding",
+  "domain": "amazon",
+  "category": "stale_structured_data",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; JSON-LD and CSS differ by a cent (rounding), well inside POLICY_V1 tolerance — must resolve to a Winner, not a Conflict"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Xiaomi Mi Band 8</title><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"Product\", \"name\": \"Xiaomi Mi Band 8\", \"offers\": {\"@type\": \"Offer\", \"price\": \"99.00\", \"priceCurrency\": \"SAR\", \"availability\": \"https://schema.org/InStock\"}}</script></head><body>\n<span id=\"productTitle\">Xiaomi Mi Band 8</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">99.01</span>\n\n</div>\n<div id=\"availability\"><span>In Stock.</span></div>\n\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": "Mi Band"
+    },
+    "current_price": "99.01",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

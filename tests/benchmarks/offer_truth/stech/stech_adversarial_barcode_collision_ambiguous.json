@@ -1,0 +1,68 @@
+{
+  "case_id": "stech_adversarial_barcode_collision_ambiguous",
+  "domain": "stech",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, adversarial data integrity issue; two variants on the same product share an identical barcode — a selector by that barcode is genuinely ambiguous and must not silently pick either one"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Barcode Collision Item",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 100,
+          "sku": "BC-1",
+          "barcode": "DUPLICATE-EAN",
+          "price": 3000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 101,
+          "sku": "BC-2",
+          "barcode": "DUPLICATE-EAN",
+          "price": 3300,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    },
+    "variant_selector": {
+      "type": "barcode",
+      "value": "DUPLICATE-EAN"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": true,
+    "expect_no_price": false
+  }
+}

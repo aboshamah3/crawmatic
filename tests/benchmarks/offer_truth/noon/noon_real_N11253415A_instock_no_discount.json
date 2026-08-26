@@ -1,0 +1,30 @@
+{
+  "case_id": "noon_real_N11253415A_instock_no_discount",
+  "domain": "noon",
+  "category": "baseline",
+  "synthetic": false,
+  "provenance": {
+    "source": "reused verbatim from Task B5b certification set (2026-08-25, proxy-captured)"
+  },
+  "input": {
+    "kind": "platform_json_file",
+    "path": "tests/fixtures/noon_labeled/N11253415A/product.json",
+    "sku_query": "N11253415A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N11253415A",
+      "title_contains": "MLT-D111S"
+    },
+    "current_price": "349.25",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

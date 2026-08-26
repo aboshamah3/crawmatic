@@ -1,0 +1,47 @@
+{
+  "case_id": "noon_adversarial_non_saudi_storefront_currency_gap",
+  "domain": "noon",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; documents a REAL, known limitation — this benchmark's Noon PLATFORM_JSON shim hardcodes SAR (matching every real B5b capture, all __cr.sa-targeted) because the payload itself carries no currency field at all; a hit genuinely from a non-Saudi Noon storefront (market='AE') would be silently mislabeled SAR. Expected here is the TRUE currency (AED) so the scored report shows this as a real miss, not a false pass."
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000031A",
+          "catalog_sku": "N90000031A",
+          "sku_config": "N90000031A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "UAE Storefront Item",
+          "price": 100.0,
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "uae-storefront-item"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000031A",
+    "market": "AE"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000031A",
+      "title_contains": null
+    },
+    "current_price": "100.00",
+    "old_price": null,
+    "currency": "AED",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

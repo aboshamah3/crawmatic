@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_bundle_discounted_pack",
+  "domain": "noon",
+  "category": "bundle",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a discounted multi-pack — exercises the same real sale_price/price old-price signal as noon_baseline_discount_active, on a bundle-titled item"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000025A",
+          "catalog_sku": "N90000025A",
+          "sku_config": "N90000025A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Toner 3-Pack Bundle",
+          "price": 250.0,
+          "sale_price": 199.0,
+          "is_buyable": true,
+          "url": "toner-3-pack-bundle"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000025A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000025A",
+      "title_contains": "3-Pack"
+    },
+    "current_price": "199.00",
+    "old_price": "250.00",
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

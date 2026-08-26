@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_locale_format_price_as_grouped_string",
+  "domain": "noon",
+  "category": "locale_format",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; price serialized as a clean US-grouped numeric STRING rather than a JSON number — must still parse through normalize_price_text"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000023A",
+          "catalog_sku": "N90000023A",
+          "sku_config": "N90000023A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "TV 65-inch",
+          "price": "1,299.00",
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "tv-65-inch"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000023A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000023A",
+      "title_contains": null
+    },
+    "current_price": "1299.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

@@ -6,3 +6,18 @@
 #
 # EMPTY BY DESIGN: the tracked-file gate returned zero findings on this
 # repository on 2026-08-25, so every future finding here is a new one.
+
+# 2026-08-26 (EPA W3 commit; W5 review MED-1) — the first entry, and the
+# reason the note above now reads "was empty". The W3.3 offer-extraction
+# benchmark corpus became tracked in this commit, and one of its 64 cases
+# trips the gate's tier-2 name HINT: `*key*` matches, and `.json` is in
+# neither CODE_EXT nor MEDIA_EXT, so the extension escape does not apply.
+#
+# It provably holds no credential. The "key" is a JSON dict key: the case
+# asserts that a Shopify-shaped variant payload with the `price` key
+# ENTIRELY ABSENT declines cleanly instead of raising KeyError. The file is
+# `"synthetic": true` throughout — a hand-written title/handle/vendor, one
+# variant with sku `NPK-1`, and an all-null expected outcome. There is no
+# secret material of any kind in it, and none can be introduced without
+# changing what the case tests.
+tests/benchmarks/offer_truth/stech/stech_adversarial_missing_price_key.json

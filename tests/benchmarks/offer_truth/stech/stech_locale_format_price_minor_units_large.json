@@ -1,0 +1,54 @@
+{
+  "case_id": "stech_locale_format_price_minor_units_large",
+  "domain": "stech",
+  "category": "locale_format",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a large minor-unit integer, verifying exact Decimal(cents)/Decimal(100) conversion with no binary-float rounding drift"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "Server Rack Cabinet",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 60,
+          "sku": "RACK-42U",
+          "barcode": "RACK-BAR",
+          "price": 1234599,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "RACK-42U",
+      "title_contains": null
+    },
+    "current_price": "12345.99",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": "S-Tech",
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

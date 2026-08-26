@@ -1,0 +1,43 @@
+{
+  "case_id": "stech_adversarial_empty_variants_array",
+  "domain": "stech",
+  "category": "adversarial",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic, malformed/edge payload; variants=[] entirely — must decline cleanly, never index-error"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "No Variants At All",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": true
+  }
+}

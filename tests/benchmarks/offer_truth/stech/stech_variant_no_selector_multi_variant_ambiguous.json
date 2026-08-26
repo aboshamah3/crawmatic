@@ -1,0 +1,74 @@
+{
+  "case_id": "stech_variant_no_selector_multi_variant_ambiguous",
+  "domain": "stech",
+  "category": "variant",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a multi-variant product with NO typed identifier supplied — per B4, the sole-variant fallback only applies to single-variant products; with several variants and nothing to disambiguate, this is Ambiguous, never a guess at variant[0]"
+  },
+  "input": {
+    "kind": "shopify_json_inline",
+    "json": {
+      "title": "T-Shirt (Size Variants)",
+      "handle": "test-product",
+      "vendor": "Generic",
+      "variants": [
+        {
+          "id": 30,
+          "sku": "TS-S",
+          "barcode": "TS-BAR-S",
+          "price": 4000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 31,
+          "sku": "TS-M",
+          "barcode": "TS-BAR-M",
+          "price": 4000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        },
+        {
+          "id": 32,
+          "sku": "TS-L",
+          "barcode": "TS-BAR-L",
+          "price": 4000,
+          "compare_at_price": null,
+          "available": true,
+          "title": "Default Title",
+          "option1": "Default Title"
+        }
+      ],
+      "options": [
+        {
+          "name": "Title",
+          "position": 1,
+          "values": [
+            "Default Title"
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": null,
+    "old_price": null,
+    "currency": null,
+    "stock": null,
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": true,
+    "expect_no_price": false
+  }
+}

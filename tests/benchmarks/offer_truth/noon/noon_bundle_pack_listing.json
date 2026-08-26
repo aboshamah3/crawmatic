@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_bundle_pack_listing",
+  "domain": "noon",
+  "category": "bundle",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; a multi-pack listing — normal single-hit resolution, landed_total honestly left unclaimed (no shipping/fees signal in this payload shape)"
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000024A",
+          "catalog_sku": "N90000024A",
+          "sku_config": "N90000024A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "AA Batteries Pack of 20",
+          "price": 39.0,
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "aa-batteries-pack-of-20"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000024A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000024A",
+      "title_contains": "Pack of 20"
+    },
+    "current_price": "39.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

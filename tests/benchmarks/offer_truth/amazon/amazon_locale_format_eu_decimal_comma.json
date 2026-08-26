@@ -1,0 +1,36 @@
+{
+  "case_id": "amazon_locale_format_eu_decimal_comma",
+  "domain": "amazon",
+  "category": "locale_format",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; EU-style grouping (dot thousands, comma decimal) through the real normalize_price_text boundary"
+  },
+  "input": {
+    "kind": "html_inline",
+    "html": "<html><head><title>Bosch Dishwasher</title></head><body>\n<span id=\"productTitle\">Bosch Dishwasher</span>\n<div id=\"corePrice_feature_div\">\n<span class=\"a-price-symbol\">SAR</span><span class=\"a-price-whole\">1.234,56</span>\n\n</div>\n<div id=\"availability\"><span>In Stock.</span></div>\n\n</body></html>",
+    "profile": {
+      "price_selector": ".a-price-whole",
+      "currency_selector": ".a-price-symbol",
+      "stock_selector": "#availability span",
+      "title_selector": "#productTitle",
+      "old_price_selector": ".old-price .a-offscreen"
+    }
+  },
+  "expected": {
+    "identity": {
+      "primary_id": null,
+      "title_contains": null
+    },
+    "current_price": "1234.56",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}

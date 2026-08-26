@@ -1,0 +1,46 @@
+{
+  "case_id": "noon_locale_format_arabic_indic_digits_accepted",
+  "domain": "noon",
+  "category": "locale_format",
+  "synthetic": true,
+  "provenance": {
+    "note": "synthetic; price rendered as an Arabic-Indic digit string instead of a JSON number. Originally authored expecting rejection ('no normalizer in this codebase maps Arabic-Indic digits') — corrected after running the benchmark: Python's stdlib decimal.Decimal actually parses Unicode decimal-digit categories natively (Decimal('١٢٩.٠٠') == Decimal('129.00')), so app_shared.money.parse_money accepts this string correctly through its normal Decimal(str) path. This is a genuinely useful finding surfaced BY running this benchmark against real code rather than assumption — the money boundary is more robust to Arabic-Indic input than its own docstring claims, and this case now documents that as a verified positive rather than an assumed gap."
+  },
+  "input": {
+    "kind": "platform_json_inline",
+    "json": {
+      "hits": [
+        {
+          "sku": "N90000022A",
+          "catalog_sku": "N90000022A",
+          "sku_config": "N90000022A",
+          "offer_code": "c5a56723d169876f",
+          "brand": "Generic",
+          "name": "Arabic-Indic Price Test",
+          "price": "١٢٩.٠٠",
+          "sale_price": null,
+          "is_buyable": true,
+          "url": "arabic-indic-price-test"
+        }
+      ],
+      "nbHits": 1
+    },
+    "sku_query": "N90000022A"
+  },
+  "expected": {
+    "identity": {
+      "primary_id": "N90000022A",
+      "title_contains": null
+    },
+    "current_price": "129.00",
+    "old_price": null,
+    "currency": "SAR",
+    "stock": "IN_STOCK",
+    "seller": null,
+    "shipping": null,
+    "coupon": null,
+    "landed_total": null,
+    "expect_conflict": false,
+    "expect_no_price": false
+  }
+}
