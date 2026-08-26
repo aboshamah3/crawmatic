@@ -139,6 +139,13 @@ class RefreshRule(Base, WorkspaceScopedBase, TimestampMixin):
             "next_run_at",
             postgresql_where=text("enabled"),
         ),
+        # EPA W4.2 owed revision (2026-08-26). See the `consecutive_failures`
+        # column docstring below for the full rationale.
+        Index(
+            "ix_refresh_rules_dead_lettered",
+            "dead_lettered_at",
+            postgresql_where=text("dead_lettered_at IS NOT NULL"),
+        ),
     )
 
     name: Mapped[str] = mapped_column(Text(), nullable=False)
@@ -170,3 +177,38 @@ class RefreshRule(Base, WorkspaceScopedBase, TimestampMixin):
     next_run_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     last_run_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     locked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+    # --- EPA W4.2 owed revision (2026-08-26) -------------------------------
+    # `app_shared.scheduling.fair_queue.RetryLedger` (W4.2, the scheduler's
+    # bounded-retry/dead-letter/replay pass) keeps its retry counters and
+    # dead-letter set IN-PROCESS today -- a deliberate, stated limitation
+    # (see that module's own "Durability" docstring section: "this task
+    # adds no migration ... See the PENDING-MIGRATION note in this task's
+    # report for the columns that would make the counter durable too").
+    # These four columns ARE that pending migration. Nothing in
+    # `fair_queue.py` reads or writes them yet -- the in-process
+    # `RetryLedger` fallback stays exactly as-is (out of scope here; only
+    # the model + migration land in this change) -- so a future change can
+    # make the retry counter and dead-letter decision survive a restart
+    # without a second migration.
+    #: Consecutive UNEXPECTED-exception failures since the last success
+    #: (mirrors `RetryLedger`'s in-process attempt counter). A denial
+    #: (`CostAuthorizationDenied` etc.) does NOT increment this, same
+    #: "a denial is not a poison" rule `fair_queue.default_denial_reason`
+    #: already encodes.
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default=text("0")
+    )
+    #: When the most recent failure happened (`NULL` = no failure since
+    #: the counter last reset).
+    last_failure_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: The most recent failure's message, truncated at the call site the
+    #: same way every other best-effort error string in this codebase is
+    #: (`opsmetrics.snapshot._section`'s 300-char truncation precedent) --
+    #: never a full traceback.
+    last_failure_error: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: When `RetryLedger.on_dead_letter` durably disabled this rule after
+    #: exhausting its retry bound (`NULL` = never dead-lettered). Indexed
+    #: partially (`ix_refresh_rules_dead_lettered`) for an operator's
+    #: "which rules are dead-lettered right now" query.
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)

@@ -105,12 +105,26 @@ from __future__ import annotations
 import logging
 import signal
 import time
+import uuid
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from types import FrameType
 
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
 from app_shared.config import Settings, get_settings
 from app_shared.config_validation import assert_production_safe
+from app_shared.costauth.service import CostAuthorizationService
 from app_shared.database import get_system_sessionmaker
+from app_shared.enums import (
+    ScrapeJobSource,
+    ScrapeJobType,
+    ScrapeScope,
+    WebhookEventType,
+)
+from app_shared.ids import new_uuid7
+from app_shared.jobs.service import create_scope_job
 from app_shared.maintenance.cadence import (
     claim_cadence,
     ensure_cadence_rows,
@@ -119,6 +133,8 @@ from app_shared.maintenance.cadence import (
 )
 from app_shared.maintenance.health import check_maintenance_health, log_health_report
 from app_shared.messaging import enqueue
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.models.cost_authorization import CostReservation, ReservationState
 from app_shared.models.maintenance_cadence import (
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
@@ -126,9 +142,26 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
 )
+from app_shared.models.refresh_rules import RefreshRule
 from app_shared.opsmetrics import collect_snapshot, emit_snapshot
+from app_shared.outbox.writer import write_outbox_message
+from app_shared.scheduling.cadence import compute_next_run_at
+from app_shared.scheduling.fair_queue import (
+    DEFAULT_DOMAIN_CONCURRENCY,
+    DEFAULT_FLEET_CONCURRENCY,
+    DEFAULT_MAX_ATTEMPTS,
+    DeadLetterRecord,
+    FairShare,
+    FleetLimits,
+    LiveUsage,
+    PassOutcome,
+    RetryLedger,
+    ScheduleCandidate,
+    run_pass,
+)
 from app_shared.task_names import (
     COSTAUTH_RESERVATION_SWEEP,
+    CREATE_WEBHOOK_EVENT,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
@@ -589,6 +622,490 @@ def _run_ops_snapshot_tick(settings: Settings) -> None:
         logger.exception("scheduler: ops snapshot tick failed")
 
 
+# ---------------------------------------------------------------------------
+# EPA W4.2 — two-plane limits + weighted fair queuing (report §6)
+# ---------------------------------------------------------------------------
+#
+# The pass below is an ALTERNATIVE due-rule pass, not a replacement of the
+# SPEC-13 one: it is gated by `SCHEDULER_FAIR_QUEUE_ENABLED`, which
+# defaults to False, so a deploy that merely takes this code changes no
+# live scheduling behaviour at all. Turning it on swaps the SPEC-13
+# refresh tick (`_run_refresh_pass_tick`) for `_run_fair_scheduling_tick`
+# on the SAME cadence knob and the SAME batch limit — no new interval.
+#
+# What it adds over `run_refresh_pass`:
+#
+# * a FLEET plane: a per-domain concurrency cap enforced ACROSS tenants,
+#   so two workspaces monitoring one merchant share that merchant's cap
+#   instead of multiplying it (the workspace-scoped multiplication of
+#   merchant traffic report §6 names);
+# * a TENANT plane: weighted deficit round robin, so a workspace with ten
+#   thousand due rules cannot consume the whole pass;
+# * per-item failure isolation with bounded retries and a dead letter, so
+#   one poison rule no longer aborts the pass for every other tenant (the
+#   `break` in `run_refresh_pass`'s except branch).
+#
+# The policy itself lives in `app_shared.scheduling.fair_queue`, which is
+# pure and deterministic; everything here is the thin I/O wiring —
+# reading occupancy, resolving domains, firing a rule, recording a dead
+# letter.
+
+
+def read_fleet_domain_usage(session: Session, now: datetime) -> LiveUsage:
+    """Live per-domain occupancy, read from C3's OWN reservations.
+
+    The fleet plane must be measured against something authoritative, and
+    C3 (`app_shared.costauth.service`) already holds exactly that: a
+    ``RESERVED`` reservation with an unexpired lease IS one unit of live,
+    paid-for work on that domain. Reading it here is what makes this a
+    *composition* with the single budget authority rather than a second
+    one — this module counts what C3 has granted; it never grants, never
+    reserves, and never settles.
+
+    "Live" is spelled the same way `CostAuthorizationService._check_
+    concurrency` spells it (``RESERVED`` **and** ``lease_expires_at >
+    now``), deliberately: a lapsed lease the sweeper has not reached yet
+    must not be able to wedge a domain, and the two definitions drifting
+    apart would silently change what the cap means.
+
+    Cross-tenant by nature, so it runs on the sanctioned BYPASSRLS system
+    session — the same seam, for the same reason, as `run_refresh_pass`'s
+    due-rule claim and the outbox drain.
+    """
+    rows = session.execute(
+        select(CostReservation.domain, func.count())  # noqa: workspace-scope
+        .where(
+            CostReservation.state == ReservationState.RESERVED,
+            CostReservation.lease_expires_at > now,
+        )
+        .group_by(CostReservation.domain)
+    ).all()
+    per_domain = {str(domain): int(count) for domain, count in rows}
+    return LiveUsage(per_domain=per_domain, total=sum(per_domain.values()))
+
+
+def load_due_candidates(
+    session: Session, *, now: datetime, limit: int
+) -> list[ScheduleCandidate]:
+    """Due `refresh_rules` as fair-queue candidates, with their domain resolved.
+
+    The domain is what the fleet plane keys on, so it is resolved in the
+    claim query rather than guessed: a ``COMPETITOR``-scope rule takes its
+    competitor's ``domain``, a ``MATCH``-scope rule takes the domain of
+    the competitor behind the match. Every other scope legitimately spans
+    several domains, and a scheduler-plane cap cannot bind a domain it
+    cannot name, so those become wildcard candidates — they still consume
+    fleet capacity and a fair-share slot, and their per-domain accounting
+    happens where the domain IS known: C3's per-batch authorization inside
+    dispatch.
+
+    Cross-tenant, sanctioned-unscoped, exactly like `run_refresh_pass`'s
+    own claim (which this replaces when the fair queue is enabled).
+
+    ``limit`` is deliberately larger than the pass's batch limit at the
+    call site: the planner needs to SEE the noisy tenant's backlog in
+    order to fairly not schedule most of it.
+    """
+    match_competitor = Competitor.__table__.alias("match_competitor")
+    rows = session.execute(
+        select(  # noqa: workspace-scope
+            RefreshRule,
+            func.coalesce(Competitor.domain, match_competitor.c.domain),
+        )
+        .select_from(RefreshRule)
+        .outerjoin(
+            Competitor,
+            (Competitor.workspace_id == RefreshRule.workspace_id)
+            & (Competitor.id == RefreshRule.competitor_id),
+        )
+        .outerjoin(
+            CompetitorProductMatch,
+            (CompetitorProductMatch.workspace_id == RefreshRule.workspace_id)
+            & (CompetitorProductMatch.id == RefreshRule.match_id),
+        )
+        .outerjoin(
+            match_competitor,
+            (match_competitor.c.workspace_id == CompetitorProductMatch.workspace_id)
+            & (match_competitor.c.id == CompetitorProductMatch.competitor_id),
+        )
+        .where(RefreshRule.enabled, RefreshRule.next_run_at <= now)
+        .order_by(RefreshRule.next_run_at, RefreshRule.id)
+        .limit(limit)
+    ).all()
+
+    candidates: list[ScheduleCandidate] = []
+    for rule, domain in rows:
+        # The cadence IS the freshness target: a rule that asks to run
+        # every 15 minutes is a rule whose data is stale after 15 minutes.
+        # Cron rules have no single interval, so they fall back to the
+        # no-target branch of `freshness_urgency` (hours overdue).
+        target = (
+            int(rule.interval_minutes) * 60
+            if rule.interval_minutes is not None
+            else None
+        )
+        candidates.append(
+            ScheduleCandidate(
+                key=str(rule.id),
+                workspace_id=str(rule.workspace_id),
+                domain=domain,
+                due_at=rule.next_run_at,
+                priority=int(rule.priority or 0),
+                last_success_at=rule.last_run_at,
+                freshness_target_seconds=target,
+                payload={"scope": rule.scope.value, "name": rule.name},
+            )
+        )
+    return candidates
+
+
+def fire_refresh_rule(
+    session: Session, *, rule_id: uuid.UUID | str, now: datetime
+) -> bool:
+    """Create + enqueue one due rule's job and advance its clock.
+
+    The per-rule half of `run_refresh_pass`, addressed by id instead of by
+    claim order, and holding the SAME row lock (``FOR UPDATE SKIP
+    LOCKED``) so two scheduler replicas cannot both fire one rule. Returns
+    False when the row is gone, disabled, or held by another claimant —
+    all three are ordinary, none is an error.
+
+    Enqueue-then-commit, like every other producer here: a crash between
+    them re-fires the rule, which the SPEC-08 idempotent dispatch guard
+    absorbs. Duplicates over misses.
+
+    Raises whatever `create_scope_job` raises. That is the point — the
+    caller (`app_shared.scheduling.fair_queue.execute_plan`) is what turns
+    a raising rule into a bounded retry and then a dead letter, instead of
+    into an aborted pass.
+    """
+    rule = (
+        session.execute(
+            select(RefreshRule)  # noqa: workspace-scope
+            .where(RefreshRule.id == _as_uuid(rule_id), RefreshRule.enabled)
+            .with_for_update(skip_locked=True)
+        )
+        .scalars()
+        .first()
+    )
+    if rule is None:
+        return False
+
+    target_id = _target_id_for_rule(rule)
+    create_scope_job(
+        session,
+        workspace_id=rule.workspace_id,
+        scope=rule.scope,
+        target_id=target_id,
+        requested_by=None,
+        job_type=ScrapeJobType.SCHEDULED,
+        source=ScrapeJobSource.SCHEDULER,
+    )
+    rule.last_run_at = now
+    rule.locked_at = now
+    rule.next_run_at = compute_next_run_at(rule, now)
+    session.commit()
+    return True
+
+
+def _target_id_for_rule(rule: RefreshRule) -> uuid.UUID | None:
+    """The non-null scope-target id for ``rule.scope`` (``None`` for WORKSPACE).
+
+    Same mapping as `app.scheduler.refresh._target_id_for_rule`; kept here
+    so this pass does not import the pass it replaces.
+    """
+    if rule.scope is ScrapeScope.WORKSPACE:
+        return None
+    if rule.scope is ScrapeScope.COMPETITOR:
+        return rule.competitor_id
+    if rule.scope is ScrapeScope.PRODUCT:
+        return rule.product_id
+    if rule.scope is ScrapeScope.VARIANT:
+        return rule.product_variant_id
+    if rule.scope is ScrapeScope.PRODUCT_GROUP:
+        return rule.product_group_id
+    if rule.scope is ScrapeScope.MATCH:
+        return rule.match_id
+    raise ValueError(f"unsupported scope {rule.scope!r}")
+
+
+def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+#: ``webhook_events.event_type`` announcing a dead-lettered scheduler item.
+SCHEDULER_DEAD_LETTER_EVENT_TYPE = WebhookEventType.SCHEDULER_ITEM_DEAD_LETTERED.value
+
+
+def record_dead_letter(
+    session_factory: Callable[[], Session], record: DeadLetterRecord
+) -> None:
+    """Make one dead letter DURABLE: disable the rule, announce the event.
+
+    Two writes in one transaction:
+
+    1. ``refresh_rules.enabled = false`` — the terminal decision itself.
+       ``enabled`` is the column the claim query already filters on and
+       the one an operator already understands, so a restart cannot
+       resurrect a rule this pass gave up on. This is the "existing store"
+       half of the fallback: the in-memory ledger holds the *attempt
+       count*, but the *outcome* lives in Postgres.
+    2. A transactional-outbox message on the EXISTING
+       ``webhook_events.create_webhook_event`` consumer, carrying
+       ``event_type = scheduler.item.dead_lettered``. No new task name is
+       invented (EPA B7's ruling: an outbox row naming a task nothing
+       consumes is a message that looks delivered and never is), and the
+       write is in the same transaction as the disable, so an operator
+       cannot be told about a rule that is still running or left unaware
+       of one that has stopped.
+
+    ``dedup_key`` includes the attempt count, so a rule that is replayed,
+    re-poisons and is dead-lettered again does announce a second time —
+    the partial unique index only collapses UNPUBLISHED duplicates of the
+    same crossing.
+
+    Errors are logged and swallowed: this is the ledger's ``on_dead_letter``
+    hook, and a sink that can raise into the pass would recreate exactly
+    the "one bad item stops everything" failure the dead letter exists to
+    remove.
+    """
+    try:
+        with session_factory() as session:
+            rule = (
+                session.execute(
+                    select(RefreshRule)  # noqa: workspace-scope
+                    .where(RefreshRule.id == _as_uuid(record.key))
+                    .with_for_update()
+                )
+                .scalars()
+                .first()
+            )
+            if rule is not None:
+                rule.enabled = False
+                rule.updated_at = record.dead_lettered_at
+            dedup_key = f"sched-dead-letter:{record.key}:{record.attempts}"
+            write_outbox_message(
+                session,
+                workspace_id=record.workspace_id,
+                task_name=CREATE_WEBHOOK_EVENT,
+                queue="webhook_events",
+                kwargs={
+                    "workspace_id": str(record.workspace_id),
+                    "event_type": SCHEDULER_DEAD_LETTER_EVENT_TYPE,
+                    "payload": {
+                        "refresh_rule_id": record.key,
+                        "domain": record.domain,
+                        "attempts": record.attempts,
+                        "last_error": record.last_error,
+                        "payload": dict(record.payload or {}),
+                    },
+                    "dedup_key": dedup_key,
+                    "event_id": str(new_uuid7()),
+                    "occurred_at": record.dead_lettered_at.isoformat(),
+                },
+                dedup_key=dedup_key,
+                now=record.dead_lettered_at,
+            )
+            session.commit()
+    except Exception:
+        logger.exception(
+            "scheduler: could not durably record dead letter for rule %s", record.key
+        )
+
+
+def replay_dead_letters(
+    session_factory: Callable[[], Session],
+    ledger: RetryLedger,
+    *,
+    keys: Sequence[str] | None = None,
+) -> list[str]:
+    """Replay tooling: un-park dead letters and re-enable their rules.
+
+    The inverse of :func:`record_dead_letter`, and the reason dead-
+    lettering is a safe thing to do automatically: an operator who has
+    fixed the underlying cause runs this and the rules resume on the next
+    pass with a clean attempt count.
+
+    ``keys=None`` replays everything. Returns the keys actually replayed
+    (a key that is not parked is skipped, not an error — replaying "all"
+    twice is a normal operator action).
+    """
+    parked = {record.key for record in ledger.dead_letters()}
+    wanted = parked if keys is None else [k for k in keys if k in parked]
+
+    replayed: list[str] = []
+    with session_factory() as session:
+        for key in wanted:
+            # Sanctioned unscoped access on the system seam, exactly like
+            # the pass's own due-rule claim: replay is operator tooling
+            # over a fleet-wide dead-letter set and is addressed by rule
+            # id, which is globally unique. Nothing but `enabled` is read
+            # or written, so no row content crosses a tenant boundary.
+            rule = (
+                session.execute(
+                    select(RefreshRule)  # noqa: workspace-scope
+                    .where(RefreshRule.id == _as_uuid(key))
+                )
+                .scalars()
+                .first()
+            )
+            if rule is not None:
+                rule.enabled = True
+            ledger.replay(key)
+            replayed.append(key)
+        session.commit()
+    if replayed:
+        logger.info("scheduler: replayed %d dead-lettered rule(s)", len(replayed))
+    return replayed
+
+
+def fair_queue_policy(settings: Settings) -> tuple[FleetLimits, FairShare]:
+    """The two planes' configured policy. Conservative defaults.
+
+    Weights are uniform: this repository has no per-workspace scheduling
+    tier to read them from, and inventing one (from plan name, spend, or
+    rule count) would be a product decision made in a scheduler. Uniform
+    weights are the honest default and already deliver the property the
+    contract asks for — no tenant starves another — because deficit round
+    robin with equal weights IS fair share. `FairShare.weights` is
+    threaded through so a caller with a real tier can supply it without
+    touching this module.
+    """
+    limits = FleetLimits(
+        default_domain_concurrency=int(
+            getattr(
+                settings,
+                "SCHEDULER_FAIR_QUEUE_DOMAIN_CONCURRENCY",
+                DEFAULT_DOMAIN_CONCURRENCY,
+            )
+        ),
+        fleet_concurrency=int(
+            getattr(
+                settings,
+                "SCHEDULER_FAIR_QUEUE_FLEET_CONCURRENCY",
+                DEFAULT_FLEET_CONCURRENCY,
+            )
+        ),
+    )
+    return limits, FairShare()
+
+
+def run_fair_scheduling_pass(
+    session_factory: Callable[[], Session],
+    *,
+    now: datetime,
+    batch_limit: int,
+    ledger: RetryLedger,
+    limits: FleetLimits | None = None,
+    share: FairShare | None = None,
+    gate: Callable[[ScheduleCandidate], object] | None = None,
+    candidate_multiplier: int = 10,
+) -> PassOutcome:
+    """One fair pass: load, plan under both planes, authorize, fire.
+
+    ``gate`` is the authorization seam and defaults to C3's NON-SPENDING
+    entitlement check (`CostAuthorizationService.assert_entitled`). That
+    choice is load-bearing: paid work in this engine is authorized and
+    reserved PER BATCH inside dispatch, where the domain, transport and
+    byte estimate are actually known, so a scheduler that called
+    `authorize()` here would reserve money against a request it is not the
+    one making — a second budget authority by accident. What the scheduler
+    plane legitimately owes is the one refusal that needs no batch: an
+    unentitled workspace's rules should not create jobs at all.
+
+    Ordering is fixed and is the contract: freshness urgency orders, the
+    two planes admit, the gate authorizes, and only then does anything
+    fire. An urgent item that the gate refuses appears in
+    ``outcome.denied`` and never in ``outcome.dispatched``.
+    """
+    with session_factory() as session:
+        usage = read_fleet_domain_usage(session, now)
+        candidates = load_due_candidates(
+            session, now=now, limit=max(batch_limit, batch_limit * candidate_multiplier)
+        )
+        session.rollback()
+
+    if gate is None:
+        service = CostAuthorizationService()
+
+        def gate(candidate: ScheduleCandidate) -> object:  # noqa: F811
+            service.assert_entitled(candidate.workspace_id)
+            return None
+
+    def dispatch(candidate: ScheduleCandidate, _grant: object) -> None:
+        with session_factory() as session:
+            fire_refresh_rule(session, rule_id=candidate.key, now=now)
+
+    outcome = run_pass(
+        candidates,
+        now=now,
+        batch_limit=batch_limit,
+        gate=gate,
+        dispatch=dispatch,
+        ledger=ledger,
+        limits=limits,
+        usage=usage,
+        share=share,
+    )
+    logger.info(
+        "scheduler: fair pass candidates=%d dispatched=%d denied=%d "
+        "retried=%d dead_lettered=%d deferred=%d",
+        len(candidates),
+        len(outcome.dispatched),
+        len(outcome.denied),
+        len(outcome.retried),
+        len(outcome.dead_lettered),
+        len(outcome.plan.deferred),
+    )
+    return outcome
+
+
+#: Process-wide retry ledger for the fair pass. Module-level because the
+#: attempt count must survive from one tick to the next within a process
+#: (a per-tick ledger would make "bounded retries" mean "retry forever,
+#: one attempt per pass"). It does NOT survive a restart — see the
+#: PENDING-MIGRATION note: the durable half of a dead letter is the
+#: disabled rule + the outbox event written by `record_dead_letter`.
+_FAIR_QUEUE_LEDGER: RetryLedger | None = None
+
+
+def _fair_queue_ledger(settings: Settings) -> RetryLedger:
+    global _FAIR_QUEUE_LEDGER
+    if _FAIR_QUEUE_LEDGER is None:
+        _FAIR_QUEUE_LEDGER = RetryLedger(
+            max_attempts=int(
+                getattr(
+                    settings, "SCHEDULER_FAIR_QUEUE_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS
+                )
+            ),
+            on_dead_letter=lambda record: record_dead_letter(
+                get_system_sessionmaker(), record
+            ),
+        )
+    return _FAIR_QUEUE_LEDGER
+
+
+def _run_fair_scheduling_tick(settings: Settings, batch_limit: int) -> None:
+    """One fair pass on the system sessionmaker; errors logged and swallowed.
+
+    Same posture as `_run_refresh_pass_tick`, which it replaces when
+    `SCHEDULER_FAIR_QUEUE_ENABLED` is on: a failed tick is retried on the
+    next poll interval and must never crash-loop the scheduler.
+    """
+    try:
+        limits, share = fair_queue_policy(settings)
+        run_fair_scheduling_pass(
+            get_system_sessionmaker(),
+            now=datetime.now(timezone.utc),
+            batch_limit=batch_limit,
+            ledger=_fair_queue_ledger(settings),
+            limits=limits,
+            share=share,
+        )
+    except Exception:
+        logger.exception("scheduler: fair scheduling pass failed")
+
+
 def main() -> None:
     # Audit §L1: refuse to boot when `ENVIRONMENT`/`RAILWAY_ENVIRONMENT_NAME`
     # says "production" and the resolved config still looks local-dev-shaped
@@ -619,6 +1136,12 @@ def main() -> None:
     cadence_poll_interval = settings.MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS
     health_interval = settings.MAINTENANCE_HEALTH_INTERVAL_SECONDS
     ops_snapshot_interval = settings.OPS_SNAPSHOT_INTERVAL_SECONDS
+    fair_queue_enabled = bool(getattr(settings, "SCHEDULER_FAIR_QUEUE_ENABLED", False))
+    if fair_queue_enabled:
+        logger.info(
+            "scheduler: due-rule pass is the W4.2 FAIR QUEUE "
+            "(two-plane limits + weighted round robin)"
+        )
 
     logger.info(
         "scheduler up (strategy_light_recheck + strategy_stats_flush + "
@@ -689,7 +1212,13 @@ def main() -> None:
             _enqueue_costauth_reservation_sweep()
         if refresh_elapsed >= refresh_interval:
             refresh_elapsed = 0.0
-            _run_refresh_pass_tick(refresh_batch_limit)
+            # EPA W4.2: the fair pass REPLACES the SPEC-13 pass on the same
+            # cadence and the same batch limit when enabled. Default off,
+            # so taking this code changes nothing until an operator says so.
+            if fair_queue_enabled:
+                _run_fair_scheduling_tick(settings, refresh_batch_limit)
+            else:
+                _run_refresh_pass_tick(refresh_batch_limit)
         # NOTE: this accumulator only decides how often we ASK the
         # database; the daily deadlines themselves live in
         # `maintenance_cadences`, so resetting it on restart costs at most

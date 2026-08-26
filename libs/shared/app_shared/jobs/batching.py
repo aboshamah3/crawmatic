@@ -85,6 +85,21 @@ class ResolvedTarget:
     #: domain+mode keep working — those simply plan one method's worth of
     #: work, which is what they were already doing implicitly.
     strategy_method: str = DEFAULT_STRATEGY_METHOD
+    #: EPA W4.3 (single-workspace same-URL coalescing, report §8): the
+    #: ledger's own canonical URL grouping key
+    #: (`app_shared.netledger.recorder.canonical_url_hash`), attached by
+    #: the caller — this module never computes or re-implements
+    #: canonicalization, and never reads this field itself.
+    #: `plan_batches`'s grouping key stays exactly `(competitor_domain,
+    #: mode, strategy_method)`; this field exists only so
+    #: `app_shared.jobs.coalescing.cluster_for_coalescing` can reorder
+    #: targets (behind `JOBS_COALESCING_ENABLED`) before they reach
+    #: `plan_batches`, so a same-URL cluster lands in one chunk instead of
+    #: splitting across a chunk boundary by accident of input order.
+    #: `None` for every pre-W4.3 construction site (including every
+    #: existing unit test) — a target with no attached identity is never
+    #: coalesced with anything (see `coalescing.cluster_for_coalescing`).
+    canonical_url_hash: str | None = None
 
 
 @dataclass(frozen=True)

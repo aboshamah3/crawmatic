@@ -53,6 +53,7 @@ from app_shared.jobs.batching import (
     ResolvedTarget,
     plan_batches,
 )
+from app_shared.jobs.coalescing import cluster_for_coalescing
 from app_shared.jobs.dispatch_intents import DispatchIntentStore
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
@@ -61,6 +62,7 @@ from app_shared.jobs.targets import Counts, aggregate_counts, mark_target
 from app_shared.messaging import enqueue
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
+from app_shared.netledger.recorder import canonical_url_hash
 from app_shared.models.domain_playbooks import DomainState
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
@@ -535,6 +537,15 @@ def _resolve_domains_and_modes(
                 competitor_domain=domain,
                 mode=mode,
                 strategy_method=_strategy_method_label(selected_method),
+                # EPA W4.3: the SAME canonicalization the network ledger
+                # groups on (`app_shared.netledger.recorder.
+                # canonical_url_hash`), never a second one. Attached
+                # unconditionally -- it is cheap and pure, and
+                # `plan_batches` never reads this field, so computing it
+                # here changes nothing about `plan_batches`'s output.
+                # Only `cluster_for_coalescing`, called behind
+                # `JOBS_COALESCING_ENABLED` below, ever reads it.
+                canonical_url_hash=canonical_url_hash(match.normalized_competitor_url),
             )
         )
 
@@ -648,8 +659,20 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             planning_generation += 1
             job.planning_generation = planning_generation
 
+        # EPA W4.3: reorder same-canonical-URL targets to be contiguous
+        # before chunking, so a cluster lands in one dispatch chunk
+        # instead of splitting across one by accident of input order
+        # (`app_shared.jobs.coalescing` module docstring). OFF by default
+        # (`JOBS_COALESCING_ENABLED`) -- when off this is a no-op and
+        # `plan_batches` receives `resolved_targets` in its original
+        # order, exactly as before W4.3.
+        planning_targets = (
+            cluster_for_coalescing(resolved_targets)
+            if settings.JOBS_COALESCING_ENABLED
+            else resolved_targets
+        )
         batches = plan_batches(
-            resolved_targets,
+            planning_targets,
             http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
             http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
             browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,
@@ -1170,8 +1193,15 @@ def recover_stalled_batches() -> None:
             # clock-derived string smuggled through `batch_index`.
             replan_generation = int(job.planning_generation or 0) + 1
             job.planning_generation = replan_generation
+            # EPA W4.3: same reordering as the primary dispatch path, same
+            # OFF-by-default no-op when `JOBS_COALESCING_ENABLED` is False.
+            replan_targets = (
+                cluster_for_coalescing(resolved_targets)
+                if settings.JOBS_COALESCING_ENABLED
+                else resolved_targets
+            )
             re_batches = plan_batches(
-                resolved_targets,
+                replan_targets,
                 http_min=settings.SCRAPE_DISPATCH_HTTP_BATCH_MIN,
                 http_max=settings.SCRAPE_DISPATCH_HTTP_BATCH_MAX,
                 browser_max=settings.SCRAPE_BATCH_BROWSER_MAX,

@@ -131,7 +131,12 @@ from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 # 2026-08-11 proxy-cost Fix 4: fully-global curated per-domain scraping
 # playbook (no workspace column at all — operator-seeded reference data;
 # see the model's module docstring). Not workspace-owned, no RLS.
-from app_shared.models.domain_playbooks import DomainPlaybook
+# `DomainLifecycleAudit` (EPA W4.1) is the append-only transition trail
+# for `domain_playbooks.state`. Re-exported alongside its parent so
+# `Base.metadata` reaches it through the same import every other model
+# uses, and so a reader of this registry sees the audit table exists —
+# it was previously importable only from the leaf module.
+from app_shared.models.domain_playbooks import DomainLifecycleAudit, DomainPlaybook
 
 # 2026-08-15 audit risk H3: durable (non-Redis) proxy-spend circuit
 # breaker state. Also fully global, no workspace column, no RLS — a
@@ -295,6 +300,7 @@ __all__ = [
     "VariantPriceDailyRollup",
     "WebhookEndpoint",
     "WebhookEvent",
+    "DomainLifecycleAudit",
     "DomainPlaybook",
     "ProxyBreakerState",
     "ProxyBreakerTrip",
