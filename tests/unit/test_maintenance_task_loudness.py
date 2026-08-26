@@ -187,3 +187,53 @@ print("OK")
 """
         )
     )
+
+
+def test_entitlement_refresh_runs_on_the_system_seam_and_reports_its_count() -> None:
+    """EPA go-live prep (2026-08-26). The task must open the BYPASSRLS
+    system session (the pass is cross-tenant under FORCE RLS), commit the
+    re-stamp, and log the row count — an INFO line that silently says
+    nothing is how an operator fails to notice that the C3 gate's
+    placeholder evidence has stopped being refreshed."""
+    _assert_ok(
+        _run(
+            """
+opened = []
+
+
+@contextmanager
+def _tracking_session(task_name):
+    opened.append(task_name)
+    yield _FakeSession()
+
+
+tasks_maintenance._system_session = _tracking_session
+tasks_maintenance.refresh_seeded_entitlements = lambda session, *, now: 7
+
+tasks_maintenance.entitlement_refresh()
+
+assert opened == ["entitlement_refresh"], opened
+info = _recorder.text(logging.INFO)
+assert "maintenance_entitlement_refresh rows_refreshed=7" in info, info
+print("OK")
+"""
+        )
+    )
+
+
+def test_entitlement_refresh_is_declared_fleet_scoped() -> None:
+    """One pass must see EVERY workspace's row, so the entry point is
+    FLEET — the same declaration, for the same reason, as the C3 lease
+    sweep it sits beside."""
+    _assert_ok(
+        _run(
+            """
+from app_shared.maintenance.scoping import MaintenanceScope, maintenance_scope_of
+from app_shared.task_names import MAINTENANCE_ENTITLEMENT_REFRESH
+
+assert tasks_maintenance.entitlement_refresh.name == MAINTENANCE_ENTITLEMENT_REFRESH
+assert maintenance_scope_of(tasks_maintenance.entitlement_refresh) is MaintenanceScope.FLEET
+print("OK")
+"""
+        )
+    )

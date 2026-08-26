@@ -585,6 +585,22 @@ class Settings(BaseSettings):
     PARTITION_CREATE_INTERVAL_SECONDS: int = 86400
     DAILY_ROLLUP_INTERVAL_SECONDS: int = 86400
     RETENTION_INTERVAL_SECONDS: int = 86400
+    # --- Seeded-entitlement staleness refresh (EPA go-live prep,
+    # 2026-08-26). How often the scheduler re-stamps `observed_at` on
+    # `workspace_entitlements` rows the seeder owns
+    # (`app_shared.costauth.entitlements.refresh_seeded_entitlements`).
+    #
+    # This is the ONE interval in this block that is not daily, and the
+    # reason is arithmetic rather than taste: the gate denies on evidence
+    # older than `DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS` (86400),
+    # so a daily refresh would put the deadline and the cadence on the
+    # same number and make "did the tick land before the evidence
+    # expired?" a coin flip every single day. 21600 (6h) leaves three
+    # whole missed ticks of margin before any workspace starts denying,
+    # which is enough for a redeploy, a broker hiccup, and an operator's
+    # night's sleep. It costs one bounded UPDATE over one row per
+    # workspace, four times a day.
+    ENTITLEMENT_REFRESH_INTERVAL_SECONDS: int = 21600
     # Raised 1 -> 3 in the 2026-08-15 readiness cycle. With a lookahead of
     # 1 the entire safety margin between "maintenance stops working" and
     # "every INSERT into four partitioned tables fails" is however many

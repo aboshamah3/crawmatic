@@ -138,6 +138,7 @@ from app_shared.models.cost_authorization import CostReservation, ReservationSta
 from app_shared.models.maintenance_cadence import (
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
+    CADENCE_ENTITLEMENT_REFRESH,
     CADENCE_PARTITION_CREATE,
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
@@ -164,6 +165,7 @@ from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
@@ -390,6 +392,32 @@ def _enqueue_outbox_reconcile() -> None:
         logger.exception("scheduler: failed to enqueue %s", OUTBOX_RECONCILE)
 
 
+def _enqueue_entitlement_refresh() -> None:
+    """Fire-and-forget `MAINTENANCE_ENTITLEMENT_REFRESH` on the
+    `maintenance` queue (EPA go-live prep, 2026-08-26) — re-stamps
+    `observed_at` on the SEEDED `workspace_entitlements` rows so the C3
+    gate's placeholder evidence never ages into a stale-deny.
+
+    The only DURABLE cadence here that is not daily
+    (`ENTITLEMENT_REFRESH_INTERVAL_SECONDS`, 6h), and durable rather than
+    a 60s-class in-process accumulator for exactly the reason the
+    2026-08-15 readiness cycle established: an interval measured in hours
+    against a process that restarts on every deploy is a countdown that
+    may never complete. Here that failure mode has teeth — the deadline
+    it races is `DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`, past
+    which EVERY workspace is denied all paid work.
+
+    Errors are logged and swallowed like every other maintenance enqueue.
+    A missed tick loses nothing on its own: the deadline is in
+    `maintenance_cadences`, the evidence still has hours of margin, and
+    the next tick re-stamps it.
+    """
+    try:
+        enqueue(MAINTENANCE_ENTITLEMENT_REFRESH, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_ENTITLEMENT_REFRESH)
+
+
 def _enqueue_costauth_reservation_sweep() -> None:
     """Fire-and-forget `COSTAUTH_RESERVATION_SWEEP` on the `maintenance`
     queue (EPA C3, READY-006) — reap expired cost-authorization leases
@@ -464,6 +492,17 @@ _DURABLE_CADENCES = (
         _enqueue_reconcile_provider_usage,
     ),
     (CADENCE_COST_ROLLUP, "DAILY_ROLLUP_INTERVAL_SECONDS", _enqueue_cost_rollup),
+    # EPA go-live prep 2026-08-26. Unlike the five above this one has its
+    # OWN `Settings` field (`ENTITLEMENT_REFRESH_INTERVAL_SECONDS`, 6h)
+    # rather than borrowing the daily one — it must stay far under
+    # `DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS` (86400), so sharing
+    # a knob whose whole purpose is to be daily would couple this
+    # cadence's correctness to an unrelated tuning decision.
+    (
+        CADENCE_ENTITLEMENT_REFRESH,
+        "ENTITLEMENT_REFRESH_INTERVAL_SECONDS",
+        _enqueue_entitlement_refresh,
+    ),
 )
 
 
@@ -1133,6 +1172,7 @@ def main() -> None:
     retention_interval = settings.RETENTION_INTERVAL_SECONDS
     outbox_drain_interval = settings.OUTBOX_DRAIN_INTERVAL_SECONDS
     outbox_reconcile_interval = settings.OUTBOX_RECONCILE_INTERVAL_SECONDS
+    entitlement_refresh_interval = settings.ENTITLEMENT_REFRESH_INTERVAL_SECONDS
     cadence_poll_interval = settings.MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS
     health_interval = settings.MAINTENANCE_HEALTH_INTERVAL_SECONDS
     ops_snapshot_interval = settings.OPS_SNAPSHOT_INTERVAL_SECONDS
@@ -1148,7 +1188,8 @@ def main() -> None:
         "finalize_jobs + recover_stalled_batches + costauth_reservation_sweep "
         "every %ss; "
         "refresh pass every %ss; DURABLE cadences partition_create every %ss / "
-        "daily_rollup every %ss / retention_drop every %ss polled every %ss from "
+        "daily_rollup every %ss / retention_drop every %ss / entitlement_refresh "
+        "every %ss polled every %ss from "
         "maintenance_cadences; outbox_drain every %ss; outbox_reconcile every %ss; "
         "maintenance health assertions every %ss; ops snapshot + alert "
         "evaluation every %ss)",
@@ -1157,6 +1198,7 @@ def main() -> None:
         partition_create_interval,
         daily_rollup_interval,
         retention_interval,
+        entitlement_refresh_interval,
         cadence_poll_interval,
         outbox_drain_interval,
         outbox_reconcile_interval,

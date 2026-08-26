@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 from app.workers.celery_app import app
 from app_shared.config import get_settings
 from app_shared.costauth import sweep_expired_reservations
+from app_shared.costauth.entitlements import refresh_seeded_entitlements
 from app_shared.database import get_system_session
 from app_shared.maintenance.health import (
     EVENT_PARTITION_MISSING,
@@ -65,6 +66,7 @@ from app_shared.task_names import (
     COSTAUTH_RESERVATION_SWEEP,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
@@ -516,4 +518,50 @@ def cost_rollup(target_date: str | None = None) -> None:
         report.tenant_rows_upserted,
         report.watermark_store_available,
         report.watermark_advanced,
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_ENTITLEMENT_REFRESH)
+def entitlement_refresh() -> None:
+    """`MAINTENANCE_ENTITLEMENT_REFRESH` (`maintenance` queue, EPA go-live prep).
+
+    Re-stamps `workspace_entitlements.observed_at` on the rows
+    `scripts/seed_workspace_entitlements.py` owns — and ONLY those, matched
+    by the `seeded-` `evidence_version` prefix
+    (`app_shared.costauth.entitlements.refresh_seeded_entitlements`).
+
+    **Why this task exists.** The C3 gate treats staleness as inactive:
+    evidence older than `DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`
+    (86400) denies exactly as a `CANCELLED` row does. Until W1.1's real
+    SaaS->engine billing replication lands, the only evidence in the table
+    is the placeholder the seeder wrote, and a placeholder nobody refreshes
+    stops the entire fleet's paid work 24h after the deploy that seeded it.
+    Running four times a day (`ENTITLEMENT_REFRESH_INTERVAL_SECONDS`, 6h)
+    leaves three whole missed ticks of margin before any workspace denies.
+
+    **Why it cannot fight the future ingest.** The `seeded-` prefix is the
+    ownership marker: a row the real ingest writes carries the SaaS's own
+    version tag, never matches this task's `WHERE`, and keeps its freshness
+    entirely its own business. A row with a `NULL` version never matches
+    either (`NULL LIKE ...` is `NULL`) — the correct fail-safe for evidence
+    this task did not produce.
+
+    FLEET-scoped and run on the BYPASSRLS system session: one pass must see
+    every workspace's row, which `FORCE ROW LEVEL SECURITY` makes impossible
+    for the pooled tenant role. Same seam, same reason, as the C3 lease
+    sweep above.
+
+    Idempotent and no-arg: the statement is a blind set-based re-stamp to
+    this run's `now`, so a duplicate delivery writes the same freshness
+    twice and two concurrent runners cannot disagree about anything.
+    """
+    with _system_session("entitlement_refresh") as session:
+        rows_refreshed = refresh_seeded_entitlements(
+            session, now=datetime.now(timezone.utc)
+        )
+        session.commit()
+
+    logger.info(
+        "maintenance_entitlement_refresh rows_refreshed=%d", rows_refreshed
     )

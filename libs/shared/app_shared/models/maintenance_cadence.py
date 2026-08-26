@@ -83,16 +83,26 @@ CADENCE_RECONCILE_PROVIDER_USAGE = "reconcile_provider_usage"
 #: ``CADENCE_RECONCILE_PROVIDER_USAGE`` above — its own key, the daily
 #: rollup's existing interval setting.
 CADENCE_COST_ROLLUP = "cost_rollup"
+#: EPA go-live prep (2026-08-26): re-stamps ``observed_at`` on the
+#: ``workspace_entitlements`` rows ``scripts/seed_workspace_entitlements.
+#: py`` owns, so the C3 gate's placeholder evidence never ages into a
+#: stale-deny (``app_shared.costauth.entitlements``). The one durable
+#: cadence here that is NOT daily — its interval
+#: (``ENTITLEMENT_REFRESH_INTERVAL_SECONDS``, 6h) must stay comfortably
+#: under ``DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`` (86400) or the
+#: refresh and the expiry race each other once a day.
+CADENCE_ENTITLEMENT_REFRESH = "entitlement_refresh"
 
-#: Every cadence the scheduler drives durably (the daily ones). The 60s
-#: cadences deliberately stay in-process — see
-#: ``app_shared.maintenance.cadence`` module docstring.
+#: Every cadence the scheduler drives durably (the daily ones, plus the
+#: 6-hourly entitlement refresh). The 60s cadences deliberately stay
+#: in-process — see ``app_shared.maintenance.cadence`` module docstring.
 DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_PARTITION_CREATE,
     CADENCE_DAILY_ROLLUP,
     CADENCE_RETENTION_DROP,
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_COST_ROLLUP,
+    CADENCE_ENTITLEMENT_REFRESH,
 )
 
 
@@ -128,6 +138,7 @@ class MaintenanceCadence(Base, TimestampMixin):
 __all__ = [
     "CADENCE_COST_ROLLUP",
     "CADENCE_DAILY_ROLLUP",
+    "CADENCE_ENTITLEMENT_REFRESH",
     "CADENCE_PARTITION_CREATE",
     "CADENCE_RECONCILE_PROVIDER_USAGE",
     "CADENCE_RETENTION_DROP",

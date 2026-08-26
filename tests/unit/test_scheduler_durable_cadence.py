@@ -40,6 +40,7 @@ from app_shared.config import get_settings
 from app_shared.task_names import (
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
@@ -47,6 +48,7 @@ from app_shared.task_names import (
 from app_shared.models.maintenance_cadence import (
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
+    CADENCE_ENTITLEMENT_REFRESH,
     CADENCE_PARTITION_CREATE,
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
@@ -190,8 +192,8 @@ fns = [c[2].__name__ for c in scheduler_app._DURABLE_CADENCES]
 
 assert CADENCE_RECONCILE_PROVIDER_USAGE in keys, keys
 assert CADENCE_COST_ROLLUP in keys, keys
-assert keys[-2:] == [CADENCE_RECONCILE_PROVIDER_USAGE, CADENCE_COST_ROLLUP], keys
-assert fns[-2:] == ["_enqueue_reconcile_provider_usage", "_enqueue_cost_rollup"], fns
+assert keys[3:5] == [CADENCE_RECONCILE_PROVIDER_USAGE, CADENCE_COST_ROLLUP], keys
+assert fns[3:5] == ["_enqueue_reconcile_provider_usage", "_enqueue_cost_rollup"], fns
 print("OK")
 """
         )
@@ -294,6 +296,66 @@ assert lookahead >= 3, lookahead
 poll = Settings.model_fields["MAINTENANCE_CADENCE_POLL_INTERVAL_SECONDS"].default
 daily = Settings.model_fields["PARTITION_CREATE_INTERVAL_SECONDS"].default
 assert poll < daily, (poll, daily)
+print("OK")
+"""
+        )
+    )
+
+
+def test_durable_cadences_also_cover_the_seeded_entitlement_refresh() -> None:
+    """EPA go-live prep (2026-08-26). The C3 gate treats stale evidence as
+    inactive, so the placeholder rows `scripts/seed_workspace_entitlements
+    .py` writes must be re-stamped on a cadence or the whole fleet is
+    denied 24h after the deploy that seeded it. Additive entry — the
+    original three and the C5/C6 pair are untouched (tests above)."""
+    _assert_ok(
+        _run(
+            """
+keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
+attrs = [c[1] for c in scheduler_app._DURABLE_CADENCES]
+fns = [c[2].__name__ for c in scheduler_app._DURABLE_CADENCES]
+
+assert CADENCE_ENTITLEMENT_REFRESH in keys, keys
+index = keys.index(CADENCE_ENTITLEMENT_REFRESH)
+assert fns[index] == "_enqueue_entitlement_refresh", fns
+# Its OWN interval knob, not the daily one it must stay far under.
+assert attrs[index] == "ENTITLEMENT_REFRESH_INTERVAL_SECONDS", attrs
+print("OK")
+"""
+        )
+    )
+
+
+def test_entitlement_refresh_cadence_is_claimable_and_enqueues_its_own_task() -> None:
+    """Behavioral proof, not a list check: a claimed cadence must enqueue
+    `MAINTENANCE_ENTITLEMENT_REFRESH` on the `maintenance` queue."""
+    _assert_ok(
+        _run(
+            """
+enqueue, session = _install({CADENCE_ENTITLEMENT_REFRESH})
+
+claimed = scheduler_app._run_durable_cadence_tick(get_settings())
+
+assert claimed == [CADENCE_ENTITLEMENT_REFRESH], claimed
+assert enqueue.calls == [(MAINTENANCE_ENTITLEMENT_REFRESH, "maintenance")], enqueue.calls
+print("OK")
+"""
+        )
+    )
+
+
+def test_entitlement_refresh_interval_is_far_under_the_staleness_deadline() -> None:
+    """The arithmetic that makes this cadence worth having. If the refresh
+    interval ever reached `DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`,
+    a single missed tick would deny every workspace all paid work."""
+    _assert_ok(
+        _run(
+            """
+from app_shared.costauth.service import DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS
+
+interval = get_settings().ENTITLEMENT_REFRESH_INTERVAL_SECONDS
+assert interval > 0, interval
+assert interval * 4 <= DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS, interval
 print("OK")
 """
         )

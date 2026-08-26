@@ -1,9 +1,17 @@
 """Unified cost authorization + reservation (EPA C3, READY-006).
 
-Public surface: :mod:`app_shared.costauth.service`. Nothing else in this
-package is importable API — the service is deliberately the ONLY door to
-the reservation ledger, because a second writer of ``cost_reservations``
-is a second answer to "how much is this workspace allowed to spend".
+Public surface: :mod:`app_shared.costauth.service` — re-exported below —
+plus :mod:`app_shared.costauth.entitlements`, imported by its own path.
+The service remains deliberately the ONLY door to the reservation
+ledger, because a second writer of ``cost_reservations`` is a second
+answer to "how much is this workspace allowed to spend".
+
+``entitlements`` is not a second such door and does not weaken that
+rule: it writes ``workspace_entitlements`` — the *evidence* the gate
+reads — and never touches a reservation, a budget counter or a limit. It
+is kept out of this namespace on purpose, so that "import from
+``app_shared.costauth``" keeps meaning "use the gate" and a call site
+that seeds or refreshes evidence has to say so in its import line.
 """
 
 from __future__ import annotations

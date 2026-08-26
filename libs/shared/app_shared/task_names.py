@@ -99,3 +99,15 @@ MAINTENANCE_RECONCILE_PROVIDER_USAGE = "maintenance.reconcile_provider_usage"
 # scoped ``GET /v1/cost-rollups`` both read — neither ever aggregates the
 # raw ``network_operations`` ledger synchronously on request.
 MAINTENANCE_COST_ROLLUP = "maintenance.cost_rollup"
+
+# --- Seeded-entitlement staleness refresh (EPA go-live prep, 2026-08-26) ---
+# Enqueued by the scheduler on a durable 6-hourly cadence
+# (``CADENCE_ENTITLEMENT_REFRESH``); consumed by ``apps/workers/app/
+# workers/tasks_maintenance.py`` on the existing ``maintenance`` queue.
+# Re-stamps ``workspace_entitlements.observed_at`` on the rows
+# ``scripts/seed_workspace_entitlements.py`` owns — and ONLY those — so
+# the placeholder evidence the C3 gate reads never ages past
+# ``DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`` and starts denying all
+# paid work, while the future real SaaS->engine ingest's rows keep their
+# own freshness entirely. See ``app_shared.costauth.entitlements``.
+MAINTENANCE_ENTITLEMENT_REFRESH = "maintenance.entitlement_refresh"
