@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts import run_gate_d_canary  # noqa: E402
 from scripts.run_gate_d_canary import (  # noqa: E402
     DEPLOY_GATES,
     FAIL,
@@ -68,6 +69,7 @@ from scripts.run_gate_d_canary import (  # noqa: E402
     default_strata,
     evaluate_canary,
     pinned_commit,
+    pool_sql,
     require_owner_go,
     target_set_hash,
     validate_sample,
@@ -231,6 +233,42 @@ def test_pool_outside_the_authorized_set_is_refused():
     pool.append(_candidate(9999, "extra.com", classification="UNKNOWN"))
     with pytest.raises(ValueError, match="forbids widening the pool"):
         build_stratified_sample(pool, size=199)
+
+
+def test_pool_sql_is_unchanged_without_a_workspace_filter():
+    """The fleet-wide pool must stay byte-identical, so every sample built
+    before ``--workspace`` existed remains reproducible."""
+    assert pool_sql(None) == run_gate_d_canary._POOL_SQL
+    assert "workspace_id" not in pool_sql(None)
+
+
+def test_pool_sql_restricts_to_one_workspace_by_bound_parameter():
+    """A workspace-scoped sample narrows the pool, and does it with a bound
+    parameter — never string interpolation of a caller-supplied id."""
+    sql = pool_sql("01a020de-871c-7760-8273-59f3b67d9c18")
+    assert "AND m.workspace_id = :workspace_id" in sql
+    # the id itself is never interpolated into the statement
+    assert "01a020de" not in sql
+    # the authorized-pool predicate survives the addition
+    assert "WHERE m.status = 'ACTIVE'" in sql
+    assert sql.startswith(run_gate_d_canary._POOL_SQL.rstrip("\n"))
+
+
+def test_workspace_argument_rejects_a_non_uuid():
+    """A typo'd workspace must fail loudly at parse time, not silently
+    produce an empty pool that surfaces as a confusing 'undersized' error."""
+    parser = run_gate_d_canary.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["build-sample", "--workspace", "not-a-uuid"])
+
+
+def test_workspace_argument_defaults_to_none_and_canonicalizes():
+    parser = run_gate_d_canary.build_parser()
+    assert parser.parse_args(["build-sample"]).workspace is None
+    args = parser.parse_args(
+        ["build-sample", "--workspace", "01A020DE-871C-7760-8273-59F3B67D9C18"]
+    )
+    assert args.workspace == "01a020de-871c-7760-8273-59f3b67d9c18"
 
 
 def test_a_pool_smaller_than_the_sample_is_refused_not_padded():

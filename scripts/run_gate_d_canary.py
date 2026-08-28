@@ -123,6 +123,7 @@ import math
 import os
 import subprocess
 import sys
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import MISSING, dataclass, field
 from datetime import UTC, datetime
@@ -1327,6 +1328,29 @@ LEFT JOIN (
 WHERE m.status = 'ACTIVE'
 """
 
+#: Appended to :data:`_POOL_SQL` when the sample is restricted to one
+#: workspace. Bound parameter, never interpolated.
+_POOL_WORKSPACE_PREDICATE = "  AND m.workspace_id = :workspace_id\n"
+
+
+def pool_sql(workspace_id: str | None) -> str:
+    """The candidate-pool query, optionally restricted to one workspace.
+
+    ``workspace_id=None`` reproduces the original fleet-wide pool exactly, so
+    every previously-built sample remains byte-reproducible. A non-``None``
+    value appends a bound-parameter predicate — the sample is then drawn only
+    from that workspace's ACTIVE matches.
+
+    Restricting the pool is a *sample design* decision with certification
+    consequences: whatever is excluded is not covered by the run. The chosen
+    workspace is recorded in ``target_set.json`` (``workspace_filter``) so no
+    reader has to infer the sample's tenancy from the targets themselves.
+    """
+    if workspace_id is None:
+        return _POOL_SQL
+    return _POOL_SQL.rstrip("\n") + "\n" + _POOL_WORKSPACE_PREDICATE
+
+
 #: Per-domain SLA inputs, measured from history rather than assumed.
 #: `attempts_p95` is the p95 of attempts-per-(target, job) — the fan-out one
 #: target costs in one run. `p95_latency_seconds` is the p95 of raw per-attempt
@@ -1403,13 +1427,19 @@ def load_candidate_pool(
     *,
     classifications: Mapping[str, str],
     labeled_stech_ids: Sequence[str],
+    workspace_id: str | None = None,
 ) -> list[TargetCandidate]:
-    """Build the authorized candidate pool from the database + A6 verdicts."""
+    """Build the authorized candidate pool from the database + A6 verdicts.
+
+    ``workspace_id`` restricts the pool to a single workspace (see
+    :func:`pool_sql`); ``None`` keeps the fleet-wide behaviour.
+    """
     from sqlalchemy import text
 
     labeled = set(labeled_stech_ids)
     pool: list[TargetCandidate] = []
-    for row in session.execute(text(_POOL_SQL)).all():
+    params = {} if workspace_id is None else {"workspace_id": workspace_id}
+    for row in session.execute(text(pool_sql(workspace_id)), params).all():
         state = classifications.get(row.match_id, "UNKNOWN")
         is_labeled = row.match_id in labeled
         if state != "ACTIVE" and not is_labeled:
@@ -1655,7 +1685,10 @@ def cmd_build_sample(args: argparse.Namespace) -> int:
         classifications = load_classifications(session, args.classifications_csv)
         labeled = labeled_stech_match_ids(args.stech_fixtures)
         pool = load_candidate_pool(
-            session, classifications=classifications, labeled_stech_ids=labeled
+            session,
+            classifications=classifications,
+            labeled_stech_ids=labeled,
+            workspace_id=args.workspace,
         )
         domain_stats = load_domain_stats(session)
         server_version = _server_version(session)
@@ -1679,6 +1712,7 @@ def cmd_build_sample(args: argparse.Namespace) -> int:
         ),
         "classification_rows": len(classifications),
         "labeled_stech_subset": len(labeled),
+        "workspace_filter": args.workspace,
         "pool_size": result.pool_size,
         "sample_size": len(result.targets),
         "selection_seed": result.seed,
@@ -2021,6 +2055,19 @@ def cmd_gates(args: argparse.Namespace) -> int:
 DEFAULT_EVIDENCE_DIR = Path("/srv/crawmatic/evidence/run-gate-d-2026-08-26")
 
 
+def _workspace_uuid(raw: str) -> str:
+    """argparse type for ``--workspace``: a well-formed UUID, kept canonical.
+
+    Rejects anything that is not a UUID rather than letting a typo silently
+    produce an empty pool (which ``build_stratified_sample`` would then refuse
+    as undersized, several steps and one confusing error later).
+    """
+    try:
+        return str(uuid.UUID(raw))
+    except (ValueError, AttributeError, TypeError):
+        raise argparse.ArgumentTypeError(f"not a valid UUID: {raw!r}") from None
+
+
 def _add_owner_gate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--owner-go",
@@ -2078,6 +2125,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--stech-fixtures",
         type=Path,
         default=_REPO_ROOT / "tests" / "fixtures" / "stech_30_targets",
+    )
+    p_sample.add_argument(
+        "--workspace",
+        type=_workspace_uuid,
+        default=None,
+        metavar="UUID",
+        help=(
+            "restrict the candidate pool to one workspace; omit for the "
+            "fleet-wide pool. Recorded in target_set.json as workspace_filter — "
+            "whatever is excluded is NOT covered by the certification."
+        ),
     )
     p_sample.add_argument("--size", type=int, default=DEFAULT_SAMPLE_SIZE)
     p_sample.add_argument("--seed", default=DEFAULT_SELECTION_SEED)
