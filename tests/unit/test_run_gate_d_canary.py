@@ -1,6 +1,6 @@
 """Unit tests for `scripts/run_gate_d_canary.py` (EPA D1, 2026-08-26).
 
-Four things are worth testing here, and they are exactly the four things that
+Five things are worth testing here, and they are exactly the five things that
 would silently ruin Run Gate D if they were wrong:
 
 1. **Stratification validity** — a sample that misses a stratum makes a §12.6
@@ -14,9 +14,16 @@ would silently ruin Run Gate D if they were wrong:
 4. **The owner gates** — every live step must hard-refuse without explicit
    acknowledgment AND closed deploy gates. This is the property that lets D1
    be prepared autonomously at all.
+5. **The repo pins** (added 2026-08-28) — the three cross-repo pins must still
+   refuse on drift, and the engine entry, which is now resolved from HEAD
+   because a pin stored inside the repo it pins can never match, must still
+   refuse a dirty tree and an unreadable repository. A pin check that stopped
+   failing would let a manifest name a build nobody can reproduce.
 
 Everything is driven from literals: no database, no network, no clock, no
-production anything.
+production anything. The pin tests drive a fake `git` rather than the real
+repositories, so they assert the *rule* and not today's shas — except for one
+deliberate check that the engine entry tracks this checkout's actual HEAD.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -42,7 +50,9 @@ from scripts.run_gate_d_canary import (  # noqa: E402
     LIVE_STEPS,
     PASS,
     PENDING,
+    REPO_PINS,
     RESTORE_PROVENANCE_BANNER,
+    RUNTIME_HEAD,
     SECTION_12_6_TARGET_SECONDS,
     CanaryFacts,
     DomainRateLimit,
@@ -52,14 +62,17 @@ from scripts.run_gate_d_canary import (  # noqa: E402
     TargetCandidate,
     build_stratified_sample,
     cmd_enqueue,
+    cmd_manifest,
     cmd_sign,
     compute_completion_sla,
     default_strata,
     evaluate_canary,
+    pinned_commit,
     require_owner_go,
     target_set_hash,
     validate_sample,
     verdict,
+    verify_repo_pins,
 )
 
 # --------------------------------------------------------------------------
@@ -623,3 +636,222 @@ def test_every_deploy_gate_names_a_recorded_blocker():
         assert gate.blocker_ref.startswith("2026-")
         assert len(gate.assertion) > 40
     assert {"entitlement-writer", "budget-seeding", "role-ordering"} <= set(GATE_NAMES)
+
+
+# --------------------------------------------------------------------------
+# Repo pins (2026-08-28)
+# --------------------------------------------------------------------------
+#
+# `verify_repo_pins` shells out to git against four absolute paths on the
+# build host. These tests replace that shell-out with a dictionary so the
+# assertions are about the *rule* — drift refuses, dirt refuses, an
+# unreadable repo refuses, the engine follows HEAD — rather than about
+# whatever the four checkouts happen to be at right now. One test at the end
+# deliberately does use the real repository, because "the engine entry equals
+# this checkout's HEAD" is precisely the claim the fix makes.
+
+_FAKE_ENGINE_HEAD = "d27c5a7c0ffee0000000000000000000000000ab"
+
+
+def _sha(short: str) -> str:
+    """A plausible 40-char sha whose prefix is `short`."""
+    return (short + "0" * 40)[:40]
+
+
+class _FakeGit:
+    """A stand-in for `_git` driven by per-repo-path literals.
+
+    `heads[path] is None` means "not a readable git repository": every git
+    invocation against it fails, exactly as it would on a missing directory.
+    """
+
+    def __init__(self, heads, statuses=None, tag_commits=None):
+        self.heads = heads
+        self.statuses = statuses or {}
+        self.tag_commits = tag_commits or {}
+
+    def __call__(self, repo, *args):
+        head = self.heads.get(str(repo))
+        if head is None:
+            return None
+        if args[0] == "rev-parse":
+            return head[:7] if "--short" in args else head
+        if args[0] == "status":
+            return self.statuses.get(str(repo), "")
+        if args[0] == "rev-list":
+            return self.tag_commits.get(str(repo), head)
+        return None
+
+
+def _clean_world(**overrides):
+    """Every repo readable, clean, and sitting on the commit it is pinned to.
+
+    The engine sits on an arbitrary sha, which is the whole point: no constant
+    in the tool names it.
+    """
+    heads = {}
+    for pin in REPO_PINS:
+        heads[pin["path"]] = (
+            _FAKE_ENGINE_HEAD if pin["commit"] == RUNTIME_HEAD else _sha(pin["commit"])
+        )
+    heads.update(overrides)
+    return _FakeGit(heads)
+
+
+def _record(records, name):
+    return next(r for r in records if r["name"] == name)
+
+
+def _path_of(name):
+    return next(p["path"] for p in REPO_PINS if p["name"] == name)
+
+
+def test_only_the_engine_is_runtime_resolved_and_the_others_stay_pinned():
+    """A hardcoded sha is right for a repo this file cannot edit, and wrong
+    for the repo this file lives in. Exactly one entry may be the latter."""
+    runtime = [p["name"] for p in REPO_PINS if p["commit"] == RUNTIME_HEAD]
+    assert runtime == ["engine"]
+    assert pinned_commit("saas") == "283ee52"
+    # Ratified 2026-08-28: one docs-only commit on the W5.1 branch.
+    assert pinned_commit("saas-wt-w51") == "adc3631"
+    assert pinned_commit("plugin") == "c616bd0"
+
+
+def test_asking_for_the_engine_pin_as_a_constant_is_an_error():
+    """`pinned_commit` must not quietly hand back the sentinel string — a
+    caller that pinned against "RUNTIME_HEAD" would compare shas to a word."""
+    with pytest.raises(KeyError):
+        pinned_commit("engine")
+    with pytest.raises(KeyError):
+        pinned_commit("no-such-repo")
+
+
+def test_a_clean_world_has_no_problems(monkeypatch):
+    monkeypatch.setattr("scripts.run_gate_d_canary._git", _clean_world())
+    records, problems = verify_repo_pins()
+    assert problems == []
+    assert len(records) == len(REPO_PINS)
+
+
+def test_the_engine_entry_records_head_rather_than_a_constant(monkeypatch):
+    """The engine's expected commit IS its HEAD, and the record says so, so a
+    reader of repo_pins.json can tell a runtime resolution from an assertion."""
+    monkeypatch.setattr("scripts.run_gate_d_canary._git", _clean_world())
+    engine = _record(verify_repo_pins()[0], "engine")
+    assert engine["pin_source"] == "runtime-head"
+    assert engine["expected_commit"] == engine["head_short"] == _FAKE_ENGINE_HEAD[:7]
+    for name in ("saas", "saas-wt-w51", "plugin"):
+        assert _record(verify_repo_pins()[0], name)["pin_source"] == "constant"
+
+
+def test_the_engine_entry_follows_head_wherever_head_moves(monkeypatch):
+    """The defect this replaced was that *any* engine commit drifted. Moving
+    HEAD twice must produce two clean records, not two refusals."""
+    for head in ("aaaaaaa1111111111111111111111111111111ab", _sha("beef123")):
+        monkeypatch.setattr(
+            "scripts.run_gate_d_canary._git",
+            _clean_world(**{_path_of("engine"): head}),
+        )
+        records, problems = verify_repo_pins()
+        assert problems == []
+        assert _record(records, "engine")["expected_commit"] == head[:7]
+
+
+@pytest.mark.parametrize("name", ["saas", "saas-wt-w51", "plugin"])
+def test_a_cross_repo_pin_still_refuses_on_drift(monkeypatch, name):
+    """Drift refusal is untouched for the three repositories this file cannot
+    edit — that is what makes their constants meaningful."""
+    monkeypatch.setattr(
+        "scripts.run_gate_d_canary._git",
+        _clean_world(**{_path_of(name): _sha("dead999")}),
+    )
+    _, problems = verify_repo_pins()
+    assert any(p.startswith(f"{name}: HEAD dead999 != pinned") for p in problems)
+
+
+def test_a_dirty_engine_tree_is_still_a_refusal(monkeypatch):
+    """Runtime resolution says nothing about uncommitted edits: a digest over
+    a dirty tree names a build nobody else can reproduce."""
+    monkeypatch.setattr(
+        "scripts.run_gate_d_canary._git",
+        _FakeGit(
+            _clean_world().heads,
+            statuses={_path_of("engine"): " M scripts/run_gate_d_canary.py"},
+        ),
+    )
+    records, problems = verify_repo_pins()
+    assert _record(records, "engine")["tree_clean"] is False
+    assert "engine: working tree is dirty" in problems
+
+
+@pytest.mark.parametrize("name", [p["name"] for p in REPO_PINS])
+def test_a_dirty_tree_is_a_refusal_for_every_repo(monkeypatch, name):
+    monkeypatch.setattr(
+        "scripts.run_gate_d_canary._git",
+        _FakeGit(_clean_world().heads, statuses={_path_of(name): " M somefile"}),
+    )
+    assert f"{name}: working tree is dirty" in verify_repo_pins()[1]
+
+
+def test_an_unreadable_engine_repository_is_still_a_refusal(monkeypatch):
+    """`RUNTIME_HEAD` resolves from git; if git cannot answer there is no pin
+    at all, which must refuse rather than record a null."""
+    monkeypatch.setattr(
+        "scripts.run_gate_d_canary._git",
+        _clean_world(**{_path_of("engine"): None}),
+    )
+    records, problems = verify_repo_pins()
+    assert any(p.startswith("engine: not a readable git repository") for p in problems)
+    assert _record(records, "engine")["expected_commit"] is None
+
+
+def test_a_tag_that_resolves_away_from_head_is_still_a_refusal(monkeypatch):
+    """The plugin's v0.9.3 tag must name the commit being shipped."""
+    monkeypatch.setattr(
+        "scripts.run_gate_d_canary._git",
+        _FakeGit(
+            _clean_world().heads,
+            tag_commits={_path_of("plugin"): _sha("0ddba11")},
+        ),
+    )
+    _, problems = verify_repo_pins()
+    assert any("tag v0.9.3 resolves to 0ddba11" in p for p in problems)
+
+
+def test_manifest_refuses_to_build_from_drifted_pins(monkeypatch, tmp_path):
+    """The refusal the whole check exists for: exit 2, no manifest written,
+    unless the owner explicitly asks for the drift to be recorded instead."""
+    monkeypatch.setattr(
+        "scripts.run_gate_d_canary._git",
+        _clean_world(**{_path_of("saas"): _sha("dead999")}),
+    )
+    args = argparse.Namespace(
+        out_dir=tmp_path,
+        allow_pin_drift=False,
+        image_digest=[],
+        evidence=[],
+        saas_commit=None,
+        saas_protocol_range=None,
+        salla_contract_version=None,
+        generated_at="2026-08-28T00:00:00+00:00",
+        gpg_key=None,
+        identity_image=None,
+    )
+    assert cmd_manifest(args) == 2
+    assert not (tmp_path / "release_manifest.json").exists()
+
+
+def test_the_engine_entry_matches_this_checkouts_real_head():
+    """Not a fake: the fix is only real if `manifest` can build from the tree
+    it is being run out of. This is the regression that PIN DRIFT was."""
+    repo_root = Path(__file__).resolve().parents[2]
+    head_short = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    engine = _record(verify_repo_pins()[0], "engine")
+    assert engine["path"] == str(repo_root)
+    assert engine["expected_commit"] == engine["head_short"] == head_short

@@ -49,6 +49,40 @@ A6's ``match_audit_classifications`` sidecar does not exist in the
 source, and prefers the live table whenever it exists. Both paths feed the
 identical pure core.
 
+WHY THE ENGINE PIN IS RESOLVED AT RUNTIME (2026-08-28)
+======================================================
+
+The other three repositories are pinned to hardcoded short shas, which is
+exactly what a cross-repo pin is for: this script cannot be edited by a
+commit in ``saas``, so a constant here is an independent statement about a
+repository elsewhere, and drift from it is real drift.
+
+The engine pin is different, and was broken from the day this tool was
+committed. The constant lived *inside the repository it pinned*, so any
+commit that wrote or updated it necessarily moved the engine's HEAD past the
+value it had just recorded. ``head.startswith(pin["commit"])`` could
+therefore never hold for the engine — not after a stale commit, but
+structurally, for every possible value of the constant. ``manifest`` refused
+with PIN DRIFT on every invocation since 3f3ea52, which made a certified
+gate tool unusable except via ``--allow-pin-drift``, i.e. via the flag that
+turns the check off.
+
+The fix is to stop asserting a self-referential fact. The engine entry is
+resolved from ``git rev-parse HEAD`` of this repository at run time and
+recorded (``pin_source: "runtime-head"``) rather than compared. Nothing is
+lost by this, because the engine's candidate identity was never carried by
+that sha in the first place: the manifest's ``source.digest`` is derived
+from the engine tree itself, and *that* is what proves deployed == candidate.
+A sha the tool copies out of its own source proves only that the file was
+saved.
+
+The two engine checks that were never self-referential stay, and stay hard:
+a working tree that is dirty is still a refusal (a digest over uncommitted
+edits names a build nobody else can reproduce), and a path that is not a
+readable git repository is still a refusal. Owner decision, 2026-08-28:
+fix the tool rather than routinely pass ``--allow-pin-drift``, because a
+gate whose normal operation requires its own override is not a gate.
+
 SECRET DISCIPLINE
 =================
 
@@ -112,16 +146,27 @@ RESTORE_PROVENANCE_BANNER = (
 # Candidate release identity (Step 1 inputs)
 # --------------------------------------------------------------------------
 
-#: The four repositories that make up one Run Gate D release, pinned to the
-#: clean commits the EPA run produced. `path` is where the repo lives on the
-#: build host; `commit` is the short sha the run committed. `verify-pins`
+#: Sentinel for `commit`: this repository's pin is read from `git rev-parse
+#: HEAD` when the manifest is built, not compared against a constant. See the
+#: module docstring, "WHY THE ENGINE PIN IS RESOLVED AT RUNTIME (2026-08-28)":
+#: a pin stored inside the repo it pins is moved by the very commit that
+#: writes it, so it can never match, and the engine's candidate identity is
+#: carried by the manifest's tree-derived `source.digest` regardless.
+RUNTIME_HEAD = "RUNTIME_HEAD"
+
+#: The four repositories that make up one Run Gate D release. `path` is where
+#: the repo lives on the build host; `commit` is the short sha the run
+#: committed, or :data:`RUNTIME_HEAD` for this repository. `verify-pins`
 #: (folded into `manifest`) re-reads git and refuses on any drift — a manifest
-#: that names a commit nobody can reproduce is worse than no manifest.
+#: that names a commit nobody can reproduce is worse than no manifest. Drift
+#: refusal applies to the three cross-repo pins; the engine entry still
+#: refuses on a dirty tree or an unreadable repository.
 REPO_PINS: tuple[dict[str, Any], ...] = (
     {
         "name": "engine",
         "path": "/srv/crawmatic/crawmatic",
-        "commit": "efc8042",
+        # Self-referential — resolved from HEAD at run time (2026-08-28).
+        "commit": RUNTIME_HEAD,
         "role": "scrape engine + API + workers (this repository)",
         "tag": None,
     },
@@ -135,7 +180,10 @@ REPO_PINS: tuple[dict[str, Any], ...] = (
     {
         "name": "saas-wt-w51",
         "path": "/srv/crawmatic/saas-wt-w51",
-        "commit": "8b543c2",
+        # Ratified 2026-08-28: advanced 8b543c2 -> adc3631 by one docs-only
+        # commit (app/docs/SALLA_MCP_LOGIN_INCIDENT_2026-08-28.md), verified
+        # additive, owner-ratified. Still a hardcoded cross-repo pin.
+        "commit": "adc3631",
         "role": "W5.1 integration branch (owner merge gate — NOT auto-merged)",
         "tag": None,
     },
@@ -147,6 +195,20 @@ REPO_PINS: tuple[dict[str, Any], ...] = (
         "tag": "v0.9.3",
     },
 )
+
+
+def pinned_commit(name: str) -> str:
+    """Short sha the release pins `name` to.
+
+    Only defined for the hardcoded cross-repo pins; asking for a
+    runtime-resolved pin is a programming error, not a fallback.
+    """
+    for pin in REPO_PINS:
+        if pin["name"] == name:
+            if pin["commit"] == RUNTIME_HEAD:
+                raise KeyError(f"{name} is resolved from HEAD at run time, not pinned")
+            return str(pin["commit"])
+    raise KeyError(f"no repo pin named {name}")
 
 #: sha256 of the byte-reproducible release ZIP built by the plugin repo's
 #: `scripts/build_release_zip.py --ref v0.9.3`. Recorded as a constant so the
@@ -1425,6 +1487,12 @@ def verify_repo_pins() -> tuple[list[dict[str, Any]], list[str]]:
     Returns ``(records, problems)``. A pin that does not match, a tree that is
     dirty, or a tag that resolves elsewhere is a *problem*, because the whole
     point of a build manifest is that someone else can rebuild the same thing.
+
+    The engine entry carries :data:`RUNTIME_HEAD` instead of a sha: its
+    expected commit *is* whatever HEAD reads at build time, so there is no
+    comparison to make (see the module docstring for why a self-pin can never
+    hold). Every other check on that entry is unchanged and still fails shut —
+    an unreadable repository and a dirty working tree are both refusals.
     """
     records: list[dict[str, Any]] = []
     problems: list[str] = []
@@ -1433,10 +1501,12 @@ def verify_repo_pins() -> tuple[list[dict[str, Any]], list[str]]:
         head = _git(repo, "rev-parse", "HEAD")
         short = _git(repo, "rev-parse", "--short", "HEAD")
         status = _git(repo, "status", "--porcelain")
+        runtime_head = pin["commit"] == RUNTIME_HEAD
         record = {
             "name": pin["name"],
             "path": pin["path"],
-            "expected_commit": pin["commit"],
+            "expected_commit": short if runtime_head else pin["commit"],
+            "pin_source": "runtime-head" if runtime_head else "constant",
             "head_commit": head,
             "head_short": short,
             "tree_clean": status == "" if status is not None else None,
@@ -1446,7 +1516,7 @@ def verify_repo_pins() -> tuple[list[dict[str, Any]], list[str]]:
         }
         if short is None:
             problems.append(f"{pin['name']}: not a readable git repository at {pin['path']}")
-        elif not head.startswith(pin["commit"]):  # type: ignore[union-attr]
+        elif not runtime_head and not head.startswith(pin["commit"]):  # type: ignore[union-attr]
             problems.append(
                 f"{pin['name']}: HEAD {short} != pinned {pin['commit']}"
             )
@@ -1510,7 +1580,7 @@ def cmd_manifest(args: argparse.Namespace) -> int:
             f"repo_pins=file://{pins_path}#sha256={pins_digest}",
             *(args.evidence or []),
         ],
-        saas_commit=args.saas_commit or REPO_PINS[1]["commit"],
+        saas_commit=args.saas_commit or pinned_commit("saas"),
         saas_protocol_range=args.saas_protocol_range,
         plugin_zip_sha256=PLUGIN_RELEASE_ZIP_SHA256,
         plugin_version_matrix=[PLUGIN_VERSION_MATRIX],
