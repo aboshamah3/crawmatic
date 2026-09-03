@@ -6,6 +6,57 @@ each deployed independently, unlike the SaaS repo's single `deploy.sh`. This
 document does not itself run anything; it is the reference the operator reads
 before touching Railway.
 
+## Step 0, before any image is built: write the release manifest
+
+Run `scripts/write_release_manifest.py` from the engine repo root, **before**
+`docker build` runs for any service (the manifest records the source digest
+of the exact tree being shipped) — this is the step
+`/srv/crawmatic/evidence/A5_DEPLOY_RUNBOOK.md` §1.1/§1.3 calls "bake the
+identity" and where a generated `libs/shared/app_shared/_baked_release.py` (or
+the `release_identity.json` alternative that script also emits) comes from:
+
+```bash
+cd /srv/crawmatic/crawmatic
+mkdir -m 0700 -p build
+uv run python scripts/write_release_manifest.py \
+  --out build/release_manifest.json \
+  --emit-identity ./release_identity.json \
+  --saas-repo /srv/crawmatic/saas \
+  --image-digest api=sha256:<digest of the api image> \
+  --evidence tests=<CI run URL>
+```
+
+This is a thin wrapper around `scripts/build_release_manifest.py` (which it
+calls internally, so every existing manifest field — image digests, API
+schema version, migration set, config schema, external components, GPG
+signing — is produced exactly as before) that adds two things a deploy
+specifically needs and a hand-run `build_release_manifest.py` invocation
+does not enforce on its own (H6, production-readiness audit):
+
+1. **It refuses (exit 2) instead of building, when the engine tree is
+   dirty.** `build_release_manifest.py` itself stays permissive and honest
+   (`source.dirty: true` recorded, build still produced — useful evidence
+   for a non-deploy build) but a manifest a real deploy attests to must
+   describe exactly what is checked in, not an uncommitted working tree.
+   `--allow-dirty` exists only for local experimentation and must never be
+   used for a real deploy.
+2. **It embeds both repositories' HEAD SHAs** — `source.engine_sha` (this
+   repo) and `source.saas_sha` (read from `--saas-repo`, or pass
+   `--saas-sha <sha>` directly if the SaaS repo isn't checked out on this
+   box) — because a release of this platform is a pair of commits, not one.
+
+`scripts/build_deployment_attestation.py` (§1.6 below) independently refuses
+to attest to any manifest whose `source.dirty` is `true`, as a second gate —
+so a manifest that slipped through some other path (a hand-run
+`build_release_manifest.py`, an older file) still can't be attested to.
+
+Everything else in this runbook — the two-pass image-digest dance, GPG
+signing, baking the identity file into the image via the repo-root `COPY . .`
+trick, deploy ordering, and producing the deployment attestation — is
+unchanged; see `/srv/crawmatic/evidence/A5_DEPLOY_RUNBOOK.md` §1 for the full
+walkthrough, with `write_release_manifest.py` in place of the bare
+`build_release_manifest.py` invocations there.
+
 ## Deploy order: migrate → api → workers/scheduler → scrapers
 
 ```

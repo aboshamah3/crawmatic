@@ -830,7 +830,25 @@ def _build_manifest(tmp_path: Path, *extra: str) -> tuple[Path, dict[str, Any]]:
         *extra,
     )
     assert result.returncode == 0, result.stderr
-    return out, json.loads(out.read_text(encoding="utf-8"))
+    manifest = json.loads(out.read_text(encoding="utf-8"))
+
+    # `build_release_manifest.py`'s own `_source_record()` reports THIS
+    # checkout's real `git status --porcelain` (H6, production-readiness
+    # audit) — which is whatever it happens to be while this suite runs,
+    # not a property these tests are exercising. Force it clean here so
+    # every test using this helper is deterministic regardless of the
+    # ambient working tree, and so `build_deployment_attestation.py`'s
+    # dirty-manifest refusal (also H6; see test_write_release_manifest.py
+    # for the tests that specifically target it) doesn't leak into tests
+    # that have nothing to do with it. Recomputing manifest_id keeps the
+    # file's own self-hash check consistent with the edit.
+    brm = _load_script("build_release_manifest.py")
+    if manifest.get("source", {}).get("dirty") is not False:
+        manifest["source"]["dirty"] = False
+        manifest["manifest_id"] = brm.compute_manifest_id(manifest)
+        out.write_text(json.dumps(manifest), encoding="utf-8")
+
+    return out, manifest
 
 
 def test_build_release_manifest_emits_a_self_hashed_immutable_record(tmp_path: Path) -> None:

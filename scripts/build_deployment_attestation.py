@@ -107,6 +107,23 @@ def load_and_verify_manifest(path: Path) -> tuple[dict[str, Any], str]:
             "the file has been modified since it was built; rebuild it rather "
             f"than attesting to it ({path})"
         )
+
+    # H6: a manifest built from a dirty tree (`source.dirty == true`) records
+    # that fact honestly (see `build_release_manifest.py`'s `_source_record`
+    # docstring — a dishonest-looking "clean" manifest is worse than a build
+    # that admits it wasn't) but must never be attested to: an attestation
+    # says "this exact, committed tree was deployed", and a dirty tree has no
+    # single commit that claim can point at. `scripts/write_release_manifest.py`
+    # already refuses to *write* a dirty manifest in the first place — this is
+    # the second, independent gate for any manifest that reaches this script
+    # by another path (a hand-run `build_release_manifest.py`, an older
+    # manifest file, ...).
+    if manifest.get("source", {}).get("dirty") is True:
+        raise SystemExit(
+            "build manifest was built from a DIRTY source tree "
+            "(source.dirty == true) — refusing to attest to it. Rebuild from a "
+            f"clean, committed tree ({path})."
+        )
     return manifest, sha256_digest(raw)
 
 
