@@ -583,6 +583,7 @@ def _run_planner_scenario(scenario: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "scenario",
     [

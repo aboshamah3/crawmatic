@@ -17,3 +17,8 @@ dev = [
     "httpx>=0.28,<1",
     "alembic>=1.13,<2",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: needs the docker-compose DB/pgbouncer stack; skipped by -m 'not integration'",
+]

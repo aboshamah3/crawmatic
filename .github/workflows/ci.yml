@@ -83,8 +83,23 @@ jobs:
       - name: Workspace-scoping guard
         run: uv run python scripts/check_workspace_scoping.py
 
+      # `-m "not integration"` (H5): a handful of tests under tests/unit
+      # (test_dispatch_identity.py::test_real_planner_path[*],
+      # test_overflow_expansion.py::test_dispatch_job_expansion_selects_pending_and_deferred)
+      # shell out to a subprocess with a hardcoded DATABASE_URL/REDIS_URL/
+      # SCRAPYD_*_URLS pointed at the docker-compose service DNS names
+      # (pgbouncer/redis/scrapers/scrapers-browser). Those names only
+      # resolve on the compose network, which this job does not bring up —
+      # this step must stay runnable standalone. They're marked
+      # `@pytest.mark.integration` (registered in pyproject.toml) and
+      # excluded here; no CI job currently attaches to the compose network
+      # to run them (compose-smoke's own docker compose lifecycle is
+      # entirely internal to tests/integration/test_compose_smoke.py and
+      # tears itself down before any other step could run against it), so
+      # they are exercised locally against `docker compose up` today. See
+      # H5 task notes.
       - name: Unit test suite
-        run: uv run pytest tests/unit -q
+        run: uv run pytest tests/unit -q -m "not integration"
 
   # ── W5.1: the engine half of the engine/SaaS contract ───────────────────
   # Its own job, not a step inside `checks`, because a contract breach is a

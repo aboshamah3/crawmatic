@@ -32,6 +32,8 @@ import sys
 import uuid
 from datetime import datetime, timezone
 
+import pytest
+
 from app_shared.enums import ScrapeErrorCode, ScrapeTargetStatus
 from app_shared.jobs.targets import mark_target
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
@@ -256,6 +258,7 @@ _EXPANSION_ENV = {
 }
 
 
+@pytest.mark.integration
 def test_dispatch_job_expansion_selects_pending_and_deferred() -> None:
     env = {**os.environ, **_EXPANSION_ENV}
     result = subprocess.run(
