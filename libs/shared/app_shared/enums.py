@@ -399,6 +399,20 @@ class ScrapeErrorCode(StrEnum):
     TLS_CONNECTION_FAILED = "TLS_CONNECTION_FAILED"
     TLS_VERIFICATION_FAILED = "TLS_VERIFICATION_FAILED"
     PROTOCOL_FAILED = "PROTOCOL_FAILED"
+    #: EPA A3/B2 (2026-09-03). The *job* ran past
+    #: ``SCRAPE_JOB_MAX_RUNTIME_SECONDS`` and this target was still
+    #: non-terminal, so ``app_shared.jobs.reaper.fail_targets_past_job_deadline``
+    #: failed it to let ``finalize_jobs`` close the job. Deliberately not
+    #: ``TIMEOUT`` (which asserts a *request* timed out — a per-fetch
+    #: verdict the strategy optimizer legitimately learns from) and not
+    #: ``UNKNOWN_ERROR`` (which asserts we tried and could not classify
+    #: the failure). This code asserts something different and strictly
+    #: weaker: we never found out. The attempt may never have been made
+    #: at all, so nothing downstream may treat it as evidence about the
+    #: domain, the strategy, or the URL.
+    #: No ``ALTER TYPE``: like every member above, this column is an
+    #: app-validated ``VARCHAR(32)`` (``enum_column``), not a PG enum.
+    JOB_DEADLINE_EXCEEDED = "JOB_DEADLINE_EXCEEDED"
 
 
 class ScrapeScope(StrEnum):

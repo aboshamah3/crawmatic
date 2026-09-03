@@ -174,6 +174,7 @@ from app_shared.task_names import (
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
     SCRAPE_FINALIZE_JOBS,
+    SCRAPE_REAP_STALE_TARGETS,
     SCRAPE_RECOVER_STALLED,
     SCRAPE_REDISPATCH_JOBS,
     STRATEGY_LIGHT_RECHECK,
@@ -225,6 +226,31 @@ def _enqueue_stats_flush() -> None:
         enqueue(STRATEGY_STATS_FLUSH, queue="maintenance")
     except Exception:
         logger.exception("scheduler: failed to enqueue %s", STRATEGY_STATS_FLUSH)
+
+
+def _enqueue_reap_stale_targets() -> None:
+    """Fire-and-forget periodic `SCRAPE_REAP_STALE_TARGETS` on the
+    `maintenance` queue (EPA A3/B2, 2026-09-03) — reverts targets
+    orphaned `STARTED` by a vanished scrapyd container and fails every
+    non-terminal target of a job past its hard runtime ceiling.
+
+    Enqueued BEFORE `_enqueue_finalize_jobs` on purpose. The reaper's
+    whole output is targets reaching a terminal status, and
+    `finalize_jobs` closes a job only once ALL of its targets are
+    terminal — so running the reaper first lets a job un-wedged by this
+    tick finalize on the same tick instead of waiting a full minute for
+    the next one. (The ordering is an optimisation, not a correctness
+    requirement: both tasks are idempotent no-arg sweeps and the queue
+    gives no delivery-order guarantee anyway.)
+
+    Errors are logged and swallowed like every other maintenance
+    enqueue: a missed tick just leaves a wedged job wedged one more
+    minute, never a crashed scheduler.
+    """
+    try:
+        enqueue(SCRAPE_REAP_STALE_TARGETS, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", SCRAPE_REAP_STALE_TARGETS)
 
 
 def _enqueue_finalize_jobs() -> None:
@@ -1288,6 +1314,10 @@ def main() -> None:
             _enqueue_stats_flush()
             # Same maintenance tick/knob (SPEC-12 precedent of reusing
             # this cadence): sweep dangling jobs + stalled batches.
+            # EPA A3/B2: reap first, finalize second — a job whose last
+            # STARTED orphan this sweep closes out becomes finalizable
+            # within the same tick.
+            _enqueue_reap_stale_targets()
             _enqueue_finalize_jobs()
             _enqueue_recover_stalled()
             _enqueue_redispatch_pending()

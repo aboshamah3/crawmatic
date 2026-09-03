@@ -55,6 +55,10 @@ from app_shared.jobs.batching import (
 )
 from app_shared.jobs.coalescing import cluster_for_coalescing
 from app_shared.jobs.dispatch_intents import DispatchIntentStore
+from app_shared.jobs.reaper import (
+    fail_targets_past_job_deadline,
+    revert_stale_started_targets,
+)
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.jobs.nodes import select_node
@@ -79,6 +83,7 @@ from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
+    SCRAPE_REAP_STALE_TARGETS,
     SCRAPE_RECOVER_STALLED,
     SCRAPE_RECONCILE_FALSE_FAILURES,
     SCRAPE_REDISPATCH_JOBS,
@@ -1351,3 +1356,76 @@ def recover_stalled_batches() -> None:
                 session.commit()
 
         session.commit()
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=SCRAPE_REAP_STALE_TARGETS)
+def reap_stale_targets() -> None:
+    """`SCRAPE_REAP_STALE_TARGETS` (`maintenance` queue, EPA A3/B2).
+
+    Un-wedges jobs abandoned mid-flight, in two passes over
+    `app_shared.jobs.reaper`.
+
+    **The failure this closes.** A scrapyd container is replaced mid-job
+    — a redeploy, an OOM kill, a drained node. Every target it had
+    already claimed stays `STARTED`, and the process that would have
+    written the terminal status is gone, so nothing ever writes it:
+    `finalize_jobs` never sees "all targets terminal", the job dangles
+    `RUNNING` forever, and the customer's refresh silently never
+    completes. Neither existing sweep covers that state —
+    `recover_stalled_batches` owns only targets still bare `PENDING`, and
+    `redispatch_pending_jobs` only jobs holding `PENDING`/`DEFERRED`
+    work — so before this task nothing in the system could ever resolve
+    a `STARTED` orphan.
+
+    **Pass 1** reverts targets `STARTED` for longer than
+    `SCRAPE_STARTED_REAP_AFTER_SECONDS` back to `PENDING` with their
+    dispatch stamps cleared, putting them back in front of the ordinary
+    dispatcher. The threshold is the browser lock TTL plus a grace, so
+    every row it touches has provably outlived its claimant's own
+    in-flight lock.
+
+    **Pass 2** is the backstop for what pass 1 cannot fix (a target that
+    keeps being re-dispatched and re-lost, or a domain gone permanently
+    unreachable): once a job has been `RUNNING` past
+    `SCRAPE_JOB_MAX_RUNTIME_SECONDS`, every non-terminal target of it is
+    failed `JOB_DEADLINE_EXCEEDED` and stamped `completed_at`, which
+    makes the job finalizable on the next `finalize_jobs` sweep.
+
+    Order is deliberate and both passes share one `now`: reverting first
+    means a target this tick rescues from `STARTED` is still visible to
+    the deadline pass, so an expired job's rows are closed out in the
+    same transaction rather than being handed back to the dispatcher for
+    another 12 hours.
+
+    FLEET-scoped and run on the BYPASSRLS system session. A wedged job in
+    any workspace is exactly the thing being fixed, and under FORCE ROW
+    LEVEL SECURITY the ordinary role's unscoped sweep would fail closed
+    to zero rows (the mushtryati F-1 failure mode) — silently doing
+    nothing, forever, which is indistinguishable from the bug.
+
+    Idempotent and no-arg: a duplicate delivery re-runs both statements,
+    whose `WHERE` clauses no longer match the rows the first delivery
+    moved.
+    """
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+
+    with get_system_session() as session:
+        reverted = revert_stale_started_targets(
+            session,
+            now=now,
+            older_than_seconds=settings.SCRAPE_STARTED_REAP_AFTER_SECONDS,
+        )
+        deadline_failed = fail_targets_past_job_deadline(
+            session,
+            now=now,
+            max_runtime_seconds=settings.SCRAPE_JOB_MAX_RUNTIME_SECONDS,
+        )
+        session.commit()
+
+    logger.info(
+        "maintenance_reap_stale_targets reverted=%d deadline_failed=%d",
+        reverted,
+        deadline_failed,
+    )

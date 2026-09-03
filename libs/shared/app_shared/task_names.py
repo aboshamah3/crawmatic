@@ -128,3 +128,21 @@ MAINTENANCE_ENTITLEMENT_REFRESH = "maintenance.entitlement_refresh"
 # the cycle, because the scheduler does not need the gate's permission
 # to run. See ``app_shared.access.breaker``.
 MAINTENANCE_BREAKER_EVALUATE = "maintenance.breaker_evaluate"
+
+# --- STARTED-target reaper + hard job deadline (EPA A3/B2, 2026-09-03) ---
+# Enqueued by the scheduler on the same 60s maintenance tick as
+# ``SCRAPE_FINALIZE_JOBS`` (and deliberately BEFORE it, so a target the
+# reaper closes out is finalizable within the same tick); consumed by
+# ``apps/workers/app/workers/tasks_jobs.py`` on the existing
+# ``maintenance`` queue.
+#
+# Closes a WEDGE. When a scrapyd container is replaced mid-job, every
+# target it had claimed stays ``STARTED`` — the process that would have
+# written the terminal status is gone, so nothing ever writes it,
+# ``finalize_jobs`` never sees "all targets terminal", and the job dangles
+# ``RUNNING`` forever while the customer's refresh silently never
+# completes. Neither existing sweep covers that state:
+# ``SCRAPE_RECOVER_STALLED`` owns only targets still bare ``PENDING`` and
+# ``SCRAPE_REDISPATCH_JOBS`` only jobs holding ``PENDING``/``DEFERRED``
+# work. See ``app_shared.jobs.reaper``.
+SCRAPE_REAP_STALE_TARGETS = "maintenance.reap_stale_targets"

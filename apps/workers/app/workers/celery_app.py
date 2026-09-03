@@ -54,6 +54,7 @@ from app_shared.task_names import (
     PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
+    SCRAPE_REAP_STALE_TARGETS,
     SCRAPE_RECOVER_STALLED,
     SCRAPE_RECONCILE_FALSE_FAILURES,
     SCRAPE_REDISPATCH_JOBS,
@@ -206,6 +207,10 @@ app.conf.task_queues = {
 app.conf.task_routes = {
     SCRAPE_DISPATCH_JOB: {"queue": "scrape_dispatch"},
     SCRAPE_RECOVER_STALLED: {"queue": "maintenance"},
+    # EPA A3/B2: the STARTED-target reaper + hard job deadline. Routed
+    # explicitly for the same reason as every sweep above — a call that
+    # omits `queue=` still has to land where a consumer is listening.
+    SCRAPE_REAP_STALE_TARGETS: {"queue": "maintenance"},
     SCRAPE_FINALIZE_JOBS: {"queue": "maintenance"},
     SCRAPE_REDISPATCH_JOBS: {"queue": "maintenance"},
     SCRAPE_RECONCILE_FALSE_FAILURES: {"queue": "maintenance"},

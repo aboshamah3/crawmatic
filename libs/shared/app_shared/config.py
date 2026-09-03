@@ -236,6 +236,23 @@ class Settings(BaseSettings):
     # instead of SCRAPE_DISPATCH_HTTP_BATCH_MAX.
     SCRAPE_BATCH_BROWSER_MAX: int = 15
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
+    # --- EPA A3/B2 (2026-09-03): the two maintenance-sweep deadlines that
+    # stop a job dangling RUNNING forever after a scrapyd container is
+    # replaced mid-run. See `app_shared.jobs.reaper`.
+    #
+    # How long a target may sit STARTED before the reaper concludes the
+    # spider that claimed it is gone and reverts it to PENDING.
+    # `MATCH_LOCK_BROWSER_TTL_SECONDS` (1800) is the longest a healthy
+    # in-flight target can legitimately hold its lock, so anything past
+    # that + a 300s grace is provably unowned: nothing can be racing the
+    # revert, because the claimant's own lock has already expired.
+    SCRAPE_STARTED_REAP_AFTER_SECONDS: int = 2100
+    # Hard ceiling on a single job's wall-clock runtime. Past it, every
+    # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
+    # `finalize_jobs` can close the job. 12h is far beyond any legitimate
+    # refresh (the largest measured full run is hours, not half a day),
+    # so this is a wedge detector, not a throughput limit.
+    SCRAPE_JOB_MAX_RUNTIME_SECONDS: int = 43200
     # TTL on the dispatch client's Redis idempotency guard
     # (``dispatched:{job}:{batch_index}``). Without an expiry the guard
     # suppressed every later re-dispatch of the same batch_index forever —

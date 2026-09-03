@@ -172,8 +172,16 @@ class Thresholds:
     #: A target that has been PENDING for an hour is not queued, it is lost.
     target_pending_age_seconds: float = 3_600.0
     #: ``MATCH_LOCK_BROWSER_TTL_SECONDS`` (1800) is the longest a healthy
-    #: in-flight target can legitimately hold its lock.
-    target_started_age_seconds: float = 1_800.0
+    #: in-flight target can legitimately hold its lock — but since EPA
+    #: A3/B2 a STARTED target past that is no longer a standing anomaly,
+    #: it is the reaper's ordinary workload: `reap_stale_targets` reverts
+    #: it to PENDING at ``SCRAPE_STARTED_REAP_AFTER_SECONDS`` (2100).
+    #: Alerting at 1800 would therefore have fired on every single
+    #: orphan in the 300s window the reaper is deliberately waiting out.
+    #: Set past the reap deadline instead, so what this rule now means is
+    #: the thing an operator actually has to act on: **the reaper is not
+    #: running** (or is failing) — a target that survived its own reaping.
+    target_started_age_seconds: float = 2_700.0
     #: DEFERRED is non-terminal by design, but a day-old deferral means
     #: nothing ever re-dispatched it.
     target_deferred_age_seconds: float = 86_400.0
