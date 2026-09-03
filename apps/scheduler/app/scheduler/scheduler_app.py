@@ -136,6 +136,7 @@ from app_shared.messaging import enqueue
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.cost_authorization import CostReservation, ReservationState
 from app_shared.models.maintenance_cadence import (
+    CADENCE_BREAKER_EVALUATE,
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
     CADENCE_ENTITLEMENT_REFRESH,
@@ -161,6 +162,7 @@ from app_shared.scheduling.fair_queue import (
     run_pass,
 )
 from app_shared.task_names import (
+    MAINTENANCE_BREAKER_EVALUATE,
     COSTAUTH_RESERVATION_SWEEP,
     CREATE_WEBHOOK_EVENT,
     MAINTENANCE_COST_ROLLUP,
@@ -418,6 +420,36 @@ def _enqueue_entitlement_refresh() -> None:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_ENTITLEMENT_REFRESH)
 
 
+def _enqueue_breaker_evaluate() -> None:
+    """Fire-and-forget `MAINTENANCE_BREAKER_EVALUATE` on the `maintenance`
+    queue (EPA B1, 2026-09-03) — re-evaluates the durable proxy circuit
+    breaker so its `evaluated_at` evidence never ages past
+    `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS`.
+
+    This cadence exists to break a DEADLOCK, not merely to keep a number
+    warm. The cost gate denies all paid work on stale breaker evidence,
+    and the only other evaluator runs inside the scraping path that the
+    denial blocks — so once the row went stale, nothing in the system
+    could ever refresh it again. The scheduler can: it needs no
+    permission from the gate it is unblocking.
+
+    The fastest durable cadence here by an order of magnitude
+    (`PROXY_BREAKER_EVAL_INTERVAL_SECONDS`, 5m against a 3600s deadline),
+    which is affordable precisely because the expensive part is behind
+    the evaluator's own lease: an enqueue that arrives while the lease is
+    fresh does no aggregate work at all.
+
+    Errors are logged and swallowed like every other maintenance enqueue.
+    A missed tick loses nothing: the deadline lives in
+    `maintenance_cadences`, the evidence still has many ticks of margin,
+    and the next tick re-evaluates.
+    """
+    try:
+        enqueue(MAINTENANCE_BREAKER_EVALUATE, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_BREAKER_EVALUATE)
+
+
 def _enqueue_costauth_reservation_sweep() -> None:
     """Fire-and-forget `COSTAUTH_RESERVATION_SWEEP` on the `maintenance`
     queue (EPA C3, READY-006) — reap expired cost-authorization leases
@@ -502,6 +534,18 @@ _DURABLE_CADENCES = (
         CADENCE_ENTITLEMENT_REFRESH,
         "ENTITLEMENT_REFRESH_INTERVAL_SECONDS",
         _enqueue_entitlement_refresh,
+    ),
+    # EPA B1 2026-09-03. Reuses the evaluator's OWN knob
+    # (`PROXY_BREAKER_EVAL_INTERVAL_SECONDS`, 5m) rather than a new one,
+    # so the cadence that enqueues an evaluation and the lease that
+    # decides whether one is due can never disagree. Far faster than
+    # every other durable cadence because the deadline it races
+    # (`DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS`, 3600) denies ALL paid
+    # work when missed, and no other process can recover from it.
+    (
+        CADENCE_BREAKER_EVALUATE,
+        "PROXY_BREAKER_EVAL_INTERVAL_SECONDS",
+        _enqueue_breaker_evaluate,
     ),
 )
 

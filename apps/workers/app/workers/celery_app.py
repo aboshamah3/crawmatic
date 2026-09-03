@@ -45,6 +45,7 @@ from app_shared.database import dispose_engine
 from app_shared.memory_watchdog import start_memory_watchdog
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
+    MAINTENANCE_BREAKER_EVALUATE,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RETENTION_DROP,
@@ -214,6 +215,10 @@ app.conf.task_routes = {
     STRATEGY_STATS_FLUSH: {"queue": "maintenance"},
     STRATEGY_PATTERN_BACKFILL: {"queue": "maintenance"},
     MAINTENANCE_PARTITION_CREATE: {"queue": "maintenance"},
+    # EPA B1: the durable breaker evaluator. Routed explicitly so a call
+    # that omits `queue=` (a runbook `.delay()`, say) still lands where a
+    # consumer is listening rather than on an unconsumed default queue.
+    MAINTENANCE_BREAKER_EVALUATE: {"queue": "maintenance"},
     MAINTENANCE_DAILY_ROLLUP: {"queue": "maintenance"},
     MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
     CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},

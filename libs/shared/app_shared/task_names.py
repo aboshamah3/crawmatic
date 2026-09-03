@@ -111,3 +111,20 @@ MAINTENANCE_COST_ROLLUP = "maintenance.cost_rollup"
 # paid work, while the future real SaaS->engine ingest's rows keep their
 # own freshness entirely. See ``app_shared.costauth.entitlements``.
 MAINTENANCE_ENTITLEMENT_REFRESH = "maintenance.entitlement_refresh"
+
+# --- Durable proxy-breaker evaluator (EPA B1, 2026-09-03) ---
+# Enqueued by the scheduler on the durable ``CADENCE_BREAKER_EVALUATE``
+# cadence; consumed by ``apps/workers/app/workers/tasks_maintenance.py``
+# on the existing ``maintenance`` queue.
+#
+# Closes a DEADLOCK. The cost gate treats breaker evidence older than
+# ``DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS`` (3600) as missing and
+# DENIES all paid work — and until this task the only thing that ever
+# refreshed ``proxy_circuit_breakers.evaluated_at`` ran *inside* the
+# scraping path that same gate blocks. An idle fleet (or one already
+# denied for any reason) therefore let the evidence rot, after which
+# nothing could ever refresh it again: no scraping -> no evaluation ->
+# stale evidence -> no scraping. Evaluating from the scheduler breaks
+# the cycle, because the scheduler does not need the gate's permission
+# to run. See ``app_shared.access.breaker``.
+MAINTENANCE_BREAKER_EVALUATE = "maintenance.breaker_evaluate"

@@ -92,10 +92,21 @@ CADENCE_COST_ROLLUP = "cost_rollup"
 #: under ``DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`` (86400) or the
 #: refresh and the expiry race each other once a day.
 CADENCE_ENTITLEMENT_REFRESH = "entitlement_refresh"
+#: EPA B1 (2026-09-03): re-evaluates the durable proxy circuit breaker
+#: (``app_shared.access.breaker.evaluate_and_persist``) so its
+#: ``evaluated_at`` evidence stays fresh even when nothing is scraping.
+#: The fastest durable cadence here by an order of magnitude
+#: (``PROXY_BREAKER_EVAL_INTERVAL_SECONDS``, 5m) and deliberately so: the
+#: deadline it races is ``DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS``
+#: (3600), past which the cost gate denies ALL paid work — and the only
+#: other evaluator lives inside the scraping path that denial blocks, so
+#: a stale row could never recover on its own.
+CADENCE_BREAKER_EVALUATE = "breaker_evaluate"
 
 #: Every cadence the scheduler drives durably (the daily ones, plus the
-#: 6-hourly entitlement refresh). The 60s cadences deliberately stay
-#: in-process — see ``app_shared.maintenance.cadence`` module docstring.
+#: 6-hourly entitlement refresh and the 5-minute breaker evaluation). The
+#: 60s cadences deliberately stay in-process — see
+#: ``app_shared.maintenance.cadence`` module docstring.
 DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_PARTITION_CREATE,
     CADENCE_DAILY_ROLLUP,
@@ -103,6 +114,7 @@ DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_COST_ROLLUP,
     CADENCE_ENTITLEMENT_REFRESH,
+    CADENCE_BREAKER_EVALUATE,
 )
 
 
@@ -136,6 +148,7 @@ class MaintenanceCadence(Base, TimestampMixin):
 
 
 __all__ = [
+    "CADENCE_BREAKER_EVALUATE",
     "CADENCE_COST_ROLLUP",
     "CADENCE_DAILY_ROLLUP",
     "CADENCE_ENTITLEMENT_REFRESH",

@@ -38,6 +38,7 @@ from contextlib import contextmanager
 from app.scheduler import scheduler_app
 from app_shared.config import get_settings
 from app_shared.task_names import (
+    MAINTENANCE_BREAKER_EVALUATE,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
@@ -46,6 +47,7 @@ from app_shared.task_names import (
     MAINTENANCE_RETENTION_DROP,
 )
 from app_shared.models.maintenance_cadence import (
+    CADENCE_BREAKER_EVALUATE,
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
     CADENCE_ENTITLEMENT_REFRESH,
@@ -356,6 +358,76 @@ from app_shared.costauth.service import DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SEC
 interval = get_settings().ENTITLEMENT_REFRESH_INTERVAL_SECONDS
 assert interval > 0, interval
 assert interval * 4 <= DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS, interval
+print("OK")
+"""
+        )
+    )
+
+
+def test_durable_cadences_cover_the_breaker_evaluator() -> None:
+    """EPA B1 (2026-09-03). The proxy breaker's `evaluated_at` is evidence
+    the cost gate fails CLOSED on once it passes
+    `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS` — and until this entry the
+    ONLY thing that refreshed it ran inside the scraping path that the
+    very same gate blocks. An idle (or already-denied) fleet therefore let
+    the evidence rot and then denied all paid work permanently, with no
+    process anywhere able to break the loop. A scheduler-driven cadence is
+    the break: it evaluates whether or not anything is scraping."""
+    _assert_ok(
+        _run(
+            """
+keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
+attrs = [c[1] for c in scheduler_app._DURABLE_CADENCES]
+fns = [c[2].__name__ for c in scheduler_app._DURABLE_CADENCES]
+
+assert CADENCE_BREAKER_EVALUATE in keys, keys
+index = keys.index(CADENCE_BREAKER_EVALUATE)
+assert fns[index] == "_enqueue_breaker_evaluate", fns
+# Its own knob — the same one the in-scrape evaluator's lease already
+# uses, so the cadence and the lease can never disagree about how often
+# an evaluation is due.
+assert attrs[index] == "PROXY_BREAKER_EVAL_INTERVAL_SECONDS", attrs
+print("OK")
+"""
+        )
+    )
+
+
+def test_breaker_evaluate_interval_is_far_under_the_staleness_deadline() -> None:
+    """The arithmetic that makes this cadence worth having. Evidence must be
+    refreshed several times inside the staleness window, so losing a run (or
+    three) still cannot age the row past
+    `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS` and deny every paid path."""
+    _assert_ok(
+        _run(
+            """
+from app_shared.costauth.service import DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS
+
+keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
+attrs = [c[1] for c in scheduler_app._DURABLE_CADENCES]
+attr = attrs[keys.index(CADENCE_BREAKER_EVALUATE)]
+
+interval = getattr(get_settings(), attr)
+assert interval > 0, interval
+assert interval * 4 <= DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS, (attr, interval)
+print("OK")
+"""
+        )
+    )
+
+
+def test_breaker_evaluate_cadence_enqueues_its_own_task() -> None:
+    """Behavioral proof, not a list check: a claimed cadence must enqueue
+    `MAINTENANCE_BREAKER_EVALUATE` on the `maintenance` queue."""
+    _assert_ok(
+        _run(
+            """
+enqueue, session = _install({CADENCE_BREAKER_EVALUATE})
+
+claimed = scheduler_app._run_durable_cadence_tick(get_settings())
+
+assert claimed == [CADENCE_BREAKER_EVALUATE], claimed
+assert enqueue.calls == [(MAINTENANCE_BREAKER_EVALUATE, "maintenance")], enqueue.calls
 print("OK")
 """
         )

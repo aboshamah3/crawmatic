@@ -39,6 +39,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import app
+from app_shared.access.breaker import evaluate_and_persist, thresholds_from_settings
 from app_shared.config import get_settings
 from app_shared.costauth import sweep_expired_reservations
 from app_shared.costauth.entitlements import refresh_seeded_entitlements
@@ -64,6 +65,7 @@ from app_shared.netledger.reconcile import (
 from app_shared.netledger.rollups import run_cost_rollup
 from app_shared.task_names import (
     COSTAUTH_RESERVATION_SWEEP,
+    MAINTENANCE_BREAKER_EVALUATE,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
@@ -564,4 +566,63 @@ def entitlement_refresh() -> None:
 
     logger.info(
         "maintenance_entitlement_refresh rows_refreshed=%d", rows_refreshed
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_BREAKER_EVALUATE)
+def breaker_evaluate() -> None:
+    """`MAINTENANCE_BREAKER_EVALUATE` (`maintenance` queue, EPA B1).
+
+    Keeps `proxy_circuit_breakers.evaluated_at` fresh even when the fleet
+    is completely idle.
+
+    **Why this task exists — the deadlock.** The cost gate treats breaker
+    evidence older than `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS` (3600)
+    as missing and denies all paid work. The only evaluator that existed
+    before this one runs inside `scrape_core.targets`' dispatch path — the
+    path that denial blocks. So an hour of quiet (a weekend, a deploy
+    pause, or a single unrelated denial) aged the row past the deadline,
+    and from then on nothing could refresh it: no scraping -> no
+    evaluation -> stale evidence -> no scraping, permanently, until a
+    human touched the row by hand.
+
+    Running the evaluator from the scheduler's durable cadence breaks the
+    cycle at exactly one point: the scheduler does not need the gate's
+    permission to run, so the evidence is refreshed on a wall-clock
+    schedule regardless of whether any paid work is happening.
+
+    The lease inside `evaluate_and_persist` is unchanged, so this task and
+    the in-scrape evaluator cannot both do the expensive aggregate pass
+    within one `PROXY_BREAKER_EVAL_INTERVAL_SECONDS` window — whichever
+    arrives first wins and the other returns `None` having done nothing.
+    That is why a `None` verdict here is a perfectly healthy outcome and
+    is logged as such rather than as an error.
+
+    FLEET-scoped and run on the BYPASSRLS system session: the breaker is a
+    global (no `workspace_id`, no RLS) row and its inputs are the durable
+    fleet-wide audit tables.
+
+    Idempotent and no-arg: a duplicate delivery either re-reads the same
+    aggregates and writes the same verdict, or loses the lease and does
+    nothing at all.
+    """
+    settings = get_settings()
+    if not settings.PROXY_BREAKER_ENABLED:
+        logger.info("maintenance_breaker_evaluate skipped=breaker_disabled")
+        return
+
+    with _system_session("breaker_evaluate") as session:
+        verdict = evaluate_and_persist(
+            session,
+            thresholds=thresholds_from_settings(settings),
+            min_interval_seconds=settings.PROXY_BREAKER_EVAL_INTERVAL_SECONDS,
+        )
+        session.commit()
+
+    logger.info(
+        "maintenance_breaker_evaluate ran=%s state=%s tripped=%s",
+        verdict is not None,
+        getattr(getattr(verdict, "state", None), "value", "lease-held"),
+        getattr(verdict, "tripped", None),
     )
