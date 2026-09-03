@@ -89,6 +89,24 @@ _PLACEHOLDER_DB_PASSWORD = "crawmatic"
 #: asks the database rather than guessing from a name.
 _BOOTSTRAP_DB_ROLES = frozenset({"crawmatic", "postgres"})
 
+#: Structured log event emitted (at ERROR) when a production deploy
+#: carries no explicit fleet money cap for one or both paid transport
+#: classes — EPA A4/B3.
+#:
+#: Deliberately a LOG LINE and not a finding: an unset cap is not a
+#: reason to refuse to boot. `maintenance.fleet_budget_rollforward`
+#: carries the last cap it finds forward, so an unset var usually means
+#: "keep what the operator already chose" and the fleet stays capped.
+#: Refusing to start would turn a well-behaved fallback into an outage.
+#:
+#: This check is deliberately settings-only. The question that would
+#: actually prove the fleet is capped — "does a `fleet_cost_budgets` row
+#: with a non-NULL limit exist for this period?" — needs a database, and
+#: `assert_production_safe` runs at API import time with no session. The
+#: DB-aware half lives in the cadence's own report
+#: (`RollForwardReport.uncapped`), which is logged at ERROR every 6h.
+EVENT_FLEET_BUDGET_UNCAPPED = "fleet_budget_uncapped"
+
 #: Minimum acceptable length for a raw HMAC/Fernet-style secret,
 #: mirroring PyJWT's own `InsecureKeyLengthWarning` threshold (32 bytes
 #: for HS256).
@@ -226,6 +244,35 @@ def _database_role_findings(settings: Settings) -> list[str]:
     return findings
 
 
+def _log_uncapped_fleet_budget(settings: Settings) -> None:
+    """Announce, at ERROR, any paid transport class with no configured cap.
+
+    Never raises and never contributes a finding — see
+    :data:`EVENT_FLEET_BUDGET_UNCAPPED` for why an unset cap is a warning
+    rather than a refusal to boot.
+    """
+    unset = [
+        name
+        for name, value in (
+            ("FLEET_BUDGET_MONTHLY_CAP_USD_PROXY", settings.FLEET_BUDGET_MONTHLY_CAP_USD_PROXY),
+            (
+                "FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER",
+                settings.FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER,
+            ),
+        )
+        if value is None
+    ]
+    if not unset:
+        return
+    logger.error(
+        "%s unset=%s impact=fleet_money_ceiling_not_explicitly_configured "
+        "fallback=maintenance.fleet_budget_rollforward_carries_the_last_cap_forward "
+        "action=set_these_vars_or_run_scripts/seed_fleet_budget_cap.py_--propose",
+        EVENT_FLEET_BUDGET_UNCAPPED,
+        ",".join(unset),
+    )
+
+
 def assert_production_safe(settings: Settings | None = None) -> None:
     """Raise :class:`ProductionConfigError` if this looks like a
     production deploy running with local-dev-shaped configuration.
@@ -238,6 +285,8 @@ def assert_production_safe(settings: Settings | None = None) -> None:
         return
 
     resolved = settings if settings is not None else get_settings()
+
+    _log_uncapped_fleet_budget(resolved)
 
     findings: list[str] = []
     findings.extend(_weak_secret_findings(resolved))

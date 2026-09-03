@@ -639,6 +639,26 @@ class Settings(BaseSettings):
     # night's sleep. It costs one bounded UPDATE over one row per
     # workspace, four times a day.
     ENTITLEMENT_REFRESH_INTERVAL_SECONDS: int = 21600
+    # --- Fleet budget cap policy (EPA A4/B3, 2026-09-03). The monthly
+    # money ceiling `maintenance.fleet_budget_rollforward` writes onto
+    # `fleet_cost_budgets` for each PAID transport class, in DOLLARS
+    # (converted once, by `app_shared.costauth.fleet_budget_policy.
+    # usd_to_units`, so the ledger's unit can change under Task B1 without
+    # anyone re-deriving these numbers).
+    #
+    # `None` is not "no cap" — it means "carry the last cap you find
+    # forward", which is what keeps a deploy that forgot these vars from
+    # silently uncapping the fleet. Only a scope with NO configured cap
+    # AND no earlier capped period is genuinely uncapped, and that is
+    # logged at ERROR from two places: `assert_production_safe` at
+    # startup, and the cadence's own report every 6h.
+    #
+    # Deliberately unset by default: a default here would be this
+    # repository inventing a money ceiling for someone else's provider
+    # account. `scripts/seed_fleet_budget_cap.py --propose` derives the
+    # number from observed spend and prints its full derivation.
+    FLEET_BUDGET_MONTHLY_CAP_USD_PROXY: float | None = None
+    FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER: float | None = None
     # Raised 1 -> 3 in the 2026-08-15 readiness cycle. With a lookahead of
     # 1 the entire safety margin between "maintenance stops working" and
     # "every INSERT into four partitioned tables fails" is however many

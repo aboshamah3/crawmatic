@@ -47,6 +47,7 @@ from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     MAINTENANCE_BREAKER_EVALUATE,
     MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
@@ -225,6 +226,10 @@ app.conf.task_routes = {
     # consumer is listening rather than on an unconsumed default queue.
     MAINTENANCE_BREAKER_EVALUATE: {"queue": "maintenance"},
     MAINTENANCE_DAILY_ROLLUP: {"queue": "maintenance"},
+    # EPA A4/B3: the fleet budget cap roll-forward. Routed explicitly for
+    # the same reason as every sweep above — a call that omits `queue=`
+    # still has to land where a consumer is listening.
+    MAINTENANCE_FLEET_BUDGET_ROLLFORWARD: {"queue": "maintenance"},
     MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
     CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},
     # Audit H1: both outbox passes are ordinary `maintenance` sweeps —

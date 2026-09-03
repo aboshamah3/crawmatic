@@ -42,6 +42,7 @@ from app_shared.task_names import (
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
+    MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
@@ -51,6 +52,7 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
     CADENCE_ENTITLEMENT_REFRESH,
+    CADENCE_FLEET_BUDGET_ROLLFORWARD,
     CADENCE_PARTITION_CREATE,
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
@@ -428,6 +430,76 @@ claimed = scheduler_app._run_durable_cadence_tick(get_settings())
 
 assert claimed == [CADENCE_BREAKER_EVALUATE], claimed
 assert enqueue.calls == [(MAINTENANCE_BREAKER_EVALUATE, "maintenance")], enqueue.calls
+print("OK")
+"""
+        )
+    )
+
+
+def test_durable_cadences_cover_the_fleet_budget_rollforward() -> None:
+    """EPA A4/B3 (2026-09-03). `fleet_cost_budgets` is the only fleet-wide
+    money ceiling there is, and it was seeded for a FIXED set of months
+    ending `2026_10`. A budget row is born with `NULL` limits, so the
+    first paid dispatch of the month after the last one seeded creates an
+    uncapped row and the ceiling is gone — with no denial, no log line and
+    the provider bill as the only symptom. This cadence is what makes the
+    ceiling survive a month boundary without an operator."""
+    _assert_ok(
+        _run(
+            """
+keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
+attrs = [c[1] for c in scheduler_app._DURABLE_CADENCES]
+fns = [c[2].__name__ for c in scheduler_app._DURABLE_CADENCES]
+
+assert CADENCE_FLEET_BUDGET_ROLLFORWARD in keys, keys
+index = keys.index(CADENCE_FLEET_BUDGET_ROLLFORWARD)
+assert fns[index] == "_enqueue_fleet_budget_rollforward", fns
+# Deliberately shares the 6h entitlement knob rather than adding one:
+# the deadline this cadence races is a MONTH boundary, so six hours is
+# three orders of magnitude of margin and a knob of its own would be a
+# setting with no decision behind it.
+assert attrs[index] == "ENTITLEMENT_REFRESH_INTERVAL_SECONDS", attrs
+print("OK")
+"""
+        )
+    )
+
+
+def test_fleet_budget_rollforward_interval_is_far_under_a_month() -> None:
+    """The arithmetic that makes the cadence worth having: many ticks
+    inside every month, so losing several in a row still cannot let a
+    month boundary be crossed with an uncapped budget row."""
+    _assert_ok(
+        _run(
+            """
+keys = [c[0] for c in scheduler_app._DURABLE_CADENCES]
+attrs = [c[1] for c in scheduler_app._DURABLE_CADENCES]
+attr = attrs[keys.index(CADENCE_FLEET_BUDGET_ROLLFORWARD)]
+
+interval = getattr(get_settings(), attr)
+assert interval > 0, interval
+# 28 days is the shortest month.
+assert interval * 20 <= 28 * 86400, (attr, interval)
+print("OK")
+"""
+        )
+    )
+
+
+def test_fleet_budget_rollforward_cadence_enqueues_its_own_task() -> None:
+    """Behavioral proof, not a list check: a claimed cadence must enqueue
+    `MAINTENANCE_FLEET_BUDGET_ROLLFORWARD` on the `maintenance` queue."""
+    _assert_ok(
+        _run(
+            """
+enqueue, session = _install({CADENCE_FLEET_BUDGET_ROLLFORWARD})
+
+claimed = scheduler_app._run_durable_cadence_tick(get_settings())
+
+assert claimed == [CADENCE_FLEET_BUDGET_ROLLFORWARD], claimed
+assert enqueue.calls == [
+    (MAINTENANCE_FLEET_BUDGET_ROLLFORWARD, "maintenance")
+], enqueue.calls
 print("OK")
 """
         )

@@ -31,7 +31,10 @@ Three modes
   data it says so, in those words, and falls back to the repository's
   own measured evidence, naming the document each number came from.
 * ``--apply --monthly-cap-minor-units N --currency XXX`` — upserts the
-  cap onto the fleet budget rows.
+  cap onto the fleet budget rows. ``--monthly-cap-usd D`` is the same
+  ceiling spelled in dollars, converted by the same
+  ``app_shared.costauth.fleet_budget_policy.usd_to_units`` the
+  maintenance cadence uses on its settings.
 * no flags — dry-run: prints exactly which rows would change and how.
 
 Scope: which rows get the cap
@@ -47,19 +50,31 @@ has no single fleet-total row to put one number on. The script prints the
 aggregate worst case (`cap x scopes`) on every run so that arithmetic is
 never a surprise.
 
-Periods: the cap does NOT carry itself forward
------------------------------------------------
+Periods: carried forward by the maintenance cadence
+---------------------------------------------------
 A fleet budget row is created on first use of a `(scope_key, period_key)`
 pair with **NULL limits** (`app_shared.costauth.service.
 _get_or_create_budget_locked`, and deliberately so — a row that
 materialised with an invented ceiling would deny work nobody budgeted
 for). Next month's row is therefore born uncapped, and a cap applied only
-to the current month silently evaporates at the month boundary.
+to the current month evaporates at the month boundary.
 
 ``--months-ahead`` (default 1, i.e. this month plus the next) exists for
-exactly that reason, and the script prints the last period it capped on
-every run. **Until a real budget-policy writer exists, re-running this
-script is a recurring operator task**, not a one-off deploy step.
+exactly that reason. Since EPA A4/B3 it is no longer the only defence:
+`app_shared.costauth.fleet_budget_policy` is the real budget-policy
+writer, and `maintenance.fleet_budget_rollforward` runs it on the
+scheduler's durable 6-hourly cadence, so the current and next month stay
+capped without an operator. This script is now the way an operator
+CHOOSES a number (`--propose`) and puts it in place immediately, not a
+recurring calendar task.
+
+Where the shared logic lives
+-----------------------------
+`DEFAULT_SCOPE_KEYS`, `period_keys_from`, `plan_budget_rows` and
+`apply_budget_cap` moved to `app_shared.costauth.fleet_budget_policy` and
+are re-imported here. The cadence and this script therefore run the SAME
+"which rows get the cap" code — two implementations would be two answers
+to what is capped, and only one of them would be running at 3am.
 
 Session seam
 ------------
@@ -86,22 +101,24 @@ from typing import Callable, Sequence
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app_shared.costauth.service import (
-    FLEET_PROVIDER_BROWSER,
-    FLEET_PROVIDER_PROXY,
-    period_key_for,
+# The shared policy: the cadence (`maintenance.fleet_budget_rollforward`)
+# and this script must agree on which rows get the cap, so they run the
+# same functions rather than two copies of them.
+from app_shared.costauth.fleet_budget_policy import (
+    DEFAULT_SCOPE_KEYS,
+    USD_TO_UNITS,
+    BudgetRowPlan,
+    apply_budget_cap,
+    period_keys_from,
+    plan_budget_rows,
+    usd_to_units,
 )
-from app_shared.models.cost_authorization import FleetCostBudget
 from app_shared.models.network_operations import (
     NetworkOperation,
     NetworkOperationSettlement,
 )
 
 SessionFactory = Callable[[], Session]
-
-#: The paid transport classes a fleet money cap must bind. `direct` is
-#: deliberately absent — see the module docstring.
-DEFAULT_SCOPE_KEYS: tuple[str, ...] = (FLEET_PROVIDER_PROXY, FLEET_PROVIDER_BROWSER)
 
 #: The owner's multiplier: a cap is a runaway brake, not a forecast, so it
 #: sits well clear of normal spend. 3x is high enough that ordinary
@@ -149,42 +166,6 @@ class SpendObservation:
     currency: str
     source: str
     derivation: str
-
-
-@dataclass(frozen=True)
-class BudgetRowPlan:
-    """What one ``(scope_key, period_key)`` row would become."""
-
-    scope_key: str
-    period_key: str
-    existing_limit_minor_units: int | None
-    new_limit_minor_units: int
-    row_exists: bool
-
-    @property
-    def is_change(self) -> bool:
-        """False when the row already carries exactly this cap."""
-        return self.existing_limit_minor_units != self.new_limit_minor_units
-
-
-def period_keys_from(now: datetime, *, months_ahead: int) -> tuple[str, ...]:
-    """``%Y_%m`` keys for the current month plus ``months_ahead`` more.
-
-    Computed by walking month numbers rather than adding days, so a
-    31-day month never skips a period and February never doubles one.
-    ``months_ahead=0`` yields the current month alone.
-    """
-    if months_ahead < 0:
-        raise ValueError("months_ahead must be >= 0")
-    keys: list[str] = []
-    year, month = now.year, now.month
-    for _ in range(months_ahead + 1):
-        keys.append(period_key_for(datetime(year, month, 1, tzinfo=timezone.utc)))
-        month += 1
-        if month > 12:
-            month = 1
-            year += 1
-    return tuple(keys)
 
 
 def observe_monthly_spend(session: Session, *, now: datetime) -> SpendObservation:
@@ -304,94 +285,6 @@ def propose_cap(observation: SpendObservation) -> int:
     return observation.monthly_minor_units * CAP_MULTIPLIER
 
 
-def plan_budget_rows(
-    session: Session,
-    *,
-    scope_keys: Sequence[str],
-    period_keys: Sequence[str],
-    monthly_cap_minor_units: int,
-) -> list[BudgetRowPlan]:
-    """Classify every targeted ``(scope_key, period_key)`` row. Writes nothing.
-
-    Separated from :func:`apply_budget_cap` so the dry run and the apply
-    report the SAME plan rather than two independently-computed ones —
-    the property that makes a dry run worth reading.
-    """
-    existing = {
-        (row.scope_key, row.period_key): row
-        for row in session.execute(
-            select(FleetCostBudget).where(
-                FleetCostBudget.scope_key.in_(list(scope_keys)),
-                FleetCostBudget.period_key.in_(list(period_keys)),
-            )
-        ).scalars()
-    }
-    plans: list[BudgetRowPlan] = []
-    for scope_key in scope_keys:
-        for period_key in period_keys:
-            row = existing.get((scope_key, period_key))
-            plans.append(
-                BudgetRowPlan(
-                    scope_key=scope_key,
-                    period_key=period_key,
-                    existing_limit_minor_units=(
-                        None if row is None else row.limit_cost_minor_units
-                    ),
-                    new_limit_minor_units=monthly_cap_minor_units,
-                    row_exists=row is not None,
-                )
-            )
-    return plans
-
-
-def apply_budget_cap(
-    session: Session,
-    *,
-    plans: Sequence[BudgetRowPlan],
-    currency: str,
-    monthly_cap_minor_units: int,
-) -> int:
-    """Upsert ``limit_cost_minor_units`` for every planned row. Returns rows changed.
-
-    Only ``limit_cost_minor_units`` is written. The `reserved_*` /
-    `settled_*` counters are the authorization path's to maintain and are
-    never touched here — resetting a counter would hand back money the
-    fleet has already spent — and the other three `limit_*` columns stay
-    `NULL` (see the module docstring).
-
-    A row that does not exist yet is INSERTed with the cap already on it,
-    rather than left for `_get_or_create_budget_locked` to materialise
-    uncapped on the month's first authorization. That is the whole point
-    of `--months-ahead`: the ceiling must be in place BEFORE the first
-    spend of the period, not after it.
-
-    Does not commit — the caller owns the transaction.
-    """
-    changed = 0
-    for plan in plans:
-        if not plan.is_change:
-            continue
-        if plan.row_exists:
-            row = session.execute(
-                select(FleetCostBudget).where(
-                    FleetCostBudget.scope_key == plan.scope_key,
-                    FleetCostBudget.period_key == plan.period_key,
-                )
-            ).scalar_one()
-            row.limit_cost_minor_units = monthly_cap_minor_units
-        else:
-            session.add(
-                FleetCostBudget(
-                    scope_key=plan.scope_key,
-                    period_key=plan.period_key,
-                    currency=currency,
-                    limit_cost_minor_units=monthly_cap_minor_units,
-                )
-            )
-        changed += 1
-    return changed
-
-
 def format_proposal(observation: SpendObservation, *, scope_keys: Sequence[str]) -> str:
     """The `--propose` report: the number, the formula, and the provenance."""
     cap = propose_cap(observation)
@@ -436,9 +329,13 @@ def format_plan(
         )
     if plans:
         lines.append(
-            f"  NOTE: the cap does NOT carry itself into a period this run did not "
-            f"cover — the last period capped here is {plans[-1].period_key}. Re-run "
-            "before it ends, or a new month's budget row is born with NULL limits."
+            f"  NOTE: the last period capped here is {plans[-1].period_key}; beyond "
+            "it the cap is carried forward automatically by "
+            "maintenance.fleet_budget_rollforward "
+            "(app_shared.costauth.fleet_budget_policy), which re-caps the current "
+            "and next month every 6h — so this is no longer a recurring operator "
+            "task. Set FLEET_BUDGET_MONTHLY_CAP_USD_PROXY / _BROWSER to make that "
+            "cadence write THIS number rather than carry the last one it finds."
         )
     return "\n".join(lines)
 
@@ -529,14 +426,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "a dry-run: prints every row that WOULD change, then rolls back."
         ),
     )
-    parser.add_argument(
+    # One ceiling, two spellings. The minor-units flag is the ledger's own
+    # unit and stays authoritative (`--propose` prints its recommendation
+    # in it); `--monthly-cap-usd` exists because the SETTINGS the
+    # maintenance cadence reads
+    # (`FLEET_BUDGET_MONTHLY_CAP_USD_PROXY` / `_BROWSER`) are in dollars,
+    # and an operator choosing "$75" should not have to convert by hand
+    # to reach the same number from both directions. Mutually exclusive:
+    # two ceilings on one run is a question, not an instruction.
+    cap_group = parser.add_mutually_exclusive_group()
+    cap_group.add_argument(
         "--monthly-cap-minor-units",
         type=int,
         default=None,
         help=(
             "The monthly money ceiling, in integer MINOR units (cents for "
             "USD) — never a float, per the app_shared.money contract. "
-            "Required unless --propose."
+            "Required unless --propose or --monthly-cap-usd."
+        ),
+    )
+    cap_group.add_argument(
+        "--monthly-cap-usd",
+        type=float,
+        default=None,
+        help=(
+            "The same ceiling in DOLLARS, converted with "
+            f"app_shared.costauth.fleet_budget_policy.usd_to_units "
+            f"(x{USD_TO_UNITS}) — the identical conversion the "
+            "maintenance cadence applies to "
+            "FLEET_BUDGET_MONTHLY_CAP_USD_PROXY / _BROWSER, so the two "
+            "routes to a cap can never disagree by a rounding step."
         ),
     )
     parser.add_argument(
@@ -569,7 +488,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "set only for this month evaporates at the month boundary."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # Normalise to the ledger's unit immediately, so exactly one field
+    # carries the cap from here on and `validate_args`/`run` never have
+    # to ask which spelling was used.
+    if args.monthly_cap_usd is not None:
+        args.monthly_cap_minor_units = usd_to_units(args.monthly_cap_usd)
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> str | None:

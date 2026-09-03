@@ -129,6 +129,24 @@ MAINTENANCE_ENTITLEMENT_REFRESH = "maintenance.entitlement_refresh"
 # to run. See ``app_shared.access.breaker``.
 MAINTENANCE_BREAKER_EVALUATE = "maintenance.breaker_evaluate"
 
+# --- Fleet budget cap roll-forward (EPA A4/B3, 2026-09-03) ---
+# Enqueued by the scheduler on the durable
+# ``CADENCE_FLEET_BUDGET_ROLLFORWARD`` cadence; consumed by
+# ``apps/workers/app/workers/tasks_maintenance.py`` on the existing
+# ``maintenance`` queue.
+#
+# Closes a DATED GAP rather than a deadlock. `fleet_cost_budgets` is the
+# only fleet-wide money ceiling there is, and it was put in place by a
+# one-off operator run of ``scripts/seed_fleet_budget_cap.py`` covering a
+# FIXED number of months — the last of them ``2026_10``. A budget row is
+# born with ``NULL`` limits, so on the first paid dispatch of the month
+# after the last one seeded, ``authorize()`` materialises an uncapped row
+# and the ceiling is gone with no log line, no denial and no symptom
+# short of the provider bill. This task re-caps the current and next
+# month every 6h, carrying the last cap forward when no explicit one is
+# configured. See ``app_shared.costauth.fleet_budget_policy``.
+MAINTENANCE_FLEET_BUDGET_ROLLFORWARD = "maintenance.fleet_budget_rollforward"
+
 # --- STARTED-target reaper + hard job deadline (EPA A3/B2, 2026-09-03) ---
 # Enqueued by the scheduler on the same 60s maintenance tick as
 # ``SCRAPE_FINALIZE_JOBS`` (and deliberately BEFORE it, so a target the

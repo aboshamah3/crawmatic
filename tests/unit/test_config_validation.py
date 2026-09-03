@@ -8,10 +8,13 @@ process-wide cache is never touched.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from app_shared.config import Settings
 from app_shared.config_validation import (
+    EVENT_FLEET_BUDGET_UNCAPPED,
     EXTRA_PRODUCTION_CHECKS,
     ProductionConfigError,
     assert_production_safe,
@@ -306,3 +309,70 @@ def test_override_is_ignored_outside_production(
 ) -> None:
     settings = _settings(LOCAL_DEV_ENV)
     assert_production_safe(settings)
+
+
+# --- fleet money cap (EPA A4/B3) --------------------------------------------
+#
+# `fleet_cost_budgets` is the only fleet-wide money ceiling there is, and
+# `FLEET_BUDGET_MONTHLY_CAP_USD_PROXY` / `_BROWSER` are how an operator
+# states it. Unset is WARNED and never fatal: the roll-forward cadence
+# carries the last cap it finds forward, so an unset var usually means
+# "keep the number the operator already chose" — turning that into a
+# refusal to boot would make a working fallback an outage.
+
+
+def test_production_logs_an_error_when_a_fleet_cap_is_unset(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    settings = _settings(SAFE_ENV, FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER="25.0")
+
+    with caplog.at_level(logging.ERROR, logger="app_shared.config_validation"):
+        assert_production_safe(settings)  # must NOT raise
+
+    records = [r for r in caplog.records if EVENT_FLEET_BUDGET_UNCAPPED in r.getMessage()]
+    assert len(records) == 1, caplog.records
+    message = records[0].getMessage()
+    assert "FLEET_BUDGET_MONTHLY_CAP_USD_PROXY" in message
+    assert "FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER" not in message
+
+
+def test_production_is_silent_when_both_fleet_caps_are_configured(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    settings = _settings(
+        SAFE_ENV,
+        FLEET_BUDGET_MONTHLY_CAP_USD_PROXY="75.0",
+        FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER="25.0",
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app_shared.config_validation"):
+        assert_production_safe(settings)
+
+    assert [r for r in caplog.records if EVENT_FLEET_BUDGET_UNCAPPED in r.getMessage()] == []
+
+
+def test_an_unset_fleet_cap_never_blocks_a_boot(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both caps unset on an otherwise safe production config still boots.
+    The cadence carries the last cap forward; refusing to start would make
+    a fallback into an outage."""
+    monkeypatch.setenv("ENVIRONMENT", "production")
+
+    with caplog.at_level(logging.ERROR, logger="app_shared.config_validation"):
+        assert_production_safe(settings=_settings(SAFE_ENV))
+
+    assert any(
+        EVENT_FLEET_BUDGET_UNCAPPED in r.getMessage() for r in caplog.records
+    ), caplog.records
+
+
+def test_the_fleet_cap_warning_never_fires_outside_production(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.ERROR, logger="app_shared.config_validation"):
+        assert_production_safe(settings=_settings(LOCAL_DEV_ENV))
+
+    assert caplog.records == []

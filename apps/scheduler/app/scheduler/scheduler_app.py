@@ -140,6 +140,7 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
     CADENCE_ENTITLEMENT_REFRESH,
+    CADENCE_FLEET_BUDGET_ROLLFORWARD,
     CADENCE_PARTITION_CREATE,
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_RETENTION_DROP,
@@ -168,6 +169,7 @@ from app_shared.task_names import (
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
+    MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
@@ -476,6 +478,38 @@ def _enqueue_breaker_evaluate() -> None:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_BREAKER_EVALUATE)
 
 
+def _enqueue_fleet_budget_rollforward() -> None:
+    """Fire-and-forget `MAINTENANCE_FLEET_BUDGET_ROLLFORWARD` on the
+    `maintenance` queue (EPA A4/B3, 2026-09-03) — re-caps
+    `fleet_cost_budgets` for the current and next month so the fleet-wide
+    money ceiling survives a month boundary without an operator.
+
+    The gap it closes is DATED, not intermittent: the one-off seeder
+    capped a fixed number of months ending `2026_10`, and a budget row is
+    born with `NULL` limits, so the first paid dispatch of the following
+    month creates an uncapped row and the ceiling disappears silently.
+
+    Reuses `ENTITLEMENT_REFRESH_INTERVAL_SECONDS` (6h) rather than
+    introducing a knob of its own. The only deadline this cadence races
+    is a MONTH boundary, so six hours is already three orders of
+    magnitude of margin, and reusing an existing 6-hourly value keeps the
+    scheduler's tuning surface from growing a knob nobody would ever have
+    a reason to turn. It is affordable because the work is bounded and
+    idempotent: on all but the first tick of a month it is one SELECT
+    that finds every row already capped.
+
+    Errors are logged and swallowed like every other maintenance enqueue.
+    A missed tick loses nothing — the deadline lives in
+    `maintenance_cadences` and the next tick re-caps.
+    """
+    try:
+        enqueue(MAINTENANCE_FLEET_BUDGET_ROLLFORWARD, queue="maintenance")
+    except Exception:
+        logger.exception(
+            "scheduler: failed to enqueue %s", MAINTENANCE_FLEET_BUDGET_ROLLFORWARD
+        )
+
+
 def _enqueue_costauth_reservation_sweep() -> None:
     """Fire-and-forget `COSTAUTH_RESERVATION_SWEEP` on the `maintenance`
     queue (EPA C3, READY-006) — reap expired cost-authorization leases
@@ -572,6 +606,16 @@ _DURABLE_CADENCES = (
         CADENCE_BREAKER_EVALUATE,
         "PROXY_BREAKER_EVAL_INTERVAL_SECONDS",
         _enqueue_breaker_evaluate,
+    ),
+    # EPA A4/B3 2026-09-03. Shares the entitlement refresh's 6h knob
+    # rather than adding one: both are "keep a piece of durable evidence
+    # from expiring" cadences, and the deadline here is a MONTH boundary
+    # — six hours is three orders of magnitude of margin, so a knob of
+    # its own would be a setting with no decision behind it.
+    (
+        CADENCE_FLEET_BUDGET_ROLLFORWARD,
+        "ENTITLEMENT_REFRESH_INTERVAL_SECONDS",
+        _enqueue_fleet_budget_rollforward,
     ),
 )
 

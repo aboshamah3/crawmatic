@@ -41,8 +41,13 @@ from sqlalchemy.orm import Session
 from app.workers.celery_app import app
 from app_shared.access.breaker import evaluate_and_persist, thresholds_from_settings
 from app_shared.config import get_settings
-from app_shared.costauth import sweep_expired_reservations
+from app_shared.costauth import (
+    FLEET_PROVIDER_BROWSER,
+    FLEET_PROVIDER_PROXY,
+    sweep_expired_reservations,
+)
 from app_shared.costauth.entitlements import refresh_seeded_entitlements
+from app_shared.costauth.fleet_budget_policy import roll_fleet_budget_caps_forward
 from app_shared.database import get_system_session
 from app_shared.maintenance.health import (
     EVENT_PARTITION_MISSING,
@@ -69,6 +74,7 @@ from app_shared.task_names import (
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
+    MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
@@ -634,4 +640,90 @@ def breaker_evaluate() -> None:
         verdict is not None,
         getattr(getattr(verdict, "state", None), "value", "lease-held"),
         getattr(verdict, "tripped", None),
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_FLEET_BUDGET_ROLLFORWARD)
+def fleet_budget_rollforward() -> None:
+    """`MAINTENANCE_FLEET_BUDGET_ROLLFORWARD` (`maintenance` queue, EPA A4/B3).
+
+    Keeps a money ceiling on `fleet_cost_budgets` for the current AND the
+    next month, so the fleet never crosses a month boundary uncapped.
+
+    **Why this task exists.** `fleet_cost_budgets` is the only fleet-wide
+    money ceiling in the system — every authorization locks that row
+    before the tenant's — and the ceiling on it was put there by a single
+    operator run of `scripts/seed_fleet_budget_cap.py` covering a FIXED
+    number of months, the last being `2026_10`. A budget row is born with
+    `NULL` limits (`_get_or_create_budget_locked`, deliberately: a row
+    that materialised with an invented ceiling would deny work nobody
+    budgeted for), so on the first paid dispatch of the month after the
+    last one seeded, `authorize()` creates an uncapped row and the
+    ceiling is simply gone. Nothing denies, nothing logs, and the only
+    symptom is the provider bill — which is exactly how the 2026-08-12
+    extra.com discovery leak (~$325/mo of proxy egress from one
+    misconfigured `url_pattern`) went unnoticed.
+
+    "Re-run the script every month" is a reminder, not a control. This is
+    the control.
+
+    **What it writes.** Only `limit_cost_minor_units`, and only where
+    there is no limit already: an existing explicit cap is never lowered
+    and never overwritten, and the `reserved_*`/`settled_*` counters are
+    never touched (they are the authorization path's money, already
+    spent). With no configured cap for a scope, the most recent earlier
+    cap is CARRIED FORWARD — a deploy that forgot the env vars keeps the
+    ceiling the operator already chose rather than losing it. See
+    `app_shared.costauth.fleet_budget_policy` for the full decision.
+
+    **The ERROR line is the whole point of the report.** A
+    `(scope_key, period_key)` pair with no configured cap and nothing to
+    carry is a period the fleet will run through with NO money ceiling.
+    That is the one outcome an operator must see, so it is logged at
+    ERROR while every other outcome is INFO.
+
+    FLEET-scoped and run on the BYPASSRLS system session: the table is
+    global (no `workspace_id`, no RLS) and declared `SYSTEM` in
+    `scripts/rls_table_manifest.txt`.
+
+    Idempotent and no-arg: a second run in the same period finds every
+    row already capped and writes nothing, so all but the first tick of a
+    month costs one SELECT.
+    """
+    settings = get_settings()
+    caps_usd = {
+        FLEET_PROVIDER_PROXY: settings.FLEET_BUDGET_MONTHLY_CAP_USD_PROXY,
+        FLEET_PROVIDER_BROWSER: settings.FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER,
+    }
+
+    with _system_session("fleet_budget_rollforward") as session:
+        report = roll_fleet_budget_caps_forward(
+            session,
+            now=datetime.now(timezone.utc),
+            # This month plus the next: the cadence runs every 6h, so the
+            # next month is always capped long before anything can spend
+            # against it.
+            months_ahead=1,
+            caps_usd=caps_usd,
+        )
+        session.commit()
+
+    if report.uncapped:
+        logger.error(
+            "maintenance_fleet_budget_rollforward written=%d carried=%d "
+            "uncapped=%d uncapped_pairs=%s "
+            "impact=fleet_spends_with_no_money_ceiling_in_those_periods "
+            "action=set_FLEET_BUDGET_MONTHLY_CAP_USD_PROXY/_BROWSER",
+            report.written,
+            len(report.carried),
+            len(report.uncapped),
+            ",".join(f"{scope}/{period}" for scope, period in report.uncapped),
+        )
+        return
+
+    logger.info(
+        "maintenance_fleet_budget_rollforward written=%d carried=%d uncapped=0",
+        report.written,
+        len(report.carried),
     )

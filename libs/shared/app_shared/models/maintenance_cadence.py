@@ -102,6 +102,15 @@ CADENCE_ENTITLEMENT_REFRESH = "entitlement_refresh"
 #: other evaluator lives inside the scraping path that denial blocks, so
 #: a stale row could never recover on its own.
 CADENCE_BREAKER_EVALUATE = "breaker_evaluate"
+#: EPA A4/B3 (2026-09-03): keeps the fleet-wide money ceiling on
+#: ``fleet_cost_budgets`` in place for the current and next month
+#: (``app_shared.costauth.fleet_budget_policy.
+#: roll_fleet_budget_caps_forward``). Reuses
+#: ``ENTITLEMENT_REFRESH_INTERVAL_SECONDS`` (6h) rather than adding a
+#: knob: the only deadline it races is a MONTH boundary, so six hours is
+#: already three orders of magnitude of margin, and the work on all but
+#: the first tick of a month is a single SELECT.
+CADENCE_FLEET_BUDGET_ROLLFORWARD = "fleet_budget_rollforward"
 
 #: Every cadence the scheduler drives durably (the daily ones, plus the
 #: 6-hourly entitlement refresh and the 5-minute breaker evaluation). The
@@ -115,6 +124,7 @@ DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_COST_ROLLUP,
     CADENCE_ENTITLEMENT_REFRESH,
     CADENCE_BREAKER_EVALUATE,
+    CADENCE_FLEET_BUDGET_ROLLFORWARD,
 )
 
 
@@ -152,6 +162,7 @@ __all__ = [
     "CADENCE_COST_ROLLUP",
     "CADENCE_DAILY_ROLLUP",
     "CADENCE_ENTITLEMENT_REFRESH",
+    "CADENCE_FLEET_BUDGET_ROLLFORWARD",
     "CADENCE_PARTITION_CREATE",
     "CADENCE_RECONCILE_PROVIDER_USAGE",
     "CADENCE_RETENTION_DROP",
