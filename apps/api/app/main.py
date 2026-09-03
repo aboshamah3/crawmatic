@@ -133,6 +133,8 @@ operator documents are under `docs/ops/`.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 
@@ -175,6 +177,8 @@ from app.routers import (
 # PGBOUNCER_AUTH_TYPE=trust, the DB bootstrap/owner role as DATABASE_URL).
 # No-op otherwise — never affects local dev, CI, or `docker compose up`.
 assert_production_safe()
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="crawmatic-api", openapi_url=None, docs_url=None, redoc_url=None)
 
@@ -228,9 +232,33 @@ app.include_router(ops_metrics.router)
 # anyio's unrelated default — see `app.thread_pool` for why. Runs at
 # startup, not import time: the anyio limiter it configures belongs to the
 # event loop the app is served on, which doesn't exist yet at import.
+#
+# `get_settings()` failing here is swallowed, not raised: this repo already
+# resolves `Settings` lazily, per call site (`deps.py`, `service_auth.py`,
+# `auth.py`, ...), specifically so unit tests can exercise one router
+# without a full DATABASE_URL/REDIS_URL/... environment (see e.g.
+# `test_admin_router.py::test_admin_routes_require_the_service_token`'s own
+# docstring on why it monkeypatches `get_settings` rather than provide a
+# real `Settings()`). Every `TestClient(app)` used as a context manager
+# fires this hook, so raising here would newly force a full settings
+# environment onto tests that have nothing to do with the DB/thread pool —
+# a real deploy still gets a fail-fast Settings error at first request,
+# unchanged from before this hook existed; this only skips the one-time
+# tuning step when settings aren't resolvable yet, leaving anyio's own
+# default limiter in place rather than taking the whole process down.
 @app.on_event("startup")
 def _configure_thread_pool() -> None:
-    configure_thread_pool(get_settings())
+    try:
+        settings = get_settings()
+    except Exception:
+        logger.warning(
+            "H2 thread-pool tuning skipped: Settings() could not be constructed "
+            "at startup (see app.thread_pool.configure_thread_pool); the anyio "
+            "default limiter is in effect instead of API_THREAD_POOL_SIZE.",
+            exc_info=True,
+        )
+        return
+    configure_thread_pool(settings)
 
 
 @app.get("/health")
