@@ -71,8 +71,21 @@ class Settings(BaseSettings):
     # --- Database (required — never silently defaulted) ---
     # Host must be pgbouncer:6432, never postgres:5432 (FR-011).
     DATABASE_URL: str
-    DB_POOL_SIZE: int = 5
-    DB_MAX_OVERFLOW: int = 2
+    # Raised 5→8 / 2→4 (H2, production-readiness audit): pgbouncer sits in
+    # front of Postgres and absorbs the extra backend connections, so these
+    # are sized to match `API_THREAD_POOL_SIZE` below rather than Postgres's
+    # own connection budget — a request thread pool bigger than the DB pool
+    # just queues at the DB instead of the thread pool, moving the bottleneck
+    # without fixing it.
+    DB_POOL_SIZE: int = 8
+    DB_MAX_OVERFLOW: int = 4
+
+    # --- API request thread pool (H2) ---
+    # `anyio.to_thread` runs every sync DB call (SQLAlchemy) off a worker
+    # thread; if that pool is sized larger than DB_POOL_SIZE+DB_MAX_OVERFLOW,
+    # requests can pile up waiting on DB connections while still holding a
+    # thread-pool slot. Keep this <= DB_POOL_SIZE + DB_MAX_OVERFLOW.
+    API_THREAD_POOL_SIZE: int = 8
 
     # --- Migration job (optional — direct-to-Postgres, bypasses the pooler) ---
     # Used ONLY by the one-shot migration job / Alembic env.py (host must be

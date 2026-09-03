@@ -136,12 +136,14 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 
+from app_shared.config import get_settings
 from app_shared.config_validation import assert_production_safe
 
 from app.abuse_limit import AbuseLimitMiddleware
 from app.error_envelope import register_error_handlers
 from app.openapi_public import build_public_openapi
 from app.rate_limit import RateLimitMiddleware
+from app.thread_pool import configure_thread_pool
 from app.routers import (
     access_policies,
     admin,
@@ -219,6 +221,16 @@ app.include_router(jobs_admin.router)
 app.include_router(version.router)
 app.include_router(ready.router)
 app.include_router(ops_metrics.router)
+
+
+# H2 (production-readiness audit): bound the anyio worker-thread pool that
+# backs every sync DB call to the DB connection pool's size, instead of
+# anyio's unrelated default — see `app.thread_pool` for why. Runs at
+# startup, not import time: the anyio limiter it configures belongs to the
+# event loop the app is served on, which doesn't exist yet at import.
+@app.on_event("startup")
+def _configure_thread_pool() -> None:
+    configure_thread_pool(get_settings())
 
 
 @app.get("/health")
