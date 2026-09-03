@@ -136,16 +136,20 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app_shared import heartbeat as heartbeat_mod
 from app_shared import release as release_mod
+from app_shared.config import get_settings
+from app_shared.costauth.service import DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS
 from app_shared.database import get_session
+from app_shared.models.proxy_breaker import GLOBAL_BREAKER_SCOPE, ProxyCircuitBreaker
 from app_shared.redis_client import get_redis_client
 
 router = APIRouter(tags=["ready"])
@@ -348,6 +352,72 @@ def _check_heartbeats(client: Any) -> DependencyCheck:
     return DependencyCheck(ok=True, detail=detail)
 
 
+def _breaker_enabled() -> bool:
+    """`PROXY_BREAKER_ENABLED`, without requiring a COMPLETE `Settings`.
+
+    Task H2's lesson, applied one module over: a probe that constructs the
+    whole settings object inherits every unrelated required field, and a
+    process that is missing one then reports a `ValidationError` as a
+    failed dependency — a config problem masquerading as an outage. The
+    field's own default is `True`, and defaulting to "enabled" is the
+    fail-safe side of the question: it makes this check DO the freshness
+    read rather than silently declare the deadlock somebody else's
+    problem.
+    """
+    try:
+        return bool(get_settings().PROXY_BREAKER_ENABLED)
+    except Exception:  # noqa: BLE001 - a probe must not depend on full config
+        return True
+
+
+def _check_breaker_evidence(session: Session) -> DependencyCheck:
+    """Is the proxy breaker's evidence fresh enough for the cost gate?
+
+    EPA B1. The cost gate fails CLOSED on breaker evidence older than
+    `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS`: a stale
+    `proxy_circuit_breakers.evaluated_at` denies every paid scrape in the
+    fleet. That is a total functional outage of the product's main job,
+    and before this check it was completely invisible from the outside —
+    every dependency up, every probe green, and not one paid request able
+    to run. An instance in that state is NOT ready, so this check
+    participates in the 200/503 verdict like every other one.
+
+    It reads the same row the gate reads, so it cannot disagree with it.
+    Nothing request-derived reaches the body: `detail` is built from an
+    integer this process computed and the row's own enum value.
+    """
+    if not _breaker_enabled():
+        # No breaker means no gate to deadlock; a disabled subsystem is a
+        # labelled absence, not a pass and not a failure (this module's
+        # docstring, same treatment as undeclared heartbeat services).
+        return DependencyCheck(ok=True, detail="disabled")
+
+    row = session.execute(
+        select(ProxyCircuitBreaker.evaluated_at, ProxyCircuitBreaker.state).where(
+            ProxyCircuitBreaker.scope_key == GLOBAL_BREAKER_SCOPE
+        )
+    ).first()
+    if row is None:
+        return DependencyCheck(
+            ok=False,
+            error="no-row",
+            detail="cost gate denies all paid work",
+        )
+
+    evaluated_at, state = row[0], row[1]
+    # TIMESTAMPTZ everywhere, so a naive value can only come from outside
+    # the ORM; assume UTC rather than crash the probe.
+    if evaluated_at.tzinfo is None:
+        evaluated_at = evaluated_at.replace(tzinfo=UTC)
+    age_seconds = int((datetime.now(UTC) - evaluated_at).total_seconds())
+    stale = age_seconds > DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS
+    return DependencyCheck(
+        ok=not stale,
+        error="stale" if stale else None,
+        detail=f"age_seconds={age_seconds} state={getattr(state, 'value', state)}",
+    )
+
+
 @router.get("/ready", response_model=ReadyResponse)
 def ready(
     response: Response,
@@ -384,6 +454,20 @@ def ready(
         )
     else:
         checks["migrations"] = DependencyCheck(
+            ok=False,
+            error="DatabaseUnavailable",
+            detail="not checked — the database check failed first",
+        )
+
+    # Same session hazard, same short-circuit, same reason as `migrations`
+    # above: a timed-out `database` check leaves its worker thread still
+    # holding this session, and a `Session` is not thread-safe.
+    if checks["database"].ok:
+        checks["breaker_evidence"] = _run_check_with_timeout(
+            lambda: _check_breaker_evidence(session), timeout=_CHECK_TIMEOUT_SECONDS
+        )
+    else:
+        checks["breaker_evidence"] = DependencyCheck(
             ok=False,
             error="DatabaseUnavailable",
             detail="not checked — the database check failed first",

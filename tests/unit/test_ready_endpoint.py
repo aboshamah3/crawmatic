@@ -12,6 +12,7 @@ one DB dependency.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -44,21 +45,41 @@ class _FakeResult:
 
 
 class _FakeSession:
-    """Answers the `SELECT 1` connectivity probe with nothing, and the
+    """Answers the `SELECT 1` connectivity probe with nothing, the
     `alembic_version` read (added to `/ready` by READY-001 / Task A5) with
-    `head`. Defaulting `head` to `_HEAD` keeps every pre-existing test in
-    this file meaning exactly what it always meant: an all-dependencies-up
-    fixture now also has a schema its code agrees with."""
+    `head`, and the `proxy_circuit_breakers` read (EPA B1) with a row
+    `breaker_age_seconds` old. Defaulting `head` to `_HEAD` and the
+    breaker age to zero keeps every pre-existing test in this file meaning
+    exactly what it always meant: an all-dependencies-up fixture now also
+    has a schema its code agrees with and breaker evidence the cost gate
+    accepts."""
 
-    def __init__(self, *, raises: Exception | None = None, head: str | None = _HEAD) -> None:
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        head: str | None = _HEAD,
+        breaker_age_seconds: float = 0.0,
+        breaker_row: bool = True,
+    ) -> None:
         self._raises = raises
         self._head = head
+        self._breaker_age_seconds = breaker_age_seconds
+        self._breaker_row = breaker_row
 
     def execute(self, statement: object = None, *_args: object, **_kwargs: object) -> object:
         if self._raises is not None:
             raise self._raises
-        if "alembic_version" in str(statement):
+        rendered = str(statement)
+        if "alembic_version" in rendered:
             return _FakeResult(_FakeRow(self._head) if self._head is not None else None)
+        if "proxy_circuit_breakers" in rendered:
+            if not self._breaker_row:
+                return _FakeResult(None)
+            evaluated_at = datetime.now(UTC) - timedelta(
+                seconds=self._breaker_age_seconds
+            )
+            return _FakeResult((evaluated_at, "CLOSED"))
         return None
 
 
@@ -167,7 +188,14 @@ def test_ready_all_deps_up_returns_200_and_ready_true(client: TestClient) -> Non
     # Asserted key-by-key rather than as one exact dict so the next check
     # this probe legitimately grows does not read as a regression here; what
     # matters is that every check is present, passing, and error-free.
-    assert set(body["checks"]) == {"database", "redis", "migrations", "heartbeats"}
+    assert set(body["checks"]) == {
+        "database",
+        "redis",
+        "migrations",
+        "heartbeats",
+        # EPA B1.
+        "breaker_evidence",
+    }
     for name, check in body["checks"].items():
         assert check["ok"] is True, name
         assert check["error"] is None, name
@@ -277,3 +305,91 @@ def test_ready_path_excluded_from_admin_internal_tags() -> None:
     from app.openapi_public import INTERNAL_TAGS
 
     assert "ready" not in INTERNAL_TAGS
+
+
+# --- breaker evidence (EPA B1, 2026-09-03) -----------------------------------
+#
+# The cost gate fails CLOSED on `proxy_circuit_breakers.evaluated_at`
+# older than `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS`: a stale row
+# denies every paid scrape in the fleet. That is a total outage of the
+# product's main job which, until this check existed, was invisible from
+# outside — every dependency up, every probe green, nothing able to run.
+
+
+def test_ready_reports_fresh_breaker_evidence(client: TestClient) -> None:
+    _setup(session=_FakeSession(breaker_age_seconds=60), redis_client=_FakeRedis())
+
+    resp = client.get("/ready")
+    body = resp.json()
+
+    assert resp.status_code == 200
+    assert body["checks"]["breaker_evidence"]["ok"] is True
+    assert body["checks"]["breaker_evidence"]["error"] is None
+    assert "age_seconds=" in body["checks"]["breaker_evidence"]["detail"]
+
+
+def test_ready_returns_503_when_breaker_evidence_is_stale(client: TestClient) -> None:
+    """4000s > the 3600s the gate accepts, so the fleet is denying all paid
+    work. Everything else is healthy — which is exactly the state this
+    check exists to make visible."""
+    _setup(session=_FakeSession(breaker_age_seconds=4000), redis_client=_FakeRedis())
+
+    resp = client.get("/ready")
+    body = resp.json()
+
+    assert resp.status_code == 503
+    assert body["ready"] is False
+    assert body["checks"]["breaker_evidence"]["ok"] is False
+    assert body["checks"]["breaker_evidence"]["error"] == "stale"
+    assert body["checks"]["database"]["ok"] is True
+    assert body["checks"]["redis"]["ok"] is True
+
+
+def test_ready_returns_503_when_the_breaker_row_does_not_exist(
+    client: TestClient,
+) -> None:
+    """No row at all is the same outage with a different cause: the gate
+    has no evidence to read, so it denies."""
+    _setup(session=_FakeSession(breaker_row=False), redis_client=_FakeRedis())
+
+    resp = client.get("/ready")
+    body = resp.json()
+
+    assert resp.status_code == 503
+    assert body["checks"]["breaker_evidence"]["ok"] is False
+    assert body["checks"]["breaker_evidence"]["error"] == "no-row"
+    assert "denies all paid work" in body["checks"]["breaker_evidence"]["detail"]
+
+
+def test_ready_breaker_check_is_skipped_when_the_database_is_down(
+    client: TestClient,
+) -> None:
+    """One root cause, reported once — and never by touching a session a
+    timed-out worker thread may still hold."""
+    _setup(
+        session=_FakeSession(raises=RuntimeError("connection refused")),
+        redis_client=_FakeRedis(),
+    )
+
+    resp = client.get("/ready")
+    body = resp.json()
+
+    assert resp.status_code == 503
+    assert body["checks"]["breaker_evidence"]["error"] == "DatabaseUnavailable"
+
+
+def test_ready_reports_a_disabled_breaker_as_a_labelled_absence(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PROXY_BREAKER_ENABLED=false` means there is no gate to deadlock, so
+    there is no evidence to be stale — reported the way undeclared
+    heartbeat services are, not as a pass and not as a failure."""
+    monkeypatch.setattr(ready, "_breaker_enabled", lambda: False)
+    _setup(session=_FakeSession(breaker_age_seconds=999_999), redis_client=_FakeRedis())
+
+    resp = client.get("/ready")
+    body = resp.json()
+
+    assert resp.status_code == 200
+    assert body["checks"]["breaker_evidence"]["ok"] is True
+    assert body["checks"]["breaker_evidence"]["detail"] == "disabled"

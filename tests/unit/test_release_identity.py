@@ -50,6 +50,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -87,8 +88,14 @@ class _FakeResult:
 
 
 class _FakeSession:
-    """Answers `SELECT version_num FROM alembic_version` with `head`, and any
-    other statement (`SELECT 1`, the `/ready` connectivity probe) with None."""
+    """Answers `SELECT version_num FROM alembic_version` with `head`, the
+    `proxy_circuit_breakers` freshness read (EPA B1) with a just-evaluated
+    row, and any other statement (`SELECT 1`, the `/ready` connectivity
+    probe) with None.
+
+    These tests are about release identity, not about the breaker: a fresh
+    breaker row keeps "every dependency is up" meaning exactly what it
+    meant before `/ready` grew that check."""
 
     def __init__(self, *, head: str | None = None, raises: Exception | None = None) -> None:
         self._head = head
@@ -97,8 +104,11 @@ class _FakeSession:
     def execute(self, statement: Any = None, *_args: object, **_kwargs: object) -> Any:
         if self._raises is not None:
             raise self._raises
-        if "alembic_version" in str(statement):
+        rendered = str(statement)
+        if "alembic_version" in rendered:
             return _FakeResult(_FakeRow(self._head) if self._head is not None else None)
+        if "proxy_circuit_breakers" in rendered:
+            return _FakeResult((datetime.now(UTC), "CLOSED"))
         return _FakeResult(None)
 
 

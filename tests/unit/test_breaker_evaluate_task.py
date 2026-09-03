@@ -47,7 +47,7 @@ from app_shared.maintenance.scoping import MaintenanceScope, maintenance_scope_o
 from app_shared.task_names import MAINTENANCE_BREAKER_EVALUATE
 
 
-def _install(*, enabled=True, interval=300):
+def _install(*, enabled=True, interval=300, auto_close=3600):
     session = MagicMock(name="session")
 
     @contextmanager
@@ -58,6 +58,7 @@ def _install(*, enabled=True, interval=300):
     settings = MagicMock(
         PROXY_BREAKER_ENABLED=enabled,
         PROXY_BREAKER_EVAL_INTERVAL_SECONDS=interval,
+        PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS=auto_close,
     )
     evaluate = MagicMock(name="evaluate_and_persist", return_value=None)
 
@@ -99,7 +100,13 @@ tasks_maintenance.breaker_evaluate()
 assert evaluate.call_count == 1, evaluate.call_args_list
 args, kwargs = evaluate.call_args
 assert args == (session,), args
-assert kwargs == {"thresholds": "THR", "min_interval_seconds": 300}, kwargs
+assert kwargs == {
+    "thresholds": "THR",
+    "min_interval_seconds": 300,
+    # EPA B1 second half: this task is the ONLY evaluator that can close
+    # an open breaker, so it must be the one carrying the cooldown.
+    "auto_close_after_seconds": 3600,
+}, kwargs
 assert session.commit.call_count == 1, session.commit.call_args_list
 print("OK")
 """

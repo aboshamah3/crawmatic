@@ -148,6 +148,14 @@ class Settings(BaseSettings):
     PROXY_BREAKER_MAX_DISCOVERY_RUNS_PER_DOMAIN_PER_DAY: int | None = 50
     #: How often any one process re-evaluates the durable breaker.
     PROXY_BREAKER_EVAL_INTERVAL_SECONDS: int = 300
+    #: EPA B1: how long an OPEN breaker must stay open before an
+    #: evaluation whose CURRENT window is clean may close it. `0` disables
+    #: auto-recovery entirely (operator-only, the pre-B1 behaviour).
+    #: Both halves are required, so a runaway that is still running keeps
+    #: re-tripping and can never auto-close — what this recovers from is a
+    #: trip whose cause is genuinely gone, which would otherwise have
+    #: stopped ALL paid work until a human noticed.
+    PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS: int = 3600
     #: How long a process may reuse its cached breaker verdict before
     #: re-reading the durable row. Bounds how long a trip takes to stop
     #: paid work fleet-wide.

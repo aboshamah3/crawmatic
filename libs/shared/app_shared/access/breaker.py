@@ -61,10 +61,26 @@ that the job can finalize on.
 
 ## Recovery
 
-Deliberately **manual**. An auto-closing spend breaker re-arms the same
-runaway it just stopped; whatever caused a month's budget to evaporate
-in an hour needs a human. :func:`close_breaker` is the reset, and the
-runbook command is in the accompanying report.
+Manual by default, with a **bounded** automatic path added by EPA B1
+(2026-09-03). The original reasoning still holds -- an auto-closing
+spend breaker can re-arm the same runaway it just stopped -- so
+auto-recovery is off unless a caller passes
+``auto_close_after_seconds`` and it requires **both** conditions at
+once:
+
+1. the trip is older than the full cooldown, and
+2. the **current** window passes every threshold.
+
+A live runaway therefore keeps re-tripping and can never satisfy (2);
+only a condition that has actually gone away closes the breaker. What
+this buys is the other half of B1: with the durable evaluator cadence
+now keeping evidence fresh whether or not anything is scraping, a
+single transient trip would otherwise have stopped ALL paid work
+indefinitely, on a system whose owner may be asleep. The recorded close
+reason distinguishes an auto-recovery from an operator's reset.
+
+:func:`close_breaker` remains the manual reset, and the runbook command
+is in the accompanying report.
 """
 
 from __future__ import annotations
@@ -73,7 +89,7 @@ import calendar
 import json
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -86,6 +102,7 @@ from app_shared.models.proxy_breaker import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BREAKER_AUTO_CLOSED_EVENT",
     "BreakerObservation",
     "BreakerThresholds",
     "BreakerVerdict",
@@ -103,6 +120,10 @@ __all__ = [
 BREAKER_TRIPPED_EVENT = "proxy_breaker.tripped"
 BREAKER_DENIED_EVENT = "proxy_breaker.denied"
 BREAKER_UNAVAILABLE_EVENT = "proxy_breaker.unavailable"
+#: EPA B1: the breaker closed itself after its cooldown (never an
+#: operator). Distinct event name so "recovered on its own" and "a human
+#: reset it" are separable in the logs without parsing free text.
+BREAKER_AUTO_CLOSED_EVENT = "proxy_breaker.auto_closed"
 
 
 # --------------------------------------------------------------------------
@@ -162,11 +183,23 @@ class BreakerObservation:
 
 @dataclass(frozen=True)
 class BreakerVerdict:
-    """Outcome of :func:`evaluate_thresholds`."""
+    """Outcome of :func:`evaluate_thresholds`.
+
+    ``state`` is the DURABLE position of the breaker after the verdict was
+    persisted, and is therefore only ever set by
+    :func:`evaluate_and_persist`. The pure evaluator leaves it ``None``:
+    it measures the window, it does not know (or need to know) what the
+    row said beforehand. A caller reading ``state`` is asking "is paid
+    work allowed now?", which is a different question from ``tripped``
+    ("did THIS window breach a threshold?") -- they disagree exactly in
+    the two cases that matter, an already-open breaker whose window is
+    now clean, and a fresh trip.
+    """
 
     tripped: bool
     reason: ProxyBreakerTrip | None = None
     detail: str | None = None
+    state: ProxyBreakerState | None = None
 
 
 def _seconds_remaining_in_month(now: datetime) -> float:
@@ -393,6 +426,25 @@ def _get_or_create_row(session: Any, scope_key: str) -> Any:
     return row
 
 
+def _is_open(row: Any) -> bool:
+    """True if ``row`` is OPEN, whether the column round-tripped as the
+    enum or as its raw string (same tolerance :func:`trip_breaker` and
+    :func:`paid_requests_allowed` already apply)."""
+    return row.state is ProxyBreakerState.OPEN or row.state == "OPEN"
+
+
+def _as_aware(moment: datetime) -> datetime:
+    """Treat a naive timestamp as UTC.
+
+    Every timestamp column here is ``TIMESTAMPTZ``, so this only fires for
+    a row written outside the ORM (a seed script, a manual operator
+    UPDATE). Assuming UTC beats raising: the alternative is a cooldown
+    comparison that crashes the evaluator, which would take the durable
+    freshness stamp down with it -- precisely the B1 deadlock.
+    """
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
 def trip_breaker(
     session: Any,
     *,
@@ -431,14 +483,32 @@ def trip_breaker(
 
 
 def close_breaker(
-    session: Any, *, scope_key: str = GLOBAL_BREAKER_SCOPE, now: datetime | None = None
+    session: Any,
+    *,
+    reason: str | None = None,
+    scope_key: str = GLOBAL_BREAKER_SCOPE,
+    now: datetime | None = None,
 ) -> None:
-    """Reset the breaker to CLOSED (the manual recovery action)."""
+    """Reset the breaker to CLOSED.
+
+    ``reason`` is persisted in the row's ``detail`` column -- there is no
+    separate reason column and adding one would be a migration for a
+    single string, while ``detail`` is exactly "why is the row in the
+    state it is in" and is read by nothing while the breaker is CLOSED
+    (:func:`paid_requests_allowed` only formats it on the OPEN branch).
+    That makes an auto-recovery legible in the row itself, not only in a
+    log line that has since rotated away: an operator looking at a CLOSED
+    breaker can tell whether it closed itself after its cooldown or
+    whether a human reset it.
+
+    Passing no ``reason`` keeps the historical behaviour exactly --
+    ``detail`` is cleared, as it was before the reason argument existed.
+    """
     now = now or datetime.now(UTC)
     row = _get_or_create_row(session, scope_key)
     row.state = ProxyBreakerState.CLOSED
     row.trip_reason = None
-    row.detail = None
+    row.detail = reason
     row.cleared_at = now
 
 
@@ -449,6 +519,7 @@ def evaluate_and_persist(
     min_interval_seconds: int = 300,
     scope_key: str = GLOBAL_BREAKER_SCOPE,
     now: datetime | None = None,
+    auto_close_after_seconds: int = 0,
 ) -> BreakerVerdict | None:
     """Take the evaluator lease, measure, evaluate, persist.
 
@@ -456,11 +527,24 @@ def evaluate_and_persist(
     lease (i.e. this call did no work). The lease is an atomic
     ``UPDATE ... WHERE evaluated_at < cutoff`` -- exactly one caller's
     update matches, so N spiders sharing a database do not all run the
-    aggregates.
+    aggregates. Winning the lease also refreshes ``evaluated_at``, which
+    is the freshness evidence the cost gate fails closed on.
 
-    **Only ever trips, never auto-closes** (see the module docstring's
-    recovery note): a passing evaluation on an OPEN breaker leaves it
-    OPEN for a human to clear with :func:`close_breaker`.
+    ``auto_close_after_seconds`` (EPA B1, default ``0`` = never) is the
+    ONLY way an OPEN breaker closes without an operator, and it needs
+    both halves of the recovery test to hold in the same pass:
+
+    * the trip is at least that many seconds old, and
+    * this evaluation found nothing wrong with the CURRENT window.
+
+    A still-running runaway re-trips above and never reaches the
+    auto-close branch, so recovery cannot re-arm the condition it
+    stopped. A trip whose cause is genuinely gone clears itself and
+    records ``auto-recovery`` in the row's ``detail``.
+
+    The returned verdict's ``state`` is the durable position after this
+    pass, which is not the same thing as ``tripped``: an OPEN breaker
+    still inside its cooldown returns ``tripped=False, state=OPEN``.
     """
     from sqlalchemy import update
 
@@ -469,7 +553,7 @@ def evaluate_and_persist(
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(seconds=min_interval_seconds)
 
-    _get_or_create_row(session, scope_key)
+    row = _get_or_create_row(session, scope_key)
     claimed = session.execute(
         update(ProxyCircuitBreaker)
         .where(
@@ -493,7 +577,42 @@ def evaluate_and_persist(
             scope_key=scope_key,
             now=now,
         )
-    return verdict
+        return replace(verdict, state=ProxyBreakerState.OPEN)
+
+    if not _is_open(row):
+        return replace(verdict, state=ProxyBreakerState.CLOSED)
+
+    # OPEN, and this window is clean. Recovery only if the cooldown has
+    # fully elapsed. `tripped_at` missing means we cannot prove it has,
+    # so we do not -- an unprovable cooldown must fail toward staying
+    # open, the side that costs money to be wrong about only once.
+    opened_at = row.tripped_at
+    if (
+        auto_close_after_seconds > 0
+        and opened_at is not None
+        and (now - _as_aware(opened_at)).total_seconds() >= auto_close_after_seconds
+    ):
+        reason = (
+            f"auto-recovery after {auto_close_after_seconds}s cooldown "
+            "with a passing window"
+        )
+        close_breaker(session, reason=reason, scope_key=scope_key, now=now)
+        logger.warning(
+            json.dumps(
+                {
+                    "event": BREAKER_AUTO_CLOSED_EVENT,
+                    "scope_key": scope_key,
+                    "detail": reason,
+                    "observed": observation.as_dict(),
+                },
+                default=str,
+            )
+        )
+        return BreakerVerdict(
+            tripped=False, detail=reason, state=ProxyBreakerState.CLOSED
+        )
+
+    return replace(verdict, state=ProxyBreakerState.OPEN)
 
 
 # --------------------------------------------------------------------------

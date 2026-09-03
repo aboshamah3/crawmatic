@@ -12,13 +12,14 @@ the integration suite, not here.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from app_shared.access.breaker import (
     BreakerObservation,
     BreakerThresholds,
+    evaluate_and_persist,
     evaluate_thresholds,
     paid_requests_allowed,
     reset_gate_cache,
@@ -306,3 +307,206 @@ def test_gate_caches_within_the_window() -> None:
         counting_factory, cache_seconds=30, monotonic=lambda: next(clock)
     )
     assert len(factory_calls) == 1
+
+
+# --- cooldown auto-recovery (EPA B1, 2026-09-03) -----------------------------
+#
+# Before B1 an OPEN breaker was a permanent state: `evaluate_and_persist`
+# only ever tripped, and the only reset was an operator running
+# `close_breaker` by hand. Combined with the durable evaluator cadence
+# (which now keeps evidence fresh whether or not anything is scraping),
+# that made a single trip an indefinite full stop on paid work even after
+# the condition that caused it had been gone for days. Auto-recovery is
+# strictly bounded: a cooldown must have fully elapsed AND the *current*
+# window must be passing, so re-arming a live runaway remains impossible.
+
+
+class _FakeBreakerRow:
+    """The `proxy_circuit_breakers` row as a plain object.
+
+    Only the columns the evaluator reads or writes; assertions below read
+    the same attributes the real ORM row would carry, so a change that
+    stops persisting one of them fails here.
+    """
+
+    def __init__(
+        self,
+        *,
+        state: ProxyBreakerState = ProxyBreakerState.CLOSED,
+        tripped_at: datetime | None = None,
+        detail: str | None = None,
+    ) -> None:
+        self.id = "breaker-row"
+        self.scope_key = "global"
+        self.state = state
+        self.trip_reason = ProxyBreakerTrip.MONTHLY_SPEND if detail else None
+        self.detail = detail
+        self.observed: dict | None = None
+        self.tripped_at = tripped_at
+        self.cleared_at: datetime | None = None
+        self.trip_count = 1 if state is ProxyBreakerState.OPEN else 0
+
+
+class _EvalResult:
+    """One `session.execute(...)` result.
+
+    Dispatches per ACCESSOR rather than per statement, because that is what
+    actually distinguishes the calls `evaluate_and_persist` makes: the row
+    lookup uses `scalar_one_or_none`, the lease UPDATE and the discovery
+    aggregate use `first`, the two count aggregates use `scalar_one`, and
+    the 24h count/distinct pair uses `one`.
+    """
+
+    def __init__(self, session: "_EvalSession") -> None:
+        self._session = session
+
+    def scalar_one_or_none(self) -> object:
+        return self._session.row
+
+    def scalar_one(self) -> object:
+        return self._session.scalars.pop(0)
+
+    def one(self) -> object:
+        return self._session.day_counts
+
+    def first(self) -> object:
+        return self._session.firsts.pop(0)
+
+
+class _EvalSession:
+    def __init__(
+        self,
+        row: _FakeBreakerRow,
+        *,
+        claimed: bool = True,
+        month: int = 0,
+        hour: int = 0,
+        day: tuple[int, int] = (0, 0),
+        discovery: tuple[str, int] | None = None,
+    ) -> None:
+        self.row = row
+        self.scalars = [month, hour]
+        self.day_counts = day
+        self.firsts = [("breaker-row",) if claimed else None, discovery]
+        self.added: list[object] = []
+
+    def execute(self, *_args: object, **_kw: object) -> _EvalResult:
+        return _EvalResult(self)
+
+    def add(self, obj: object) -> None:  # pragma: no cover - row always exists
+        self.added.append(obj)
+
+    def flush(self) -> None:  # pragma: no cover - row always exists
+        pass
+
+
+def _open_row(*, opened_seconds_ago: int) -> _FakeBreakerRow:
+    return _FakeBreakerRow(
+        state=ProxyBreakerState.OPEN,
+        tripped_at=_NOW - timedelta(seconds=opened_seconds_ago),
+        detail="month-to-date proxied requests 250000 >= ceiling 250000",
+    )
+
+
+def test_open_breaker_auto_closes_after_cooldown_when_window_is_healthy() -> None:
+    """Cooldown fully elapsed and the CURRENT window passes every threshold
+    -> the breaker closes itself and says why."""
+    row = _open_row(opened_seconds_ago=3601)
+    session = _EvalSession(row)
+
+    verdict = evaluate_and_persist(
+        session,
+        thresholds=BreakerThresholds(),
+        min_interval_seconds=0,
+        now=_NOW,
+        auto_close_after_seconds=3600,
+    )
+
+    assert verdict is not None
+    assert verdict.tripped is False
+    assert verdict.state is ProxyBreakerState.CLOSED
+    assert row.state is ProxyBreakerState.CLOSED
+    assert row.cleared_at == _NOW
+    # The reason is durable, not just logged: an operator reading the row
+    # must be able to tell an auto-recovery from a manual reset.
+    assert "auto-recovery" in (row.detail or ""), row.detail
+
+
+def test_open_breaker_stays_open_inside_cooldown() -> None:
+    """A healthy window is not enough on its own. The cooldown exists so a
+    runaway that pauses for a minute cannot immediately re-arm itself."""
+    row = _open_row(opened_seconds_ago=600)
+    session = _EvalSession(row)
+
+    verdict = evaluate_and_persist(
+        session,
+        thresholds=BreakerThresholds(),
+        min_interval_seconds=0,
+        now=_NOW,
+        auto_close_after_seconds=3600,
+    )
+
+    assert verdict is not None
+    assert verdict.state is ProxyBreakerState.OPEN
+    assert row.state is ProxyBreakerState.OPEN
+    assert row.cleared_at is None
+
+
+def test_auto_close_disabled_never_closes_however_long_it_has_been_open() -> None:
+    """`auto_close_after_seconds=0` is the documented operator-only posture,
+    and it is also the DEFAULT — no caller gets auto-recovery by accident."""
+    row = _open_row(opened_seconds_ago=30 * 86400)
+    session = _EvalSession(row)
+
+    verdict = evaluate_and_persist(
+        session,
+        thresholds=BreakerThresholds(),
+        min_interval_seconds=0,
+        now=_NOW,
+    )
+
+    assert verdict is not None
+    assert verdict.state is ProxyBreakerState.OPEN
+    assert row.state is ProxyBreakerState.OPEN
+    assert row.cleared_at is None
+
+
+def test_open_breaker_past_cooldown_with_an_unhealthy_window_stays_open() -> None:
+    """THE safety property. Cooldown elapsed, but the spend that tripped it
+    is still happening -> re-arming would restart the runaway the breaker
+    was built to stop."""
+    row = _open_row(opened_seconds_ago=86400)
+    session = _EvalSession(row, month=250_000)
+
+    verdict = evaluate_and_persist(
+        session,
+        thresholds=BreakerThresholds(monthly_proxied_requests=100_000),
+        min_interval_seconds=0,
+        now=_NOW,
+        auto_close_after_seconds=3600,
+    )
+
+    assert verdict is not None
+    assert verdict.tripped is True
+    assert verdict.reason is ProxyBreakerTrip.MONTHLY_SPEND
+    assert verdict.state is ProxyBreakerState.OPEN
+    assert row.state is ProxyBreakerState.OPEN
+    assert row.cleared_at is None
+
+
+def test_auto_close_never_runs_without_the_evaluator_lease() -> None:
+    """Recovery is a real evaluation, so it obeys the same lease every other
+    verdict does — N processes cannot each decide to close the breaker."""
+    row = _open_row(opened_seconds_ago=86400)
+    session = _EvalSession(row, claimed=False)
+
+    verdict = evaluate_and_persist(
+        session,
+        thresholds=BreakerThresholds(),
+        min_interval_seconds=300,
+        now=_NOW,
+        auto_close_after_seconds=3600,
+    )
+
+    assert verdict is None
+    assert row.state is ProxyBreakerState.OPEN

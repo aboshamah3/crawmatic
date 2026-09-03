@@ -1096,9 +1096,12 @@ def _breaker_allows_paid_work() -> tuple[bool, str | None]:
         session_factory, cache_seconds=settings.PROXY_BREAKER_STATE_CACHE_SECONDS
     )
 
-    # Only bother re-evaluating while the breaker is closed -- once open
-    # it stays open until an operator clears it (breaker docstring,
-    # "Recovery"), so there is nothing for an evaluation to decide.
+    # Only bother re-evaluating while the breaker is closed. An OPEN
+    # breaker has already denied this call, so there is nothing here for
+    # an evaluation to decide -- and recovery is deliberately NOT this
+    # path's job: an evaluator that only runs when paid work is allowed
+    # can never un-deny anything. That is the scheduler's
+    # `maintenance.breaker_evaluate` (EPA B1).
     if allowed:
         try:
             with session_factory() as session:
@@ -1106,6 +1109,17 @@ def _breaker_allows_paid_work() -> tuple[bool, str | None]:
                     session,
                     thresholds=thresholds_from_settings(settings),
                     min_interval_seconds=settings.PROXY_BREAKER_EVAL_INTERVAL_SECONDS,
+                    # Passed for completeness and to keep both call sites
+                    # identical; it cannot fire from here, because this
+                    # branch only runs while the breaker is already
+                    # CLOSED. The evaluation that actually recovers an
+                    # OPEN breaker is the scheduler's
+                    # `maintenance.breaker_evaluate` (EPA B1) — which is
+                    # the point: recovery must not depend on the scrape
+                    # path an OPEN breaker is blocking.
+                    auto_close_after_seconds=(
+                        settings.PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS
+                    ),
                 )
                 session.commit()
         except Exception:  # noqa: BLE001 - evaluation is best-effort

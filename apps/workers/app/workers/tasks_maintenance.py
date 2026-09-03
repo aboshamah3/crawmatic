@@ -599,6 +599,14 @@ def breaker_evaluate() -> None:
     That is why a `None` verdict here is a perfectly healthy outcome and
     is logged as such rather than as an error.
 
+    It is also the only place a tripped breaker can RECOVER. Passing
+    `PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS` lets an evaluation close an
+    OPEN breaker once the cooldown has fully elapsed AND the current
+    window is clean — two conditions a still-running runaway can never
+    satisfy together, because it re-trips first. The in-scrape evaluator
+    structurally cannot do this: it runs only while paid work is already
+    allowed.
+
     FLEET-scoped and run on the BYPASSRLS system session: the breaker is a
     global (no `workspace_id`, no RLS) row and its inputs are the durable
     fleet-wide audit tables.
@@ -617,6 +625,7 @@ def breaker_evaluate() -> None:
             session,
             thresholds=thresholds_from_settings(settings),
             min_interval_seconds=settings.PROXY_BREAKER_EVAL_INTERVAL_SECONDS,
+            auto_close_after_seconds=settings.PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS,
         )
         session.commit()
 
