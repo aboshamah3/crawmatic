@@ -253,6 +253,17 @@ def refresh_seeded_entitlements(session: Session, *, now: datetime) -> int:
     for why re-stamping a suspended placeholder is both harmless and
     kinder to the operator reading the denial.
 
+    EPA C2 (2026-09-03) makes that ownership predicate load-bearing in a
+    second place: the SaaS control plane
+    (:mod:`app_shared.control_plane.service`) now writes real billing
+    evidence onto these same rows, stamping ``evidence_version`` as
+    ``str(int)`` — never with the ``seeded-`` prefix. So this refresher
+    and the replication path can never fight over a row: a replicated row
+    stops matching ``LIKE 'seeded-%'`` the moment the SaaS first writes to
+    it, and its ``observed_at`` is thereafter owned solely by the SaaS's
+    ``as_of``. ``test_refresh_leaves_a_control_plane_numeric_version_alone``
+    holds that line.
+
     Idempotent and safe to run concurrently with itself: the statement is
     a blind re-stamp to the caller's ``now``, so a duplicate delivery
     writes the same freshness twice and two runners cannot disagree about

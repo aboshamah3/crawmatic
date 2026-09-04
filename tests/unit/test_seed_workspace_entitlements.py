@@ -340,6 +340,26 @@ def test_refresh_restamps_only_the_rows_the_seeder_owns(db_session) -> None:
     assert _observed_at(_entitlement(db_session, untagged_ws)) == stale
 
 
+def test_refresh_leaves_a_control_plane_numeric_version_alone(db_session) -> None:
+    """EPA C2: the SaaS control plane stamps `evidence_version` as
+    `str(int)` (`"7"`), never with the `seeded-` prefix. A refresher that
+    touched those rows would move `observed_at` off the SaaS's `as_of`
+    and make evidence the SaaS never sent look fresh — the exact failure
+    the prefix exists to prevent. Proven against a real `LIKE`."""
+    replicated_ws = _add_workspace(db_session, "replicated")
+    zero_version_ws = _add_workspace(db_session, "zero-version")
+    stale = _NOW - timedelta(days=5)
+    _add_entitlement(db_session, replicated_ws, evidence_version="7", observed_at=stale)
+    _add_entitlement(db_session, zero_version_ws, evidence_version="0", observed_at=stale)
+
+    assert refresh_seeded_entitlements(db_session, now=_LATER) == 0
+    db_session.flush()
+    db_session.expire_all()
+
+    assert _observed_at(_entitlement(db_session, replicated_ws)) == stale
+    assert _observed_at(_entitlement(db_session, zero_version_ws)) == stale
+
+
 def test_refresh_restamps_a_seeded_row_whatever_its_state(db_session) -> None:
     """`observed_at` is a freshness fact, not an authorization one -- the
     gate still denies a non-ACTIVE row. Skipping suspended rows would let

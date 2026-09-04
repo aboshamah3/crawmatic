@@ -153,6 +153,7 @@ from app.routers import (
     api_keys,
     auth,
     competitors,
+    control_plane,
     cost_rollups,
     domain_access_rules,
     jobs,
@@ -217,6 +218,12 @@ app.include_router(refresh_rules.router)
 app.include_router(cost_rollups.router)
 app.include_router(webhooks.router)
 app.include_router(admin.router)
+# EPA C2: the SaaS control plane -- same service-token seam and same
+# BYPASSRLS session as `admin.router` (it is the same caller), but every
+# route is workspace-ADDRESSED via the path rather than cross-workspace.
+# Mounted after `admin.router` so the provisioning route a workspace is
+# created by is registered before the routes that address it.
+app.include_router(control_plane.router)
 # EPA A2: also under /v1/admin, but on the TENANT auth seam (scope-gated,
 # RLS-scoped session) rather than `admin.router`'s cross-workspace service
 # token — see `routers/jobs_admin.py`'s module docstring. No path is served
