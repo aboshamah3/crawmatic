@@ -21,6 +21,7 @@ from app_shared.catalog.upsert import (
     plan_upsert,
     resolve_identity,
 )
+from app_shared.control_plane import service as control_plane_service
 from app_shared.models.catalog import Product, ProductVariant
 from app_shared.pagination import InvalidCursor, clamp_limit, decode_cursor, keyset_predicate, paginate
 from app_shared.repository import scoped_get, scoped_select
@@ -39,6 +40,40 @@ from app.schemas.catalog import (
 )
 
 router = APIRouter(prefix="/v1/products", tags=["products"])
+
+
+def _ceiling_exceeded(verdict: control_plane_service.CeilingVerdict) -> HTTPException:
+    """409 for a write that would take the tenant past its plan's cap.
+
+    409 rather than 402/403: nothing is wrong with the credential or the
+    request, the CONFLICT is with the workspace's current state, and the
+    caller fixes it by archiving products or upgrading — both of which
+    change that state. The counts travel in the body because a bare "too
+    many" leaves the SaaS unable to tell the merchant how many seats they
+    actually have.
+
+    Carried on the house error envelope (`{"error": {"code", "message",
+    ...}}`, `app.error_envelope`) with the three counts alongside `code`
+    and `message`, so the promoted top-level `error` object is unchanged
+    for every existing consumer while the SaaS reads the detail it needs.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "code": "PRODUCT_CEILING_EXCEEDED",
+                "message": (
+                    "This workspace's plan allows "
+                    f"{verdict.ceiling} active product(s); it already has "
+                    f"{verdict.active} and this request would add "
+                    f"{verdict.requested}."
+                ),
+                "ceiling": verdict.ceiling,
+                "active": verdict.active,
+                "requested": verdict.requested,
+            }
+        },
+    )
 
 
 def _variants_by_product_id(
@@ -100,6 +135,16 @@ def create_product(
                 }
             },
         )
+
+    # EPA C2: the plan's product cap, enforced at the engine boundary.
+    # After the MISSING_PRICE check so a malformed request still gets the
+    # more specific error, and before the first write so a refusal leaves
+    # nothing behind.
+    verdict = control_plane_service.check_product_ceiling(
+        session, principal.workspace_id, requested=1
+    )
+    if verdict.exceeded:
+        raise _ceiling_exceeded(verdict)
 
     product = Product(
         workspace_id=principal.workspace_id,
@@ -203,6 +248,18 @@ def bulk_upsert_products(
     deduped_items = list(
         dedup_last_wins(item_dicts, lambda r: resolve_identity(r, is_variant=False))
     )
+
+    # EPA C2: the plan's product cap. Counted AFTER dedup and over NEW
+    # products only -- re-pushing an unchanged catalog is the normal shape
+    # of a connector sync, and a tenant sitting exactly at its ceiling must
+    # still be able to update what it already has.
+    ceiling_verdict = control_plane_service.check_product_ceiling_for_upsert(
+        session,
+        ws,
+        [resolve_identity(item, is_variant=False) for item in deduped_items],
+    )
+    if ceiling_verdict.exceeded:
+        raise _ceiling_exceeded(ceiling_verdict)
 
     # Bucket (item, product-column-row) pairs by identity kind so the
     # RETURNING rows from each bucket's single statement can be matched

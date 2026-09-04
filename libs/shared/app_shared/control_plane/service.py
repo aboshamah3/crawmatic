@@ -75,6 +75,7 @@ __all__ = [
     "RuleSpec",
     "SAAS_STATUS_TO_ENGINE_STATE",
     "check_product_ceiling",
+    "check_product_ceiling_for_upsert",
     "count_new_products",
     "delete_rule",
     "get_entitlement",
@@ -576,6 +577,39 @@ def check_product_ceiling(
         return CeilingVerdict(exceeded=False, requested=requested)
 
     ceiling = int(entitlement.product_ceiling)
+    active = _count_active_products(session, workspace_id)
+    return CeilingVerdict(
+        exceeded=active + requested > ceiling,
+        ceiling=ceiling,
+        active=active,
+        requested=requested,
+    )
+
+
+def check_product_ceiling_for_upsert(
+    session: Session,
+    workspace_id: uuid.UUID,
+    identities: list[tuple[str, str] | None],
+) -> CeilingVerdict:
+    """The bulk-upsert form: only NEW products count against the ceiling.
+
+    A batch that re-pushes a tenant's entire unchanged catalog must not
+    be refused for "exceeding" a ceiling it already sits exactly at —
+    that is the normal steady-state shape of a connector sync, and
+    counting updates as additions would break every one of them.
+
+    Same cheap-path ordering as :func:`check_product_ceiling`: no
+    entitlement row, or a ``NULL`` ceiling, and nothing else is queried.
+    """
+    entitlement = get_entitlement(session, workspace_id)
+    if entitlement is None or entitlement.product_ceiling is None:
+        return CeilingVerdict(exceeded=False)
+
+    ceiling = int(entitlement.product_ceiling)
+    requested = count_new_products(session, workspace_id, identities)
+    if requested <= 0:
+        return CeilingVerdict(exceeded=False, ceiling=ceiling, requested=0)
+
     active = _count_active_products(session, workspace_id)
     return CeilingVerdict(
         exceeded=active + requested > ceiling,
