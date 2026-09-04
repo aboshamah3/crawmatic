@@ -556,3 +556,16 @@ class WorkspaceEntitlement(Base, WorkspaceScopedBase, TimestampMixin):
     #: touch would move and which would therefore make stale evidence
     #: look fresh.
     observed_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
+    #: EPA C1 (2026-09-03): the plan's product cap, as replicated from the
+    #: SaaS alongside the rest of this evidence row. Read by the control
+    #: plane's admission check ("may this workspace add another monitored
+    #: product?").
+    #:
+    #: NULLABLE, and that is the whole design: ``NULL`` means *no ceiling
+    #: was recorded* — an older evidence row written before this column
+    #: existed, or a plan that does not express one — and must therefore
+    #: NOT be read as a limit. ``0`` is a real, distinct value meaning
+    #: "this plan allows zero products". A ``NOT NULL DEFAULT 0`` would
+    #: have collapsed those two into one, silently capping every
+    #: pre-existing workspace at zero the moment the migration ran.
+    product_ceiling: Mapped[int | None] = mapped_column(Integer(), nullable=True)

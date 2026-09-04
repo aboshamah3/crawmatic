@@ -283,6 +283,17 @@ from app_shared.models.network_cost_rollups import FleetNetworkCostRollup, Netwo
 # model exists solely for Alembic's target_metadata.
 from app_shared.models.api_abuse_limit_counters import ApiAbuseLimitCounter
 
+# EPA C1 (2026-09-03): the SaaS control plane's declared monitor/reprice
+# intent — re-exported so `Base.metadata` sees the table for Alembic
+# autogenerate/offline-render (`target_metadata`); without that a later
+# autogenerate would read it as a table to DROP. Workspace-owned and
+# RLS'd (`emit_rls_policy` in the SAME migration that creates it).
+# Deliberately NOT added to `app_shared.repository.WORKSPACE_OWNED_MODELS`
+# in this change — the same reasoning `NetworkOperationAllocation` above
+# uses: registering a model there belongs with the query path that
+# actually reads it (the control-plane routes), not with the schema.
+from app_shared.models.control_plane import ControlPlaneRule
+
 __all__ = [
     "Base",
     "metadata",
@@ -355,4 +366,5 @@ __all__ = [
     "FleetNetworkCostRollup",
     "NetworkCostRollup",
     "ApiAbuseLimitCounter",
+    "ControlPlaneRule",
 ]

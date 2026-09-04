@@ -45,6 +45,13 @@
 # credential (never a workspace) and the limiter must be able to count
 # an attempt from a caller whose workspace is not yet resolved (the
 # middleware runs before the auth seam).
+# Head c8d2e3f4a5b6 (EPA C1, 2026-09-03) adds ONE more relation —
+# taking the count to 55: control_plane_rules, filed WORKSPACE. It is
+# the SaaS control plane's declared monitor/reprice intent per tenant,
+# workspace-owned with the standard emit_rls_policy in the SAME
+# migration that creates it (the refresh_rules shape it links to). That
+# head also adds workspace_entitlements.product_ceiling, which changes
+# no relation's class and so leaves every declaration below untouched.
 #
 # Format: <table><TAB><class><TAB><annotation>
 #
@@ -115,6 +122,7 @@ competitor_product_matches	WORKSPACE	Which competitor URL matches which of the w
 competitors	WORKSPACE	Competitor domains a workspace tracks.
 cost_budgets	WORKSPACE	COST (READY-006). The TENANT cost-budget counters, one row per (workspace_id, period_key): a nullable limit plus a reserved_* and a settled_* counter for each of the four dimensions (money in integer minor units, bytes, request count, browser-seconds). This is the AUTHORITATIVE store — not Redis: every C3 authorization takes SELECT ... FOR UPDATE on this row, which is what makes the hard ceiling a database property instead of a race the application hopes it wins. Written on the tenant seam by app_shared.costauth.service; also written cross-tenant by the lease sweeper on the sanctioned BYPASSRLS system seam (crawmatic_auth / get_system_session), which is inherently fleet-wide and must additionally read network_operations. Added at head f1a7c02de5b4.
 cost_reservations	WORKSPACE	COST (READY-006). One row per C3 authorization grant: the four reserved dimensions, the lease (lease_expires_at), and a state that moves exactly once, RESERVED -> SETTLED | RELEASED, by compare-and-set. Tenant-owned because a grant is a claim on ONE workspace's budget — deliberately unlike C1's network_operations, which is fleet-owned because a physical fetch can serve two workspaces. Written on the tenant seam by app_shared.costauth.service (authorize/heartbeat/settle/release) and cross-tenant by the lease sweeper on the sanctioned BYPASSRLS system seam. A partial unique index over (workspace_id, dedupe_key) WHERE state = 'RESERVED' collapses redelivered requests onto the live grant they already have. Added at head f1a7c02de5b4.
+control_plane_rules	WORKSPACE	CONTROL PLANE (C1). The SaaS's declared monitor/reprice intent per tenant — kind/cadence/target_external_ids addressed by the SaaS's own external_id, UNIQUE within the workspace (never globally: two tenants may each name a rule "rule-1"). Links to the engine refresh_rules row that actually drives the scrape via a nullable refresh_rule_id, ON DELETE SET NULL — retiring the engine rule must null the pointer, never delete the record of what the customer asked for. RLS in the SAME migration that creates the table. Deliberately NOT registered in WORKSPACE_OWNED_MODELS in the schema change itself (the NetworkOperationAllocation precedent: that belongs with the control-plane read/write routes). Added at head c8d2e3f4a5b6.
 dispatch_intents	WORKSPACE	JOBS (P0.5). Planned dispatch units per scrape job; added at head e7b21f3a8c94.
 domain_access_rules	WORKSPACE	Per-domain crawl permissions and robots posture for a workspace.
 domain_strategy_methods	WORKSPACE	Versioned extraction methods per strategy profile; carries its own workspace_id (not transitive) so the column-based check covers it directly.
