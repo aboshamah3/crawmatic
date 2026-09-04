@@ -672,8 +672,9 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
         # EPA W4.3: reorder same-canonical-URL targets to be contiguous
         # before chunking, so a cluster lands in one dispatch chunk
         # instead of splitting across one by accident of input order
-        # (`app_shared.jobs.coalescing` module docstring). OFF by default
-        # (`JOBS_COALESCING_ENABLED`) -- when off this is a no-op and
+        # (`app_shared.jobs.coalescing` module docstring). ON by default
+        # since EPA plan task B4 (2026-09-04) -- `JOBS_COALESCING_ENABLED`
+        # can still be set `False` to fall back to a no-op, where
         # `plan_batches` receives `resolved_targets` in its original
         # order, exactly as before W4.3.
         planning_targets = (
@@ -1204,7 +1205,8 @@ def recover_stalled_batches() -> None:
             replan_generation = int(job.planning_generation or 0) + 1
             job.planning_generation = replan_generation
             # EPA W4.3: same reordering as the primary dispatch path, same
-            # OFF-by-default no-op when `JOBS_COALESCING_ENABLED` is False.
+            # no-op fallback when `JOBS_COALESCING_ENABLED` is set False
+            # (ON by default since EPA plan task B4, 2026-09-04).
             replan_targets = (
                 cluster_for_coalescing(resolved_targets)
                 if settings.JOBS_COALESCING_ENABLED

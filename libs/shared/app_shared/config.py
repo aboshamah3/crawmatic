@@ -770,22 +770,29 @@ class Settings(BaseSettings):
     # nothing here builds toward it (every caller resolves targets for
     # exactly one workspace at a time already).
     #
-    # Master switch, DEFAULT OFF. `False` means `cluster_for_coalescing`
-    # is never called and `plan_batches` receives targets in their
-    # original order -- byte-identical to pre-W4.3 planning. The OFF
-    # DEFAULT is pinned by `tests/unit/test_w4_flag_defaults.py`; the
-    # byte-identity of unreordered planning by the pre-existing,
-    # unmodified `tests/unit/test_jobs_batching.py`. (Neither is
-    # `tests/unit/test_jobs_batching_coalescing.py`, which this comment
-    # used to name -- that suite exercises the coalescing helpers and
-    # never reads `Settings`, so it could not have caught a flipped
-    # default. W4 gate review, 2026-08-26.) `True` reorders the
-    # targets handed to `plan_batches` so matches sharing a canonical URL
-    # (the SAME `canonical_url_hash` the network ledger groups on) land
-    # in the same dispatch chunk instead of splitting across one by
-    # accident of input order -- it never changes `plan_batches` itself,
-    # a batch's match_id cardinality, or cost authorization (still
-    # estimated off `len(batch.match_ids)`, unchanged).
+    # Master switch. Shipped OFF for the W4.3 canary period; flipped to
+    # DEFAULT ON by EPA plan task B4 (2026-09-04, "H3") once the canary
+    # ran clean -- duplicate URL fetches across matches are free to
+    # remove, and there is no reason to keep paying for them by default.
+    # `False` means `cluster_for_coalescing` is never called and
+    # `plan_batches` receives targets in their original order --
+    # byte-identical to pre-W4.3 planning; that OFF path stays reachable
+    # (and pinned by `tests/unit/test_w4_flag_defaults.py`, which now
+    # asserts the ON default and that `False` still overrides from the
+    # environment) for an operator who needs to roll the behaviour back.
+    # The byte-identity of unreordered planning itself is pinned by the
+    # pre-existing, unmodified `tests/unit/test_jobs_batching.py`.
+    # (Neither pin is `tests/unit/test_jobs_batching_coalescing.py`,
+    # which this comment used to name -- that suite exercises the
+    # coalescing helpers and never reads `Settings`, so it could not have
+    # caught a flipped default. W4 gate review, 2026-08-26.) `True`
+    # reorders the targets handed to `plan_batches` so matches sharing a
+    # canonical URL (the SAME `canonical_url_hash` the network ledger
+    # groups on) land in the same dispatch chunk instead of splitting
+    # across one by accident of input order -- it never changes
+    # `plan_batches` itself, a batch's match_id cardinality, or cost
+    # authorization (still estimated off `len(batch.match_ids)`,
+    # unchanged).
     #
     # This flag is independent of the pre-existing `SCRAPE_URL_DEDUP`
     # (2026-08-11 proxy-cost Fix 1, spider layer): that flag folds
@@ -793,9 +800,10 @@ class Settings(BaseSettings):
     # whatever match_ids one spider run already received: this one makes
     # sure same-URL matches actually reach the SAME spider run in the
     # first place. Both must be enabled for a duplicate fetch to
-    # physically collapse; enabling only this one changes nothing
-    # observable on its own.
-    JOBS_COALESCING_ENABLED: bool = False
+    # physically collapse; `SCRAPE_URL_DEDUP` itself is untouched by
+    # Task B4 and still defaults `False` -- flipping it is a separate,
+    # not-yet-made decision.
+    JOBS_COALESCING_ENABLED: bool = True
     # The freshness-window bound a FUTURE cache-reuse pass would gate on
     # (reusing a recent-enough COMPLETED fetch with no new fetch at all --
     # see `app_shared.jobs.coalescing` module docstring for why that half

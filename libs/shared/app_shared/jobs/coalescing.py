@@ -40,12 +40,15 @@ stage optimizes for); that is a known, documented limit, not a
 correctness bug — a split cluster simply dispatches as two separate
 physical fetches, exactly like today.
 
-Feature flag: ``JOBS_COALESCING_ENABLED`` (default ``False``,
-``app_shared.config.Settings``). OFF means :func:`cluster_for_coalescing`
-is never called and planning is byte-identical to pre-W4.3 (the OFF
-default is pinned by ``tests/unit/test_w4_flag_defaults.py``; the
-byte-identity of unreordered planning by the pre-existing, unmodified
-``tests/unit/test_jobs_batching.py``). ON reorders the input
+Feature flag: ``JOBS_COALESCING_ENABLED`` (default ``True`` since EPA
+plan task B4, 2026-09-04, "H3" -- shipped ``False`` for the W4.3 canary
+period; ``app_shared.config.Settings``). OFF means
+:func:`cluster_for_coalescing` is never called and planning is
+byte-identical to pre-W4.3 (that OFF path stays reachable and pinned by
+``tests/unit/test_w4_flag_defaults.py``, which now asserts the ON
+default and that the environment can still override it back to
+``False``; the byte-identity of unreordered planning itself is pinned by
+the pre-existing, unmodified ``tests/unit/test_jobs_batching.py``). ON reorders the input
 to ``plan_batches`` only — it never changes ``plan_batches`` itself, the
 grouping key, the chunk ceilings, or ``batch.match_ids`` cardinality (a
 coalesced cluster still carries every one of its match_ids in the batch;
