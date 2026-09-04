@@ -129,10 +129,25 @@ _META_START = "_netledger_start_monotonic"
 _PAID_TRANSPORTS = (NetworkTransport.PROXY, NetworkTransport.BROWSER)
 
 
+def _is_proxied(meta: dict[str, Any]) -> bool:
+    """Did this leg's bytes actually cross a PAID proxy?
+
+    Separate from :func:`_transport_for` because a BROWSER navigation can
+    go either way: ``PLAYWRIGHT_PROXY`` pays DataImpulse per byte,
+    ``PLAYWRIGHT_DIRECT`` pulls the same page over the fleet's own egress
+    for nothing. Since H4/B2 prices proxied BYTES, the two must be told
+    apart — charging a direct browser page for 2.6 MB of proxy traffic
+    it never bought is the same class of fiction as the one-cent floor.
+    """
+    return bool(meta.get("proxy")) or str(
+        meta.get("playwright_context", "")
+    ).startswith("proxy:")
+
+
 def _transport_for(meta: dict[str, Any]) -> NetworkTransport:
     if meta.get("playwright"):
         return NetworkTransport.BROWSER
-    if meta.get("proxy") or str(meta.get("playwright_context", "")).startswith("proxy:"):
+    if _is_proxied(meta):
         return NetworkTransport.PROXY
     return NetworkTransport.DIRECT
 
@@ -484,18 +499,51 @@ class NetLedgerMiddleware:
             bytes_decompressed = len(response.body) if response is not None else None
 
         transport = _transport_for(meta)
+        proxied = _is_proxied(meta)
         cost: int | None = None
         currency: str | None = None
+        billing_unit: str | None = None
+        billing_rate: int | None = None
+        # A BROWSER leg is billed even when it went out DIRECT: the
+        # proxy bytes are then zero, but Railway's CPU is not.
         if transport in _PAID_TRANSPORTS:
-            from urllib.parse import urlsplit
+            from app_shared.costauth import (
+                BROWSER_BILLING_RATE_PER_CPU_SECOND,
+                BROWSER_CPU_PER_WALL_SECOND,
+                PROXY_BILLING_RATE_PER_GIB,
+                price_operation_micro_units,
+            )
 
-            from app_shared.costauth import estimate_cost_micro_units
-
-            domain = (urlsplit(request.url).hostname or "").lower()
-            # One physical operation is one request. Sub-resources are
-            # priced on their own child rows, so the parent is never
-            # charged for them here.
-            cost = estimate_cost_micro_units(domain, 1)
+            if transport is NetworkTransport.BROWSER:
+                # Two billed resources, one navigation: the proxy's bytes
+                # (zero when the browser went out direct — those bytes
+                # cost nothing to move) plus Railway's CPU. Wall time
+                # UNDER-counts Chromium's compute, so it is scaled to
+                # CPU-seconds before it is priced.
+                #
+                # Only the MAIN DOCUMENT's bytes are here; each
+                # sub-resource carries its own on its own child row, so
+                # the page's bytes are counted once across the four rows.
+                cpu_seconds = (
+                    (duration_ms / 1000.0) * BROWSER_CPU_PER_WALL_SECOND
+                    if duration_ms
+                    else 0.0
+                )
+                cost = price_operation_micro_units(
+                    transport=transport,
+                    bytes_on_wire=(bytes_compressed or 0) if proxied else 0,
+                    browser_cpu_seconds=cpu_seconds,
+                )
+                billing_unit = "CPU_SECONDS"
+                billing_rate = BROWSER_BILLING_RATE_PER_CPU_SECOND
+            else:
+                cost = price_operation_micro_units(
+                    transport=transport,
+                    bytes_on_wire=bytes_compressed or bytes_decompressed,
+                    browser_cpu_seconds=None,
+                )
+                billing_unit = "BYTES"
+                billing_rate = PROXY_BILLING_RATE_PER_GIB
             currency = "USD"
 
         return OperationOutcome(
@@ -510,7 +558,8 @@ class NetLedgerMiddleware:
             ),
             estimated_cost_micro_units=cost,
             currency=currency,
-            billing_unit="REQUEST" if cost is not None else None,
+            billing_unit=billing_unit,
+            billing_rate_micro_units=billing_rate,
         )
 
     def _drain_subresources(
@@ -531,10 +580,23 @@ class NetLedgerMiddleware:
             return []
         from urllib.parse import urlsplit
 
-        from app_shared.costauth import estimate_cost_micro_units
+        from app_shared.costauth import (
+            PROXY_BILLING_RATE_PER_GIB,
+            price_operation_micro_units,
+        )
 
         meta = request.meta
         transport = _transport_for(meta)
+        # A sub-resource costs BYTES and nothing else: the navigation's
+        # CPU is already priced once on the parent row, and charging it
+        # again per asset is how a 4-request page books five browsers'
+        # worth of compute. Off a DIRECT browser leg those bytes crossed
+        # no paid proxy at all, so the child is unpriced (NULL) rather
+        # than floored at one micro-unit — a fabricated non-zero is the
+        # same lie as a fabricated zero, just quieter.
+        priced = transport is NetworkTransport.PROXY or (
+            transport is NetworkTransport.BROWSER and _is_proxied(meta)
+        )
         provider = _provider_for(meta, transport)
         workspace_id = getattr(spider, "workspace_id", None)
         scrape_job_id = getattr(spider, "scrape_job_id", None)
@@ -551,8 +613,12 @@ class NetLedgerMiddleware:
             domain = (urlsplit(url).hostname or "").lower()
             byte_count = observed.get("byte_count")
             cost = (
-                estimate_cost_micro_units(domain, 1)
-                if transport in _PAID_TRANSPORTS
+                price_operation_micro_units(
+                    transport=transport,
+                    bytes_on_wire=byte_count,
+                    browser_cpu_seconds=None,
+                )
+                if priced
                 else None
             )
             children.append(
@@ -578,7 +644,10 @@ class NetLedgerMiddleware:
                         extraction_result=observed.get("resource_type"),
                         estimated_cost_micro_units=cost,
                         currency="USD" if cost is not None else None,
-                        billing_unit="REQUEST" if cost is not None else None,
+                        billing_unit="BYTES" if cost is not None else None,
+                        billing_rate_micro_units=(
+                            PROXY_BILLING_RATE_PER_GIB if cost is not None else None
+                        ),
                         # A sub-resource rides its parent's C3 grant and
                         # does NOT accrue against it: the reservation was
                         # sized per top-level request, so folding every

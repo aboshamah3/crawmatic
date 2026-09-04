@@ -56,13 +56,15 @@ from app_shared.config import Settings, get_settings
 from app_shared.costauth import (
     FLEET_PROVIDER_DIRECT,
     FLEET_PROVIDER_PROXY,
+    PROXY_BILLING_RATE_PER_GIB,
     AuthorizationPurpose,
     AuthorizationRequest,
     CostAuthorizationService,
     SettledCost,
     authorize_or_none,
     estimate_bytes,
-    estimate_cost_micro_units,
+    estimate_reservation_micro_units,
+    price_operation_micro_units,
 )
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.ids import new_uuid7
@@ -714,8 +716,15 @@ def _fetch(
             )
     finally:
         rung_bytes = len(html.encode()) if html else None
+        # Priced by the BYTES the rung pulled, not by a per-domain
+        # request average with a one-cent floor (H4/B2): a probe rung
+        # that fetched 18 KB of HTML costs ~17 micro-USD, and booking it
+        # at $0.01 made the discovery ladder look ~600x more expensive
+        # than it is.
         rung_cost = (
-            estimate_cost_micro_units(domain, 1)
+            price_operation_micro_units(
+                transport=transport, bytes_on_wire=rung_bytes, browser_cpu_seconds=None
+            )
             if transport is NetworkTransport.PROXY
             else None
         )
@@ -726,7 +735,12 @@ def _fetch(
                 duration_ms=int((time.monotonic() - started) * 1000),
                 estimated_cost_micro_units=rung_cost,
                 currency="USD" if transport is NetworkTransport.PROXY else None,
-                billing_unit="REQUEST" if transport is NetworkTransport.PROXY else None,
+                billing_unit="BYTES" if transport is NetworkTransport.PROXY else None,
+                billing_rate_micro_units=(
+                    PROXY_BILLING_RATE_PER_GIB
+                    if transport is NetworkTransport.PROXY
+                    else None
+                ),
                 # The run settles its own ladder-wide grant once, after the
                 # whole `_probe_sample` walk -- a per-rung close must never
                 # accrue against it as well.
@@ -1216,8 +1230,11 @@ def run_discovery(
                 transport="DIRECT",
                 provider=FLEET_PROVIDER_PROXY,
                 estimated_bytes=estimate_bytes(ladder_requests),
-                estimated_cost_micro_units=estimate_cost_micro_units(
-                    domain, paid_requests
+                # The walk is authorized as DIRECT (its first rungs are)
+                # but the CEILING must cover the PROXY rungs it may climb
+                # to — those are the only ones that cost money.
+                estimated_cost_micro_units=estimate_reservation_micro_units(
+                    transport="PROXY", requests=paid_requests
                 ),
                 purpose=AuthorizationPurpose.DISCOVERY,
                 estimated_requests=ladder_requests,

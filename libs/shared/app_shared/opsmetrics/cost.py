@@ -55,6 +55,31 @@ Provenance
     the report measures) is ``DIRECT_USD_PER_REQUEST``, the fallback for
     any domain not in the table above.
 
+DEPRECATED FOR LEDGER PRICING (H4/B2, 2026-09-03)
+-------------------------------------------------
+
+The per-DOMAIN request rates below are **no longer what anything gets
+billed at**. Every cost written to ``network_operations`` and every
+reservation taken against a budget is now priced by
+:mod:`app_shared.costauth.pricing`, in the unit the providers actually
+invoice: proxied BYTES at ``$1.00/GiB`` and browser CPU-SECONDS at
+Railway's ``$20/vCPU-month``. A per-request average cannot express the
+10x difference between the same domain fetched over HTTP (~250 KB) and
+through a browser (~2.6 MB), and the one-cent floor that used to sit on
+top of these numbers over-stated a real request by 47x (amazon.sa) to
+2,174x (a direct site).
+
+What remains here is a **record of the 2026-08-12 measurements** and the
+``/ops/metrics`` spend ESTIMATE that is derived from them. That estimate
+is deliberately left in place rather than re-pointed at the ledger: it
+is computed from ``request_attempts`` COUNTS, which is a different data
+source with no byte column at all, and it exists as a stop-loss signal
+rather than as an invoice (see ``usd``'s own caveat). Moving
+``/ops/metrics`` onto ledger sums is a real improvement and a separate
+change; what matters for H4 is that no MONEY the fleet reserves, books
+or settles passes through this table any more. Do not add a new caller
+that prices anything.
+
 Deliberately a module of plain constants rather than ``Settings`` knobs:
 these are *observations about the world*, and an operator who changes
 them is falsifying the dashboard rather than tuning behaviour. The
@@ -83,6 +108,10 @@ AMAZON_SHARE_OF_VARIABLE: float = 0.67
 #: scrape). The 30-day production figure is 8.44 -- see the SLO doc.
 AMAZON_HEALTHY_REQUESTS_PER_URL: float = 2.48
 
+#: DEPRECATED for pricing (H4/B2) — see the module docstring. Kept as
+#: the record of the 2026-08-12 measurement and as the input to the
+#: ``/ops/metrics`` spend ESTIMATE; the ledger prices bytes now.
+#:
 #: Per-domain USD per PAID request attempt, derived from the 2026-08-12
 #: report's §2 billing table ($/link ÷ req/link -- see module docstring
 #: for the full derivation and source lines). Keyed on the same bare
@@ -94,6 +123,8 @@ USD_PER_PROXIED_REQUEST_BY_DOMAIN: dict[str, float] = {
     "noon.com": 0.00008110,
 }
 
+#: DEPRECATED for pricing (H4/B2) — see the module docstring.
+#:
 #: $/req for every domain NOT in `USD_PER_PROXIED_REQUEST_BY_DOMAIN` --
 #: the report's uniform direct-site rate (report lines 61-69). Used as
 #: the fallback in `usd_per_request_for_domain`.
@@ -110,6 +141,10 @@ def usd(proxied_requests: float) -> float:
 
 def usd_per_request_for_domain(domain: str) -> float:
     """This domain's own $/req from the 2026-08-12 report.
+
+    DEPRECATED for pricing (H4/B2): this is an OBSERVABILITY estimate over
+    `request_attempts` counts, not a billing rate. Anything that reserves,
+    books or settles money uses `app_shared.costauth.pricing` instead.
 
     Falls back to `DIRECT_USD_PER_REQUEST` for any domain not in
     `USD_PER_PROXIED_REQUEST_BY_DOMAIN` -- every other measured

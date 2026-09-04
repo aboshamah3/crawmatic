@@ -29,10 +29,20 @@ from app_shared.costauth.service import (
     SettledCost,
     authorize_or_none,
     estimate_bytes,
-    estimate_cost_micro_units,
     period_key_for,
     release_reservations_for_scrape_job,
     sweep_expired_reservations,
+)
+# Pricing is its own module, and it is the ONLY place a rate lives
+# (H4/B2). Re-exported here because every call site that authorizes
+# or settles already imports from this package, and a second import
+# line is a second chance to reach past the gate for a number.
+from app_shared.costauth.pricing import (
+    BROWSER_BILLING_RATE_PER_CPU_SECOND,
+    BROWSER_CPU_PER_WALL_SECOND,
+    PROXY_BILLING_RATE_PER_GIB,
+    estimate_reservation_micro_units,
+    price_operation_micro_units,
 )
 # Re-exported from the model module so a call site needs ONE import to
 # build a request: the purpose vocabulary is part of the authorization
@@ -41,6 +51,9 @@ from app_shared.models.cost_authorization import AuthorizationPurpose, Reservati
 
 __all__ = [
     "AuthorizationPurpose",
+    "BROWSER_BILLING_RATE_PER_CPU_SECOND",
+    "BROWSER_CPU_PER_WALL_SECOND",
+    "PROXY_BILLING_RATE_PER_GIB",
     "ReservationState",
     "FLEET_PROVIDER_BROWSER",
     "FLEET_PROVIDER_DIRECT",
@@ -54,8 +67,9 @@ __all__ = [
     "SettledCost",
     "authorize_or_none",
     "estimate_bytes",
-    "estimate_cost_micro_units",
+    "estimate_reservation_micro_units",
     "period_key_for",
+    "price_operation_micro_units",
     "release_reservations_for_scrape_job",
     "sweep_expired_reservations",
 ]

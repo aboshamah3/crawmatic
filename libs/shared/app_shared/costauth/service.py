@@ -238,7 +238,6 @@ __all__ = [
     "SettledCost",
     "authorize_or_none",
     "estimate_bytes",
-    "estimate_cost_micro_units",
     "period_key_for",
     "release_reservations_for_scrape_job",
     "sweep_expired_reservations",
@@ -1832,38 +1831,6 @@ def _grant_from(reservation: CostReservation, *, replayed: bool) -> Authorizatio
 # ---------------------------------------------------------------------------
 # Call-site helpers (the six paid dispatch sites use these)
 # ---------------------------------------------------------------------------
-
-
-def estimate_cost_micro_units(domain: str, requests: int) -> int:
-    """Estimated cost of ``requests`` fetches of ``domain``, in micro-USD.
-
-    Uses the MEASURED per-domain rate from
-    :mod:`app_shared.opsmetrics.cost` (2026-08-12 billing table) rather
-    than a guess, and rounds **up**: a batch whose estimate rounds to zero
-    is a batch that reserves nothing, and a ceiling nothing is reserved
-    against is not a ceiling. Over-reserving is the fail-closed direction
-    and settlement corrects it within one operation.
-
-    The floor of 1 micro-unit exists for the same reason — a request that
-    genuinely costs a millionth of a dollar still consumes a slot, and
-    letting a stream of them cost literally zero is how the 2026-08-12
-    rediscovery loop stayed invisible to every counter it passed.
-
-    Scaled by :data:`MICRO_UNITS_PER_USD` since H4/B1: at the old CENTS
-    scale a ``$0.0000046`` direct request and a ``$0.00021`` amazon.sa
-    request both rounded to the same floor of ``1``, which is exactly the
-    47x-to-2174x mis-booking H4 exists to end.
-    """
-    import math
-
-    from app_shared.opsmetrics.cost import usd_per_request_for_domain
-
-    return max(
-        1,
-        math.ceil(
-            usd_per_request_for_domain(domain) * max(1, int(requests)) * MICRO_UNITS_PER_USD
-        ),
-    )
 
 
 def estimate_bytes(requests: int, *, per_request: int = DEFAULT_ESTIMATED_BYTES_PER_REQUEST) -> int:

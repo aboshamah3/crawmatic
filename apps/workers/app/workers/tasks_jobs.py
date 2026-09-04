@@ -40,7 +40,7 @@ from app_shared.costauth import (
     CostAuthorizationService,
     authorize_or_none,
     estimate_bytes,
-    estimate_cost_micro_units,
+    estimate_reservation_micro_units,
 )
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.domains.lifecycle import unsupported_target_outcome
@@ -253,9 +253,12 @@ def _batch_authorization_request(
       choice: the planner cannot know which rung the spider will land on,
       and over-reserving is corrected at settlement while under-reserving
       is money spent outside any ceiling.
-    * **size** comes from the batch's own match count, priced with the
-      MEASURED per-domain rate (``app_shared.opsmetrics.cost``), not a
-      guess.
+    * **size** comes from the batch's own match count, priced by the
+      MEASURED unit the provider actually bills — proxied bytes, plus
+      browser CPU-seconds for a BROWSER batch (``costauth.pricing``,
+      H4/B2). It is deliberately no longer a per-DOMAIN request rate:
+      what a fetch costs is what it weighs, and the same domain weighs
+      ten times more through a browser than over plain HTTP.
 
     ``dedupe_key`` is the batch's dispatch identity key (EPA B1). That is
     exactly the right grain: a duplicate/at-least-once delivery of the
@@ -272,7 +275,9 @@ def _batch_authorization_request(
         transport="BROWSER" if is_browser else "PROXY",
         provider=FLEET_PROVIDER_BROWSER if is_browser else FLEET_PROVIDER_PROXY,
         estimated_bytes=estimate_bytes(requests),
-        estimated_cost_micro_units=estimate_cost_micro_units(batch.domain, requests),
+        estimated_cost_micro_units=estimate_reservation_micro_units(
+            transport="BROWSER" if is_browser else "PROXY", requests=requests
+        ),
         purpose=purpose,
         estimated_requests=requests,
         estimated_browser_seconds=requests * 30 if is_browser else 0,

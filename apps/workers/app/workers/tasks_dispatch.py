@@ -31,7 +31,7 @@ from app_shared.costauth import (
     CostAuthorizationDenied,
     CostAuthorizationService,
     estimate_bytes,
-    estimate_cost_micro_units,
+    estimate_reservation_micro_units,
 )
 from app_shared.enums import ScrapeProfileMode, ScrapeTargetStatus
 from app_shared.jobs.dispatch_intents import DispatchIntentStore
@@ -155,8 +155,9 @@ def dispatch_generic_price_spider(
                 transport="BROWSER" if is_browser else "PROXY",
                 provider=FLEET_PROVIDER_BROWSER if is_browser else FLEET_PROVIDER_PROXY,
                 estimated_bytes=estimate_bytes(requests),
-                estimated_cost_micro_units=estimate_cost_micro_units(
-                    _FALLBACK_DOMAIN, requests
+                estimated_cost_micro_units=estimate_reservation_micro_units(
+                    transport="BROWSER" if is_browser else "PROXY",
+                    requests=requests,
                 ),
                 purpose=AuthorizationPurpose.FALLBACK,
                 estimated_requests=requests,

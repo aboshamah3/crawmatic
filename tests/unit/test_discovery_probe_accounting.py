@@ -285,7 +285,8 @@ assert opened[0].workspace_id == workspace_id, opened[0].workspace_id
 assert len(closed) == 1, closed
 assert closed[0].settle_authorization is False, closed[0].settle_authorization
 
-# 3. PROXY_HTTP prices the rung (currency/billing_unit set); DIRECT_HTTP
+# 3. PROXY_HTTP prices the rung by BYTES (H4/B2 -- currency/billing_unit
+#    set, and the unit is BYTES, not REQUEST); DIRECT_HTTP
 #    (case 2, above) does not -- a fleet-side direct fetch is recorded
 #    with a NULL cost, never a fabricated zero.
 def _fake_fetch_via_proxy(session, workspace_id, url):
@@ -301,7 +302,11 @@ result = tasks_strategy._fetch(
 assert result == "<html>proxy</html>", result
 assert opened[-1].transport is NetworkTransport.PROXY, opened[-1].transport
 assert closed[0].currency == "USD", closed[0].currency
-assert closed[0].billing_unit == "REQUEST", closed[0].billing_unit
+assert closed[0].billing_unit == "BYTES", closed[0].billing_unit
+# 18 bytes of "<html>proxy</html>" at $1.00/GiB: ceil(18 * 1e6 / 2**30)
+# == 1 micro-USD. The old per-request floor booked 10,000 for the same
+# rung -- a 10,000x over-statement of a single probe fetch.
+assert closed[0].estimated_cost_micro_units == 1, closed[0].estimated_cost_micro_units
 assert closed[0].estimated_cost_micro_units is not None, closed[0].estimated_cost_micro_units
 assert closed[0].settle_authorization is False, closed[0].settle_authorization
 
