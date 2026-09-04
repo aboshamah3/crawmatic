@@ -40,7 +40,7 @@ from app_shared.costauth import (
     CostAuthorizationService,
     authorize_or_none,
     estimate_bytes,
-    estimate_cost_minor_units,
+    estimate_cost_micro_units,
 )
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.domains.lifecycle import unsupported_target_outcome
@@ -272,7 +272,7 @@ def _batch_authorization_request(
         transport="BROWSER" if is_browser else "PROXY",
         provider=FLEET_PROVIDER_BROWSER if is_browser else FLEET_PROVIDER_PROXY,
         estimated_bytes=estimate_bytes(requests),
-        estimated_cost_minor_units=estimate_cost_minor_units(batch.domain, requests),
+        estimated_cost_micro_units=estimate_cost_micro_units(batch.domain, requests),
         purpose=purpose,
         estimated_requests=requests,
         estimated_browser_seconds=requests * 30 if is_browser else 0,

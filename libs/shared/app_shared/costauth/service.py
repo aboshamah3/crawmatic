@@ -6,7 +6,7 @@ cooldown, the durable proxy breaker, and per-job requeue caps) and no
 single place that could answer "may this workspace spend this money on
 this domain right now". Each brake was individually reasonable and
 collectively unauthoritative: none of them reserved anything, so two
-concurrent decisions could both observe room for the last cent, and none
+concurrent decisions could both observe room for the last micro-USD, and none
 of them could deny work on a domain nobody had certified.
 
 This module is that single place. Its contract, in one sentence: **one
@@ -234,10 +234,11 @@ __all__ = [
     "CostAuthorizationService",
     "CrossWorkspaceCoalescingUnsupported",
     "DenialReason",
+    "MICRO_UNITS_PER_USD",
     "SettledCost",
     "authorize_or_none",
     "estimate_bytes",
-    "estimate_cost_minor_units",
+    "estimate_cost_micro_units",
     "period_key_for",
     "release_reservations_for_scrape_job",
     "sweep_expired_reservations",
@@ -285,6 +286,20 @@ BUDGET_WARNING_EVENT_TYPE = WebhookEventType.BUDGET_THRESHOLD_WARNING.value
 FLEET_PROVIDER_PROXY = "proxy"
 FLEET_PROVIDER_BROWSER = "browser"
 FLEET_PROVIDER_DIRECT = "direct"
+
+#: Ledger units in one US dollar, and the ONLY definition of the ledger's
+#: money unit in this repository (H4/B1, 2026-09-03).
+#:
+#: Every ``*_cost_micro_units`` column, every JSON key that carries the
+#: name, and :data:`app_shared.costauth.fleet_budget_policy.USD_TO_UNITS`
+#: are this unit. It used to be cents, and cents were the bug: the
+#: cheapest real request this fleet makes costs ``$0.0000046``, so at the
+#: cents scale EVERY request — a $0.0000046 direct fetch and a $0.00021
+#: amazon.sa proxied fetch alike — floored to the same ``1``, booking
+#: spend 47x to 2174x over reality and making the ledger's own numbers
+#: useless as evidence. A micro-USD represents both exactly, and
+#: ``bigint`` holds a fleet's spend for longer than the fleet will exist.
+MICRO_UNITS_PER_USD = 1_000_000
 
 #: Bytes assumed for one request when the caller has no better figure.
 #: A competitor product page plus the subresources a fetch pulls in,
@@ -391,7 +406,7 @@ class AuthorizationRequest:
     transport: str
     provider: str
     estimated_bytes: int
-    estimated_cost_minor_units: int
+    estimated_cost_micro_units: int
     purpose: AuthorizationPurpose
     estimated_requests: int = 1
     estimated_browser_seconds: int = 0
@@ -408,7 +423,7 @@ class AuthorizationRequest:
             )
         for name in (
             "estimated_bytes",
-            "estimated_cost_minor_units",
+            "estimated_cost_micro_units",
             "estimated_requests",
             "estimated_browser_seconds",
         ):
@@ -449,7 +464,7 @@ class AuthorizationGrant:
     workspace_id: uuid.UUID
     budget_decision_version: str
     lease_expires_at: datetime
-    reserved_cost_minor_units: int
+    reserved_cost_micro_units: int
     reserved_bytes: int
     reserved_requests: int
     reserved_browser_seconds: int
@@ -473,13 +488,13 @@ class SettledCost:
     that dimension's whole reservation to the budget.
     """
 
-    cost_minor_units: int
+    cost_micro_units: int
     bytes_used: int = 0
     requests: int = 1
     browser_seconds: int = 0
 
     def __post_init__(self) -> None:
-        for name in ("cost_minor_units", "bytes_used", "requests", "browser_seconds"):
+        for name in ("cost_micro_units", "bytes_used", "requests", "browser_seconds"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an int, got {type(value)!r}")
@@ -510,10 +525,10 @@ class _Dimension:
 #: to report. The rest follow in decreasing generality.
 _DIMENSIONS: tuple[_Dimension, ...] = (
     _Dimension(
-        "cost_minor_units",
-        "limit_cost_minor_units",
-        "reserved_cost_minor_units",
-        "settled_cost_minor_units",
+        "cost_micro_units",
+        "limit_cost_micro_units",
+        "reserved_cost_micro_units",
+        "settled_cost_micro_units",
         DenialReason.MONEY_BUDGET_EXCEEDED,
     ),
     _Dimension(
@@ -610,7 +625,7 @@ class CostAuthorizationService:
         now: injectable clock returning an aware UTC datetime (tests).
         default_workspace_id: convenience for callers that operate on one
             workspace for their whole lifetime (and for
-            :meth:`remaining_budget_minor_units`).
+            :meth:`remaining_budget_micro_units`).
         lease_seconds / breaker_max_evidence_age_seconds /
         entitlement_max_evidence_age_seconds: the three durations the
             contract makes decisions from. Constructor arguments rather
@@ -751,7 +766,7 @@ class CostAuthorizationService:
             self._check_concurrency(session, workspace_id, tenant_budget, now)
 
             wanted = {
-                "cost_minor_units": req.estimated_cost_minor_units,
+                "cost_micro_units": req.estimated_cost_micro_units,
                 "bytes": req.estimated_bytes,
                 "requests": req.estimated_requests,
                 "browser_seconds": req.estimated_browser_seconds,
@@ -783,7 +798,7 @@ class CostAuthorizationService:
                 entitlement_version=entitlement_version,
                 breaker_decision=breaker_decision,
                 currency=req.currency,
-                reserved_cost_minor_units=req.estimated_cost_minor_units,
+                reserved_cost_micro_units=req.estimated_cost_micro_units,
                 reserved_bytes=req.estimated_bytes,
                 reserved_requests=req.estimated_requests,
                 reserved_browser_seconds=req.estimated_browser_seconds,
@@ -806,13 +821,13 @@ class CostAuthorizationService:
 
         logger.info(
             "cost_authorization.granted workspace_id=%s domain=%s purpose=%s "
-            "provider=%s transport=%s cost_minor_units=%d bytes=%d authorization_id=%s",
+            "provider=%s transport=%s cost_micro_units=%d bytes=%d authorization_id=%s",
             workspace_id,
             req.domain,
             req.purpose.value,
             req.provider,
             req.transport,
-            req.estimated_cost_minor_units,
+            req.estimated_cost_micro_units,
             req.estimated_bytes,
             authorization_id,
         )
@@ -821,7 +836,7 @@ class CostAuthorizationService:
             workspace_id=workspace_id,
             budget_decision_version=decision_version,
             lease_expires_at=lease_expires_at,
-            reserved_cost_minor_units=req.estimated_cost_minor_units,
+            reserved_cost_micro_units=req.estimated_cost_micro_units,
             reserved_bytes=req.estimated_bytes,
             reserved_requests=req.estimated_requests,
             reserved_browser_seconds=req.estimated_browser_seconds,
@@ -902,11 +917,11 @@ class CostAuthorizationService:
             if reservation.state is not ReservationState.RESERVED:
                 logger.warning(
                     "cost_authorization.late_settlement authorization_id=%s state=%s "
-                    "cost_minor_units=%d — an operation closed under a grant that is "
+                    "cost_micro_units=%d — an operation closed under a grant that is "
                     "already terminal; the spend is in the ledger but not in the budget",
                     auth_id,
                     reservation.state.value,
-                    delta.cost_minor_units,
+                    delta.cost_micro_units,
                 )
                 session.commit()
                 return
@@ -1004,8 +1019,8 @@ class CostAuthorizationService:
         """
         prior = _accrued(reservation)
         _accrue_on_budgets(reservation, delta, prior=prior, budgets=budgets)
-        reservation.settled_cost_minor_units = (
-            prior["cost_minor_units"] + delta["cost_minor_units"]
+        reservation.settled_cost_micro_units = (
+            prior["cost_micro_units"] + delta["cost_micro_units"]
         )
         reservation.settled_bytes = prior["bytes"] + delta["bytes"]
         reservation.settled_requests = prior["requests"] + delta["requests"]
@@ -1092,7 +1107,7 @@ class CostAuthorizationService:
             self._check_entitlement(session, ws, self._now())
             session.rollback()
 
-    def remaining_budget_minor_units(
+    def remaining_budget_micro_units(
         self,
         workspace_id: uuid.UUID | str | None = None,
         *,
@@ -1112,7 +1127,7 @@ class CostAuthorizationService:
         ws = _as_uuid(workspace_id) if workspace_id is not None else self._default_workspace_id
         if ws is None:
             raise ValueError(
-                "remaining_budget_minor_units needs a workspace_id (or a "
+                "remaining_budget_micro_units needs a workspace_id (or a "
                 "default_workspace_id on the service)"
             )
         period = period_key or period_key_for(self._now())
@@ -1122,10 +1137,10 @@ class CostAuthorizationService:
                     CostBudget.workspace_id == ws, CostBudget.period_key == period
                 )
             ).scalar_one_or_none()
-            if budget is None or budget.limit_cost_minor_units is None:
+            if budget is None or budget.limit_cost_micro_units is None:
                 return None
-            return int(budget.limit_cost_minor_units) - (
-                int(budget.reserved_cost_minor_units) + int(budget.settled_cost_minor_units)
+            return int(budget.limit_cost_micro_units) - (
+                int(budget.reserved_cost_micro_units) + int(budget.settled_cost_micro_units)
             )
 
     # -- gates --------------------------------------------------------------
@@ -1295,11 +1310,11 @@ class CostAuthorizationService:
         cannot become durable unless the reservation that triggered it did.
         """
         for budget, scope in budgets:
-            limit = budget.limit_cost_minor_units
+            limit = budget.limit_cost_micro_units
             if not limit:
                 continue
-            used = int(budget.reserved_cost_minor_units) + int(
-                budget.settled_cost_minor_units
+            used = int(budget.reserved_cost_micro_units) + int(
+                budget.settled_cost_micro_units
             )
             pct = (used * 100) // int(limit)
             already = {int(v) for v in (budget.warned_thresholds or [])}
@@ -1322,8 +1337,8 @@ class CostAuthorizationService:
                             "period_key": period,
                             "threshold_pct": threshold,
                             "used_pct": pct,
-                            "used_minor_units": used,
-                            "limit_minor_units": int(limit),
+                            "used_micro_units": used,
+                            "limit_micro_units": int(limit),
                             "currency": budget.currency,
                         },
                         "dedup_key": dedup_key,
@@ -1644,7 +1659,7 @@ def _reserve(budget: Any, wanted: dict[str, int]) -> None:
 def _by_dimension(cost: SettledCost) -> dict[str, int]:
     """A :class:`SettledCost` in the four dimensions' own vocabulary."""
     return {
-        "cost_minor_units": int(cost.cost_minor_units),
+        "cost_micro_units": int(cost.cost_micro_units),
         "bytes": int(cost.bytes_used),
         "requests": int(cost.requests),
         "browser_seconds": int(cost.browser_seconds),
@@ -1654,7 +1669,7 @@ def _by_dimension(cost: SettledCost) -> dict[str, int]:
 def _holds(reservation: CostReservation) -> dict[str, int]:
     """What this grant reserved, per dimension."""
     return {
-        "cost_minor_units": int(reservation.reserved_cost_minor_units),
+        "cost_micro_units": int(reservation.reserved_cost_micro_units),
         "bytes": int(reservation.reserved_bytes),
         "requests": int(reservation.reserved_requests),
         "browser_seconds": int(reservation.reserved_browser_seconds),
@@ -1668,7 +1683,7 @@ def _accrued(reservation: CostReservation) -> dict[str, int]:
     why every read goes through here instead of touching the columns.
     """
     return {
-        "cost_minor_units": int(reservation.settled_cost_minor_units or 0),
+        "cost_micro_units": int(reservation.settled_cost_micro_units or 0),
         "bytes": int(reservation.settled_bytes or 0),
         "requests": int(reservation.settled_requests or 0),
         "browser_seconds": int(reservation.settled_browser_seconds or 0),
@@ -1799,7 +1814,7 @@ def _grant_from(reservation: CostReservation, *, replayed: bool) -> Authorizatio
         workspace_id=reservation.workspace_id,
         budget_decision_version=reservation.budget_decision_version,
         lease_expires_at=reservation.lease_expires_at,
-        reserved_cost_minor_units=int(reservation.reserved_cost_minor_units),
+        reserved_cost_micro_units=int(reservation.reserved_cost_micro_units),
         reserved_bytes=int(reservation.reserved_bytes),
         reserved_requests=int(reservation.reserved_requests),
         reserved_browser_seconds=int(reservation.reserved_browser_seconds),
@@ -1819,8 +1834,8 @@ def _grant_from(reservation: CostReservation, *, replayed: bool) -> Authorizatio
 # ---------------------------------------------------------------------------
 
 
-def estimate_cost_minor_units(domain: str, requests: int) -> int:
-    """Estimated cost of ``requests`` fetches of ``domain``, in minor units.
+def estimate_cost_micro_units(domain: str, requests: int) -> int:
+    """Estimated cost of ``requests`` fetches of ``domain``, in micro-USD.
 
     Uses the MEASURED per-domain rate from
     :mod:`app_shared.opsmetrics.cost` (2026-08-12 billing table) rather
@@ -1829,16 +1844,26 @@ def estimate_cost_minor_units(domain: str, requests: int) -> int:
     against is not a ceiling. Over-reserving is the fail-closed direction
     and settlement corrects it within one operation.
 
-    The floor of 1 minor unit exists for the same reason — a request that
-    genuinely costs a hundredth of a cent still consumes a slot, and
+    The floor of 1 micro-unit exists for the same reason — a request that
+    genuinely costs a millionth of a dollar still consumes a slot, and
     letting a stream of them cost literally zero is how the 2026-08-12
     rediscovery loop stayed invisible to every counter it passed.
+
+    Scaled by :data:`MICRO_UNITS_PER_USD` since H4/B1: at the old CENTS
+    scale a ``$0.0000046`` direct request and a ``$0.00021`` amazon.sa
+    request both rounded to the same floor of ``1``, which is exactly the
+    47x-to-2174x mis-booking H4 exists to end.
     """
     import math
 
     from app_shared.opsmetrics.cost import usd_per_request_for_domain
 
-    return max(1, math.ceil(usd_per_request_for_domain(domain) * max(1, int(requests)) * 100))
+    return max(
+        1,
+        math.ceil(
+            usd_per_request_for_domain(domain) * max(1, int(requests)) * MICRO_UNITS_PER_USD
+        ),
+    )
 
 
 def estimate_bytes(requests: int, *, per_request: int = DEFAULT_ESTIMATED_BYTES_PER_REQUEST) -> int:

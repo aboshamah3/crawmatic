@@ -668,7 +668,7 @@ def fleet_budget_rollforward() -> None:
     "Re-run the script every month" is a reminder, not a control. This is
     the control.
 
-    **What it writes.** Only `limit_cost_minor_units`, and only where
+    **What it writes.** Only `limit_cost_micro_units`, and only where
     there is no limit already: an existing explicit cap is never lowered
     and never overwritten, and the `reserved_*`/`settled_*` counters are
     never touched (they are the authorization path's money, already

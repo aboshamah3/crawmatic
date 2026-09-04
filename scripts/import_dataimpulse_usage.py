@@ -208,7 +208,7 @@ def parse_export(
     granularity: ProviderUsageGranularity,
     fmt: str | None = None,
     column_overrides: dict[str, str] | None = None,
-    total_cost_minor_units: int | None = None,
+    total_cost_micro_units: int | None = None,
     currency: str | None = None,
 ) -> ProviderUsageSource:
     """Parse ``path`` into a :class:`ProviderUsageSource`, no I/O beyond the read.
@@ -271,7 +271,7 @@ def parse_export(
         source_ref=str(path),
         raw_bytes=raw_bytes,
         granularity=granularity,
-        total_cost_minor_units=total_cost_minor_units,
+        total_cost_micro_units=total_cost_micro_units,
         currency=currency,
     )
 
@@ -329,13 +329,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="override a column's header spelling; repeatable",
     )
     parser.add_argument(
-        "--total-cost-minor-units",
+        "--total-cost-micro-units",
         type=int,
         default=None,
-        help="an independent invoice total for this window, in integer minor "
+        help="an independent invoice total for this window, in integer micro-USD "
         "units (only if the export/invoice actually names one — never guessed)",
     )
-    parser.add_argument("--currency", default=None, help="ISO-4217, required with --total-cost-minor-units")
+    parser.add_argument("--currency", default=None, help="ISO-4217, required with --total-cost-micro-units")
     return parser
 
 
@@ -358,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
             granularity=ProviderUsageGranularity(args.granularity),
             fmt=args.format,
             column_overrides=overrides,
-            total_cost_minor_units=args.total_cost_minor_units,
+            total_cost_micro_units=args.total_cost_micro_units,
             currency=args.currency,
         )
         window = import_provider_usage(source)

@@ -49,11 +49,13 @@ by more than one tick's worth of uncapped time.
 ## Money units
 
 :data:`USD_TO_UNITS` is the single conversion between the operator-facing
-dollars of the settings and the ledger's integer units. The ledger is in
-MINOR units (cents) at the time of writing; Task B1 flips the whole
-ledger to micro-USD and changes this one constant with it. Every call
-site goes through :func:`usd_to_units` so that flip is one edit rather
-than a hunt.
+dollars of the settings and the ledger's integer units. Since H4/B1 the
+ledger is in **micro-USD** (1 USD == 1_000_000 units) — cents could not
+represent a ``$0.0000046`` direct request at all, and rounded every one
+of them up to a whole cent. Every call site goes through
+:func:`usd_to_units`, and the constant itself is
+:data:`~app_shared.costauth.service.MICRO_UNITS_PER_USD` so the ledger's
+unit has exactly one definition in the repository.
 
 ## Session seam
 
@@ -75,6 +77,7 @@ from sqlalchemy.orm import Session
 from app_shared.costauth.service import (
     FLEET_PROVIDER_BROWSER,
     FLEET_PROVIDER_PROXY,
+    MICRO_UNITS_PER_USD,
     period_key_for,
 )
 from app_shared.models.cost_authorization import FleetCostBudget
@@ -85,11 +88,11 @@ from app_shared.models.cost_authorization import FleetCostBudget
 #: capping it would be a ceiling on a counter that never moves.
 DEFAULT_SCOPE_KEYS: tuple[str, ...] = (FLEET_PROVIDER_PROXY, FLEET_PROVIDER_BROWSER)
 
-#: Ledger units in one US dollar. The ledger is in MINOR units (cents)
-#: today; Task B1 flips it to micro-USD and changes this constant in the
-#: same commit. It exists so that flip touches one line, and so that no
-#: call site has to know which regime it is in.
-USD_TO_UNITS = 100
+#: Ledger units in one US dollar — **micro-USD** since H4/B1 (was cents).
+#: Re-exported from :mod:`app_shared.costauth.service` rather than
+#: re-spelled, so the ledger's unit has ONE definition: a second literal
+#: here is how a converter and an estimator drift 10_000x apart.
+USD_TO_UNITS = MICRO_UNITS_PER_USD
 
 
 def usd_to_units(usd: float) -> int:
@@ -110,14 +113,14 @@ class BudgetRowPlan:
 
     scope_key: str
     period_key: str
-    existing_limit_minor_units: int | None
-    new_limit_minor_units: int
+    existing_limit_micro_units: int | None
+    new_limit_micro_units: int
     row_exists: bool
 
     @property
     def is_change(self) -> bool:
         """False when the row already carries exactly this cap."""
-        return self.existing_limit_minor_units != self.new_limit_minor_units
+        return self.existing_limit_micro_units != self.new_limit_micro_units
 
 
 @dataclass(frozen=True)
@@ -160,7 +163,7 @@ def plan_budget_rows(
     *,
     scope_keys: Sequence[str],
     period_keys: Sequence[str],
-    monthly_cap_minor_units: int,
+    monthly_cap_micro_units: int,
 ) -> list[BudgetRowPlan]:
     """Classify every targeted ``(scope_key, period_key)`` row. Writes nothing.
 
@@ -185,10 +188,10 @@ def plan_budget_rows(
                 BudgetRowPlan(
                     scope_key=scope_key,
                     period_key=period_key,
-                    existing_limit_minor_units=(
-                        None if row is None else row.limit_cost_minor_units
+                    existing_limit_micro_units=(
+                        None if row is None else row.limit_cost_micro_units
                     ),
-                    new_limit_minor_units=monthly_cap_minor_units,
+                    new_limit_micro_units=monthly_cap_micro_units,
                     row_exists=row is not None,
                 )
             )
@@ -200,11 +203,11 @@ def apply_budget_cap(
     *,
     plans: Sequence[BudgetRowPlan],
     currency: str,
-    monthly_cap_minor_units: int,
+    monthly_cap_micro_units: int,
 ) -> int:
-    """Upsert ``limit_cost_minor_units`` for every planned row. Returns rows changed.
+    """Upsert ``limit_cost_micro_units`` for every planned row. Returns rows changed.
 
-    Only ``limit_cost_minor_units`` is written. The ``reserved_*`` /
+    Only ``limit_cost_micro_units`` is written. The ``reserved_*`` /
     ``settled_*`` counters are the authorization path's to maintain and
     are never touched here — resetting a counter would hand back money
     the fleet has already spent — and the other three ``limit_*`` columns
@@ -231,14 +234,14 @@ def apply_budget_cap(
                     FleetCostBudget.period_key == plan.period_key,
                 )
             ).scalar_one()
-            row.limit_cost_minor_units = monthly_cap_minor_units
+            row.limit_cost_micro_units = monthly_cap_micro_units
         else:
             session.add(
                 FleetCostBudget(
                     scope_key=plan.scope_key,
                     period_key=plan.period_key,
                     currency=currency,
-                    limit_cost_minor_units=monthly_cap_minor_units,
+                    limit_cost_micro_units=monthly_cap_micro_units,
                 )
             )
         changed += 1
@@ -267,7 +270,7 @@ def _read_known_limits(
             FleetCostBudget.period_key <= through_period_key,
         )
     ).scalars()
-    return {(row.scope_key, row.period_key): row.limit_cost_minor_units for row in rows}
+    return {(row.scope_key, row.period_key): row.limit_cost_micro_units for row in rows}
 
 
 def _latest_known_limit(
@@ -351,13 +354,13 @@ def roll_fleet_budget_caps_forward(
                 session,
                 scope_keys=(scope_key,),
                 period_keys=(period_key,),
-                monthly_cap_minor_units=new_limit,
+                monthly_cap_micro_units=new_limit,
             )
             written += apply_budget_cap(
                 session,
                 plans=plans,
                 currency=currency,
-                monthly_cap_minor_units=new_limit,
+                monthly_cap_micro_units=new_limit,
             )
             # So a later period in this same pass can carry what this one
             # just wrote, without a second read.

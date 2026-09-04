@@ -52,7 +52,8 @@ if str(REPO_ROOT) not in sys.path:
 
 import scripts.seed_fleet_budget_cap as capseed  # noqa: E402
 from app_shared.costauth import fleet_budget_policy as policy  # noqa: E402
-from app_shared.costauth.service import (  # noqa: E402
+from app_shared.costauth.service import (
+    MICRO_UNITS_PER_USD,  # noqa: E402
     FLEET_PROVIDER_BROWSER,
     FLEET_PROVIDER_PROXY,
 )
@@ -128,7 +129,7 @@ def _row(scope_key: str, period_key: str, limit: int | None, **counters: int):
         scope_key=scope_key,
         period_key=period_key,
         currency="USD",
-        limit_cost_minor_units=limit,
+        limit_cost_micro_units=limit,
     )
     for name, value in counters.items():
         setattr(row, name, value)
@@ -137,7 +138,7 @@ def _row(scope_key: str, period_key: str, limit: int | None, **counters: int):
 
 def _limits(session: _FakeSession) -> dict[tuple[str, str], int | None]:
     return {
-        (row.scope_key, row.period_key): row.limit_cost_minor_units
+        (row.scope_key, row.period_key): row.limit_cost_micro_units
         for row in session.rows
     }
 
@@ -145,21 +146,29 @@ def _limits(session: _FakeSession) -> dict[tuple[str, str], int | None]:
 # --- money conversion ---------------------------------------------------
 
 
-def test_usd_converts_to_the_ledger_minor_unit() -> None:
-    """One place converts operator dollars into ledger units, so Task B1's
-    micro-USD flip is one constant rather than a hunt through call sites."""
-    assert policy.USD_TO_UNITS == 100
-    assert policy.usd_to_units(75.0) == 7_500
-    assert policy.usd_to_units(25.0) == 2_500
+def test_usd_converts_to_the_ledger_micro_unit() -> None:
+    """One place converts operator dollars into ledger units, which is why
+    H4/B1's cents -> micro-USD flip was one constant and not a hunt through
+    call sites. The constant is `service.MICRO_UNITS_PER_USD`, imported
+    rather than re-spelled: a second literal is how a converter and an
+    estimator drift 10_000x apart."""
+    assert policy.USD_TO_UNITS == 1_000_000
+    assert policy.USD_TO_UNITS == MICRO_UNITS_PER_USD
+    assert policy.usd_to_units(75.0) == 75_000_000
+    assert policy.usd_to_units(25.0) == 25_000_000
 
 
 def test_usd_to_units_rounds_rather_than_truncates() -> None:
-    """`int(x * 100)` on binary floats truncates ($0.29 -> 28 cents). A cap
-    is not a place to lose a unit to representation, and a sub-unit cap
-    rounds to 0 rather than to a silently-wrong number."""
-    assert policy.usd_to_units(0.29) == 29  # 0.29 * 100 == 28.999999999999996
-    assert policy.usd_to_units(1.999) == 200
-    assert policy.usd_to_units(0.0001) == 0  # below one ledger unit == nothing
+    """`int(x * scale)` on binary floats truncates ($0.29 * 1_000_000 ==
+    289999.99999999994). A cap is not a place to lose a unit to
+    representation, and a sub-unit cap rounds to 0 rather than to a
+    silently-wrong number."""
+    assert policy.usd_to_units(0.29) == 290_000  # 0.29 * 1e6 == 289999.99999999994
+    assert policy.usd_to_units(1.999) == 1_999_000
+    # A tenth of a micro-USD: below one ledger unit == nothing. At the old
+    # CENTS scale this test's value was $0.0001 — which is now 100 units,
+    # and is exactly the kind of real per-request cost cents could not hold.
+    assert policy.usd_to_units(0.0000001) == 0
 
 
 # --- the roll-forward ---------------------------------------------------
@@ -181,10 +190,10 @@ def test_configured_caps_are_written_for_this_month_and_the_next() -> None:
     assert report.carried == []
     assert report.uncapped == []
     assert _limits(session) == {
-        (FLEET_PROVIDER_PROXY, "2026_09"): 7_500,
-        (FLEET_PROVIDER_PROXY, "2026_10"): 7_500,
-        (FLEET_PROVIDER_BROWSER, "2026_09"): 2_500,
-        (FLEET_PROVIDER_BROWSER, "2026_10"): 2_500,
+        (FLEET_PROVIDER_PROXY, "2026_09"): 75_000_000,
+        (FLEET_PROVIDER_PROXY, "2026_10"): 75_000_000,
+        (FLEET_PROVIDER_BROWSER, "2026_09"): 25_000_000,
+        (FLEET_PROVIDER_BROWSER, "2026_10"): 25_000_000,
     }
 
 
@@ -241,8 +250,8 @@ def test_an_existing_cap_is_never_lowered_and_no_counter_is_touched() -> None:
         FLEET_PROVIDER_PROXY,
         "2026_09",
         9_000,
-        settled_cost_minor_units=12_345,
-        reserved_cost_minor_units=678,
+        settled_cost_micro_units=12_345,
+        reserved_cost_micro_units=678,
     )
     session = _FakeSession([existing])
 
@@ -253,12 +262,12 @@ def test_an_existing_cap_is_never_lowered_and_no_counter_is_touched() -> None:
         caps_usd={FLEET_PROVIDER_PROXY: 75.0, FLEET_PROVIDER_BROWSER: 25.0},
     )
 
-    assert existing.limit_cost_minor_units == 9_000
-    assert existing.settled_cost_minor_units == 12_345
-    assert existing.reserved_cost_minor_units == 678
+    assert existing.limit_cost_micro_units == 9_000
+    assert existing.settled_cost_micro_units == 12_345
+    assert existing.reserved_cost_micro_units == 678
     # proxy/2026_09 skipped; the other three pairs written.
     assert report.written == 3
-    assert _limits(session)[(FLEET_PROVIDER_PROXY, "2026_10")] == 7_500
+    assert _limits(session)[(FLEET_PROVIDER_PROXY, "2026_10")] == 75_000_000
 
 
 def test_a_row_born_uncapped_gets_the_configured_cap(
@@ -268,7 +277,7 @@ def test_a_row_born_uncapped_gets_the_configured_cap(
     dispatch. The cadence must UPDATE it, not skip it and not insert a
     duplicate."""
     born_uncapped = _row(
-        FLEET_PROVIDER_PROXY, "2026_09", None, settled_cost_minor_units=4_242
+        FLEET_PROVIDER_PROXY, "2026_09", None, settled_cost_micro_units=4_242
     )
     session = _FakeSession([born_uncapped])
 
@@ -279,8 +288,8 @@ def test_a_row_born_uncapped_gets_the_configured_cap(
         caps_usd={FLEET_PROVIDER_PROXY: 75.0, FLEET_PROVIDER_BROWSER: 25.0},
     )
 
-    assert born_uncapped.limit_cost_minor_units == 7_500
-    assert born_uncapped.settled_cost_minor_units == 4_242
+    assert born_uncapped.limit_cost_micro_units == 75_000_000
+    assert born_uncapped.settled_cost_micro_units == 4_242
     assert session.added == [
         row for row in session.rows if row is not born_uncapped
     ], "the existing row must be updated in place, never re-inserted"
@@ -341,12 +350,12 @@ def test_a_cap_that_rounds_away_to_nothing_is_not_written() -> None:
         session,
         now=NOW_SEP,
         months_ahead=1,
-        caps_usd={FLEET_PROVIDER_PROXY: 0.0001, FLEET_PROVIDER_BROWSER: 25.0},
+        caps_usd={FLEET_PROVIDER_PROXY: 0.0000001, FLEET_PROVIDER_BROWSER: 25.0},
     )
 
     assert (FLEET_PROVIDER_PROXY, "2026_09") in report.uncapped
     assert _limits(session).get((FLEET_PROVIDER_PROXY, "2026_09")) is None
-    assert _limits(session)[(FLEET_PROVIDER_BROWSER, "2026_09")] == 2_500
+    assert _limits(session)[(FLEET_PROVIDER_BROWSER, "2026_09")] == 25_000_000
 
 
 def test_only_the_money_limit_is_written_on_a_created_row() -> None:

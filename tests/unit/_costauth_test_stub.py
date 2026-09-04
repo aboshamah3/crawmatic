@@ -43,7 +43,7 @@ def _fake_grant() -> SimpleNamespace:
         workspace_id=uuid.uuid4(),
         budget_decision_version="stub",
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=900),
-        reserved_cost_minor_units=0,
+        reserved_cost_micro_units=0,
         reserved_bytes=0,
         reserved_requests=1,
         reserved_browser_seconds=0,

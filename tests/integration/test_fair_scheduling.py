@@ -417,7 +417,7 @@ def _reserve_live(
                     provider="proxy",
                     budget_decision_version="test",
                     currency="USD",
-                    reserved_cost_minor_units=1,
+                    reserved_cost_micro_units=1,
                     reserved_bytes=1,
                     reserved_requests=1,
                     reserved_browser_seconds=0,

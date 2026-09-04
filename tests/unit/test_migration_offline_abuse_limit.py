@@ -126,7 +126,13 @@ def test_alembic_heads_reports_exactly_one_head() -> None:
     head_lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(head_lines) == 1, f"expected exactly one head, got: {head_lines!r}"
     assert "(head)" in head_lines[0]
-    assert "e92029e9902c" in head_lines[0]
+    # Deliberately NOT pinned to this revision's own id: `e92029e9902c` was
+    # the head when this file was written and stopped being one the moment
+    # a later migration landed on top of it (H4/B1's `b7c1d2e3f4a5` was the
+    # first). The claim worth guarding is SINGLE head — a second head is a
+    # branch nobody chose — plus the fact that this revision is still on the
+    # chain that leads to it, which the assertion below makes.
+    assert "e92029e9902c" in _run_alembic("history").stdout
 
 
 def test_down_revision_is_the_head_this_revision_was_authored_against() -> None:

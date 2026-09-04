@@ -22,7 +22,7 @@ Three separate append-only facts, never one mutable row:
 Two test classes:
 
 * the **offline** ones (always run) assert schema SHAPE from the mapped
-  metadata and the migration source — money amounts are integer minor
+  metadata and the migration source — money amounts are integer micro
   units (never float, never a bare numeric), the operation row carries
   no ``workspace_id``, the required indexes are declared, RLS is emitted
   for the allocations table ONLY, and ``RequestAttempt`` gained its
@@ -74,14 +74,14 @@ MIGRATION_PATH = (
 )
 
 #: Every column in the ledger that carries an amount of money. All four
-#: are INTEGER minor units (never float, never a bare NUMERIC) — the §19
+#: are INTEGER micro-USD (never float, never a bare NUMERIC) — the §19
 #: `app_shared.money.Money` no-float contract, expressed as scaled
 #: integers so there is no Decimal-vs-float ambiguity at any boundary.
 MONEY_COLUMNS = (
-    (NetworkOperation, "estimated_cost_minor_units"),
+    (NetworkOperation, "estimated_cost_micro_units"),
     (NetworkOperation, "billing_rate_micro_units"),
-    (NetworkOperationAllocation, "allocated_cost_minor_units"),
-    (NetworkOperationSettlement, "reconciled_cost_minor_units"),
+    (NetworkOperationAllocation, "allocated_cost_micro_units"),
+    (NetworkOperationSettlement, "reconciled_cost_micro_units"),
 )
 
 
@@ -106,11 +106,11 @@ class TestLedgerShape:
         # ...and the allocations table is where it DOES live.
         assert "workspace_id" in NetworkOperationAllocation.__table__.columns
 
-    def test_money_columns_are_integer_minor_units_never_float(self) -> None:
+    def test_money_columns_are_integer_micro_units_never_float(self) -> None:
         for model, name in MONEY_COLUMNS:
             column = _column(model, name)
             assert isinstance(column.type, BigInteger), (
-                f"{model.__tablename__}.{name} must be BigInteger minor units, "
+                f"{model.__tablename__}.{name} must be BigInteger micro-USD, "
                 f"got {column.type!r}"
             )
             # No float, and no bare NUMERIC either — a NUMERIC money column
@@ -169,7 +169,7 @@ class TestLedgerShape:
             "extraction_result",
             "identity_confidence",
             "comparability",
-            "estimated_cost_minor_units",
+            "estimated_cost_micro_units",
             "currency",
             "billing_unit",
             "billing_rate_micro_units",
@@ -219,7 +219,7 @@ class TestLedgerShape:
 
     def test_settlements_are_versioned_per_operation(self) -> None:
         columns = NetworkOperationSettlement.__table__.columns
-        assert {"operation_id", "settlement_version", "reconciled_cost_minor_units",
+        assert {"operation_id", "settlement_version", "reconciled_cost_micro_units",
                 "provider_usage_record_id", "method", "created_at"} <= set(columns.keys())
         unique_names = {
             c.name
@@ -263,8 +263,8 @@ class TestLargestRemainder:
     """The rounding rule that makes the deferred total constraint satisfiable."""
 
     def test_three_workspaces_sum_exactly(self) -> None:
-        # 100 minor units split three ways: naive rounding gives 33+33+33
-        # = 99 and one lost minor unit; largest-remainder gives back the
+        # 100 micro-USD split three ways: naive rounding gives 33+33+33
+        # = 99 and one lost micro-unit; largest-remainder gives back the
         # remainder to the largest fractional parts.
         parts = allocate_cost_largest_remainder(100, [1, 1, 1])
         assert sum(parts) == 100
@@ -350,7 +350,7 @@ def _close_operation(conn, network_request_id: uuid.UUID, cost: int | None = 100
         text(
             "UPDATE network_operations SET closed_at = now(), response_status = 200, "
             "duration_ms = 42, bytes_compressed = 1000, bytes_decompressed = 4000, "
-            "estimated_cost_minor_units = :cost, currency = 'USD' "
+            "estimated_cost_micro_units = :cost, currency = 'USD' "
             "WHERE network_request_id = :nrid"
         ),
         {"cost": cost, "nrid": network_request_id},
@@ -407,13 +407,13 @@ class TestLiveEnforcement:
             _close_operation(conn, nrid)
             row = conn.execute(
                 text(
-                    "SELECT response_status, estimated_cost_minor_units, currency "
+                    "SELECT response_status, estimated_cost_micro_units, currency "
                     "FROM network_operations WHERE network_request_id = :nrid"
                 ),
                 {"nrid": nrid},
             ).one()
         assert row.response_status == 200
-        assert row.estimated_cost_minor_units == 100
+        assert row.estimated_cost_micro_units == 100
         assert row.currency == "USD"
 
     def test_settlement_update_is_rejected(self, engine) -> None:  # type: ignore[no-untyped-def]
@@ -423,7 +423,7 @@ class TestLiveEnforcement:
             conn.execute(
                 text(
                     "INSERT INTO network_operation_settlements "
-                    "(id, operation_id, settlement_version, reconciled_cost_minor_units, "
+                    "(id, operation_id, settlement_version, reconciled_cost_micro_units, "
                     " currency, method, created_at) "
                     "VALUES (:id, :nrid, 1, 97, 'USD', 'EXACT', now())"
                 ),
@@ -434,7 +434,7 @@ class TestLiveEnforcement:
                 conn.execute(
                     text(
                         "UPDATE network_operation_settlements "
-                        "SET reconciled_cost_minor_units = 1 WHERE operation_id = :nrid"
+                        "SET reconciled_cost_micro_units = 1 WHERE operation_id = :nrid"
                     ),
                     {"nrid": nrid},
                 )
@@ -447,7 +447,7 @@ class TestLiveEnforcement:
             conn.execute(
                 text(
                     "INSERT INTO network_operation_settlements "
-                    "(id, operation_id, settlement_version, reconciled_cost_minor_units, "
+                    "(id, operation_id, settlement_version, reconciled_cost_micro_units, "
                     " currency, method, created_at) "
                     "VALUES (:id, :nrid, 1, 97, 'USD', 'PRO_RATA_BYTES', now())"
                 ),
@@ -472,7 +472,7 @@ class TestLiveEnforcement:
                     text(
                         "INSERT INTO network_operation_settlements "
                         "(id, operation_id, settlement_version, "
-                        " reconciled_cost_minor_units, currency, method, created_at) "
+                        " reconciled_cost_micro_units, currency, method, created_at) "
                         "VALUES (:id, :nrid, :v, :cost, 'USD', :method, now())"
                     ),
                     {
@@ -485,7 +485,7 @@ class TestLiveEnforcement:
                 )
             current = conn.execute(
                 text(
-                    "SELECT reconciled_cost_minor_units FROM network_operation_settlements "
+                    "SELECT reconciled_cost_micro_units FROM network_operation_settlements "
                     "WHERE operation_id = :nrid ORDER BY settlement_version DESC LIMIT 1"
                 ),
                 {"nrid": nrid},
@@ -493,7 +493,7 @@ class TestLiveEnforcement:
         assert current == 103
 
     def test_largest_remainder_allocations_satisfy_the_deferred_total(self, engine) -> None:  # type: ignore[no-untyped-def]
-        """Three workspaces, one operation, 100 minor units — the whole
+        """Three workspaces, one operation, 100 micro-USD — the whole
         set commits because largest-remainder makes 34+33+33 exact."""
         with engine.begin() as conn:
             nrid = _open_operation(conn)
@@ -506,7 +506,7 @@ class TestLiveEnforcement:
                     text(
                         "INSERT INTO network_operation_allocations "
                         "(id, operation_id, workspace_id, fraction_ppb, "
-                        " allocated_cost_minor_units, currency, created_at) "
+                        " allocated_cost_micro_units, currency, created_at) "
                         "VALUES (:id, :nrid, :ws, :fraction, :cost, 'USD', now())"
                     ),
                     {
@@ -520,7 +520,7 @@ class TestLiveEnforcement:
         with engine.connect() as conn:
             total = conn.execute(
                 text(
-                    "SELECT SUM(allocated_cost_minor_units) "
+                    "SELECT SUM(allocated_cost_micro_units) "
                     "FROM network_operation_allocations WHERE operation_id = :nrid"
                 ),
                 {"nrid": nrid},
@@ -545,7 +545,7 @@ class TestLiveEnforcement:
                 text(
                     "INSERT INTO network_operation_allocations "
                     "(id, operation_id, workspace_id, fraction_ppb, "
-                    " allocated_cost_minor_units, currency, created_at) "
+                    " allocated_cost_micro_units, currency, created_at) "
                     "VALUES (:id, :nrid, :ws, :fraction, 33, 'USD', now())"
                 ),
                 {"id": uuid.uuid4(), "nrid": nrid, "ws": ws_id, "fraction": fraction},
@@ -568,7 +568,7 @@ class TestLiveEnforcement:
                 text(
                     "INSERT INTO network_operation_allocations "
                     "(id, operation_id, workspace_id, fraction_ppb, "
-                    " allocated_cost_minor_units, currency, created_at) "
+                    " allocated_cost_micro_units, currency, created_at) "
                     "VALUES (:id, :nrid, :ws, :fraction, 4237, 'USD', now())"
                 ),
                 {

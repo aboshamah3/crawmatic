@@ -643,8 +643,8 @@ class Settings(BaseSettings):
     # money ceiling `maintenance.fleet_budget_rollforward` writes onto
     # `fleet_cost_budgets` for each PAID transport class, in DOLLARS
     # (converted once, by `app_shared.costauth.fleet_budget_policy.
-    # usd_to_units`, so the ledger's unit can change under Task B1 without
-    # anyone re-deriving these numbers).
+    # usd_to_units` — micro-USD since H4/B1 — so these numbers never had
+    # to be re-derived when the ledger's unit changed).
     #
     # `None` is not "no cap" — it means "carry the last cap you find
     # forward", which is what keeps a deploy that forgot these vars from

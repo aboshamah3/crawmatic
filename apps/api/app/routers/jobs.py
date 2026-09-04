@@ -25,7 +25,7 @@ from app_shared.costauth import (
     CostAuthorizationService,
     DenialReason,
     estimate_bytes,
-    estimate_cost_minor_units,
+    estimate_cost_micro_units,
 )
 from app_shared.jobs.service import create_match_job, create_variant_job
 from app_shared.models.catalog import ProductVariant
@@ -157,7 +157,7 @@ def _authorize_manual_recheck(
                 transport="PROXY",
                 provider=FLEET_PROVIDER_PROXY,
                 estimated_bytes=estimate_bytes(1),
-                estimated_cost_minor_units=estimate_cost_minor_units(domain, 1),
+                estimated_cost_micro_units=estimate_cost_micro_units(domain, 1),
                 purpose=AuthorizationPurpose.MANUAL_RECHECK,
                 estimated_requests=1,
                 # No dedupe key: a human asking twice means twice.

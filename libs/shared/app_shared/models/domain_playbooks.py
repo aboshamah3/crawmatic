@@ -168,7 +168,7 @@ class DomainPlaybook(Base, TimestampMixin):
     #: mirrors the scraping runtime's identity-adapter status enum
     #: without importing the scraping package here, same boundary rule
     #: as ``ScrapeProfile.price_json_path``'s docstring), ``expected_bytes``/
-    #: ``expected_latency_ms``/``expected_cost_minor_units`` (certified
+    #: ``expected_latency_ms``/``expected_cost_micro_units`` (certified
     #: performance envelope), and ``fixtures`` (identifiers of the
     #: recorded fixtures/golden pages a re-certification replays against).
     #: All keys optional; unset keys mean "not yet captured for this

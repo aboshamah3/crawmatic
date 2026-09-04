@@ -302,7 +302,7 @@ assert result == "<html>proxy</html>", result
 assert opened[-1].transport is NetworkTransport.PROXY, opened[-1].transport
 assert closed[0].currency == "USD", closed[0].currency
 assert closed[0].billing_unit == "REQUEST", closed[0].billing_unit
-assert closed[0].estimated_cost_minor_units is not None, closed[0].estimated_cost_minor_units
+assert closed[0].estimated_cost_micro_units is not None, closed[0].estimated_cost_micro_units
 assert closed[0].settle_authorization is False, closed[0].settle_authorization
 
 print("OK")
@@ -464,9 +464,9 @@ def fake_probe(session, *, workspace_id, urls, thresholds, competitor_id=None,
     # Stand in for the ladder walk: three rungs per url, only the PROXY
     # one costing money -- exactly the shape `_fetch` records.
     for _ in urls:
-        observed.record(bytes_used=1000, cost_minor_units=None)   # DIRECT
-        observed.record(bytes_used=1000, cost_minor_units=None)   # DIRECT_RETRY
-        observed.record(bytes_used=2000, cost_minor_units=7)      # PROXY
+        observed.record(bytes_used=1000, cost_micro_units=None)   # DIRECT
+        observed.record(bytes_used=1000, cost_micro_units=None)   # DIRECT_RETRY
+        observed.record(bytes_used=2000, cost_micro_units=7)      # PROXY
     return {}
 
 
@@ -498,16 +498,16 @@ if len(settled) != 1:
     fail("EXPECTED_ONE_TERMINAL_SETTLE_GOT:" + str(len(settled)))
 
 actual = settled[0]
-# OBSERVED, not reserved: 9 fetches, 12000 bytes, 21 minor units (three
+# OBSERVED, not reserved: 9 fetches, 12000 bytes, 21 micro-USD (three
 # priced PROXY rungs at 7).
 if actual.requests != len(SAMPLE) * ladder:
     fail("SETTLED_REQUEST_COUNT_IS_NOT_THE_OBSERVED_ONE:" + str(actual.requests))
 if actual.bytes_used != len(SAMPLE) * 4000:
     fail("SETTLED_BYTES_ARE_NOT_THE_OBSERVED_ONES:" + str(actual.bytes_used))
-if actual.cost_minor_units != len(SAMPLE) * 7:
-    fail("SETTLED_COST_IS_NOT_THE_OBSERVED_ONE:" + str(actual.cost_minor_units))
+if actual.cost_micro_units != len(SAMPLE) * 7:
+    fail("SETTLED_COST_IS_NOT_THE_OBSERVED_ONE:" + str(actual.cost_micro_units))
 # ...and it is emphatically NOT the reserved estimate.
-if actual.cost_minor_units == req.estimated_cost_minor_units:
+if actual.cost_micro_units == req.estimated_cost_micro_units:
     fail("SETTLED_THE_RESERVED_ESTIMATE_INSTEAD_OF_THE_OBSERVED_TOTAL")
 
 print("OK")

@@ -489,13 +489,13 @@ class NetLedgerMiddleware:
         if transport in _PAID_TRANSPORTS:
             from urllib.parse import urlsplit
 
-            from app_shared.costauth import estimate_cost_minor_units
+            from app_shared.costauth import estimate_cost_micro_units
 
             domain = (urlsplit(request.url).hostname or "").lower()
             # One physical operation is one request. Sub-resources are
             # priced on their own child rows, so the parent is never
             # charged for them here.
-            cost = estimate_cost_minor_units(domain, 1)
+            cost = estimate_cost_micro_units(domain, 1)
             currency = "USD"
 
         return OperationOutcome(
@@ -508,7 +508,7 @@ class NetLedgerMiddleware:
                 if exception is not None
                 else None
             ),
-            estimated_cost_minor_units=cost,
+            estimated_cost_micro_units=cost,
             currency=currency,
             billing_unit="REQUEST" if cost is not None else None,
         )
@@ -531,7 +531,7 @@ class NetLedgerMiddleware:
             return []
         from urllib.parse import urlsplit
 
-        from app_shared.costauth import estimate_cost_minor_units
+        from app_shared.costauth import estimate_cost_micro_units
 
         meta = request.meta
         transport = _transport_for(meta)
@@ -551,7 +551,7 @@ class NetLedgerMiddleware:
             domain = (urlsplit(url).hostname or "").lower()
             byte_count = observed.get("byte_count")
             cost = (
-                estimate_cost_minor_units(domain, 1)
+                estimate_cost_micro_units(domain, 1)
                 if transport in _PAID_TRANSPORTS
                 else None
             )
@@ -576,7 +576,7 @@ class NetLedgerMiddleware:
                         bytes_compressed=byte_count,
                         response_status=observed.get("status"),
                         extraction_result=observed.get("resource_type"),
-                        estimated_cost_minor_units=cost,
+                        estimated_cost_micro_units=cost,
                         currency="USD" if cost is not None else None,
                         billing_unit="REQUEST" if cost is not None else None,
                         # A sub-resource rides its parent's C3 grant and

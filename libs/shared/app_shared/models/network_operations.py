@@ -36,7 +36,7 @@ tables**, deliberately not one mutable row:
     The tenant-visible half, and the ONLY one of the three with
     row-level security. One row per (operation, workspace): the
     ``fraction`` of the operation attributed to that workspace and the
-    ``allocated_cost_minor_units`` that follows from it. Fractions are
+    ``allocated_cost_micro_units`` that follows from it. Fractions are
     exact scaled integers (parts per billion, :data:`FRACTION_SCALE`),
     never floats. Rounding uses :func:`allocate_cost_largest_remainder`
     so the parts sum EXACTLY to the operation's cost, and a **deferred**
@@ -52,18 +52,18 @@ tables**, deliberately not one mutable row:
 
 Money
 -----
-Every amount in this ledger is an **integer in currency minor units**
+Every amount in this ledger is an **integer in micro-USD**
 paired with an ISO-4217 ``currency`` code — the ``app_shared.money``
 §19 contract ("money is never a float") expressed as scaled integers so
 there is no Decimal-vs-float ambiguity at any boundary, in the ORM, in
 raw SQL, or in JSON. :class:`app_shared.money.Money` (``NUMERIC(18,4)``)
 stays the right type for *prices observed on a page*; a per-request
-provider charge is a counted quantity of minor units, and counting it as
+provider charge is a counted quantity of micro-USD, and counting it as
 one keeps addition exact and the deferred total constraint decidable.
 
 The one figure that is a **rate** rather than an amount —
 ``billing_rate_micro_units`` — is scaled by a further
-:data:`BILLING_RATE_SCALE` (millionths of a minor unit per one
+:data:`BILLING_RATE_SCALE` (millionths of one US cent per one
 ``billing_unit``) precisely so that sub-cent rates (``$0.0007`` per
 request is a real proxy price) survive as exact integers instead of
 rounding to zero.
@@ -122,10 +122,13 @@ from app_shared.models.base import Base, TZDateTime, WorkspaceScopedBase
 #: staying far inside ``bigint``.
 FRACTION_SCALE = 1_000_000_000
 
-#: ``billing_rate_micro_units`` is expressed in MILLIONTHS of one
-#: currency minor unit per one ``billing_unit``. A ``$3.00/GB`` proxy
-#: rate is ``300 * 1_000_000``; a ``$0.0007`` per-request rate is
-#: ``70_000`` — exact, where plain minor units would round it to zero.
+#: ``billing_rate_micro_units`` is expressed in MILLIONTHS of one US
+#: CENT per one ``billing_unit`` — its own scale, deliberately left
+#: alone by H4's move of the ledger AMOUNT columns to micro-USD (this
+#: is a rate, no amount is derived from it anywhere in the repository).
+#: A ``$3.00/GB`` proxy rate is ``300 * 1_000_000``; a ``$0.0007``
+#: per-request rate is ``70_000`` — exact, where a plain cents-scaled
+#: integer would round it to zero.
 BILLING_RATE_SCALE = 1_000_000
 
 
@@ -162,9 +165,9 @@ class SettlementMethod(StrEnum):
 
 
 def allocate_cost_largest_remainder(
-    total_minor_units: int, weights: Sequence[int]
+    total_micro_units: int, weights: Sequence[int]
 ) -> list[int]:
-    """Split ``total_minor_units`` across ``weights`` so the parts sum EXACTLY.
+    """Split ``total_micro_units`` across ``weights`` so the parts sum EXACTLY.
 
     The largest-remainder (Hamilton) method: floor every share, then hand
     the leftover units back one at a time to the shares with the largest
@@ -172,7 +175,7 @@ def allocate_cost_largest_remainder(
     deterministic for a given input order).
 
     This is the rounding rule the deferred allocation-total constraint
-    assumes. Naive per-share rounding loses a minor unit on the classic
+    assumes. Naive per-share rounding loses a micro-unit on the classic
     ``100 / 3`` case (``33 + 33 + 33 = 99``) — and a ledger that loses a
     unit per multi-tenant fetch is a ledger that cannot be reconciled
     against a provider invoice.
@@ -182,13 +185,13 @@ def allocate_cost_largest_remainder(
     error into money (§19, the same posture as
     :func:`app_shared.money.parse_money`).
     """
-    if isinstance(total_minor_units, bool) or not isinstance(total_minor_units, int):
+    if isinstance(total_micro_units, bool) or not isinstance(total_micro_units, int):
         raise TypeError(
-            "total_minor_units must be an int of currency minor units, "
-            f"got {type(total_minor_units)!r} — money is never a float"
+            "total_micro_units must be an int of micro-USD, "
+            f"got {type(total_micro_units)!r} — money is never a float"
         )
-    if total_minor_units < 0:
-        raise ValueError(f"total_minor_units must be non-negative: {total_minor_units!r}")
+    if total_micro_units < 0:
+        raise ValueError(f"total_micro_units must be non-negative: {total_micro_units!r}")
 
     weight_list = list(weights)
     if not weight_list:
@@ -207,12 +210,12 @@ def allocate_cost_largest_remainder(
     if weight_total <= 0:
         raise ValueError("weights must sum to a positive value")
 
-    floors = [(total_minor_units * weight) // weight_total for weight in weight_list]
+    floors = [(total_micro_units * weight) // weight_total for weight in weight_list]
     remainders = [
-        (total_minor_units * weight) - floor * weight_total
+        (total_micro_units * weight) - floor * weight_total
         for weight, floor in zip(weight_list, floors, strict=True)
     ]
-    leftover = total_minor_units - sum(floors)
+    leftover = total_micro_units - sum(floors)
     # Hand the leftover units to the largest remainders first; `-index`
     # is not used — a stable sort on (-remainder, index) keeps the result
     # deterministic and independent of Python's sort internals.
@@ -267,7 +270,7 @@ class NetworkOperation(Base):
             name="fk_no_parent_operation_id_network_operations",
         ),
         CheckConstraint(
-            "estimated_cost_minor_units IS NULL OR estimated_cost_minor_units >= 0",
+            "estimated_cost_micro_units IS NULL OR estimated_cost_micro_units >= 0",
             name="no_estimated_cost_non_negative",
         ),
         CheckConstraint(
@@ -275,7 +278,7 @@ class NetworkOperation(Base):
             name="no_billing_rate_non_negative",
         ),
         CheckConstraint(
-            "estimated_cost_minor_units IS NULL OR currency IS NOT NULL",
+            "estimated_cost_micro_units IS NULL OR currency IS NOT NULL",
             name="no_cost_requires_currency",
         ),
         CheckConstraint(
@@ -359,9 +362,9 @@ class NetworkOperation(Base):
     identity_confidence: Mapped[str | None] = mapped_column(Text(), nullable=True)
     comparability: Mapped[str | None] = mapped_column(Text(), nullable=True)
     #: The operation's cost as the FLEET estimated it at close, in
-    #: currency minor units. Reconciled later, never overwritten (see
+    #: micro-USD. Reconciled later, never overwritten (see
     #: `NetworkOperationSettlement`).
-    estimated_cost_minor_units: Mapped[int | None] = mapped_column(
+    estimated_cost_micro_units: Mapped[int | None] = mapped_column(
         BigInteger(), nullable=True
     )
     currency: Mapped[str | None] = mapped_column(String(length=3), nullable=True)
@@ -383,10 +386,10 @@ class NetworkOperationAllocation(Base, WorkspaceScopedBase):
     operation gets exactly one row with ``fraction_ppb =
     FRACTION_SCALE``.
 
-    ``allocated_cost_minor_units`` is computed with
+    ``allocated_cost_micro_units`` is computed with
     :func:`allocate_cost_largest_remainder`, and a DEFERRED constraint
     trigger re-checks at COMMIT that the rows for one operation sum
-    exactly to that operation's ``estimated_cost_minor_units`` (and that
+    exactly to that operation's ``estimated_cost_micro_units`` (and that
     the fractions sum to :data:`FRACTION_SCALE`). Deferred, not
     immediate, because an allocation set is written a row at a time and
     is only meaningful complete — an immediate check would reject the
@@ -413,7 +416,7 @@ class NetworkOperationAllocation(Base, WorkspaceScopedBase):
             name="noa_fraction_in_range",
         ),
         CheckConstraint(
-            "allocated_cost_minor_units >= 0",
+            "allocated_cost_micro_units >= 0",
             # Short suffix on purpose: the convention prefixes
             # `ck_network_operation_allocations_`, which already spends 33
             # of Postgres's 63 identifier bytes.
@@ -427,7 +430,7 @@ class NetworkOperationAllocation(Base, WorkspaceScopedBase):
     #: Exact scaled integer share, parts per billion (:data:`FRACTION_SCALE`
     #: == 1.0). Never a float, never a bare NUMERIC.
     fraction_ppb: Mapped[int] = mapped_column(BigInteger(), nullable=False)
-    allocated_cost_minor_units: Mapped[int] = mapped_column(BigInteger(), nullable=False)
+    allocated_cost_micro_units: Mapped[int] = mapped_column(BigInteger(), nullable=False)
     currency: Mapped[str] = mapped_column(String(length=3), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TZDateTime(), nullable=False, server_default=text("now()")
@@ -469,7 +472,7 @@ class NetworkOperationSettlement(Base):
         ),
         CheckConstraint("settlement_version >= 1", name="nos_version_is_positive"),
         CheckConstraint(
-            "reconciled_cost_minor_units >= 0", name="nos_cost_non_negative"
+            "reconciled_cost_micro_units >= 0", name="nos_cost_non_negative"
         ),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="nos_currency_is_iso4217"),
         Index("ix_nos_operation_id", "operation_id"),
@@ -477,7 +480,7 @@ class NetworkOperationSettlement(Base):
 
     operation_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     settlement_version: Mapped[int] = mapped_column(Integer(), nullable=False)
-    reconciled_cost_minor_units: Mapped[int] = mapped_column(BigInteger(), nullable=False)
+    reconciled_cost_micro_units: Mapped[int] = mapped_column(BigInteger(), nullable=False)
     currency: Mapped[str] = mapped_column(String(length=3), nullable=False)
     #: The provider's own identifier for the usage record this
     #: settlement was derived from — the thread back to the invoice.
@@ -589,7 +592,7 @@ BEGIN
         op_id := NEW.operation_id;
     END IF;
 
-    SELECT o.estimated_cost_minor_units
+    SELECT o.estimated_cost_micro_units
       INTO op_cost
       FROM network_operations o
      WHERE o.network_request_id = op_id;
@@ -598,7 +601,7 @@ BEGIN
         RETURN NULL;
     END IF;
 
-    SELECT COALESCE(SUM(a.allocated_cost_minor_units), 0),
+    SELECT COALESCE(SUM(a.allocated_cost_micro_units), 0),
            COALESCE(SUM(a.fraction_ppb), 0),
            COUNT(*)
       INTO alloc_total, alloc_frac, alloc_count
@@ -614,8 +617,8 @@ BEGIN
             ERRCODE = '23514',
             MESSAGE = 'network_operation_allocations do not sum to the operation cost',
             DETAIL  = 'allocated total ' || alloc_total::text
-                      || ' minor units vs operation cost ' || op_cost::text
-                      || ' minor units. Split with largest-remainder rounding so the '
+                      || ' micro-USD vs operation cost ' || op_cost::text
+                      || ' micro-USD. Split with largest-remainder rounding so the '
                       || 'parts sum exactly.';
     END IF;
 

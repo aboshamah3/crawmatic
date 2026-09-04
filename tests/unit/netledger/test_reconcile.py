@@ -135,7 +135,7 @@ class TestProviderUsageSourceValidation:
             ProviderUsageSource(
                 provider="dataimpulse", window_start=start, window_end=end,
                 rows=self._rows(), source_ref="test", raw_bytes=b"x",
-                total_cost_minor_units=100,
+                total_cost_micro_units=100,
             )
 
 
@@ -248,7 +248,7 @@ def session_scope(engine):  # type: ignore[no-untyped-def]
 
 def _make_operation(
     *, provider: str, domain: str, bytes_compressed: int, closed_at: datetime,
-    cost_minor_units: int | None = None, currency: str = "USD",
+    cost_micro_units: int | None = None, currency: str = "USD",
     provider_account: str | None = None, parent_operation_id: uuid.UUID | None = None,
 ) -> NetworkOperation:
     nrid = uuid.uuid4()
@@ -267,8 +267,8 @@ def _make_operation(
         bytes_compressed=bytes_compressed,
         bytes_decompressed=bytes_compressed * 4,
         response_status=200,
-        estimated_cost_minor_units=cost_minor_units,
-        currency=currency if cost_minor_units is not None else None,
+        estimated_cost_micro_units=cost_micro_units,
+        currency=currency if cost_micro_units is not None else None,
     )
 
 
@@ -315,7 +315,7 @@ class TestLiveReconciliation:
                     _make_operation(
                         provider=provider, domain=host, bytes_compressed=1_000,
                         closed_at=window_start + timedelta(minutes=i),
-                        cost_minor_units=10,
+                        cost_micro_units=10,
                     )
                 )
             session.commit()
@@ -386,7 +386,7 @@ class TestLiveReconciliation:
         with session_scope() as session:
             window = import_provider_usage(source, session_scope=session_scope)
 
-        window = replace(window, total_cost_minor_units=8_000, currency="USD")
+        window = replace(window, total_cost_micro_units=8_000, currency="USD")
 
         with session_scope() as session:
             report = reconcile_window(window, session_scope=session_scope)
@@ -400,7 +400,7 @@ class TestLiveReconciliation:
 
         with session_scope() as session:
             total_reconciled = session.execute(
-                select(sa.func.sum(NetworkOperationSettlement.reconciled_cost_minor_units))
+                select(sa.func.sum(NetworkOperationSettlement.reconciled_cost_micro_units))
                 .where(
                     NetworkOperationSettlement.operation_id.in_(
                         [parent.network_request_id]
@@ -422,7 +422,7 @@ class TestLiveReconciliation:
 
         op = _make_operation(
             provider=provider, domain=host, bytes_compressed=20_000,
-            closed_at=window_start + timedelta(minutes=1), cost_minor_units=500,
+            closed_at=window_start + timedelta(minutes=1), cost_micro_units=500,
         )
         with session_scope() as session:
             session.add(op)
@@ -445,7 +445,7 @@ class TestLiveReconciliation:
                 select(NetworkOperationSettlement)
                 .where(NetworkOperationSettlement.operation_id == op.network_request_id)
             ).scalar_one()
-            v1_cost = v1.reconciled_cost_minor_units
+            v1_cost = v1.reconciled_cost_micro_units
             v1_method = v1.method
             v1_created_at = v1.created_at
             assert v1.settlement_version == 1
@@ -480,7 +480,7 @@ class TestLiveReconciliation:
         assert rows[1].method == SettlementMethod.CORRECTION
         # The FIRST version is untouched — same cost, same method, same
         # created_at — proving this was an APPEND, not an edit.
-        assert rows[0].reconciled_cost_minor_units == v1_cost
+        assert rows[0].reconciled_cost_micro_units == v1_cost
         assert rows[0].method == v1_method
         assert rows[0].created_at == v1_created_at
 
@@ -496,7 +496,7 @@ class TestLiveReconciliation:
 
         op = _make_operation(
             provider=provider, domain=host, bytes_compressed=9_000,
-            closed_at=window_start + timedelta(minutes=1), cost_minor_units=90,
+            closed_at=window_start + timedelta(minutes=1), cost_micro_units=90,
         )
         with session_scope() as session:
             session.add(op)
@@ -601,4 +601,4 @@ class TestLiveReconciliation:
         assert found[0].total_bytes == 300
         # Window-level cost is not durably persisted (see the module
         # docstring) — reconstructed windows always carry None here.
-        assert found[0].total_cost_minor_units is None
+        assert found[0].total_cost_micro_units is None

@@ -356,11 +356,11 @@ class TestBoundaryOffline:
     def test_money_is_never_a_float(self) -> None:
         """§19, at the boundary's own front door."""
         with pytest.raises(TypeError):
-            OperationOutcome(estimated_cost_minor_units=1.5, currency="USD")  # type: ignore[arg-type]
+            OperationOutcome(estimated_cost_micro_units=1.5, currency="USD")  # type: ignore[arg-type]
         with pytest.raises(ValueError):
-            OperationOutcome(estimated_cost_minor_units=7)  # no currency
+            OperationOutcome(estimated_cost_micro_units=7)  # no currency
         with pytest.raises(ValueError):
-            OperationOutcome(estimated_cost_minor_units=7, currency="dollars")
+            OperationOutcome(estimated_cost_micro_units=7, currency="dollars")
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +436,7 @@ def _operation(engine, network_request_id: uuid.UUID) -> Any:  # type: ignore[no
             text(
                 "SELECT network_request_id, retry_parent_id, parent_operation_id, "
                 "       transport, provider, domain, closed_at, bytes_compressed, "
-                "       bytes_decompressed, response_status, estimated_cost_minor_units, "
+                "       bytes_decompressed, response_status, estimated_cost_micro_units, "
                 "       currency, authorization_id "
                 "  FROM network_operations WHERE network_request_id = :nrid"
             ),
@@ -543,7 +543,7 @@ class TestLedgerAtTheBoundary:
 
         row = _operation(engine, network_request_id)
         assert row["transport"] == NetworkTransport.DIRECT.value
-        assert row["estimated_cost_minor_units"] is None
+        assert row["estimated_cost_micro_units"] is None
         assert row["currency"] is None
         with engine.begin() as conn:
             allocations = conn.execute(
@@ -671,7 +671,7 @@ class TestLedgerAtTheBoundary:
             bytes_compressed=4_096,
             bytes_decompressed=16_384,
             response_status=200,
-            estimated_cost_minor_units=7,
+            estimated_cost_micro_units=7,
             currency="USD",
         )
 
@@ -702,7 +702,7 @@ class TestLedgerAtTheBoundary:
         assert recovered["closed_at"] is not None
         assert recovered["bytes_compressed"] == 4_096
         assert recovered["bytes_decompressed"] == 16_384
-        assert recovered["estimated_cost_minor_units"] == 7
+        assert recovered["estimated_cost_micro_units"] == 7
 
     def test_startup_sweep_flushes_children_a_dead_process_left_behind(
         self, engine, system_scope, workspace, tmp_path: Path
@@ -798,7 +798,7 @@ class TestLedgerAtTheBoundary:
         """One fetch, five logical attempts, allocations summing EXACTLY.
 
         The 100/3 case is the reason largest-remainder rounding is
-        mandatory: naive per-share rounding loses a minor unit, and C1's
+        mandatory: naive per-share rounding loses a micro-unit, and C1's
         deferred trigger rejects the result at COMMIT.
         """
         recorder = _recorder(system_scope, tmp_path)
@@ -818,10 +818,10 @@ class TestLedgerAtTheBoundary:
             OperationOutcome(
                 bytes_compressed=2_048,
                 response_status=200,
-                estimated_cost_minor_units=100,
+                estimated_cost_micro_units=100,
                 currency="USD",
                 # A genuinely awkward split: three workspaces, equal
-                # weights, 100 minor units.
+                # weights, 100 micro-USD.
                 allocations={workspace: 1, other_a: 1, other_b: 1},
             ),
         )
@@ -830,17 +830,17 @@ class TestLedgerAtTheBoundary:
         with engine.begin() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT workspace_id, fraction_ppb, allocated_cost_minor_units "
+                    "SELECT workspace_id, fraction_ppb, allocated_cost_micro_units "
                     "  FROM network_operation_allocations WHERE operation_id = :nrid"
                 ),
                 {"nrid": network_request_id},
             ).mappings().all()
 
         assert len(rows) == 3
-        assert sum(row["allocated_cost_minor_units"] for row in rows) == 100
+        assert sum(row["allocated_cost_micro_units"] for row in rows) == 100
         assert sum(row["fraction_ppb"] for row in rows) == FRACTION_SCALE
         # Largest-remainder, not naive rounding: 34/33/33, never 33/33/33.
-        assert sorted(row["allocated_cost_minor_units"] for row in rows) == [33, 33, 34]
+        assert sorted(row["allocated_cost_micro_units"] for row in rows) == [33, 33, 34]
 
         # And the five sibling attempts all reference this ONE operation.
         attempts = _write_fanout_attempts(
@@ -884,7 +884,7 @@ class TestLedgerAtTheBoundary:
             OperationOutcome(
                 bytes_compressed=9_000,
                 response_status=200,
-                estimated_cost_minor_units=12,
+                estimated_cost_micro_units=12,
                 currency="USD",
                 browser_seconds=4,
             ),
@@ -893,7 +893,7 @@ class TestLedgerAtTheBoundary:
         assert recorder.open_operations == ()
         settled_auth, settled_cost = costauth.settlements[0]
         assert settled_auth == authorization_id
-        assert settled_cost.cost_minor_units == 12
+        assert settled_cost.cost_micro_units == 12
         assert settled_cost.bytes_used == 9_000
         assert settled_cost.browser_seconds == 4
         assert _operation(engine, network_request_id)["authorization_id"] == authorization_id
@@ -940,18 +940,18 @@ class TestLedgerAtTheBoundary:
                 OperationOutcome(
                     bytes_compressed=100 * (index + 1),
                     response_status=200,
-                    estimated_cost_minor_units=index + 1,
+                    estimated_cost_micro_units=index + 1,
                     currency="USD",
                 ),
             )
 
         assert [auth for auth, _ in costauth.settlements] == [authorization_id] * 4
-        assert sum(delta.cost_minor_units for _, delta in costauth.settlements) == 10
+        assert sum(delta.cost_micro_units for _, delta in costauth.settlements) == 10
         assert costauth.terminal_settlements == []
 
         # The redelivery: already-closed operations accrue nothing more.
         for nrid in ids:
-            receipt = recorder.close(nrid, OperationOutcome(estimated_cost_minor_units=None))
+            receipt = recorder.close(nrid, OperationOutcome(estimated_cost_micro_units=None))
             assert receipt.settled is False
         assert len(costauth.settlements) == 4
 
@@ -1098,7 +1098,7 @@ class TestCostRollupDimensionsAgainstRealLedgerRows:
                 OperationOutcome(
                     bytes_compressed=1_000,
                     response_status=200,
-                    estimated_cost_minor_units=cost,
+                    estimated_cost_micro_units=cost,
                     currency="USD",
                 ),
             )
@@ -1125,8 +1125,8 @@ class TestCostRollupDimensionsAgainstRealLedgerRows:
 
         buckets = aggregate_fleet_cost_buckets(rows, [])
         by_method = {b.method: b for b in buckets}
-        assert by_method["BROWSER"].estimated_cost_minor_units == 900
-        assert by_method["PROXY"].estimated_cost_minor_units == 100
+        assert by_method["BROWSER"].estimated_cost_micro_units == 900
+        assert by_method["PROXY"].estimated_cost_micro_units == 100
         assert all(b.profile_version == "9" for b in buckets)
 
     def test_an_operation_on_a_domain_with_no_playbook_still_appears(
@@ -1165,7 +1165,7 @@ class TestCostRollupDimensionsAgainstRealLedgerRows:
             OperationOutcome(
                 bytes_compressed=500,
                 response_status=200,
-                estimated_cost_minor_units=3,
+                estimated_cost_micro_units=3,
                 currency="USD",
             ),
         )

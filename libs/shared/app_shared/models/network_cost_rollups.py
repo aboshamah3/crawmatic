@@ -40,7 +40,7 @@ Mirrors ``network_operations`` (fleet-owned) /
   the standard ``workspace_id = <ctx>`` policy). One row per
   ``(workspace_id, rollup_date, domain, method, profile_version)``
   bucket, using this workspace's OWN allocated share
-  (``network_operation_allocations.allocated_cost_minor_units``), never
+  (``network_operation_allocations.allocated_cost_micro_units``), never
   the operation's fleet-wide cost. Registered in
   ``app_shared.repository.WORKSPACE_OWNED_MODELS`` — unlike
   ``NetworkOperationAllocation`` (deliberately left unregistered pending
@@ -151,10 +151,10 @@ class FleetNetworkCostRollup(Base, TimestampMixin):
         ),
         CheckConstraint("operation_count >= 0", name="fncr_operation_count_non_negative"),
         CheckConstraint(
-            "estimated_cost_minor_units >= 0", name="fncr_estimated_cost_non_negative"
+            "estimated_cost_micro_units >= 0", name="fncr_estimated_cost_non_negative"
         ),
         CheckConstraint(
-            "reconciled_cost_minor_units IS NULL OR reconciled_cost_minor_units >= 0",
+            "reconciled_cost_micro_units IS NULL OR reconciled_cost_micro_units >= 0",
             name="fncr_reconciled_cost_non_negative",
         ),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="fncr_currency_is_iso4217"),
@@ -175,17 +175,17 @@ class FleetNetworkCostRollup(Base, TimestampMixin):
     #: the upsert key below is always comparable.
     profile_version: Mapped[str] = mapped_column(Text(), nullable=False, default="")
     operation_count: Mapped[int] = mapped_column(BigInteger(), nullable=False, default=0)
-    #: Sum of ``network_operations.estimated_cost_minor_units`` over the
+    #: Sum of ``network_operations.estimated_cost_micro_units`` over the
     #: bucket — the FLEET's own estimate, never a tenant allocation.
-    estimated_cost_minor_units: Mapped[int] = mapped_column(
+    estimated_cost_micro_units: Mapped[int] = mapped_column(
         BigInteger(), nullable=False, default=0
     )
     #: Sum of each covered operation's LATEST settlement
-    #: (``network_operation_settlements.reconciled_cost_minor_units``,
+    #: (``network_operation_settlements.reconciled_cost_micro_units``,
     #: highest ``settlement_version``). ``NULL`` iff not one operation in
     #: the bucket has a settlement yet — distinct from ``0``, which would
     #: falsely claim "reconciled to zero cost".
-    reconciled_cost_minor_units: Mapped[int | None] = mapped_column(
+    reconciled_cost_micro_units: Mapped[int | None] = mapped_column(
         BigInteger(), nullable=True
     )
     currency: Mapped[str] = mapped_column(String(length=3), nullable=False)
@@ -218,10 +218,10 @@ class NetworkCostRollup(Base, WorkspaceScopedBase, TimestampMixin):
         ),
         CheckConstraint("operation_count >= 0", name="ncr_operation_count_non_negative"),
         CheckConstraint(
-            "estimated_cost_minor_units >= 0", name="ncr_estimated_cost_non_negative"
+            "estimated_cost_micro_units >= 0", name="ncr_estimated_cost_non_negative"
         ),
         CheckConstraint(
-            "reconciled_cost_minor_units IS NULL OR reconciled_cost_minor_units >= 0",
+            "reconciled_cost_micro_units IS NULL OR reconciled_cost_micro_units >= 0",
             name="ncr_reconciled_cost_non_negative",
         ),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="ncr_currency_is_iso4217"),
@@ -236,15 +236,15 @@ class NetworkCostRollup(Base, WorkspaceScopedBase, TimestampMixin):
     profile_version: Mapped[str] = mapped_column(Text(), nullable=False, default="")
     operation_count: Mapped[int] = mapped_column(BigInteger(), nullable=False, default=0)
     #: This workspace's own share
-    #: (``network_operation_allocations.allocated_cost_minor_units``),
+    #: (``network_operation_allocations.allocated_cost_micro_units``),
     #: never the operation's fleet-wide cost.
-    estimated_cost_minor_units: Mapped[int] = mapped_column(
+    estimated_cost_micro_units: Mapped[int] = mapped_column(
         BigInteger(), nullable=False, default=0
     )
     #: This workspace's ``fraction_ppb`` applied to each covered
     #: operation's latest settlement. ``NULL`` iff not one covered
     #: operation has a settlement yet.
-    reconciled_cost_minor_units: Mapped[int | None] = mapped_column(
+    reconciled_cost_micro_units: Mapped[int | None] = mapped_column(
         BigInteger(), nullable=True
     )
     currency: Mapped[str] = mapped_column(String(length=3), nullable=False)

@@ -67,7 +67,7 @@ unique are the same bug: neither aggregates.
 
 ## Reconciled cost
 
-A bucket's ``reconciled_cost_minor_units`` sums, over every operation in
+A bucket's ``reconciled_cost_micro_units`` sums, over every operation in
 the bucket, that operation's LATEST settlement
 (``network_operation_settlements``, highest ``settlement_version`` —
 never a mutable "current" column, matching C1/C5's own append-only
@@ -81,7 +81,7 @@ allocate_cost_largest_remainder` guarantees for the authoritative
 allocation row itself. That exactness is deliberately NOT reproduced
 here: a rollup bucket is a reporting aggregate over potentially many
 operations' settlements, not itself a per-operation ledger entry, so a
-few minor units of floor-division drift across a whole day's bucket is
+few micro-USD of floor-division drift across a whole day's bucket is
 an acceptable, documented approximation — the authoritative figure
 always remains ``network_operation_settlements`` itself.
 
@@ -211,7 +211,7 @@ class RawOperationRow:
     #: COST_ROLLUP_UNKNOWN_PROFILE_VERSION` by the aggregator, never left
     #: as SQL NULL in a bucket key.
     profile_version: str | None
-    estimated_cost_minor_units: int
+    estimated_cost_micro_units: int
     currency: str
 
 
@@ -223,7 +223,7 @@ class RawAllocationRow:
     operation_id: uuid.UUID
     workspace_id: uuid.UUID
     fraction_ppb: int
-    allocated_cost_minor_units: int
+    allocated_cost_micro_units: int
     currency: str
 
 
@@ -235,7 +235,7 @@ class RawSettlementRow:
 
     operation_id: uuid.UUID
     settlement_version: int
-    reconciled_cost_minor_units: int
+    reconciled_cost_micro_units: int
     currency: str
 
 
@@ -250,9 +250,9 @@ class CostBucketRow:
     profile_version: str
     currency: str
     operation_count: int
-    estimated_cost_minor_units: int
+    estimated_cost_micro_units: int
     #: ``None`` iff not one operation in the bucket has a settlement yet.
-    reconciled_cost_minor_units: int | None
+    reconciled_cost_micro_units: int | None
 
 
 def latest_settlements_by_operation(
@@ -280,8 +280,8 @@ def _bucket_key(op: RawOperationRow) -> tuple[str, str, str, str]:
 @dataclass
 class _MutableBucket:
     operation_count: int = 0
-    estimated_cost_minor_units: int = 0
-    reconciled_cost_minor_units: int = 0
+    estimated_cost_micro_units: int = 0
+    reconciled_cost_micro_units: int = 0
     has_reconciled: bool = False
 
 
@@ -306,10 +306,10 @@ def _collapse_to_top_n(
     for (_, _, _, currency), bucket in overflow:
         other = other_by_currency.setdefault(currency, _MutableBucket())
         other.operation_count += bucket.operation_count
-        other.estimated_cost_minor_units += bucket.estimated_cost_minor_units
+        other.estimated_cost_micro_units += bucket.estimated_cost_micro_units
         if bucket.has_reconciled:
             other.has_reconciled = True
-            other.reconciled_cost_minor_units += bucket.reconciled_cost_minor_units
+            other.reconciled_cost_micro_units += bucket.reconciled_cost_micro_units
 
     for currency, other in other_by_currency.items():
         key = (
@@ -323,10 +323,10 @@ def _collapse_to_top_n(
             kept[key] = other
         else:
             existing.operation_count += other.operation_count
-            existing.estimated_cost_minor_units += other.estimated_cost_minor_units
+            existing.estimated_cost_micro_units += other.estimated_cost_micro_units
             if other.has_reconciled:
                 existing.has_reconciled = True
-                existing.reconciled_cost_minor_units += other.reconciled_cost_minor_units
+                existing.reconciled_cost_micro_units += other.reconciled_cost_micro_units
     return kept
 
 
@@ -348,12 +348,12 @@ def aggregate_fleet_cost_buckets(
         key = _bucket_key(op)
         bucket = buckets.setdefault(key, _MutableBucket())
         bucket.operation_count += 1
-        bucket.estimated_cost_minor_units += op.estimated_cost_minor_units
+        bucket.estimated_cost_micro_units += op.estimated_cost_micro_units
 
         settlement = latest.get(op.network_request_id)
         if settlement is not None and settlement.currency == op.currency:
             bucket.has_reconciled = True
-            bucket.reconciled_cost_minor_units += settlement.reconciled_cost_minor_units
+            bucket.reconciled_cost_micro_units += settlement.reconciled_cost_micro_units
 
     bounded = _collapse_to_top_n(buckets, top_n=top_n)
     return tuple(
@@ -364,9 +364,9 @@ def aggregate_fleet_cost_buckets(
             profile_version=profile_version,
             currency=currency,
             operation_count=b.operation_count,
-            estimated_cost_minor_units=b.estimated_cost_minor_units,
-            reconciled_cost_minor_units=(
-                b.reconciled_cost_minor_units if b.has_reconciled else None
+            estimated_cost_micro_units=b.estimated_cost_micro_units,
+            reconciled_cost_micro_units=(
+                b.reconciled_cost_micro_units if b.has_reconciled else None
             ),
         )
         for (domain, method, profile_version, currency), b in sorted(bounded.items())
@@ -404,13 +404,13 @@ def aggregate_tenant_cost_buckets(
         ws_buckets = per_workspace.setdefault(alloc.workspace_id, {})
         bucket = ws_buckets.setdefault(key, _MutableBucket())
         bucket.operation_count += 1
-        bucket.estimated_cost_minor_units += alloc.allocated_cost_minor_units
+        bucket.estimated_cost_micro_units += alloc.allocated_cost_micro_units
 
         settlement = latest.get(alloc.operation_id)
         if settlement is not None and settlement.currency == alloc.currency:
-            share = (alloc.fraction_ppb * settlement.reconciled_cost_minor_units) // FRACTION_SCALE
+            share = (alloc.fraction_ppb * settlement.reconciled_cost_micro_units) // FRACTION_SCALE
             bucket.has_reconciled = True
-            bucket.reconciled_cost_minor_units += share
+            bucket.reconciled_cost_micro_units += share
 
     out: list[CostBucketRow] = []
     for workspace_id, ws_buckets in per_workspace.items():
@@ -424,9 +424,9 @@ def aggregate_tenant_cost_buckets(
                     profile_version=profile_version,
                     currency=currency,
                     operation_count=b.operation_count,
-                    estimated_cost_minor_units=b.estimated_cost_minor_units,
-                    reconciled_cost_minor_units=(
-                        b.reconciled_cost_minor_units if b.has_reconciled else None
+                    estimated_cost_micro_units=b.estimated_cost_micro_units,
+                    reconciled_cost_micro_units=(
+                        b.reconciled_cost_micro_units if b.has_reconciled else None
                     ),
                 )
             )
@@ -463,13 +463,13 @@ def _operations_stmt(day_start: datetime, day_end: datetime):
                no.domain,
                no.transport AS method,
                dp.profile_version::text AS profile_version,
-               no.estimated_cost_minor_units,
+               no.estimated_cost_micro_units,
                no.currency
         FROM network_operations no
         LEFT JOIN domain_playbooks dp ON dp.domain = no.domain
         WHERE no.closed_at IS NOT NULL
           AND no.closed_at >= :day_start AND no.closed_at < :day_end
-          AND no.estimated_cost_minor_units IS NOT NULL
+          AND no.estimated_cost_micro_units IS NOT NULL
           AND no.currency IS NOT NULL
         """
     ).bindparams(day_start=day_start, day_end=day_end)
@@ -479,7 +479,7 @@ def _allocations_stmt(day_start: datetime, day_end: datetime):
     return text(
         """
         SELECT noa.operation_id, noa.workspace_id, noa.fraction_ppb,
-               noa.allocated_cost_minor_units, noa.currency
+               noa.allocated_cost_micro_units, noa.currency
         FROM network_operation_allocations noa
         JOIN network_operations no ON no.network_request_id = noa.operation_id
         WHERE no.closed_at IS NOT NULL
@@ -491,7 +491,7 @@ def _allocations_stmt(day_start: datetime, day_end: datetime):
 def _settlements_stmt(day_start: datetime, day_end: datetime):
     return text(
         """
-        SELECT s.operation_id, s.settlement_version, s.reconciled_cost_minor_units,
+        SELECT s.operation_id, s.settlement_version, s.reconciled_cost_micro_units,
                s.currency
         FROM network_operation_settlements s
         JOIN network_operations no ON no.network_request_id = s.operation_id
@@ -517,7 +517,7 @@ def _fetch_day_rows(
             domain=row.domain,
             method=str(row.method),
             profile_version=row.profile_version,
-            estimated_cost_minor_units=int(row.estimated_cost_minor_units),
+            estimated_cost_micro_units=int(row.estimated_cost_micro_units),
             currency=row.currency,
         )
         for row in session.execute(_operations_stmt(day_start, day_end))  # noqa: workspace-scope
@@ -527,7 +527,7 @@ def _fetch_day_rows(
             operation_id=row.operation_id,
             workspace_id=row.workspace_id,
             fraction_ppb=int(row.fraction_ppb),
-            allocated_cost_minor_units=int(row.allocated_cost_minor_units),
+            allocated_cost_micro_units=int(row.allocated_cost_micro_units),
             currency=row.currency,
         )
         for row in session.execute(_allocations_stmt(day_start, day_end))  # noqa: workspace-scope
@@ -536,7 +536,7 @@ def _fetch_day_rows(
         RawSettlementRow(
             operation_id=row.operation_id,
             settlement_version=int(row.settlement_version),
-            reconciled_cost_minor_units=int(row.reconciled_cost_minor_units),
+            reconciled_cost_micro_units=int(row.reconciled_cost_micro_units),
             currency=row.currency,
         )
         for row in session.execute(_settlements_stmt(day_start, day_end))  # noqa: workspace-scope
@@ -553,8 +553,8 @@ def _upsert_fleet_buckets(session: Session, target_date: date_type, buckets: Seq
             method=bucket.method,
             profile_version=bucket.profile_version,
             operation_count=bucket.operation_count,
-            estimated_cost_minor_units=bucket.estimated_cost_minor_units,
-            reconciled_cost_minor_units=bucket.reconciled_cost_minor_units,
+            estimated_cost_micro_units=bucket.estimated_cost_micro_units,
+            reconciled_cost_micro_units=bucket.reconciled_cost_micro_units,
             currency=bucket.currency,
         )
         stmt = stmt.on_conflict_do_update(
@@ -563,8 +563,8 @@ def _upsert_fleet_buckets(session: Session, target_date: date_type, buckets: Seq
             ],
             set_={
                 "operation_count": stmt.excluded.operation_count,
-                "estimated_cost_minor_units": stmt.excluded.estimated_cost_minor_units,
-                "reconciled_cost_minor_units": stmt.excluded.reconciled_cost_minor_units,
+                "estimated_cost_micro_units": stmt.excluded.estimated_cost_micro_units,
+                "reconciled_cost_micro_units": stmt.excluded.reconciled_cost_micro_units,
                 "updated_at": func.now(),
             },
         )
@@ -583,8 +583,8 @@ def _upsert_tenant_buckets(session: Session, target_date: date_type, buckets: Se
             method=bucket.method,
             profile_version=bucket.profile_version,
             operation_count=bucket.operation_count,
-            estimated_cost_minor_units=bucket.estimated_cost_minor_units,
-            reconciled_cost_minor_units=bucket.reconciled_cost_minor_units,
+            estimated_cost_micro_units=bucket.estimated_cost_micro_units,
+            reconciled_cost_micro_units=bucket.reconciled_cost_micro_units,
             currency=bucket.currency,
         )
         stmt = stmt.on_conflict_do_update(
@@ -597,8 +597,8 @@ def _upsert_tenant_buckets(session: Session, target_date: date_type, buckets: Se
             ],
             set_={
                 "operation_count": stmt.excluded.operation_count,
-                "estimated_cost_minor_units": stmt.excluded.estimated_cost_minor_units,
-                "reconciled_cost_minor_units": stmt.excluded.reconciled_cost_minor_units,
+                "estimated_cost_micro_units": stmt.excluded.estimated_cost_micro_units,
+                "reconciled_cost_micro_units": stmt.excluded.reconciled_cost_micro_units,
                 "currency": stmt.excluded.currency,
                 "updated_at": func.now(),
             },

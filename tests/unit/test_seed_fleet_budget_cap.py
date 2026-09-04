@@ -132,7 +132,7 @@ def _existing_row(scope_key: str, period_key: str, limit: int | None) -> FleetCo
         scope_key=scope_key,
         period_key=period_key,
         currency="USD",
-        limit_cost_minor_units=limit,
+        limit_cost_micro_units=limit,
     )
 
 
@@ -186,12 +186,12 @@ def test_plan_marks_an_absent_row_as_an_insert() -> None:
         session,
         scope_keys=("proxy",),
         period_keys=("2026_08",),
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
     )
 
     assert len(plans) == 1
     assert plans[0].row_exists is False
-    assert plans[0].existing_limit_minor_units is None
+    assert plans[0].existing_limit_micro_units is None
     assert plans[0].is_change is True
 
 
@@ -206,7 +206,7 @@ def test_plan_marks_an_already_capped_row_as_no_change() -> None:
         session,
         scope_keys=("proxy",),
         period_keys=("2026_08",),
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
     )
 
     assert plans[0].is_change is False
@@ -219,7 +219,7 @@ def test_plan_covers_every_scope_period_pair() -> None:
         session,
         scope_keys=("proxy", "browser"),
         period_keys=("2026_08", "2026_09"),
-        monthly_cap_minor_units=1,
+        monthly_cap_micro_units=1,
     )
 
     assert {(p.scope_key, p.period_key) for p in plans} == {
@@ -243,11 +243,11 @@ def test_apply_inserts_a_capped_row_when_none_exists() -> None:
         session,
         scope_keys=("proxy",),
         period_keys=("2026_09",),
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
     )
 
     changed = capseed.apply_budget_cap(
-        session, plans=plans, currency="USD", monthly_cap_minor_units=18_000
+        session, plans=plans, currency="USD", monthly_cap_micro_units=18_000
     )
 
     assert changed == 1
@@ -256,7 +256,7 @@ def test_apply_inserts_a_capped_row_when_none_exists() -> None:
     assert isinstance(row, FleetCostBudget)
     assert row.scope_key == "proxy"
     assert row.period_key == "2026_09"
-    assert row.limit_cost_minor_units == 18_000
+    assert row.limit_cost_micro_units == 18_000
     assert row.currency == "USD"
 
 
@@ -269,11 +269,11 @@ def test_apply_sets_only_the_money_limit_and_leaves_the_others_null() -> None:
         session,
         scope_keys=("proxy",),
         period_keys=("2026_08",),
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
     )
 
     capseed.apply_budget_cap(
-        session, plans=plans, currency="USD", monthly_cap_minor_units=18_000
+        session, plans=plans, currency="USD", monthly_cap_micro_units=18_000
     )
 
     row = session.added[0]
@@ -286,25 +286,25 @@ def test_apply_updates_an_existing_row_without_touching_its_counters() -> None:
     """Resetting `reserved_*`/`settled_*` would hand back money the fleet
     has already spent — the counters belong to the authorization path."""
     existing = _existing_row("proxy", "2026_08", None)
-    existing.reserved_cost_minor_units = 4_200
-    existing.settled_cost_minor_units = 9_100
+    existing.reserved_cost_micro_units = 4_200
+    existing.settled_cost_micro_units = 9_100
     session = _FakeSession(rows={FleetCostBudget: [existing]})
     plans = capseed.plan_budget_rows(
         session,
         scope_keys=("proxy",),
         period_keys=("2026_08",),
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
     )
 
     changed = capseed.apply_budget_cap(
-        session, plans=plans, currency="USD", monthly_cap_minor_units=18_000
+        session, plans=plans, currency="USD", monthly_cap_micro_units=18_000
     )
 
     assert changed == 1
     assert session.added == [], "an existing row must be updated, never re-inserted"
-    assert existing.limit_cost_minor_units == 18_000
-    assert existing.reserved_cost_minor_units == 4_200
-    assert existing.settled_cost_minor_units == 9_100
+    assert existing.limit_cost_micro_units == 18_000
+    assert existing.reserved_cost_micro_units == 4_200
+    assert existing.settled_cost_micro_units == 9_100
 
 
 def test_apply_is_idempotent_when_the_cap_is_already_in_place() -> None:
@@ -314,11 +314,11 @@ def test_apply_is_idempotent_when_the_cap_is_already_in_place() -> None:
         session,
         scope_keys=("proxy",),
         period_keys=("2026_08",),
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
     )
 
     changed = capseed.apply_budget_cap(
-        session, plans=plans, currency="USD", monthly_cap_minor_units=18_000
+        session, plans=plans, currency="USD", monthly_cap_micro_units=18_000
     )
 
     assert changed == 0
@@ -348,8 +348,8 @@ def test_propose_prefers_reconciled_settlements_over_estimates() -> None:
 
     observation = capseed.observe_monthly_spend(session, now=_NOW)
 
-    # 3000 minor units over 15 days -> 6000/month.
-    assert observation.monthly_minor_units == 6_000
+    # 3000 micro-USD over 15 days -> 6000/month.
+    assert observation.monthly_micro_units == 6_000
     assert "settlements" in observation.source
     assert "15.00 day(s)" in observation.derivation
 
@@ -363,9 +363,9 @@ def test_propose_falls_back_to_ledger_estimates_when_nothing_is_settled() -> Non
 
     observation = capseed.observe_monthly_spend(session, now=_NOW)
 
-    # 1000 minor units over 10 days -> 3000/month.
-    assert observation.monthly_minor_units == 3_000
-    assert "estimated_cost_minor_units" in observation.source
+    # 1000 micro-USD over 10 days -> 3000/month.
+    assert observation.monthly_micro_units == 3_000
+    assert "estimated_cost_micro_units" in observation.source
 
 
 def test_propose_says_so_out_loud_when_no_database_spend_is_reachable() -> None:
@@ -375,7 +375,7 @@ def test_propose_says_so_out_loud_when_no_database_spend_is_reachable() -> None:
 
     observation = capseed.observe_monthly_spend(session, now=_NOW)
 
-    assert observation.monthly_minor_units == 6_000
+    assert observation.monthly_micro_units == 60_000_000
     assert "no database spend reachable" in observation.source
     assert "no settled or estimated cost found in the database" in observation.derivation
     assert "HANDOVER_READINESS_CYCLE_2026-08-15.md" in observation.derivation
@@ -390,12 +390,12 @@ def test_a_sub_day_window_is_not_multiplied_into_an_absurd_month() -> None:
 
     observation = capseed.observe_monthly_spend(session, now=_NOW)
 
-    assert observation.monthly_minor_units == 3_000  # 100 * 30 / 1 day floor
+    assert observation.monthly_micro_units == 3_000  # 100 * 30 / 1 day floor
 
 
 def test_the_cap_is_three_times_observed_spend() -> None:
     observation = capseed.SpendObservation(
-        monthly_minor_units=6_000, currency="USD", source="t", derivation="d"
+        monthly_micro_units=6_000, currency="USD", source="t", derivation="d"
     )
     assert capseed.CAP_MULTIPLIER == 3
     assert capseed.propose_cap(observation) == 18_000
@@ -403,7 +403,7 @@ def test_the_cap_is_three_times_observed_spend() -> None:
 
 def test_proposal_report_carries_the_number_the_formula_and_the_provenance() -> None:
     observation = capseed.SpendObservation(
-        monthly_minor_units=6_000,
+        monthly_micro_units=6_000,
         currency="USD",
         source="repository evidence (no database spend reachable)",
         derivation="$2.00 per full catalogue refresh x 30 days",
@@ -411,11 +411,11 @@ def test_proposal_report_carries_the_number_the_formula_and_the_provenance() -> 
 
     report = capseed.format_proposal(observation, scope_keys=("proxy", "browser"))
 
-    assert "RECOMMENDED CAP        : 18000 minor units (USD)" in report
+    assert "RECOMMENDED CAP        : 18000 micro-USD (USD)" in report
     assert "3 x observed monthly spend" in report
     assert "$2.00 per full catalogue refresh" in report
     assert "aggregate worst case   : 36000" in report
-    assert "--monthly-cap-minor-units 18000" in report
+    assert "--monthly-cap-usd 0.018000" in report
 
 
 # --- the report ---------------------------------------------------------
@@ -429,8 +429,8 @@ def test_plan_report_always_warns_that_the_cap_does_not_carry_forward() -> None:
         capseed.BudgetRowPlan(
             scope_key="proxy",
             period_key="2026_09",
-            existing_limit_minor_units=None,
-            new_limit_minor_units=18_000,
+            existing_limit_micro_units=None,
+            new_limit_micro_units=18_000,
             row_exists=False,
         )
     ]
@@ -449,13 +449,43 @@ def _args(**overrides: Any) -> SimpleNamespace:
     base = dict(
         propose=False,
         apply=False,
-        monthly_cap_minor_units=None,
+        monthly_cap_micro_units=None,
         currency="USD",
         scope_keys=None,
         months_ahead=1,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_the_pre_h4_cents_flag_is_parsed_and_always_rejected() -> None:
+    """`--monthly-cap-minor-units` named CENTS. H4/B1 made the ledger
+    micro-USD, so the same number re-run from an old runbook would have
+    capped the fleet at one ten-thousandth of the intended ceiling — a
+    silent outage. The flag still PARSES (an "unrecognized argument" is
+    easy to paper over with a shrug) and is then refused in words that
+    say what changed and what to use instead."""
+    args = capseed.parse_args(["--apply", "--monthly-cap-minor-units", "7500"])
+    error = capseed.validate_args(args)
+
+    assert error is not None
+    assert "--monthly-cap-minor-units was REMOVED" in error
+    assert "micro-USD" in error
+    assert "--monthly-cap-usd" in error
+    # And it never leaks through as a cap under the new name.
+    assert args.monthly_cap_micro_units is None
+
+
+def test_dollars_and_micro_units_reach_the_same_ceiling() -> None:
+    """The two live spellings are one ceiling: $75 and 75_000_000
+    micro-USD are the same instruction, converted by the same
+    `usd_to_units` the maintenance cadence applies to its settings."""
+    from_usd = capseed.parse_args(["--apply", "--monthly-cap-usd", "75"])
+    from_units = capseed.parse_args(["--apply", "--monthly-cap-micro-units", "75000000"])
+
+    assert from_usd.monthly_cap_micro_units == from_units.monthly_cap_micro_units
+    assert capseed.validate_args(from_usd) is None
+    assert capseed.validate_args(from_units) is None
 
 
 def test_propose_and_apply_are_mutually_exclusive() -> None:
@@ -465,7 +495,7 @@ def test_propose_and_apply_are_mutually_exclusive() -> None:
 
 
 def test_apply_without_a_cap_is_refused() -> None:
-    assert "requires --monthly-cap-minor-units" in (
+    assert "requires --monthly-cap-usd or --monthly-cap-micro-units" in (
         capseed.validate_args(_args(apply=True)) or ""
     )
 
@@ -473,8 +503,8 @@ def test_apply_without_a_cap_is_refused() -> None:
 def test_a_non_positive_cap_is_refused() -> None:
     """A zero money limit is not "no ceiling" (that is NULL) — it is a
     ceiling of nothing, which denies every paid request in the fleet."""
-    assert capseed.validate_args(_args(apply=True, monthly_cap_minor_units=0)) is not None
-    assert capseed.validate_args(_args(apply=True, monthly_cap_minor_units=-1)) is not None
+    assert capseed.validate_args(_args(apply=True, monthly_cap_micro_units=0)) is not None
+    assert capseed.validate_args(_args(apply=True, monthly_cap_micro_units=-1)) is not None
 
 
 def test_currency_must_be_iso4217_shaped() -> None:
@@ -486,7 +516,7 @@ def test_currency_must_be_iso4217_shaped() -> None:
 
 
 def test_a_valid_dry_run_invocation_passes_validation() -> None:
-    assert capseed.validate_args(_args(monthly_cap_minor_units=18_000)) is None
+    assert capseed.validate_args(_args(monthly_cap_micro_units=18_000)) is None
 
 
 # --- run() wiring -------------------------------------------------------
@@ -500,7 +530,7 @@ def test_run_dry_run_issues_the_read_only_guard_first_and_rolls_back() -> None:
         now=_NOW,
         propose=False,
         apply=False,
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
         currency="USD",
         scope_keys=("proxy",),
         months_ahead=0,
@@ -521,7 +551,7 @@ def test_run_apply_commits_and_never_issues_the_guard() -> None:
         now=_NOW,
         propose=False,
         apply=True,
-        monthly_cap_minor_units=18_000,
+        monthly_cap_micro_units=18_000,
         currency="USD",
         scope_keys=("proxy",),
         months_ahead=0,
@@ -535,13 +565,13 @@ def test_run_apply_commits_and_never_issues_the_guard() -> None:
 def test_run_refuses_to_plan_without_a_cap() -> None:
     session = _FakeSession(rows={FleetCostBudget: []})
 
-    with pytest.raises(ValueError, match="--monthly-cap-minor-units"):
+    with pytest.raises(ValueError, match="--monthly-cap-micro-units"):
         capseed.run(
             session_factory=lambda: session,
             now=_NOW,
             propose=False,
             apply=False,
-            monthly_cap_minor_units=None,
+            monthly_cap_micro_units=None,
             currency="USD",
             scope_keys=("proxy",),
             months_ahead=0,

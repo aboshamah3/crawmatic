@@ -240,7 +240,7 @@ def _seed(
     breaker_state: ProxyBreakerState = ProxyBreakerState.CLOSED,
     breaker_age_seconds: int = 0,
     domain_state: DomainState | None = DomainState.ACTIVE,
-    limit_cost_minor_units: int | None = None,
+    limit_cost_micro_units: int | None = None,
     limit_bytes: int | None = None,
     max_concurrent: int | None = None,
 ) -> uuid.UUID:
@@ -303,7 +303,7 @@ def _seed(
                 )
             )
         if (
-            limit_cost_minor_units is not None
+            limit_cost_micro_units is not None
             or limit_bytes is not None
             or max_concurrent is not None
         ):
@@ -313,7 +313,7 @@ def _seed(
                     workspace_id=workspace_id,
                     period_key=period_key_for(now),
                     currency="USD",
-                    limit_cost_minor_units=limit_cost_minor_units,
+                    limit_cost_micro_units=limit_cost_micro_units,
                     limit_bytes=limit_bytes,
                     max_concurrent_reservations=max_concurrent,
                     created_at=now,
@@ -332,7 +332,7 @@ def _req(workspace_id: uuid.UUID, **overrides) -> AuthorizationRequest:
         transport="PROXY",
         provider="proxy",
         estimated_bytes=1_000,
-        estimated_cost_minor_units=10,
+        estimated_cost_micro_units=10,
         purpose=AuthorizationPurpose.REFRESH,
         estimated_requests=1,
     )
@@ -463,12 +463,12 @@ def test_hard_budget_cannot_be_exceeded_under_concurrency(sessions) -> None:
     read-then-write without the lock) this would over-grant — which is
     exactly what it did before C3.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
 
     def attempt():
         try:
-            return service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+            return service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
         except CostAuthorizationDenied as denial:
             return denial
 
@@ -481,7 +481,7 @@ def test_hard_budget_cannot_be_exceeded_under_concurrency(sessions) -> None:
     assert len(grants) == 10, [d.reason.value for d in denials]
     assert len(denials) == 10
     assert {d.reason for d in denials} == {DenialReason.MONEY_BUDGET_EXCEEDED}
-    assert service.remaining_budget_minor_units() == 0
+    assert service.remaining_budget_micro_units() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +499,7 @@ def test_all_dimensions_reserved_atomically(sessions) -> None:
     means in practice.
     """
     workspace_id = _seed(
-        sessions, limit_cost_minor_units=10_000, limit_bytes=1_000_000
+        sessions, limit_cost_micro_units=10_000, limit_bytes=1_000_000
     )
     service = _service(sessions, workspace_id=workspace_id)
 
@@ -507,14 +507,14 @@ def test_all_dimensions_reserved_atomically(sessions) -> None:
         service.authorize(
             _req(
                 workspace_id,
-                estimated_cost_minor_units=1,
+                estimated_cost_micro_units=1,
                 estimated_bytes=10**9,
             )
         )
 
     assert excinfo.value.reason == DenialReason.BYTE_BUDGET_EXCEEDED
     # The money dimension must NOT have been reserved on the way past.
-    assert service.remaining_budget_minor_units() == 10_000
+    assert service.remaining_budget_micro_units() == 10_000
     with sessions() as session:
         assert session.execute(select(CostReservation)).first() is None
 
@@ -533,9 +533,9 @@ def test_lease_expiry_does_not_release_live_operation(sessions) -> None:
     how a budget gets spent twice while its counters look healthy. The
     sweeper must consult C1's ledger, and this proves it does.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
     with sessions() as session:
         # The operation C4 will open under this grant: present, and OPEN
@@ -571,7 +571,7 @@ def test_lease_expiry_does_not_release_live_operation(sessions) -> None:
             )
         ).scalar_one()
     assert state is ReservationState.RESERVED
-    assert service.remaining_budget_minor_units() == 90
+    assert service.remaining_budget_micro_units() == 90
 
 
 def test_lease_expiry_releases_when_no_operation_ever_opened(sessions) -> None:
@@ -581,9 +581,9 @@ def test_lease_expiry_releases_when_no_operation_ever_opened(sessions) -> None:
     operation" could be implemented as "never release", and a crashed
     worker's money would be stranded until someone noticed.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
     with sessions() as session:
         session.execute(
@@ -604,7 +604,7 @@ def test_lease_expiry_releases_when_no_operation_ever_opened(sessions) -> None:
             )
         ).scalar_one()
     assert state is ReservationState.RELEASED
-    assert service.remaining_budget_minor_units() == 100
+    assert service.remaining_budget_micro_units() == 100
 
 
 # ---------------------------------------------------------------------------
@@ -620,26 +620,26 @@ def test_settle_is_cas_and_idempotent(sessions) -> None:
     the reservation's own state is what makes the replay a no-op rather
     than a second debit.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
-    service.settle(grant.authorization_id, SettledCost(cost_minor_units=4))
-    service.settle(grant.authorization_id, SettledCost(cost_minor_units=4))  # replay
+    service.settle(grant.authorization_id, SettledCost(cost_micro_units=4))
+    service.settle(grant.authorization_id, SettledCost(cost_micro_units=4))  # replay
 
-    assert service.remaining_budget_minor_units() == 96
+    assert service.remaining_budget_micro_units() == 96
 
 
 def test_release_is_cas_and_idempotent(sessions) -> None:
     """Releasing twice returns the hold once. Same guard, other transition."""
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
     service.release(grant.authorization_id)
     service.release(grant.authorization_id)
 
-    assert service.remaining_budget_minor_units() == 100
+    assert service.remaining_budget_micro_units() == 100
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +656,7 @@ def test_cancelled_workspace_gets_denied_from_durable_evidence(sessions) -> None
     API call.
     """
     workspace_id = _seed(
-        sessions, entitlement=EntitlementState.CANCELLED, limit_cost_minor_units=100
+        sessions, entitlement=EntitlementState.CANCELLED, limit_cost_micro_units=100
     )
     service = _service(sessions, workspace_id=workspace_id)
 
@@ -678,7 +678,7 @@ def test_assert_entitled_is_the_account_level_gate_for_fan_out_routes(sessions) 
     pressing a button).
     """
     workspace_id = _seed(
-        sessions, entitlement=EntitlementState.CANCELLED, limit_cost_minor_units=100
+        sessions, entitlement=EntitlementState.CANCELLED, limit_cost_micro_units=100
     )
     service = _service(sessions, workspace_id=workspace_id)
 
@@ -688,7 +688,7 @@ def test_assert_entitled_is_the_account_level_gate_for_fan_out_routes(sessions) 
     assert excinfo.value.reason == DenialReason.ENTITLEMENT_INACTIVE
     with sessions() as session:
         assert session.execute(select(CostReservation)).first() is None
-    assert service.remaining_budget_minor_units() == 100
+    assert service.remaining_budget_micro_units() == 100
 
     # ...and it is silent for a live account. `_seed` clears the fleet
     # rows it owns, so the domain-state cache must be dropped with them or
@@ -708,7 +708,7 @@ def test_stale_entitlement_evidence_is_treated_as_inactive(sessions) -> None:
     to be part of the predicate rather than an assumption about it.
     """
     workspace_id = _seed(
-        sessions, entitlement_age_seconds=30 * 86_400, limit_cost_minor_units=100
+        sessions, entitlement_age_seconds=30 * 86_400, limit_cost_micro_units=100
     )
     service = _service(sessions, workspace_id=workspace_id)
 
@@ -733,11 +733,11 @@ def test_warning_thresholds_emit_events(sessions) -> None:
     task nothing consumes is a message that looks delivered and never is,
     so the task name is asserted here rather than left to review.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
 
     for _ in range(9):
-        service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+        service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
     with sessions() as session:
         messages = list(session.execute(select(OutboxMessage)).scalars().all())
@@ -767,16 +767,16 @@ def test_release_reservations_for_job_releases_the_jobs_grants(sessions) -> None
     """
     from app_shared.costauth.service import release_reservations_for_scrape_job
 
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
     job_id = uuid.uuid4()
     service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=10, scrape_job_id=job_id)
+        _req(workspace_id, estimated_cost_micro_units=10, scrape_job_id=job_id)
     )
     service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=10, scrape_job_id=job_id)
+        _req(workspace_id, estimated_cost_micro_units=10, scrape_job_id=job_id)
     )
-    assert service.remaining_budget_minor_units() == 80
+    assert service.remaining_budget_micro_units() == 80
 
     with sessions() as session:
         released = release_reservations_for_scrape_job(
@@ -784,7 +784,7 @@ def test_release_reservations_for_job_releases_the_jobs_grants(sessions) -> None
         )
         session.commit()
     assert released == 2
-    assert service.remaining_budget_minor_units() == 100
+    assert service.remaining_budget_micro_units() == 100
 
     # Idempotent: a re-run of a crashed cancellation releases nothing more.
     with sessions() as session:
@@ -795,7 +795,7 @@ def test_release_reservations_for_job_releases_the_jobs_grants(sessions) -> None
             == 0
         )
         session.commit()
-    assert service.remaining_budget_minor_units() == 100
+    assert service.remaining_budget_micro_units() == 100
 
 
 # ---------------------------------------------------------------------------
@@ -810,19 +810,19 @@ def test_redelivery_with_the_same_dedupe_key_reuses_the_grant(sessions) -> None:
     delivered twice must cost the budget once, or an at-least-once broker
     becomes an at-least-once *spender*.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
 
     first = service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=10, dedupe_key="batch-a")
+        _req(workspace_id, estimated_cost_micro_units=10, dedupe_key="batch-a")
     )
     second = service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=10, dedupe_key="batch-a")
+        _req(workspace_id, estimated_cost_micro_units=10, dedupe_key="batch-a")
     )
 
     assert second.authorization_id == first.authorization_id
     assert second.replayed is True
-    assert service.remaining_budget_minor_units() == 90
+    assert service.remaining_budget_micro_units() == 90
 
 
 def test_concurrency_cap_denies_past_the_live_grant_limit(sessions) -> None:
@@ -860,7 +860,7 @@ def _accrue_operations(service, authorization_id, *, count: int, each: int) -> N
     """
     for _ in range(count):
         service.settle_partial(
-            authorization_id, SettledCost(cost_minor_units=each, requests=1)
+            authorization_id, SettledCost(cost_micro_units=each, requests=1)
         )
 
 
@@ -872,10 +872,10 @@ def test_many_operations_under_one_grant_settle_to_their_sum(sessions) -> None:
     two-hundred-target batch — the single most expensive way for a budget
     to be wrong.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
     grant = service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=20, estimated_requests=20)
+        _req(workspace_id, estimated_cost_micro_units=20, estimated_requests=20)
     )
 
     _accrue_operations(service, grant.authorization_id, count=20, each=1)
@@ -886,7 +886,7 @@ def test_many_operations_under_one_grant_settle_to_their_sum(sessions) -> None:
                 CostReservation.authorization_id == grant.authorization_id
             )
         ).scalar_one()
-        assert reservation.settled_cost_minor_units == 20
+        assert reservation.settled_cost_micro_units == 20
         assert reservation.settled_requests == 20
         # NON-terminal: the grant is still live, because a batch is not
         # over just because one of its operations closed.
@@ -894,11 +894,11 @@ def test_many_operations_under_one_grant_settle_to_their_sum(sessions) -> None:
 
     # Settled totals equal the SUM of the operations' observed costs, and
     # the hold is fully drawn down rather than released early.
-    assert service.remaining_budget_minor_units() == 80
+    assert service.remaining_budget_micro_units() == 80
     with sessions() as session:
         budget = session.execute(select(CostBudget)).scalar_one()
-        assert budget.settled_cost_minor_units == 20
-        assert budget.reserved_cost_minor_units == 0
+        assert budget.settled_cost_micro_units == 20
+        assert budget.reserved_cost_micro_units == 0
 
 
 def test_an_operation_overrunning_the_batch_estimate_is_real_spend(sessions) -> None:
@@ -908,17 +908,17 @@ def test_an_operation_overrunning_the_batch_estimate_is_real_spend(sessions) -> 
     What must not happen is a negative `reserved_*`, which would be a
     silent, permanent over-grant.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=5))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=5))
 
     _accrue_operations(service, grant.authorization_id, count=8, each=1)
 
     with sessions() as session:
         budget = session.execute(select(CostBudget)).scalar_one()
-        assert budget.settled_cost_minor_units == 8
-        assert budget.reserved_cost_minor_units == 0
-    assert service.remaining_budget_minor_units() == 92
+        assert budget.settled_cost_micro_units == 8
+        assert budget.reserved_cost_micro_units == 0
+    assert service.remaining_budget_micro_units() == 92
 
 
 def test_terminal_settle_returns_only_the_residual_hold(sessions) -> None:
@@ -928,26 +928,26 @@ def test_terminal_settle_returns_only_the_residual_hold(sessions) -> None:
     exactly once. This is also the shape a discovery run uses — accrue the
     ladder's rungs, then close the grant with what is left.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
     _accrue_operations(service, grant.authorization_id, count=4, each=1)
     # Still 90: "remaining" is limit - (reserved + settled), and while the
     # grant is live 4 have moved from held to spent but the other 6 are
     # STILL HELD -- which is the whole point of reserving.
-    assert service.remaining_budget_minor_units() == 90
+    assert service.remaining_budget_micro_units() == 90
 
-    service.settle(grant.authorization_id, SettledCost(cost_minor_units=0, requests=0))
+    service.settle(grant.authorization_id, SettledCost(cost_micro_units=0, requests=0))
 
-    assert service.remaining_budget_minor_units() == 96
+    assert service.remaining_budget_micro_units() == 96
     with sessions() as session:
         reservation = session.execute(select(CostReservation)).scalar_one()
         assert reservation.state is ReservationState.SETTLED
-        assert reservation.settled_cost_minor_units == 4
+        assert reservation.settled_cost_micro_units == 4
         budget = session.execute(select(CostBudget)).scalar_one()
-        assert budget.reserved_cost_minor_units == 0
-        assert budget.settled_cost_minor_units == 4
+        assert budget.reserved_cost_micro_units == 0
+        assert budget.settled_cost_micro_units == 4
 
 
 def test_a_replayed_operation_close_accrues_nothing_twice(sessions) -> None:
@@ -964,9 +964,9 @@ def test_a_replayed_operation_close_accrues_nothing_twice(sessions) -> None:
         OperationOutcome,
     )
 
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
-    grant = service.authorize(_req(workspace_id, estimated_cost_minor_units=10))
+    grant = service.authorize(_req(workspace_id, estimated_cost_micro_units=10))
 
     recorder = NetLedgerRecorder(
         lambda: _scope_factory(sessions), costauth=service
@@ -982,7 +982,7 @@ def test_a_replayed_operation_close_accrues_nothing_twice(sessions) -> None:
     nrid = recorder.open(intent)
     outcome = OperationOutcome(
         bytes_compressed=1_000,
-        estimated_cost_minor_units=3,
+        estimated_cost_micro_units=3,
         currency="USD",
         billing_unit="REQUEST",
     )
@@ -995,9 +995,9 @@ def test_a_replayed_operation_close_accrues_nothing_twice(sessions) -> None:
 
     with sessions() as session:
         reservation = session.execute(select(CostReservation)).scalar_one()
-        assert reservation.settled_cost_minor_units == 3
+        assert reservation.settled_cost_micro_units == 3
     # 3 spent + 7 still held against the rest of the batch = 10 of the hold.
-    assert service.remaining_budget_minor_units() == 90
+    assert service.remaining_budget_micro_units() == 90
 
 
 def test_a_crash_between_operations_leaves_spent_money_spent(sessions) -> None:
@@ -1009,10 +1009,10 @@ def test_a_crash_between_operations_leaves_spent_money_spent(sessions) -> None:
     three completed fetches back would make a crash cheaper than a
     success, which is the direction a budget must never be wrong in.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
     grant = service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=20, estimated_requests=20)
+        _req(workspace_id, estimated_cost_micro_units=20, estimated_requests=20)
     )
 
     _accrue_operations(service, grant.authorization_id, count=3, each=1)
@@ -1032,8 +1032,8 @@ def test_a_crash_between_operations_leaves_spent_money_spent(sessions) -> None:
         reservation = session.execute(select(CostReservation)).scalar_one()
         assert reservation.state is ReservationState.RELEASED
         # The accrued spend SURVIVES the release; only the hold went back.
-        assert reservation.settled_cost_minor_units == 3
-    assert service.remaining_budget_minor_units() == 97
+        assert reservation.settled_cost_micro_units == 3
+    assert service.remaining_budget_micro_units() == 97
 
 
 def test_the_lease_is_extended_while_any_operation_is_still_open(sessions) -> None:
@@ -1043,10 +1043,10 @@ def test_the_lease_is_extended_while_any_operation_is_still_open(sessions) -> No
     because it asks C1's ledger first. One open operation is enough to
     keep the whole grant — and the rest of its batch's hold — alive.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
     grant = service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=20, estimated_requests=20)
+        _req(workspace_id, estimated_cost_micro_units=20, estimated_requests=20)
     )
     _accrue_operations(service, grant.authorization_id, count=3, each=1)
 
@@ -1078,7 +1078,7 @@ def test_the_lease_is_extended_while_any_operation_is_still_open(sessions) -> No
         reservation = session.execute(select(CostReservation)).scalar_one()
         assert reservation.state is ReservationState.RESERVED
     # 3 spent, 17 still held against the batch's remaining targets.
-    assert service.remaining_budget_minor_units() == 80
+    assert service.remaining_budget_micro_units() == 80
 
 
 def test_accruals_from_concurrent_operations_all_land(sessions) -> None:
@@ -1088,15 +1088,15 @@ def test_accruals_from_concurrent_operations_all_land(sessions) -> None:
     closes serialize rather than lose each other's increments — the
     read-then-write race that a non-locking accumulator would have.
     """
-    workspace_id = _seed(sessions, limit_cost_minor_units=100)
+    workspace_id = _seed(sessions, limit_cost_micro_units=100)
     service = _service(sessions, workspace_id=workspace_id)
     grant = service.authorize(
-        _req(workspace_id, estimated_cost_minor_units=20, estimated_requests=20)
+        _req(workspace_id, estimated_cost_micro_units=20, estimated_requests=20)
     )
 
     def accrue(_):
         service.settle_partial(
-            grant.authorization_id, SettledCost(cost_minor_units=1, requests=1)
+            grant.authorization_id, SettledCost(cost_micro_units=1, requests=1)
         )
 
     with ThreadPoolExecutor(max_workers=20) as pool:
@@ -1104,9 +1104,9 @@ def test_accruals_from_concurrent_operations_all_land(sessions) -> None:
 
     with sessions() as session:
         reservation = session.execute(select(CostReservation)).scalar_one()
-        assert reservation.settled_cost_minor_units == 20
+        assert reservation.settled_cost_micro_units == 20
         assert reservation.settled_requests == 20
-    assert service.remaining_budget_minor_units() == 80
+    assert service.remaining_budget_micro_units() == 80
 
 
 def test_a_grant_carries_the_decision_facts_it_was_issued_on(sessions) -> None:

@@ -62,7 +62,7 @@ from app_shared.costauth import (
     SettledCost,
     authorize_or_none,
     estimate_bytes,
-    estimate_cost_minor_units,
+    estimate_cost_micro_units,
 )
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.ids import new_uuid7
@@ -611,14 +611,14 @@ class _ObservedSpend:
 
     requests: int = 0
     bytes_used: int = 0
-    cost_minor_units: int = 0
+    cost_micro_units: int = 0
 
     def record(
-        self, *, bytes_used: int | None, cost_minor_units: int | None
+        self, *, bytes_used: int | None, cost_micro_units: int | None
     ) -> None:
         self.requests += 1
         self.bytes_used += int(bytes_used or 0)
-        self.cost_minor_units += int(cost_minor_units or 0)
+        self.cost_micro_units += int(cost_micro_units or 0)
 
 
 def _fetch(
@@ -715,7 +715,7 @@ def _fetch(
     finally:
         rung_bytes = len(html.encode()) if html else None
         rung_cost = (
-            estimate_cost_minor_units(domain, 1)
+            estimate_cost_micro_units(domain, 1)
             if transport is NetworkTransport.PROXY
             else None
         )
@@ -724,7 +724,7 @@ def _fetch(
             OperationOutcome(
                 bytes_compressed=rung_bytes,
                 duration_ms=int((time.monotonic() - started) * 1000),
-                estimated_cost_minor_units=rung_cost,
+                estimated_cost_micro_units=rung_cost,
                 currency="USD" if transport is NetworkTransport.PROXY else None,
                 billing_unit="REQUEST" if transport is NetworkTransport.PROXY else None,
                 # The run settles its own ladder-wide grant once, after the
@@ -734,7 +734,7 @@ def _fetch(
             ),
         )
         if observed is not None:
-            observed.record(bytes_used=rung_bytes, cost_minor_units=rung_cost)
+            observed.record(bytes_used=rung_bytes, cost_micro_units=rung_cost)
     return html
 
 
@@ -1216,7 +1216,7 @@ def run_discovery(
                 transport="DIRECT",
                 provider=FLEET_PROVIDER_PROXY,
                 estimated_bytes=estimate_bytes(ladder_requests),
-                estimated_cost_minor_units=estimate_cost_minor_units(
+                estimated_cost_micro_units=estimate_cost_micro_units(
                     domain, paid_requests
                 ),
                 purpose=AuthorizationPurpose.DISCOVERY,
@@ -1264,7 +1264,7 @@ def run_discovery(
         costauth.settle(
             grant.authorization_id,
             SettledCost(
-                cost_minor_units=observed.cost_minor_units,
+                cost_micro_units=observed.cost_micro_units,
                 bytes_used=observed.bytes_used,
                 requests=observed.requests,
             ),

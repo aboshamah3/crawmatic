@@ -17,7 +17,7 @@ leak (~$325/mo of proxy egress from one misconfigured `url_pattern`) is
 what that costs when it goes wrong.
 
 Owner decision (2026-08-26): **a fleet-wide monthly money cap.** This
-script sets `limit_cost_minor_units` and nothing else — the other three
+script sets `limit_cost_micro_units` and nothing else — the other three
 dimensions stay `NULL` deliberately: bytes/requests/browser-seconds have
 no owner-agreed number, and inventing one would deny work nobody
 budgeted for while adding no protection the money cap does not already
@@ -30,11 +30,19 @@ Three modes
   writes nothing. It never guesses silently: if it cannot reach spend
   data it says so, in those words, and falls back to the repository's
   own measured evidence, naming the document each number came from.
-* ``--apply --monthly-cap-minor-units N --currency XXX`` — upserts the
-  cap onto the fleet budget rows. ``--monthly-cap-usd D`` is the same
-  ceiling spelled in dollars, converted by the same
-  ``app_shared.costauth.fleet_budget_policy.usd_to_units`` the
-  maintenance cadence uses on its settings.
+* ``--apply --monthly-cap-usd D --currency XXX`` — upserts the cap onto
+  the fleet budget rows. Dollars are the PRIMARY spelling since H4/B1:
+  they are what the operator actually decides and what the settings
+  (``FLEET_BUDGET_MONTHLY_CAP_USD_*``) hold, and they are converted by
+  the same ``app_shared.costauth.fleet_budget_policy.usd_to_units`` the
+  maintenance cadence uses. ``--monthly-cap-micro-units N`` spells the
+  identical ceiling in the ledger's own unit.
+
+  ``--monthly-cap-minor-units`` — the pre-H4 cents flag — is still
+  PARSED and always REJECTED. The ledger's unit changed by a factor of
+  10_000 under H4/B1, so an old runbook re-run verbatim would have set a
+  cap 10_000x too small and silently strangled the fleet. It fails loudly
+  instead.
 * no flags — dry-run: prints exactly which rows would change and how.
 
 Scope: which rows get the cap
@@ -130,17 +138,17 @@ CAP_MULTIPLIER = 3
 
 #: Repository-carried spend evidence, used ONLY when the database has no
 #: settled/estimated cost to measure. Each entry is
-#: ``(monthly_minor_units, currency, derivation)`` and every derivation
+#: ``(monthly_micro_units, currency, derivation)`` and every derivation
 #: names the document it came from, so a proposal can always be audited
 #: back to a measurement rather than to this script's opinion.
 #:
-#: 6000 minor units = $60.00/month: $2.00 per full catalogue refresh
+#: 60_000_000 micro-USD = $60.00/month: $2.00 per full catalogue refresh
 #: (HANDOVER_READINESS_CYCLE_2026-08-15.md §6, measured against the
 #: DataImpulse billing API when sizing a sub-user allocation; the same
 #: run is priced at $1.96 from the billing API + prod DB in
 #: PLAN_PROXY_COST_REDUCTION.md's Aug-10 baseline) at the daily cadence
 #: PLAN_AMAZON_NOON_PRICING.md §3 costs out.
-_REPO_EVIDENCE_MONTHLY_MINOR_UNITS = 6_000
+_REPO_EVIDENCE_MONTHLY_MICRO_UNITS = 60_000_000
 _REPO_EVIDENCE_CURRENCY = "USD"
 _REPO_EVIDENCE_DERIVATION = (
     "no settled or estimated cost found in the database; falling back to "
@@ -162,7 +170,7 @@ class SpendObservation:
     :func:`observe_monthly_spend`.
     """
 
-    monthly_minor_units: int
+    monthly_micro_units: int
     currency: str
     source: str
     derivation: str
@@ -174,11 +182,11 @@ def observe_monthly_spend(session: Session, *, now: datetime) -> SpendObservatio
     Three sources, tried in descending order of authority, and the FIRST
     one that yields a non-zero number wins:
 
-    1. ``network_operation_settlements.reconciled_cost_minor_units`` —
+    1. ``network_operation_settlements.reconciled_cost_micro_units`` —
        money a provider's own usage export agreed to (EPA C5's
        reconciliation). This is the only source that is a *bill* rather
        than a model of one.
-    2. ``network_operations.estimated_cost_minor_units`` — the ledger's
+    2. ``network_operations.estimated_cost_micro_units`` — the ledger's
        own pre-dispatch pricing. Available whenever the fleet has run at
        all, and (being an estimate the settlement later corrects) it is
        the right second choice: an estimate that is too high produces a
@@ -199,7 +207,7 @@ def observe_monthly_spend(session: Session, *, now: datetime) -> SpendObservatio
     settled = session.execute(
         select(
             func.coalesce(
-                func.sum(NetworkOperationSettlement.reconciled_cost_minor_units), 0
+                func.sum(NetworkOperationSettlement.reconciled_cost_micro_units), 0
             ),
             func.min(NetworkOperationSettlement.created_at),
             func.max(NetworkOperationSettlement.created_at),
@@ -212,7 +220,7 @@ def observe_monthly_spend(session: Session, *, now: datetime) -> SpendObservatio
         last=settled[2],
         currency=settled[3],
         now=now,
-        source="network_operation_settlements.reconciled_cost_minor_units",
+        source="network_operation_settlements.reconciled_cost_micro_units",
         what="provider-reconciled settlements",
     )
     if observation is not None:
@@ -220,7 +228,7 @@ def observe_monthly_spend(session: Session, *, now: datetime) -> SpendObservatio
 
     estimated = session.execute(
         select(
-            func.coalesce(func.sum(NetworkOperation.estimated_cost_minor_units), 0),
+            func.coalesce(func.sum(NetworkOperation.estimated_cost_micro_units), 0),
             func.min(NetworkOperation.created_at),
             func.max(NetworkOperation.created_at),
             func.min(NetworkOperation.currency),
@@ -232,14 +240,14 @@ def observe_monthly_spend(session: Session, *, now: datetime) -> SpendObservatio
         last=estimated[2],
         currency=estimated[3],
         now=now,
-        source="network_operations.estimated_cost_minor_units",
+        source="network_operations.estimated_cost_micro_units",
         what="ledger cost estimates",
     )
     if observation is not None:
         return observation
 
     return SpendObservation(
-        monthly_minor_units=_REPO_EVIDENCE_MONTHLY_MINOR_UNITS,
+        monthly_micro_units=_REPO_EVIDENCE_MONTHLY_MICRO_UNITS,
         currency=_REPO_EVIDENCE_CURRENCY,
         source="repository evidence (no database spend reachable)",
         derivation=_REPO_EVIDENCE_DERIVATION,
@@ -269,20 +277,20 @@ def _scale_to_month(
     window_days = max((last - first).total_seconds() / 86_400.0, 1.0)
     monthly = int(round(total * 30.0 / window_days))
     return SpendObservation(
-        monthly_minor_units=monthly,
+        monthly_micro_units=monthly,
         currency=currency or _REPO_EVIDENCE_CURRENCY,
         source=source,
         derivation=(
-            f"{what}: {total} minor units observed over {window_days:.2f} day(s) "
+            f"{what}: {total} micro-USD observed over {window_days:.2f} day(s) "
             f"({first.isoformat()} -> {last.isoformat()}), scaled to 30 days "
-            f"= {monthly} minor units/month"
+            f"= {monthly} micro-USD/month"
         ),
     )
 
 
 def propose_cap(observation: SpendObservation) -> int:
     """The recommended monthly cap: :data:`CAP_MULTIPLIER` x observed spend."""
-    return observation.monthly_minor_units * CAP_MULTIPLIER
+    return observation.monthly_micro_units * CAP_MULTIPLIER
 
 
 def format_proposal(observation: SpendObservation, *, scope_keys: Sequence[str]) -> str:
@@ -290,19 +298,20 @@ def format_proposal(observation: SpendObservation, *, scope_keys: Sequence[str])
     cap = propose_cap(observation)
     lines = [
         "seed_fleet_budget_cap PROPOSE",
-        f"  observed monthly spend : {observation.monthly_minor_units} minor units "
+        f"  observed monthly spend : {observation.monthly_micro_units} micro-USD "
         f"({observation.currency})",
         f"  source                 : {observation.source}",
         f"  derivation             : {observation.derivation}",
         f"  formula                : {CAP_MULTIPLIER} x observed monthly spend",
-        f"  RECOMMENDED CAP        : {cap} minor units ({observation.currency}) "
+        f"  RECOMMENDED CAP        : {cap} micro-USD ({observation.currency}) "
         "per scope per month",
         f"  scopes                 : {', '.join(scope_keys)}",
-        f"  aggregate worst case   : {cap * len(scope_keys)} minor units/month "
+        f"  aggregate worst case   : {cap * len(scope_keys)} micro-USD/month "
         f"across {len(scope_keys)} scope(s)",
         "  apply with             : "
         f"uv run python scripts/seed_fleet_budget_cap.py --apply "
-        f"--monthly-cap-minor-units {cap} --currency {observation.currency}",
+        f"--monthly-cap-usd {cap / USD_TO_UNITS:.6f} "
+        f"--currency {observation.currency}",
     ]
     return "\n".join(lines)
 
@@ -319,13 +328,13 @@ def format_plan(
     for plan in plans:
         was = (
             "NULL (no ceiling)"
-            if plan.existing_limit_minor_units is None
-            else str(plan.existing_limit_minor_units)
+            if plan.existing_limit_micro_units is None
+            else str(plan.existing_limit_micro_units)
         )
         verb = "unchanged" if not plan.is_change else ("row absent -> insert" if not plan.row_exists else "update")
         lines.append(
             f"  scope_key={plan.scope_key} period_key={plan.period_key} "
-            f"limit_cost_minor_units: {was} -> {plan.new_limit_minor_units} ({verb})"
+            f"limit_cost_micro_units: {was} -> {plan.new_limit_micro_units} ({verb})"
         )
     if plans:
         lines.append(
@@ -346,7 +355,7 @@ def run(
     now: datetime,
     propose: bool,
     apply: bool,
-    monthly_cap_minor_units: int | None,
+    monthly_cap_micro_units: int | None,
     currency: str,
     scope_keys: Sequence[str],
     months_ahead: int,
@@ -371,9 +380,9 @@ def run(
             session.rollback()
             return report
 
-        if monthly_cap_minor_units is None:
+        if monthly_cap_micro_units is None:
             raise ValueError(
-                "--monthly-cap-minor-units is required (run --propose first to "
+                "--monthly-cap-micro-units is required (run --propose first to "
                 "get a recommendation derived from observed spend)"
             )
 
@@ -382,7 +391,7 @@ def run(
             session,
             scope_keys=scope_keys,
             period_keys=period_keys,
-            monthly_cap_minor_units=monthly_cap_minor_units,
+            monthly_cap_micro_units=monthly_cap_micro_units,
         )
         changed = 0
         if apply:
@@ -390,7 +399,7 @@ def run(
                 session,
                 plans=plans,
                 currency=currency,
-                monthly_cap_minor_units=monthly_cap_minor_units,
+                monthly_cap_micro_units=monthly_cap_micro_units,
             )
             session.commit()
         else:
@@ -405,7 +414,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Idempotently set a fleet-wide monthly money cap on "
-            "fleet_cost_budgets.limit_cost_minor_units. Never touches "
+            "fleet_cost_budgets.limit_cost_micro_units. Never touches "
             "per-workspace (cost_budgets) rows."
         )
     )
@@ -426,36 +435,52 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "a dry-run: prints every row that WOULD change, then rolls back."
         ),
     )
-    # One ceiling, two spellings. The minor-units flag is the ledger's own
-    # unit and stays authoritative (`--propose` prints its recommendation
-    # in it); `--monthly-cap-usd` exists because the SETTINGS the
-    # maintenance cadence reads
-    # (`FLEET_BUDGET_MONTHLY_CAP_USD_PROXY` / `_BROWSER`) are in dollars,
-    # and an operator choosing "$75" should not have to convert by hand
-    # to reach the same number from both directions. Mutually exclusive:
-    # two ceilings on one run is a question, not an instruction.
+    # One ceiling, three spellings — one of which is a tombstone.
+    # `--monthly-cap-usd` is PRIMARY because dollars are what an operator
+    # actually decides and what the SETTINGS the maintenance cadence
+    # reads (`FLEET_BUDGET_MONTHLY_CAP_USD_PROXY` / `_BROWSER`) hold.
+    # `--monthly-cap-micro-units` spells the same ceiling in the ledger's
+    # own unit. `--monthly-cap-minor-units` is the pre-H4 cents flag: it
+    # is still accepted by the parser and then always rejected, because
+    # H4/B1 changed the ledger's unit by 10_000x and an old runbook
+    # re-run verbatim would otherwise have capped the fleet at one
+    # ten-thousandth of the intended ceiling — a silent outage, where
+    # this is a loud one. Mutually exclusive: two ceilings on one run is
+    # a question, not an instruction.
     cap_group = parser.add_mutually_exclusive_group()
-    cap_group.add_argument(
-        "--monthly-cap-minor-units",
-        type=int,
-        default=None,
-        help=(
-            "The monthly money ceiling, in integer MINOR units (cents for "
-            "USD) — never a float, per the app_shared.money contract. "
-            "Required unless --propose or --monthly-cap-usd."
-        ),
-    )
     cap_group.add_argument(
         "--monthly-cap-usd",
         type=float,
         default=None,
         help=(
-            "The same ceiling in DOLLARS, converted with "
+            "PRIMARY. The monthly money ceiling in DOLLARS, converted with "
             f"app_shared.costauth.fleet_budget_policy.usd_to_units "
             f"(x{USD_TO_UNITS}) — the identical conversion the "
             "maintenance cadence applies to "
             "FLEET_BUDGET_MONTHLY_CAP_USD_PROXY / _BROWSER, so the two "
             "routes to a cap can never disagree by a rounding step."
+        ),
+    )
+    cap_group.add_argument(
+        "--monthly-cap-micro-units",
+        type=int,
+        default=None,
+        help=(
+            "The same ceiling in integer MICRO-USD (1 USD == "
+            f"{USD_TO_UNITS}) — never a float, per the app_shared.money "
+            "contract. Use --monthly-cap-usd unless you need the exact "
+            "ledger integer."
+        ),
+    )
+    cap_group.add_argument(
+        "--monthly-cap-minor-units",
+        type=int,
+        default=None,
+        dest="monthly_cap_minor_units_removed",
+        help=(
+            "REMOVED (H4/B1): the ledger is in micro-USD, not cents. "
+            "Accepted only so a pre-H4 runbook fails loudly instead of "
+            "capping the fleet 10000x too low. Use --monthly-cap-usd."
         ),
     )
     parser.add_argument(
@@ -493,7 +518,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # carries the cap from here on and `validate_args`/`run` never have
     # to ask which spelling was used.
     if args.monthly_cap_usd is not None:
-        args.monthly_cap_minor_units = usd_to_units(args.monthly_cap_usd)
+        args.monthly_cap_micro_units = usd_to_units(args.monthly_cap_usd)
     return args
 
 
@@ -503,12 +528,20 @@ def validate_args(args: argparse.Namespace) -> str | None:
     Kept separate from :func:`parse_args` so the rules are unit-testable
     without argparse's ``SystemExit``.
     """
+    if getattr(args, "monthly_cap_minor_units_removed", None) is not None:
+        return (
+            "--monthly-cap-minor-units was REMOVED by H4/B1: the ledger is no "
+            f"longer in cents but in micro-USD (1 USD == {USD_TO_UNITS}). The "
+            "same number passed through would have capped the fleet 10000x too "
+            "low. Re-express the ceiling with --monthly-cap-usd "
+            "(or --monthly-cap-micro-units for the exact ledger integer)."
+        )
     if args.propose and args.apply:
         return "--propose and --apply are mutually exclusive: propose reads, apply writes"
-    if args.apply and args.monthly_cap_minor_units is None:
-        return "--apply requires --monthly-cap-minor-units (run --propose first)"
-    if args.monthly_cap_minor_units is not None and args.monthly_cap_minor_units <= 0:
-        return "--monthly-cap-minor-units must be a positive integer of minor units"
+    if args.apply and args.monthly_cap_micro_units is None:
+        return "--apply requires --monthly-cap-usd or --monthly-cap-micro-units (run --propose first)"
+    if args.monthly_cap_micro_units is not None and args.monthly_cap_micro_units <= 0:
+        return "--monthly-cap-micro-units must be a positive integer of micro-USD"
     if len(args.currency) != 3 or not args.currency.isupper() or not args.currency.isalpha():
         return "--currency must be a three-letter uppercase ISO-4217 code"
     if args.months_ahead < 0:
@@ -534,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             now=datetime.now(timezone.utc),
             propose=args.propose,
             apply=args.apply,
-            monthly_cap_minor_units=args.monthly_cap_minor_units,
+            monthly_cap_micro_units=args.monthly_cap_micro_units,
             currency=args.currency,
             scope_keys=scope_keys,
             months_ahead=args.months_ahead,

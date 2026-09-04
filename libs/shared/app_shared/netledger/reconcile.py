@@ -63,13 +63,13 @@ Reconciliation policy — stated up front, per the run's requirement
 * **Rate changes are keyed by `rate_effective_date` by construction, not
   by re-derivation.** This module never invents a $/byte rate. When the
   provider export carries an independent window-level cost
-  (:attr:`ProviderUsageSource.total_cost_minor_units`), that total is
+  (:attr:`ProviderUsageSource.total_cost_micro_units`), that total is
   apportioned across matched operations by transport-observed bytes
   (``method=PRO_RATA_BYTES``) — a pure split of a KNOWN total, not a
   rate computation. When no independent cost is available (the common
   case — a per-request DataImpulse export does not itself carry a $
   figure), the reconciled cost is the operation's OWN
-  ``estimated_cost_minor_units``, which C3/C4 already priced using the
+  ``estimated_cost_micro_units``, which C3/C4 already priced using the
   rate in effect on ITS ``rate_effective_date`` at close time. Either
   way, a rate that changed mid-window is already reflected in each
   operation's own prior estimate; this module apportions or confirms,
@@ -278,7 +278,7 @@ class ProviderUsageSource:
     re-importing the identical export is idempotent at the row level and
     a genuinely different export always gets a new hash.
 
-    ``total_cost_minor_units``/``currency`` are OPTIONAL: most metered-
+    ``total_cost_micro_units``/``currency`` are OPTIONAL: most metered-
     proxy per-request exports (DataImpulse's included, per the runbook)
     do not themselves carry a dollar figure — that lives on a separate
     invoice. When present, they name an INDEPENDENT window-level cost
@@ -294,7 +294,7 @@ class ProviderUsageSource:
     raw_bytes: bytes
     granularity: ProviderUsageGranularity = ProviderUsageGranularity.PER_REQUEST
     provider_account: str | None = None
-    total_cost_minor_units: int | None = None
+    total_cost_micro_units: int | None = None
     currency: str | None = None
 
     def __post_init__(self) -> None:
@@ -305,16 +305,16 @@ class ProviderUsageSource:
             )
         if self.window_end < self.window_start:
             raise ValueError("window_end must not precede window_start")
-        if self.total_cost_minor_units is not None:
+        if self.total_cost_micro_units is not None:
             if (
-                isinstance(self.total_cost_minor_units, bool)
-                or not isinstance(self.total_cost_minor_units, int)
+                isinstance(self.total_cost_micro_units, bool)
+                or not isinstance(self.total_cost_micro_units, int)
             ):
-                raise TypeError("total_cost_minor_units must be an int, never a float")
-            if self.total_cost_minor_units < 0:
-                raise ValueError("total_cost_minor_units must be non-negative")
+                raise TypeError("total_cost_micro_units must be an int, never a float")
+            if self.total_cost_micro_units < 0:
+                raise ValueError("total_cost_micro_units must be non-negative")
             if self.currency is None:
-                raise ValueError("total_cost_minor_units requires a currency")
+                raise ValueError("total_cost_micro_units requires a currency")
 
 
 @dataclass(frozen=True)
@@ -332,7 +332,7 @@ class ProviderUsageWindow:
     row_count: int
     total_requests: int
     total_bytes: int
-    total_cost_minor_units: int | None
+    total_cost_micro_units: int | None
     currency: str | None
     imported_at: datetime
     #: True when this call found an existing import with the same
@@ -459,7 +459,7 @@ def import_provider_usage(
                 row_count=len(source.rows),
                 total_requests=total_requests,
                 total_bytes=total_bytes,
-                total_cost_minor_units=source.total_cost_minor_units,
+                total_cost_micro_units=source.total_cost_micro_units,
                 currency=source.currency,
                 imported_at=moment,
                 already_imported=True,
@@ -521,7 +521,7 @@ def import_provider_usage(
         row_count=len(rows_to_insert),
         total_requests=total_requests,
         total_bytes=total_bytes,
-        total_cost_minor_units=source.total_cost_minor_units,
+        total_cost_micro_units=source.total_cost_micro_units,
         currency=source.currency,
         imported_at=moment,
         already_imported=False,
@@ -730,13 +730,13 @@ def _build_report_and_settlements(
     )
 
     cost_variance_pct: float | None = None
-    if window.total_cost_minor_units is not None:
+    if window.total_cost_micro_units is not None:
         app_estimated = sum(
-            op.estimated_cost_minor_units or 0 for _, ops, _ in matched_groups for op in ops
+            op.estimated_cost_micro_units or 0 for _, ops, _ in matched_groups for op in ops
         )
         if app_estimated:
             cost_variance_pct = (
-                abs(window.total_cost_minor_units - app_estimated) / app_estimated * 100.0
+                abs(window.total_cost_micro_units - app_estimated) / app_estimated * 100.0
             )
 
     report = ReconciliationReport(
@@ -772,7 +772,7 @@ def _settlements_for_matched_groups(
 ) -> tuple[list[dict[str, Any]], int]:
     """Build (unwritten) settlement rows for every RECONCILED host group.
 
-    A single largest-remainder split of ``window.total_cost_minor_units``
+    A single largest-remainder split of ``window.total_cost_micro_units``
     (when known) across ALL matched operations in the window, weighted by
     each operation's own transport-observed bytes, guarantees the parts
     sum exactly to the provider's stated total — the same rounding
@@ -804,12 +804,12 @@ def _settlements_for_matched_groups(
 
     currency = window.currency or _single_currency(all_ops)
 
-    if window.total_cost_minor_units is not None:
+    if window.total_cost_micro_units is not None:
         weights = [max(_operation_bytes(op), 0) for op in all_ops]
         if sum(weights) == 0:
             weights = [1] * len(all_ops)
         amounts: list[int | None] = allocate_cost_largest_remainder(
-            window.total_cost_minor_units, weights
+            window.total_cost_micro_units, weights
         )
     else:
         # No independent provider-billed total: the reconciled cost is
@@ -817,7 +817,7 @@ def _settlements_for_matched_groups(
         # rate_effective_date by C3/C4) — this run confirms it rather
         # than inventing a new figure. See the module docstring's "rate
         # changes" policy.
-        amounts = [op.estimated_cost_minor_units for op in all_ops]
+        amounts = [op.estimated_cost_micro_units for op in all_ops]
 
     rows: list[dict[str, Any]] = []
     skipped = 0
@@ -825,7 +825,7 @@ def _settlements_for_matched_groups(
         if amount is None:
             logger.warning(
                 "netledger.reconcile.no_cost_signal operation_id=%s window_id=%s — "
-                "no window-level cost and no prior estimated_cost_minor_units; "
+                "no window-level cost and no prior estimated_cost_micro_units; "
                 "skipping settlement (byte/request facts are still reflected in "
                 "the report)",
                 op.network_request_id,
@@ -854,7 +854,7 @@ def _settlements_for_matched_groups(
                 "id": new_uuid7(),
                 "operation_id": op.network_request_id,
                 "settlement_version": (existing_version or 0) + 1,
-                "reconciled_cost_minor_units": int(amount),
+                "reconciled_cost_micro_units": int(amount),
                 "currency": currency,
                 "provider_usage_record_id": provenance,
                 "method": method,
@@ -925,7 +925,7 @@ def windows_pending_reconciliation(
     (``apps.workers.app.workers.tasks_maintenance.reconcile_provider_usage``).
 
     Reconstructed PURELY from ``provider_usage_records`` (the durable
-    evidence), so ``total_cost_minor_units``/``currency`` come back
+    evidence), so ``total_cost_micro_units``/``currency`` come back
     ``None`` here even if the original :class:`ProviderUsageSource`
     carried a window-level cost — that figure is not currently persisted
     at the window level (no table exists to hold it; the real DataImpulse
@@ -970,7 +970,7 @@ def windows_pending_reconciliation(
                 row_count=int(row_count),
                 total_requests=int(total_requests),
                 total_bytes=int(total_bytes),
-                total_cost_minor_units=None,
+                total_cost_micro_units=None,
                 currency=None,
                 imported_at=imported_at,
                 already_imported=True,

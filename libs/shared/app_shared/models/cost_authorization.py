@@ -51,7 +51,7 @@ Four tables, each with a different owner and a different failure posture:
 
 All four counter dimensions in one place
 ----------------------------------------
-Money (integer minor units — the ``app_shared.money`` §19 "money is never
+Money (integer micro-USD — the ``app_shared.money`` §19 "money is never
 a float" contract, expressed the same way C1's ledger expresses it),
 bytes, request count, and browser-seconds are separate columns on the
 same budget row, checked and decremented inside the same transaction and
@@ -282,12 +282,12 @@ class CostReservation(Base, WorkspaceScopedBase, TimestampMixin):
             name="fk_cost_reservations_workspace_id_workspaces",
         ),
         CheckConstraint(
-            "reserved_cost_minor_units >= 0 AND reserved_bytes >= 0 "
+            "reserved_cost_micro_units >= 0 AND reserved_bytes >= 0 "
             "AND reserved_requests >= 0 AND reserved_browser_seconds >= 0",
             name="cr_reserved_non_negative",
         ),
         CheckConstraint(
-            "settled_cost_minor_units IS NULL OR settled_cost_minor_units >= 0",
+            "settled_cost_micro_units IS NULL OR settled_cost_micro_units >= 0",
             name="cr_settled_cost_non_negative",
         ),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="cr_currency_is_iso4217"),
@@ -343,13 +343,13 @@ class CostReservation(Base, WorkspaceScopedBase, TimestampMixin):
     currency: Mapped[str] = mapped_column(String(length=3), nullable=False)
 
     # --- the four reserved dimensions, held while RESERVED --------------
-    reserved_cost_minor_units: Mapped[int] = mapped_column(BigInteger(), nullable=False)
+    reserved_cost_micro_units: Mapped[int] = mapped_column(BigInteger(), nullable=False)
     reserved_bytes: Mapped[int] = mapped_column(BigInteger(), nullable=False)
     reserved_requests: Mapped[int] = mapped_column(BigInteger(), nullable=False)
     reserved_browser_seconds: Mapped[int] = mapped_column(BigInteger(), nullable=False)
 
     # --- the four settled dimensions, written once at SETTLED -----------
-    settled_cost_minor_units: Mapped[int | None] = mapped_column(
+    settled_cost_micro_units: Mapped[int | None] = mapped_column(
         BigInteger(), nullable=True
     )
     settled_bytes: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
@@ -385,14 +385,14 @@ class _BudgetCountersMixin:
     decision the instant it is taken, not when it settles.
     """
 
-    limit_cost_minor_units: Mapped[int | None] = mapped_column(
+    limit_cost_micro_units: Mapped[int | None] = mapped_column(
         BigInteger(), nullable=True
     )
     limit_bytes: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
     limit_requests: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
     limit_browser_seconds: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
 
-    reserved_cost_minor_units: Mapped[int] = mapped_column(
+    reserved_cost_micro_units: Mapped[int] = mapped_column(
         BigInteger(), nullable=False, default=0, server_default=text("0")
     )
     reserved_bytes: Mapped[int] = mapped_column(
@@ -405,7 +405,7 @@ class _BudgetCountersMixin:
         BigInteger(), nullable=False, default=0, server_default=text("0")
     )
 
-    settled_cost_minor_units: Mapped[int] = mapped_column(
+    settled_cost_micro_units: Mapped[int] = mapped_column(
         BigInteger(), nullable=False, default=0, server_default=text("0")
     )
     settled_bytes: Mapped[int] = mapped_column(
@@ -450,7 +450,7 @@ class CostBudget(Base, WorkspaceScopedBase, TimestampMixin, _BudgetCountersMixin
 
     Every authorization takes ``SELECT ... FOR UPDATE`` on this row. That
     lock is the whole hard-ceiling mechanism: twenty concurrent
-    authorizations against a hundred-cent budget serialize here, and
+    authorizations against a one-dollar budget serialize here, and
     exactly ten of them find room.
     """
 
@@ -466,7 +466,7 @@ class CostBudget(Base, WorkspaceScopedBase, TimestampMixin, _BudgetCountersMixin
         ),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="cb_currency_is_iso4217"),
         CheckConstraint(
-            "reserved_cost_minor_units >= 0 AND settled_cost_minor_units >= 0",
+            "reserved_cost_micro_units >= 0 AND settled_cost_micro_units >= 0",
             name="cb_cost_counters_non_negative",
         ),
     )
@@ -500,7 +500,7 @@ class FleetCostBudget(Base, TimestampMixin, _BudgetCountersMixin):
         ),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="fcb_currency_is_iso4217"),
         CheckConstraint(
-            "reserved_cost_minor_units >= 0 AND settled_cost_minor_units >= 0",
+            "reserved_cost_micro_units >= 0 AND settled_cost_micro_units >= 0",
             name="fcb_cost_counters_non_negative",
         ),
     )

@@ -63,7 +63,7 @@ no business writing either half.
 
 Money
 -----
-Integer minor units throughout, per C1's columns; rates in
+Integer micro-USD throughout, per C1's columns; rates in
 ``billing_rate_micro_units`` scaled by
 :data:`~app_shared.models.network_operations.BILLING_RATE_SCALE`. Splits
 use :func:`~app_shared.models.network_operations.allocate_cost_largest_remainder`
@@ -245,7 +245,7 @@ class OperationOutcome:
 
     ``allocations`` maps workspace id -> an integer WEIGHT (not a
     fraction, not a share of money). The recorder turns weights into
-    exact ``fraction_ppb`` and ``allocated_cost_minor_units`` with
+    exact ``fraction_ppb`` and ``allocated_cost_micro_units`` with
     largest-remainder rounding so both sums land exactly on
     :data:`FRACTION_SCALE` and on the operation's cost. ``None`` means
     "the intent's own workspace, at 1.0" — the ordinary single-tenant
@@ -261,7 +261,7 @@ class OperationOutcome:
     extraction_result: str | None = None
     identity_confidence: str | None = None
     comparability: str | None = None
-    estimated_cost_minor_units: int | None = None
+    estimated_cost_micro_units: int | None = None
     currency: str | None = None
     billing_unit: str | None = None
     billing_rate_micro_units: int | None = None
@@ -291,7 +291,7 @@ class OperationOutcome:
         for name in (
             "bytes_compressed",
             "bytes_decompressed",
-            "estimated_cost_minor_units",
+            "estimated_cost_micro_units",
             "billing_rate_micro_units",
         ):
             value = getattr(self, name)
@@ -306,9 +306,9 @@ class OperationOutcome:
                 raise ValueError(f"{name} must be non-negative: {value!r}")
         if self.currency is not None and not _ISO4217.match(self.currency):
             raise ValueError(f"currency must be an ISO-4217 code: {self.currency!r}")
-        if self.estimated_cost_minor_units is not None and self.currency is None:
+        if self.estimated_cost_micro_units is not None and self.currency is None:
             raise ValueError(
-                "estimated_cost_minor_units requires a currency — C1's "
+                "estimated_cost_micro_units requires a currency — C1's "
                 "no_cost_requires_currency check rejects a bare amount"
             )
 
@@ -770,7 +770,7 @@ class NetLedgerRecorder:
                 extraction_result=outcome.extraction_result,
                 identity_confidence=outcome.identity_confidence,
                 comparability=outcome.comparability,
-                estimated_cost_minor_units=outcome.estimated_cost_minor_units,
+                estimated_cost_micro_units=outcome.estimated_cost_micro_units,
                 currency=outcome.currency,
                 billing_unit=outcome.billing_unit,
                 billing_rate_micro_units=outcome.billing_rate_micro_units,
@@ -811,7 +811,7 @@ class NetLedgerRecorder:
         probe): C1's deferred trigger skips a NULL-cost operation, and an
         allocation with nothing to allocate is noise, not a fact.
         """
-        cost = outcome.estimated_cost_minor_units
+        cost = outcome.estimated_cost_micro_units
         if cost is None or outcome.currency is None:
             return
         weights = dict(outcome.allocations or {})
@@ -832,7 +832,7 @@ class NetLedgerRecorder:
                     "workspace_id": workspace_id,
                     "operation_id": nrid,
                     "fraction_ppb": fraction,
-                    "allocated_cost_minor_units": amount,
+                    "allocated_cost_micro_units": amount,
                     "currency": outcome.currency,
                 }
                 for workspace_id, fraction, amount in zip(
@@ -878,7 +878,7 @@ class NetLedgerRecorder:
             self._costauth.settle_partial(
                 authorization_id,
                 SettledCost(
-                    cost_minor_units=int(outcome.estimated_cost_minor_units or 0),
+                    cost_micro_units=int(outcome.estimated_cost_micro_units or 0),
                     bytes_used=int(bytes_used),
                     requests=1,
                     browser_seconds=int(outcome.browser_seconds),
@@ -973,7 +973,7 @@ def _outcome_payload(outcome: OperationOutcome) -> dict[str, Any]:
         "extraction_result": outcome.extraction_result,
         "identity_confidence": outcome.identity_confidence,
         "comparability": outcome.comparability,
-        "estimated_cost_minor_units": outcome.estimated_cost_minor_units,
+        "estimated_cost_micro_units": outcome.estimated_cost_micro_units,
         "currency": outcome.currency,
         "billing_unit": outcome.billing_unit,
         "billing_rate_micro_units": outcome.billing_rate_micro_units,
@@ -1000,7 +1000,7 @@ def _outcome_from_payload(payload: Mapping[str, Any]) -> OperationOutcome:
         extraction_result=payload.get("extraction_result"),
         identity_confidence=payload.get("identity_confidence"),
         comparability=payload.get("comparability"),
-        estimated_cost_minor_units=payload.get("estimated_cost_minor_units"),
+        estimated_cost_micro_units=payload.get("estimated_cost_micro_units"),
         currency=payload.get("currency"),
         billing_unit=payload.get("billing_unit"),
         billing_rate_micro_units=payload.get("billing_rate_micro_units"),

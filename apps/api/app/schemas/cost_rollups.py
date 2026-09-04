@@ -9,7 +9,7 @@ module docstring for the ownership/cardinality contract this mirrors).
 Kept in `apps/api` (never `app_shared`), the same discipline
 `app.schemas.alerts`/`matches`/`catalog`/`jobs` already follow, so the
 framework-agnostic core never depends on Pydantic. Money is exchanged as
-scaled-integer minor units (`int`, never `Decimal`/`float`) — this is a
+scaled-integer micro-USD (`int`, never `Decimal`/`float`) — this is a
 cost-ledger-derived figure, not a `Money`-parsed decimal amount, and the
 §19 no-float discipline holds regardless of which numeric type a given
 surface happens to use.
@@ -38,7 +38,7 @@ class CostRollupResponse(BaseModel):
     COST_ROLLUP_OTHER_DOMAIN` etc.) — never a real hostname, since `_`
     cannot appear in a DNS-legal one.
 
-    `reconciled_cost_minor_units` is `None` iff not one operation in this
+    `reconciled_cost_micro_units` is `None` iff not one operation in this
     bucket has a provider settlement yet — distinct from `0`, which would
     falsely claim "reconciled to zero cost".
     """
@@ -51,8 +51,8 @@ class CostRollupResponse(BaseModel):
     method: str
     profile_version: str
     operation_count: int
-    estimated_cost_minor_units: int
-    reconciled_cost_minor_units: int | None
+    estimated_cost_micro_units: int
+    reconciled_cost_micro_units: int | None
     currency: str
     created_at: datetime
     updated_at: datetime

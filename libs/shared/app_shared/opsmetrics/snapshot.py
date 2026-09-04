@@ -163,10 +163,10 @@ class CostRollupHealth:
     #: Summed over every fleet bucket on ``latest_rollup_date``, keyed by
     #: ISO-4217 currency (a rollup day may legitimately span more than
     #: one currency).
-    estimated_cost_minor_units_by_currency: dict[str, int] = field(default_factory=dict)
+    estimated_cost_micro_units_by_currency: dict[str, int] = field(default_factory=dict)
     #: Same, but only currencies where at least one bucket has a
     #: reconciled figure at all.
-    reconciled_cost_minor_units_by_currency: dict[str, int] = field(default_factory=dict)
+    reconciled_cost_micro_units_by_currency: dict[str, int] = field(default_factory=dict)
     #: ``operation_count`` summed over buckets that HAVE a reconciled
     #: figure, vs. every bucket's ``operation_count`` -- both for
     #: ``latest_rollup_date``.
@@ -186,14 +186,14 @@ class CostRollupHealth:
         multi-currency day; picking the dominant currency (by spend) is
         a documented, conservative choice -- the full per-currency
         breakdown remains available via
-        :attr:`estimated_cost_minor_units_by_currency`/
-        :attr:`reconciled_cost_minor_units_by_currency`.
+        :attr:`estimated_cost_micro_units_by_currency`/
+        :attr:`reconciled_cost_micro_units_by_currency`.
         """
-        if not self.estimated_cost_minor_units_by_currency:
+        if not self.estimated_cost_micro_units_by_currency:
             return None
         return max(
-            self.estimated_cost_minor_units_by_currency,
-            key=lambda c: self.estimated_cost_minor_units_by_currency[c],
+            self.estimated_cost_micro_units_by_currency,
+            key=lambda c: self.estimated_cost_micro_units_by_currency[c],
         )
 
     @property
@@ -201,8 +201,8 @@ class CostRollupHealth:
         currency = self._dominant_currency
         if currency is None:
             return None
-        estimated = self.estimated_cost_minor_units_by_currency.get(currency, 0)
-        reconciled = self.reconciled_cost_minor_units_by_currency.get(currency)
+        estimated = self.estimated_cost_micro_units_by_currency.get(currency, 0)
+        reconciled = self.reconciled_cost_micro_units_by_currency.get(currency)
         if reconciled is None:
             return None
         if estimated == 0:
@@ -1135,13 +1135,13 @@ def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
         for bucket in buckets:
             estimated_by_currency[bucket.currency] = (
                 estimated_by_currency.get(bucket.currency, 0)
-                + bucket.estimated_cost_minor_units
+                + bucket.estimated_cost_micro_units
             )
             total_operation_count += bucket.operation_count
-            if bucket.reconciled_cost_minor_units is not None:
+            if bucket.reconciled_cost_micro_units is not None:
                 reconciled_by_currency[bucket.currency] = (
                     reconciled_by_currency.get(bucket.currency, 0)
-                    + bucket.reconciled_cost_minor_units
+                    + bucket.reconciled_cost_micro_units
                 )
                 reconciled_operation_count += bucket.operation_count
 
@@ -1156,8 +1156,8 @@ def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
         watermark_age_days=watermark_age_days,
         latest_rollup_date=latest_date,
         fleet_bucket_rows=fleet_rows,
-        estimated_cost_minor_units_by_currency=estimated_by_currency,
-        reconciled_cost_minor_units_by_currency=reconciled_by_currency,
+        estimated_cost_micro_units_by_currency=estimated_by_currency,
+        reconciled_cost_micro_units_by_currency=reconciled_by_currency,
         reconciled_operation_count=reconciled_operation_count,
         total_operation_count=total_operation_count,
         ledger_freshness_seconds=_age(now, last_closed),
