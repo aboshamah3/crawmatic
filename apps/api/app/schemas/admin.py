@@ -58,6 +58,14 @@ class UsageRow(BaseModel):
     protected_links_attempted: int
     protected_links_succeeded: int
     check_successful: bool
+    #: Task B3 (2026-09-03): per (workspace, product, cycle) counts of the
+    #: underlying `network_operations` (B2) PROXY/BROWSER transport rows —
+    #: retries included, unlike the folded `links_total` counters above.
+    #: Additive: default 0 lets an older row shape (no network_operations
+    #: match) still validate.
+    proxied_http_attempted: int = 0
+    proxied_browser_attempted: int = 0
+    proxy_bytes: int = 0
 
 
 class UsageListResponse(BaseModel):

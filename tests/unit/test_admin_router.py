@@ -204,7 +204,43 @@ def test_usage_returns_the_frozen_contract_fields():
         "protected_links_attempted",
         "protected_links_succeeded",
         "check_successful",
+        # Task B3 (2026-09-03): additive network_operations transport facts.
+        "proxied_http_attempted",
+        "proxied_browser_attempted",
+        "proxy_bytes",
     }
+
+
+def test_usage_defaults_proxied_transport_fields_to_zero_when_source_lacks_them():
+    """A row built before Task B3 (no network_operations join in the
+    fake session) must still validate — the three new fields default to
+    `0`, never `None`/missing, keeping the response additive."""
+    client, _ = _usage_client([_usage_row()])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00Z&until=2026-08-08T00:00:00Z",
+        headers=SERVICE_HEADERS,
+    )
+    item = resp.json()["items"][0]
+    assert item["proxied_http_attempted"] == 0
+    assert item["proxied_browser_attempted"] == 0
+    assert item["proxy_bytes"] == 0
+
+
+def test_usage_reports_supplied_proxied_transport_fields():
+    row = _usage_row(
+        proxied_http_attempted=2,
+        proxied_browser_attempted=1,
+        proxy_bytes=2_200_000,
+    )
+    client, _ = _usage_client([row])
+    resp = client.get(
+        "/v1/admin/usage?since=2026-08-01T00:00:00Z&until=2026-08-08T00:00:00Z",
+        headers=SERVICE_HEADERS,
+    )
+    item = resp.json()["items"][0]
+    assert item["proxied_http_attempted"] == 2
+    assert item["proxied_browser_attempted"] == 1
+    assert item["proxy_bytes"] == 2_200_000
 
 
 def test_usage_returns_the_items_next_cursor_envelope():

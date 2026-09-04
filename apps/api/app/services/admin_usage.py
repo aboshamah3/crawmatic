@@ -70,11 +70,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from sqlalchemy import Select, and_, func, literal, select, tuple_
+from sqlalchemy import BigInteger, Select, and_, cast, func, literal, select, tuple_
 
 from app_shared.enums import AccessMethod, RequestOrigin
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob
+from app_shared.models.network_operations import NetworkOperation, NetworkTransport
 from app_shared.models.observations import PriceObservation, RequestAttempt
 
 MAX_WINDOW_DAYS = 31
@@ -86,6 +87,15 @@ MAX_USAGE_LIMIT = 1000
 PROTECTED_ACCESS_METHODS = (
     AccessMethod.PROXY_HTTP.value,
     AccessMethod.PLAYWRIGHT_PROXY.value,
+)
+
+#: `network_operations.transport` values billed against the fleet's proxy
+#: spend (B2) — the same two facts `proxied_http_attempted` /
+#: `proxied_browser_attempted` / `proxy_bytes` (Task B3) report per cycle.
+#: `DIRECT` is fleet egress with no proxy cost and is excluded.
+PROXIED_TRANSPORTS = (
+    NetworkTransport.PROXY.value,
+    NetworkTransport.BROWSER.value,
 )
 
 
@@ -201,7 +211,26 @@ def build_usage_query(
     Returns a `Select` whose columns are, in order:
     `workspace_id, product_id, cycle_ts, links_total, links_succeeded,
     protected_links_attempted, protected_links_succeeded,
-    check_successful` — the frozen §7.2 contract, positionally stable.
+    check_successful` — the frozen §7.2 contract, positionally stable —
+    followed by three additive Task B3 columns: `proxied_http_attempted`,
+    `proxied_browser_attempted`, `proxy_bytes`. The three are per (cycle,
+    workspace, product) facts about the underlying `network_operations`
+    (B2) rather than about `request_attempts`: unlike `links_total` etc,
+    which fold retries per match (a link is billed once no matter how
+    many times it was retried), these three count every physical PROXY/
+    BROWSER operation the cycle actually made, retries included — that is
+    what the fleet was actually charged for. They are computed inside the
+    same `per_link` scan (one `LEFT OUTER JOIN` from `request_attempts` to
+    `network_operations` via `network_operation_id`, added BEFORE the
+    match-folding `GROUP BY`) and then re-summed across matches in the
+    outer aggregate, so this stays a single pass over `request_attempts`
+    (see `test_query_still_bounds_origin_as_a_partition_prunable_predicate`).
+    `SUM(bigint)` renders as Postgres `numeric`, which a driver decodes as
+    `Decimal` — every SUM here is `cast(..., BigInteger)`-wrapped, at both
+    the inner and outer aggregation level, so the JSON-facing value is a
+    plain Python `int`, never a `Decimal`, and `COALESCE(..., 0)` keeps it
+    `0` rather than `NULL` when a cycle's links carried no proxy/browser
+    operation at all.
     """
     is_protected = RequestAttempt.access_method.in_(PROTECTED_ACCESS_METHODS)
 
@@ -230,6 +259,24 @@ def build_usage_query(
             func.bool_or(and_(is_protected, RequestAttempt.success)).label(
                 "protected_ok"
             ),
+            # Task B3: per-match physical-operation facts, folded the same
+            # way as the boolean flags above (one row per match_id) and
+            # re-summed across matches in the outer aggregate below.
+            func.count()
+            .filter(NetworkOperation.transport == PROXIED_TRANSPORTS[0])
+            .label("proxy_http_count"),
+            func.count()
+            .filter(NetworkOperation.transport == PROXIED_TRANSPORTS[1])
+            .label("proxy_browser_count"),
+            func.coalesce(
+                cast(
+                    func.sum(NetworkOperation.bytes_compressed).filter(
+                        NetworkOperation.transport.in_(PROXIED_TRANSPORTS)
+                    ),
+                    BigInteger,
+                ),
+                literal(0),
+            ).label("proxy_bytes"),
         )
         .join(
             CompetitorProductMatch,
@@ -244,6 +291,10 @@ def build_usage_query(
                 ScrapeJob.id == RequestAttempt.scrape_job_id,
                 ScrapeJob.workspace_id == RequestAttempt.workspace_id,
             ),
+        )
+        .outerjoin(
+            NetworkOperation,
+            NetworkOperation.network_request_id == RequestAttempt.network_operation_id,
         )
         .where(
             RequestAttempt.created_at >= since,
@@ -313,6 +364,20 @@ def build_usage_query(
             func.coalesce(
                 func.bool_or(per_check.c.observed), literal(False)
             ).label("check_successful"),
+            # Task B3: re-sum the per-match physical-operation facts across
+            # every match in the cycle. `SUM(bigint)` renders as Postgres
+            # `numeric`; cast back to `BigInteger` so the driver hands back
+            # a plain `int`, and `COALESCE(..., 0)` so an all-zero cycle
+            # reports `0`, never `NULL`.
+            func.coalesce(
+                cast(func.sum(per_link.c.proxy_http_count), BigInteger), literal(0)
+            ).label("proxied_http_attempted"),
+            func.coalesce(
+                cast(func.sum(per_link.c.proxy_browser_count), BigInteger), literal(0)
+            ).label("proxied_browser_attempted"),
+            func.coalesce(
+                cast(func.sum(per_link.c.proxy_bytes), BigInteger), literal(0)
+            ).label("proxy_bytes"),
         )
         .select_from(per_link)
         .outerjoin(

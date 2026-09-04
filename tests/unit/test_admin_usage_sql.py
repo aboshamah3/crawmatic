@@ -211,6 +211,52 @@ def test_cursor_predicate_is_a_keyset_tuple_comparison() -> None:
     assert ">" in sql.split("HAVING")[-1] or "(cycle_ts, workspace_id, product_id) >" in sql.replace('"', "")
 
 
+def test_query_reports_proxied_transport_facts_from_network_operations() -> None:
+    """Task B3 (engine half): each row must additionally report
+    `proxied_http_attempted`, `proxied_browser_attempted`, `proxy_bytes` —
+    per (workspace, product, cycle) counts/bytes of the underlying
+    `network_operations` (B2) PROXY/BROWSER transport rows."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert "network_operations" in sql
+    assert "proxied_http_attempted" in sql
+    assert "proxied_browser_attempted" in sql
+    assert "proxy_bytes" in sql
+    assert "'PROXY'" in sql
+    assert "'BROWSER'" in sql
+    # Joined on the physical-operation identity, not by workspace/product
+    # columns network_operations does not have (it is fleet-owned, C1).
+    assert "network_operations.network_request_id = request_attempts.network_operation_id" in sql
+
+
+def test_query_still_single_scan_of_request_attempts_with_transport_join() -> None:
+    """The B3 network_operations join must ride the SAME `per_link` scan
+    of `request_attempts` (added as another LEFT JOIN before the
+    match-folding GROUP BY), not a second CTE re-reading the partitioned
+    table — the docstring's risk-P2 partition-pruning guarantee must
+    survive this addition unchanged."""
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
+    assert sql.count("FROM request_attempts") == 1, sql
+
+
+def test_query_sums_bytes_compressed_over_both_proxy_and_browser_transports() -> None:
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert "sum(network_operations.bytes_compressed)" in sql.lower()
+    assert "coalesce" in sql.lower()
+
+
+def test_query_casts_proxied_sums_to_integer_not_left_as_numeric() -> None:
+    """`SUM(bigint)` renders as Postgres `numeric`, which psycopg decodes
+    as `Decimal` — the export's JSON-facing contract requires plain
+    ints, so both the inner (`bytes_compressed`) and outer (re-summed
+    per-match totals) aggregates must be `CAST(..., BigInteger)`-wrapped."""
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)).upper()
+    assert sql.count("CAST(") >= 4, sql
+
+
 def test_cycle_ts_expression_is_identical_in_select_and_group_by() -> None:
     """Regression: the GROUP BY must reuse the SELECT's `cycle_ts` object.
 
