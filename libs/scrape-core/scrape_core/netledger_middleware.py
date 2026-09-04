@@ -110,7 +110,7 @@ from scrape_core.db import await_in_thread, run_in_thread
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["NetLedgerMiddleware", "operation_intent_for"]
+__all__ = ["NetLedgerMiddleware", "is_proxied", "operation_intent_for"]
 
 #: Meta key carrying the operation identity, stamped by this middleware
 #: at open. Both spiders read it back onto their `ScrapeResult` so the
@@ -142,6 +142,17 @@ def _is_proxied(meta: dict[str, Any]) -> bool:
     return bool(meta.get("proxy")) or str(
         meta.get("playwright_context", "")
     ).startswith("proxy:")
+
+
+#: Public alias for :func:`_is_proxied` (EPA B5). The browser spider has
+#: to record the SAME proxied/direct fact for the resource-blocking
+#: policy that this middleware prices on
+#: (``scrape_core.browser.domain_profile_registry.set_domain_transport``),
+#: and a second implementation of "was this leg proxied?" is precisely
+#: the drift that would make the B5 canary's proxy-byte measurement
+#: disagree with what the ledger bills. Exported so that call site does
+#: not have to import a private name.
+is_proxied = _is_proxied
 
 
 def _transport_for(meta: dict[str, Any]) -> NetworkTransport:

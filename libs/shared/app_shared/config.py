@@ -608,6 +608,20 @@ class Settings(BaseSettings):
     SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS: int = 30000
     BROWSER_CONCURRENT_REQUESTS: int = 2
     BROWSER_MAX_CONTEXTS: int = 1
+    # EPA B5 (canary-gated): domains whose PROXIED browser legs fetch the
+    # document and nothing else — every sub-resource is aborted before its
+    # body crosses the paid proxy
+    # (`app_shared.profiles.browser_resource_policy.should_block`,
+    # `PROXIED_BLOCKED_RESOURCE_TYPES`). Comma-separated hostnames; a
+    # listed domain also covers its subdomains (`amazon.sa` covers
+    # `www.amazon.sa`). DEFAULT IS EMPTY AND MUST STAY EMPTY until the
+    # owner's canary says otherwise: with `()` every domain's runtime
+    # behaviour is byte-for-byte what it was before B5, on both
+    # transports. A DIRECT browser leg is never affected at all — those
+    # bytes are the fleet's own egress and cost nothing per byte.
+    # NoDecode for the same reason SCRAPYD_*_URLS uses it: the env value
+    # is a plain comma-separated string, never JSON.
+    BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS: Annotated[tuple[str, ...], NoDecode] = ()
 
     # --- Retention, rollups & partition maintenance tuning (SPEC-15,
     # data-model.md §6, Principle IV — env/DB-tunable, never a hardcoded
@@ -819,6 +833,21 @@ class Settings(BaseSettings):
     def _parse_url_pool(cls, value: object) -> object:
         if isinstance(value, str):
             return _split_pool(value)
+        return value
+
+    @field_validator("BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS", mode="before")
+    @classmethod
+    def _parse_document_only_domains(cls, value: object) -> object:
+        """``"amazon.sa, noon.com"`` -> ``("amazon.sa", "noon.com")``.
+
+        Same comma-separated convention as the Scrapyd URL pools (never
+        JSON), lowercased so a Railway value's casing can never make a
+        listed domain silently miss.
+        """
+        if isinstance(value, str):
+            return tuple(item.strip().lower() for item in value.split(",") if item.strip())
+        if isinstance(value, (list, tuple)):
+            return tuple(str(item).strip().lower() for item in value if str(item).strip())
         return value
 
     @model_validator(mode="after")

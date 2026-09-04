@@ -272,3 +272,188 @@ def test_subresource_on_an_unregistered_host_still_uses_the_default_policy() -> 
     result = asyncio.run(abort_unsafe_request(request, resolver=_resolver([_PUBLIC_IP])))
 
     assert result is True  # image is still blocked by default -- no certification found
+
+
+# --- EPA B5: document-only proxied browser legs for LISTED domains -----------
+#
+# `abort_unsafe_request` IS the real Playwright route handler for this
+# fleet: scrapy-playwright wires it as `PLAYWRIGHT_ABORT_REQUEST` and its
+# own handler does exactly `route.abort()` when it returns True and
+# `route.continue_()` otherwise
+# (`scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler._make_request_handler`).
+# `_drive_route` below reproduces that one branch so these tests assert the
+# ACTUAL route action, not just the boolean.
+
+
+class _FakeRoute:
+    def __init__(self) -> None:
+        self.actions: list[str] = []
+
+    async def abort(self) -> None:
+        self.actions.append("abort")
+
+    async def continue_(self) -> None:
+        self.actions.append("continue_")
+
+
+class _FakePageRequest(_FakeRequest):
+    """A `_FakeRequest` that also exposes `request.frame.url` -- the signal
+    `abort_unsafe_request` uses to recover the PAGE's domain for a
+    cross-origin sub-resource (an Amazon page's images live on
+    `m.media-amazon.com`, which would never match a listed `amazon.sa`)."""
+
+    def __init__(self, url: str, *, page_url: str, **kwargs) -> None:
+        super().__init__(url, **kwargs)
+        from types import SimpleNamespace
+
+        self.frame = SimpleNamespace(url=page_url)
+
+
+def _drive_route(request, *, resolver=None):
+    """Run the scrapy-playwright route branch; returns the fake route."""
+    route = _FakeRoute()
+
+    async def handler() -> None:
+        if await abort_unsafe_request(request, resolver=resolver or _resolver([_PUBLIC_IP])):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    asyncio.run(handler())
+    return route
+
+
+@pytest.fixture
+def _amazon_listed_and_proxied(monkeypatch):
+    """`amazon.sa` listed AND its leg recorded as PROXY, exactly as the
+    spider records it at dispatch."""
+    from app_shared.profiles import browser_resource_policy
+    from types import SimpleNamespace
+
+    from scrape_core.browser.domain_profile_registry import (
+        clear_domain_transport,
+        set_domain_transport,
+    )
+
+    monkeypatch.setattr(
+        browser_resource_policy,
+        "get_settings",
+        lambda: SimpleNamespace(BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS=("amazon.sa",)),
+    )
+    set_domain_transport("www.amazon.sa", "PROXY")
+    try:
+        yield
+    finally:
+        clear_domain_transport("www.amazon.sa")
+
+
+def test_proxied_listed_domain_script_subresource_is_aborted(_amazon_listed_and_proxied):
+    request = _FakePageRequest(
+        "https://www.amazon.sa/bundle.js",
+        page_url="https://www.amazon.sa/dp/B0ABC",
+        is_navigation=False,
+        resource_type="script",
+    )
+
+    assert _drive_route(request).actions == ["abort"]
+
+
+def test_proxied_listed_domain_cross_origin_subresource_is_aborted(
+    _amazon_listed_and_proxied,
+):
+    # The sub-resource's OWN host (`m.media-amazon.com`) is not the listed
+    # domain -- the page's is. Matching on the page domain is what makes
+    # the rule bite at all.
+    request = _FakePageRequest(
+        "https://m.media-amazon.com/images/I/hero.js",
+        page_url="https://www.amazon.sa/dp/B0ABC",
+        is_navigation=False,
+        resource_type="script",
+    )
+
+    assert _drive_route(request).actions == ["abort"]
+
+
+def test_proxied_listed_domain_document_is_continued(_amazon_listed_and_proxied):
+    request = _FakePageRequest(
+        "https://www.amazon.sa/dp/B0ABC",
+        page_url="https://www.amazon.sa/dp/B0ABC",
+        is_navigation=True,
+        resource_type="document",
+    )
+
+    assert _drive_route(request).actions == ["continue_"]
+
+
+def test_direct_leg_of_a_listed_domain_keeps_the_pre_change_decision(monkeypatch):
+    # Same page, same script -- but the leg was never recorded as proxied,
+    # so the registry's DIRECT default applies and the pre-B5 decision
+    # (script allowed) stands.
+    from app_shared.profiles import browser_resource_policy
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        browser_resource_policy,
+        "get_settings",
+        lambda: SimpleNamespace(BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS=("amazon.sa",)),
+    )
+    request = _FakePageRequest(
+        "https://www.amazon.sa/bundle.js",
+        page_url="https://www.amazon.sa/dp/B0ABC",
+        is_navigation=False,
+        resource_type="script",
+    )
+
+    assert _drive_route(request).actions == ["continue_"]
+
+
+def test_default_settings_produce_the_pre_change_decision_on_a_proxied_leg(monkeypatch):
+    # The shipped default (`BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS == ()`):
+    # a proxied Amazon leg behaves byte-for-byte as it did before B5 --
+    # script continues, image still aborts on the default type blocklist.
+    from app_shared.profiles import browser_resource_policy
+    from types import SimpleNamespace
+
+    from scrape_core.browser.domain_profile_registry import (
+        clear_domain_transport,
+        set_domain_transport,
+    )
+
+    monkeypatch.setattr(
+        browser_resource_policy,
+        "get_settings",
+        lambda: SimpleNamespace(BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS=()),
+    )
+    set_domain_transport("www.amazon.sa", "PROXY")
+    try:
+        script = _FakePageRequest(
+            "https://www.amazon.sa/bundle.js",
+            page_url="https://www.amazon.sa/dp/B0ABC",
+            is_navigation=False,
+            resource_type="script",
+        )
+        image = _FakePageRequest(
+            "https://www.amazon.sa/hero.jpg",
+            page_url="https://www.amazon.sa/dp/B0ABC",
+            is_navigation=False,
+            resource_type="image",
+        )
+
+        assert _drive_route(script).actions == ["continue_"]
+        assert _drive_route(image).actions == ["abort"]
+    finally:
+        clear_domain_transport("www.amazon.sa")
+
+
+def test_request_without_a_frame_falls_back_to_its_own_host(_amazon_listed_and_proxied):
+    # A Playwright request whose `frame` is unavailable (service worker,
+    # or any stand-in that never had one) must not raise -- the handler
+    # falls back to the request's own hostname, which for a same-origin
+    # sub-resource is still the listed domain.
+    request = _FakeRequest(
+        "https://www.amazon.sa/bundle.js",
+        is_navigation=False,
+        resource_type="script",
+    )
+
+    assert _drive_route(request).actions == ["abort"]

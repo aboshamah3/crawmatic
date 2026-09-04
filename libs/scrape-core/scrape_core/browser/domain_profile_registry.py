@@ -49,9 +49,34 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["set_domain_profile", "get_domain_profile", "clear_domain_profile"]
+__all__ = [
+    "set_domain_profile",
+    "get_domain_profile",
+    "clear_domain_profile",
+    "set_domain_transport",
+    "get_domain_transport",
+    "clear_domain_transport",
+]
 
 _profile_by_host: dict[str, Any] = {}
+
+#: EPA B5: the same side-channel, carrying each dispatched target's
+#: PROXY/DIRECT transport instead of its profile. Needed for exactly the
+#: reason the profile map is: ``PLAYWRIGHT_ABORT_REQUEST`` receives only
+#: the bare Playwright ``Request``, never the Scrapy request whose
+#: ``meta`` says whether this leg was routed through a paid proxy
+#: context. ``generic_browser_price_spider._browser_request_for`` records
+#: it from the SAME predicate the ledger prices on
+#: (``scrape_core.netledger_middleware._is_proxied``) so the two can
+#: never drift into two different notions of "proxied".
+_transport_by_host: dict[str, str] = {}
+
+#: What :func:`get_domain_transport` returns for a host nobody recorded.
+#: DIRECT is the safe default in both directions: it is what an
+#: unproxied leg genuinely is, and it is the value for which B5's
+#: document-only rule never fires — an unknown host therefore keeps the
+#: pre-B5 decision rather than having sub-resources aborted on a guess.
+DEFAULT_TRANSPORT = "DIRECT"
 
 
 def set_domain_profile(hostname: str | None, profile: Any) -> None:
@@ -89,3 +114,39 @@ def clear_domain_profile(hostname: str | None) -> None:
     if not hostname:
         return
     _profile_by_host.pop(hostname.lower(), None)
+
+
+def set_domain_transport(hostname: str | None, transport: str) -> None:
+    """Record `transport` (``"PROXY"``/``"DIRECT"``) for `hostname`.
+
+    Same falsy-hostname no-op and same overwrite-never-append bounds as
+    :func:`set_domain_profile` (see module docstring). The value is the
+    ledger's own transport notion, produced by the caller from
+    ``scrape_core.netledger_middleware._is_proxied(meta)`` — this module
+    never re-derives it.
+    """
+    if not hostname:
+        return
+    _transport_by_host[hostname.lower()] = transport
+
+
+def get_domain_transport(hostname: str | None) -> str:
+    """The transport recorded for `hostname`, or :data:`DEFAULT_TRANSPORT`.
+
+    Never ``None`` and never raises: the caller
+    (:func:`scrape_core.browser.ssrf.abort_unsafe_request`) passes the
+    result straight into
+    :func:`~app_shared.profiles.browser_resource_policy.should_block`,
+    whose `transport` parameter has no "unknown" state — a host nobody
+    recorded is treated as DIRECT, i.e. as the pre-B5 decision.
+    """
+    if not hostname:
+        return DEFAULT_TRANSPORT
+    return _transport_by_host.get(hostname.lower(), DEFAULT_TRANSPORT)
+
+
+def clear_domain_transport(hostname: str | None) -> None:
+    """Remove any recorded transport for `hostname`. Test/teardown seam only."""
+    if not hostname:
+        return
+    _transport_by_host.pop(hostname.lower(), None)

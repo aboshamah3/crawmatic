@@ -175,9 +175,11 @@ def safety_spy(monkeypatch):
         spy.safety_checked = True
         return real_validate(url)
 
-    def spying_should_block(url: str, resource_type: str, domain_profile=None) -> bool:
+    def spying_should_block(url: str, resource_type: str, domain_profile=None, **kwargs) -> bool:
+        # `**kwargs` carries B5's keyword-only `domain`/`transport` through
+        # unchanged -- the spy asserts ORDER, never the decision itself.
         spy.checked_before_block_decision = spy.safety_checked
-        return should_block(url, resource_type, domain_profile)
+        return should_block(url, resource_type, domain_profile, **kwargs)
 
     monkeypatch.setattr(browser_resource_policy, "validate_competitor_url", spying_validate)
     monkeypatch.setattr(browser_resource_policy, "should_block", spying_should_block)
@@ -248,3 +250,199 @@ def test_split_attempt_bytes_multiple_documents_sum():
     main_document_bytes, subresource_bytes = split_attempt_bytes(observed)
     assert main_document_bytes == 500 + 1_300_000
     assert subresource_bytes == 0
+
+
+# --- EPA B5: document-only proxied browser legs for LISTED domains ------------
+#
+# The canary-gated rule added on 2026-09-03. Its whole safety property is
+# that it is OFF unless an operator lists a domain in
+# `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` (default `()`), AND the leg is
+# actually proxied. Every test below either pins that gate or pins the
+# unchanged default behaviour on the other side of it.
+
+
+@pytest.fixture
+def settings_with_amazon_listed(monkeypatch):
+    """`BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS == ("amazon.sa",)`.
+
+    Patches the settings accessor the policy module itself holds (never
+    the process-wide `get_settings` cache), mirroring this repo's
+    `monkeypatch.setattr(<module>, "get_settings", ...)` convention --
+    so no real `Settings()` (and therefore no env/`.env`) is needed.
+    """
+    monkeypatch.setattr(
+        browser_resource_policy,
+        "get_settings",
+        lambda: SimpleNamespace(BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS=("amazon.sa",)),
+    )
+
+
+@pytest.fixture
+def settings_with_nothing_listed(monkeypatch):
+    """The shipped default: the new rule can never fire."""
+    monkeypatch.setattr(
+        browser_resource_policy,
+        "get_settings",
+        lambda: SimpleNamespace(BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS=()),
+    )
+
+
+def test_blocklist_version_is_2():
+    # Bumped by B5 so a `policy_version` stamp on a canary run's log lines
+    # is never silently reinterpreted as a v1 (pre-document-only) decision.
+    assert browser_resource_policy.BLOCKLIST_VERSION == 2
+
+
+def test_proxied_blocked_resource_types_never_contains_document():
+    assert "document" not in browser_resource_policy.PROXIED_BLOCKED_RESOURCE_TYPES
+    assert browser_resource_policy.PROXIED_BLOCKED_RESOURCE_TYPES == frozenset(
+        {
+            "image",
+            "media",
+            "font",
+            "stylesheet",
+            "script",
+            "xhr",
+            "fetch",
+            "other",
+            "ping",
+            "websocket",
+        }
+    )
+
+
+def test_script_blocked_on_proxy_for_listed_domain(settings_with_amazon_listed):
+    assert should_block(
+        "https://www.amazon.sa/main.js",
+        "script",
+        None,
+        domain="www.amazon.sa",
+        transport="PROXY",
+    )
+
+
+def test_script_not_blocked_on_direct_for_listed_domain(settings_with_amazon_listed):
+    # DIRECT bytes are the fleet's own egress and cost nothing per byte --
+    # the document-only rule is a PROXY-cost rule, never a general one.
+    assert not should_block(
+        "https://www.amazon.sa/main.js",
+        "script",
+        None,
+        domain="www.amazon.sa",
+        transport="DIRECT",
+    )
+
+
+def test_document_not_blocked_on_proxy_for_listed_domain(settings_with_amazon_listed):
+    assert not should_block(
+        "https://www.amazon.sa/dp/B0ABC",
+        "document",
+        None,
+        domain="www.amazon.sa",
+        transport="PROXY",
+    )
+
+
+def test_script_not_blocked_on_proxy_for_unlisted_domain(settings_with_amazon_listed):
+    # noon.com is not listed: the DEFAULT blocklist (which never blocked
+    # `script` on an ordinary host) still decides, unchanged.
+    assert not should_block(
+        "https://www.noon.com/main.js",
+        "script",
+        None,
+        domain="www.noon.com",
+        transport="PROXY",
+    )
+
+
+def test_subdomain_of_a_listed_domain_matches(settings_with_amazon_listed):
+    # Suffix match on the listed registrable domain: `www.amazon.sa`
+    # (and any other host under it) is the same site as `amazon.sa`.
+    for host in ("amazon.sa", "www.amazon.sa", "m.www.amazon.sa"):
+        assert should_block(
+            f"https://{host}/main.js", "script", None, domain=host, transport="PROXY"
+        ), host
+
+
+def test_lookalike_domain_does_not_match_a_listed_domain(settings_with_amazon_listed):
+    # Same anti-substring property the host-category blocklist already has:
+    # `notamazon.sa` is a different site, never covered by `amazon.sa`.
+    assert not should_block(
+        "https://notamazon.sa/main.js",
+        "script",
+        None,
+        domain="notamazon.sa",
+        transport="PROXY",
+    )
+
+
+def test_proxy_rule_overrides_certification(settings_with_amazon_listed):
+    # "document only" means document only: a per-domain certification
+    # cannot re-admit a sub-resource on a proxied leg of a listed domain
+    # while the canary is measuring what document-only actually costs.
+    profile = SimpleNamespace(certified_resources={"xhr"})
+    assert should_block(
+        "https://www.amazon.sa/api/price",
+        "xhr",
+        profile,
+        domain="www.amazon.sa",
+        transport="PROXY",
+    )
+
+
+def test_default_empty_setting_leaves_proxied_listed_behaviour_unchanged(
+    settings_with_nothing_listed,
+):
+    # The shipped default: byte-for-byte today's behaviour on every domain
+    # and both transports -- `script` allowed, `image` blocked by the
+    # pre-existing default type blocklist, `document` never blocked.
+    assert not should_block(
+        "https://www.amazon.sa/main.js", "script", None,
+        domain="www.amazon.sa", transport="PROXY",
+    )
+    assert should_block(
+        "https://www.amazon.sa/hero.jpg", "image", None,
+        domain="www.amazon.sa", transport="PROXY",
+    )
+    assert not should_block(
+        "https://www.amazon.sa/dp/B0ABC", "document", None,
+        domain="www.amazon.sa", transport="PROXY",
+    )
+
+
+def test_omitting_domain_and_transport_is_the_pre_b5_decision(settings_with_amazon_listed):
+    # Every pre-B5 call site (positional-only) keeps its exact decision even
+    # when a domain IS listed -- the new dimension has to be passed in.
+    assert not should_block("https://www.amazon.sa/main.js", "script")
+    assert should_block("https://www.amazon.sa/hero.jpg", "image")
+
+
+def test_settings_failure_degrades_to_the_default_policy(monkeypatch):
+    # `should_block` is documented as pure and total. A misconfigured
+    # process (no env, unparseable settings) must degrade to "nothing
+    # listed" -- i.e. today's behaviour -- never raise into a route handler.
+    def _boom():
+        raise RuntimeError("settings unavailable")
+
+    monkeypatch.setattr(browser_resource_policy, "get_settings", _boom)
+    assert not should_block(
+        "https://www.amazon.sa/main.js", "script", None,
+        domain="www.amazon.sa", transport="PROXY",
+    )
+
+
+def test_evaluate_request_forwards_domain_and_transport(settings_with_amazon_listed):
+    # The one entry point real call sites use must carry the new dimension
+    # through -- safety check first, as always.
+    assert evaluate_request(
+        "https://www.amazon.sa/main.js", "script", None,
+        domain="www.amazon.sa", transport="PROXY",
+    )
+    assert not evaluate_request(
+        "https://www.amazon.sa/dp/B0ABC", "document", None,
+        domain="www.amazon.sa", transport="PROXY",
+    )
+    assert not evaluate_request(
+        "https://www.amazon.sa/main.js", "script", None,
+        domain="www.amazon.sa", transport="DIRECT",
+    )

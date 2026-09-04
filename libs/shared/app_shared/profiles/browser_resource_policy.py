@@ -45,6 +45,17 @@ target through this module.
   this policy, unconditionally — the one thing the scraper actually
   fetches the page for.
 
+**Document-only proxied legs (EPA B5, 2026-09-03, canary-gated)**: for a
+domain an operator lists in ``BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS``,
+and ONLY on a leg whose ``transport`` is ``"PROXY"``, every sub-resource
+type in :data:`PROXIED_BLOCKED_RESOURCE_TYPES` is aborted — the paid
+proxy carries the document and nothing else. The setting defaults to
+``()``: with it, every domain on every transport decides exactly as it
+did before B5, which is the whole point — the rule ships dark and the
+owner turns it on for one domain after the canary
+(``scripts/canary_document_only_browser.py``) measures success rate,
+wall time and proxy bytes per page on both sides.
+
 **Certification (deferred wiring, not deferred code)**: ``only the
 profile's certified_resources are allowed through`` — a resource type
 present in ``domain_profile.certified_resources`` is let through
@@ -76,11 +87,13 @@ from __future__ import annotations
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
+from app_shared.config import get_settings
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
 __all__ = [
     "BLOCKLIST_VERSION",
     "BLOCKED_RESOURCE_TYPES",
+    "PROXIED_BLOCKED_RESOURCE_TYPES",
     "should_block",
     "evaluate_request",
     "split_attempt_bytes",
@@ -91,12 +104,41 @@ __all__ = [
 #: blocked" should never be silently reinterpreted by a later rule-set
 #: change, mirroring ``scripts/classify_match_set.py``'s
 #: ``CLASSIFIER_VERSION`` convention.
-BLOCKLIST_VERSION = 1
+#: * v1 — the default type/host blocklist below.
+#: * v2 (EPA B5, 2026-09-03) — adds the canary-gated document-only rule
+#:   for PROXIED legs of operator-listed domains
+#:   (:data:`PROXIED_BLOCKED_RESOURCE_TYPES`). The bump is what keeps a
+#:   canary run's ``policy_version`` stamps distinguishable from every
+#:   line logged before it, even though the v2 default (nothing listed)
+#:   decides identically to v1 on every domain.
+BLOCKLIST_VERSION = 2
 
 #: Resource types blocked on every domain by default (subject to
 #: per-domain ``certified_resources`` override). ``document`` is
 #: deliberately absent — see :func:`should_block`'s unconditional guard.
 BLOCKED_RESOURCE_TYPES: frozenset[str] = frozenset({"image", "media", "font", "stylesheet"})
+
+#: EPA B5: everything a *document-only* proxied leg aborts. Applied ONLY
+#: to a domain an operator listed in
+#: ``BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS`` AND only when that leg's
+#: `transport` is ``"PROXY"``. ``document`` is deliberately absent (and
+#: unreachable anyway — :func:`should_block`'s first guard returns before
+#: this set is consulted): the page's own navigation is the one thing the
+#: proxy is being paid for.
+PROXIED_BLOCKED_RESOURCE_TYPES: frozenset[str] = frozenset(
+    {
+        "image",
+        "media",
+        "font",
+        "stylesheet",
+        "script",
+        "xhr",
+        "fetch",
+        "other",
+        "ping",
+        "websocket",
+    }
+)
 
 #: Ad/analytics/social host suffixes blocked regardless of resource type
 #: (versioned with ``BLOCKLIST_VERSION`` above). Exact-host or
@@ -163,6 +205,40 @@ def _is_blocked_host(host: str) -> bool:
     )
 
 
+def _proxied_document_only_domains() -> tuple[str, ...]:
+    """Operator-listed domains whose PROXIED legs are document-only (B5).
+
+    Reads ``Settings.BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS`` through the
+    module-level :func:`get_settings` (the seam tests monkeypatch, per
+    this repo's ``monkeypatch.setattr(<module>, "get_settings", ...)``
+    convention). ANY failure — a process with no env at all, an
+    unparseable value, a stand-in settings object without the field —
+    degrades to ``()``, i.e. to the pre-B5 behaviour, because
+    :func:`should_block` is documented as pure and total and is called
+    from inside a Playwright route handler where raising would fail an
+    ordinary sub-resource in a way nothing downstream could explain.
+    """
+    try:
+        listed = getattr(get_settings(), "BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS", ()) or ()
+        return tuple(str(domain).strip().lower() for domain in listed if str(domain).strip())
+    except Exception:  # noqa: BLE001 - see docstring: never raise into a route handler
+        return ()
+
+
+def _is_listed_domain(domain: str | None, listed: tuple[str, ...]) -> bool:
+    """Exact-host or dot-suffix match against `listed` (never a substring).
+
+    ``amazon.sa`` therefore covers ``www.amazon.sa`` and any deeper
+    subdomain — one registrable domain is one site, and the canary lists
+    a site — while ``notamazon.sa`` is a different site and never
+    matches, exactly like :func:`_is_blocked_host`'s host-category rule.
+    """
+    if not domain or not listed:
+        return False
+    host = domain.strip().lower().rstrip(".")
+    return any(host == entry or host.endswith("." + entry) for entry in listed)
+
+
 def _certified_resource_types(domain_profile: Any) -> frozenset[str]:
     """Tolerant read of ``domain_profile.certified_resources``.
 
@@ -176,24 +252,57 @@ def _certified_resource_types(domain_profile: Any) -> frozenset[str]:
     return frozenset(values)
 
 
-def should_block(url: str, resource_type: str, domain_profile: Any = None) -> bool:
+def should_block(
+    url: str,
+    resource_type: str,
+    domain_profile: Any = None,
+    *,
+    domain: str | None = None,
+    transport: str = "DIRECT",
+) -> bool:
     """``True`` iff `resource_type` at `url` should be aborted, per the default policy.
 
     Pure and total: never raises, never performs I/O. Order of checks
-    (all three are independent overrides of "block", evaluated in the
+    (all are independent overrides of "block", evaluated in the
     safest-first order):
 
     1. ``resource_type == "document"`` -> always ``False``. The page's
-       own navigation is never blocked by this policy.
-    2. `resource_type` in `domain_profile`'s (tolerant) certified set ->
+       own navigation is never blocked by this policy, on any transport,
+       listed or not.
+    2. **EPA B5, canary-gated**: `domain` is listed in
+       ``BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS`` AND ``transport ==
+       "PROXY"`` AND `resource_type` is in
+       :data:`PROXIED_BLOCKED_RESOURCE_TYPES` -> ``True``. Deliberately
+       ABOVE certification: "document only" means document only, so a
+       per-domain ``certified_resources`` entry cannot re-admit a
+       sub-resource onto a paid proxy leg while the canary is measuring
+       what document-only actually costs.
+    3. `resource_type` in `domain_profile`'s (tolerant) certified set ->
        always ``False``. Certification is a full override for that
        resource type on that domain — see the module docstring.
-    3. `resource_type` in :data:`BLOCKED_RESOURCE_TYPES` -> ``True``.
-    4. The URL's host matches an ad/analytics/social category
+    4. `resource_type` in :data:`BLOCKED_RESOURCE_TYPES` -> ``True``.
+    5. The URL's host matches an ad/analytics/social category
        (:data:`_AD_ANALYTICS_SOCIAL_HOST_SUFFIXES`) -> ``True``,
        regardless of `resource_type` (an ad network's own script/xhr
        calls are blocked exactly like its images).
-    5. Otherwise ``False``.
+    6. Otherwise ``False``.
+
+    `domain` is the **page's** domain, not the sub-resource's own host: an
+    Amazon page's images and scripts live on ``m.media-amazon.com``/
+    ``images-*.ssl-images-amazon.com``, which would never match a listed
+    ``amazon.sa``, so matching on the sub-resource host would make the
+    rule bite on almost nothing it exists to stop. `transport` is the
+    same PROXY/DIRECT notion the ledger records
+    (scrape-core's ``netledger_middleware.is_proxied`` — named with the
+    hyphen deliberately: no file under ``app_shared`` may contain that
+    package's importable name at all, even in prose,
+    ``tests/unit/test_import_boundaries.py``): a DIRECT browser
+    leg's bytes are the fleet's own egress and cost nothing per byte, so
+    the rule never applies to one.
+
+    Both are keyword-only and default to "no domain, DIRECT", so every
+    pre-B5 positional call site keeps its exact previous decision, and
+    with the shipped empty setting rule 2 can never fire at all.
 
     Callers that also need the SSRF/redirect safety check to run FIRST
     (i.e. every real request-interception call site) must use
@@ -201,6 +310,12 @@ def should_block(url: str, resource_type: str, domain_profile: Any = None) -> bo
     """
     if resource_type == "document":
         return False
+    if (
+        transport == "PROXY"
+        and resource_type in PROXIED_BLOCKED_RESOURCE_TYPES
+        and _is_listed_domain(domain, _proxied_document_only_domains())
+    ):
+        return True
     if resource_type in _certified_resource_types(domain_profile):
         return False
     if resource_type in BLOCKED_RESOURCE_TYPES:
@@ -208,7 +323,14 @@ def should_block(url: str, resource_type: str, domain_profile: Any = None) -> bo
     return _is_blocked_host(_hostname(url))
 
 
-def evaluate_request(url: str, resource_type: str, domain_profile: Any = None) -> bool:
+def evaluate_request(
+    url: str,
+    resource_type: str,
+    domain_profile: Any = None,
+    *,
+    domain: str | None = None,
+    transport: str = "DIRECT",
+) -> bool:
     """``True`` iff `url`/`resource_type` should be aborted -- safety FIRST, then policy.
 
     The one entry point every real request-interception call site should
@@ -220,12 +342,16 @@ def evaluate_request(url: str, resource_type: str, domain_profile: Any = None) -
     unsafe -- `should_block`/`certified_resources` are never even
     consulted, so certifying a resource type can never let an SSRF
     target through. Only a URL that passes reaches the cost policy.
+
+    `domain`/`transport` (EPA B5) are forwarded verbatim to
+    :func:`should_block` — see its docstring for why the PAGE's domain,
+    not the sub-resource's own host, is the thing matched.
     """
     try:
         validate_competitor_url(url)
     except UnsafeUrlError:
         return True
-    return should_block(url, resource_type, domain_profile)
+    return should_block(url, resource_type, domain_profile, domain=domain, transport=transport)
 
 
 def split_attempt_bytes(observed: Iterable[tuple[str, int]]) -> tuple[int, int]:

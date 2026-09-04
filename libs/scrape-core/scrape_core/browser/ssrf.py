@@ -71,7 +71,7 @@ from app_shared.profiles.browser_resource_policy import BLOCKLIST_VERSION as RES
 from app_shared.profiles.browser_resource_policy import evaluate_request as evaluate_resource_request
 from app_shared.url_safety import UnsafeUrlError
 
-from scrape_core.browser.domain_profile_registry import get_domain_profile
+from scrape_core.browser.domain_profile_registry import get_domain_profile, get_domain_transport
 from scrape_core.observability import log_event
 from scrape_core.safety.fetch import Resolver, system_resolver, validate_resolved_target
 from scrape_core.safety.rejection_registry import mark_rejected
@@ -134,6 +134,34 @@ def _is_navigation_request(request: Any) -> bool:
     return getattr(request, "resource_type", None) == "document"
 
 
+def _page_hostname(request: Any) -> str | None:
+    """The hostname of the PAGE this sub-resource belongs to (EPA B5).
+
+    Playwright exposes it as ``request.frame.url`` -- the document the
+    frame is currently on, which for every sub-resource of a target page
+    is that target's own URL. This is the value B5's document-only rule
+    must match on, never the sub-resource's own host: an ``amazon.sa``
+    page's scripts and images are served from ``m.media-amazon.com`` and
+    friends, so matching the sub-resource host would leave the rule
+    firing on almost nothing it exists to stop.
+
+    Totally defensive by design -- ``frame`` is unavailable for
+    service-worker requests and raises on some Playwright builds, and
+    every unit-test stand-in is free not to have one. Any failure
+    returns ``None``, and the caller falls back to the sub-resource's own
+    hostname (correct for a same-origin sub-resource, and merely
+    "matches nothing" otherwise -- i.e. the pre-B5 decision).
+    """
+    try:
+        frame = getattr(request, "frame", None)
+        frame_url = getattr(frame, "url", None)
+        if not frame_url:
+            return None
+        return urlsplit(frame_url).hostname
+    except Exception:  # noqa: BLE001 - never let a page-domain lookup fail a request
+        return None
+
+
 def _validate(url: str, resolver: Resolver) -> None:
     """Run entirely inside `loop.run_in_executor` -- the resolver call
     (blocking DNS) plus the reused safety checks, off the event-loop thread."""
@@ -187,7 +215,25 @@ async def abort_unsafe_request(request: "PlaywrightRequest", *, resolver: Resolv
         sub_resource_type = getattr(request, "resource_type", None)
         sub_resource_host = urlsplit(request.url).hostname
         domain_profile = get_domain_profile(sub_resource_host)
-        blocked = evaluate_resource_request(request.url, sub_resource_type, domain_profile)
+        # EPA B5: the document-only rule needs two facts this hook is not
+        # handed -- WHICH page this sub-resource belongs to (recovered
+        # from `request.frame.url`, falling back to the sub-resource's own
+        # host) and whether that page's leg is PROXIED (recovered from the
+        # same dispatch-time side-channel as the profile, recorded by the
+        # spider from the ledger's own `_is_proxied` predicate). Both
+        # default to "unlisted domain, DIRECT", for which `should_block`
+        # decides exactly as it did before B5 -- and with the shipped
+        # empty `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` the rule cannot
+        # fire on any domain at all.
+        page_host = _page_hostname(request) or sub_resource_host
+        transport = get_domain_transport(page_host)
+        blocked = evaluate_resource_request(
+            request.url,
+            sub_resource_type,
+            domain_profile,
+            domain=page_host,
+            transport=transport,
+        )
         if blocked:
             log_event(
                 logger,
@@ -195,6 +241,7 @@ async def abort_unsafe_request(request: "PlaywrightRequest", *, resolver: Resolv
                 url=request.url,
                 resource_type=sub_resource_type,
                 policy_version=RESOURCE_POLICY_VERSION,
+                transport=transport,
             )
         return blocked
 

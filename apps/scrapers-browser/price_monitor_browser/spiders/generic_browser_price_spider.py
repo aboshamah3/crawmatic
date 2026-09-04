@@ -57,7 +57,7 @@ from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 
 from scrape_core.browser.byte_capture import ByteAccumulator
-from scrape_core.browser.domain_profile_registry import set_domain_profile
+from scrape_core.browser.domain_profile_registry import set_domain_profile, set_domain_transport
 from scrape_core.browser.page import build_page_methods, effective_timeout
 from scrape_core.browser.variant import VariantConfigError
 from scrape_core.adapters import (
@@ -74,6 +74,7 @@ from scrape_core.errors import (
 )
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, release_slot
+from scrape_core.netledger_middleware import is_proxied
 from scrape_core.result_builder import build_scrape_result
 from scrape_core.targets import (
     AdmissionContext,
@@ -621,6 +622,22 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         # browser fetch carries the realistic UA too.
         if context_kwargs:
             meta["playwright_context_kwargs"] = context_kwargs
+
+        # EPA B5: record whether THIS leg's bytes will cross the paid
+        # proxy, keyed by the same document hostname as the profile above,
+        # so `scrape_core.browser.ssrf.abort_unsafe_request` can apply the
+        # document-only rule to a listed domain's proxied legs only. The
+        # predicate is the ledger's own `_is_proxied(meta)` (imported, not
+        # re-implemented) so "proxied" can never come to mean one thing to
+        # the resource policy and another to the cost ledger -- which is
+        # exactly the drift that would make the canary's proxy-bytes
+        # measurement disagree with what the ledger bills. Recorded AFTER
+        # the proxy-assignment block above, since that is what sets
+        # `meta["playwright_context"]`.
+        set_domain_transport(
+            urlsplit(adapter_request.url).hostname,
+            "PROXY" if is_proxied(meta) else "DIRECT",
+        )
 
         return scrapy.Request(
             url=adapter_request.url,
