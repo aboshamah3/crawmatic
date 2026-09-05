@@ -27,8 +27,11 @@ target is not met and could not have been: **G1 (D1 canary), G2
 transcript does not exist** (it needs both a release and a real
 `OPENAI_API_KEY`, which the box does not have); and **Scenario 2 pricing is
 code-complete on both surfaces but live on neither** (the marketing `web` deploy
-and the SaaS release are both queued, and the SaaS release is additionally
-blocked by the owner's Stripe price-seeding step). One H item (H12, disk) is a
+and the SaaS releases are all queued, and **every SaaS release on this branch —
+starting with the first one, C5, not just the pricing release D6 — is blocked by
+the owner's Stripe price-seeding step**, because `4d0409d` made
+`STRIPE_PRICE_STARTER/GROWTH/SCALE` required at boot and it is already in the
+history of the C5 build). One H item (H12, disk) is a
 pure owner action that remains open, and two more (H3 fair queue, H10 second
 SaaS replica) are deliberate deferrals with triggers. Read this document as a
 **code-readiness re-score of 88/100** — a judgement over the same checklist,
@@ -39,8 +42,9 @@ release runbook that Phase R must execute, in order, to move the second number.
 
 ### What Phase R must still do to meet the plan's target
 1. Engine releases 1–3 and SaaS releases 1–3 with the prerequisites in §5 (env
-   pins, Stripe price keys, the SaaS `PROXY_BROWSER` migration ahead of the
-   engine transport counters, the netledger buffer drain).
+   pins, **the Stripe price keys before the FIRST SaaS release**, the SaaS
+   `PROXY_BROWSER` migration ahead of the engine transport counters, the
+   netledger buffer drain).
 2. Run G1 → G2 → G3 in that order and record their evidence — these are the
    only proofs that close B1 and B2 in production.
 3. Run the 2026-10-01 fleet-budget check that closes B3 in production (G4's
@@ -65,7 +69,7 @@ Score vocabulary: `CLOSED (code + unit proof)` · `CLOSED pending prod proof
 | B1 | A1 (durable `breaker_evaluate` cadence), A2 (auto-close + `/ready` evidence check), G3 (idle soak) — *breaker cold-start deadlock stops all paid scraping after one idle hour* | engine `7814eae`, `96d56ce` | Phase A gate PASS: cadence at `PROXY_BREAKER_EVAL_INTERVAL_SECONDS` (300 s × 4 ≤ 3600), idempotency test derived from `DURABLE_CADENCE_KEYS` (8 keys), `PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS=3600`, five-case auto-close matrix pinned by tests, `/ready` `breaker_evidence` participates in the 200/503 decision; suite 3,843 passed | **G3 3 h idle soak — NOT RUN** | CLOSED pending prod proof (Phase R: G3) |
 | B2 | A3 (STARTED-target reaper + job deadline), G2 (deploy-survival test) — *deploys orphan RUNNING jobs forever* | engine `0c81cb8` | Phase A gate PASS: revert sweep provably cannot reach a non-STARTED status; deadline sweep scoped to RUNNING jobs and `PENDING/STARTED/DEFERRED` targets; reverted rows clear `dispatched_at`, `dispatch_intent_id`, `locked_at`, `started_at`; `target_started_age_seconds=2_700.0`; tick order reap → finalize | **G2 redeploy-scrapers-mid-job — NOT RUN** | CLOSED pending prod proof (Phase R: G2) |
 | B3 | A4 (cap policy + 6-hourly carry-forward cadence), G4 (roll-forward proof) — *fleet monthly budget cap evaporates at the month boundary* | engine `6ce4d0e`, `5d3ab4f` | Phase A gate PASS (never lowers or overwrites a non-NULL limit, never writes counters, carries the latest earlier cap, in-pass feedback). **G4 integration proof DONE** on a self-provisioned `postgres:18-alpine` at alembic head: seeded `2026_10`, called `roll_fleet_budget_caps_forward(now=2026-10-28)` → proxy `2026_10`/`2026_11` = 75,000,000 µUSD, browser = 25,000,000 µUSD; second call `written=0` (idempotent). Evidence: `/srv/crawmatic/evidence/g4-roll-forward-2026-09-04/REPORT.md` | **2026-10-01 production check — NOT RUN** (owner); cap env vars + seeding are Phase R steps | CLOSED pending prod proof (Phase R: G4-prod, 2026-10-01) |
-| B4 | C1 (`control_plane_rules` + `product_ceiling`), C2 (six routes + ceiling enforcement), C3 (SaaS desired-state emitters + live client), C4 (live contract test), C5 (release) — *SaaS ↔ engine control plane unimplemented on both sides* | engine `da19005`, `053ceea`, `565d90d`; saas `0029517`, `7fd7e49`, `e8b36e6` | Phase C gate PASS after one fix cycle. Cross-repo contract checked field-by-field (external_id `monitor-<projectId>`, status vocabulary, cadence sets 60/360/720/1440/10080, snake_case bodies, `Bearer` + `hmac.compare_digest`, 409 envelopes). Engine suite 3,991 passed; migration head `c8d2e3f4a5b6`; SaaS targeted 19 files / 412 passed. C3 blocker (sticky DELINQUENT on a recovered, portal-cancelled subscription) fixed by `e8b36e6` | **Never executed against a real stack:** `tests/integration/test_control_plane_rls.py` (collects only) and the C4 live contract test (11 skipped without `ENGINE_CONTRACT_BASE_URL` + `SAAS_SERVICE_TOKEN`). C5 release NOT RUN | CLOSED pending prod proof (Phase R: C5) |
+| B4 | C1 (`control_plane_rules` + `product_ceiling`), C2 (six routes + ceiling enforcement), C3 (SaaS desired-state emitters + live client), C4 (live contract test), C5 (release) — *SaaS ↔ engine control plane unimplemented on both sides* | engine `da19005`, `053ceea`, `565d90d`; saas `0029517`, `7fd7e49`, `e8b36e6` | Phase C gate PASS after one fix cycle. Cross-repo contract checked field-by-field (external_id `monitor-<projectId>`, status vocabulary, cadence sets 60/360/720/1440/10080, snake_case bodies, `Bearer` + `hmac.compare_digest`, 409 envelopes). Engine suite 3,991 passed; alembic head `c8d2e3f4a5b6` (an alembic revision id, not a git SHA); SaaS targeted 19 files / 412 passed. C3 blocker (sticky DELINQUENT on a recovered, portal-cancelled subscription) fixed by `e8b36e6` | **Never executed against a real stack:** `tests/integration/test_control_plane_rls.py` (collects only) and the C4 live contract test (11 skipped without `ENGINE_CONTRACT_BASE_URL` + `SAAS_SERVICE_TOKEN`). C5 release NOT RUN | CLOSED pending prod proof (Phase R: C5) |
 
 ---
 
@@ -76,7 +80,7 @@ Score vocabulary: `CLOSED (code + unit proof)` · `CLOSED pending prod proof
 | H1 | F1 (Phase R, env-only) — *worker/scheduler liveness invisible; `/ready` reports `heartbeats: not-configured`; no uptime check, no APM* | none (no code change required) | none — the `/ready` heartbeat machinery already exists; only `READY_REQUIRED_HEARTBEAT_SERVICES` is unset in prod | Set `READY_REQUIRED_HEARTBEAT_SERVICES=scheduler,worker` at release. External uptime-probe account signup was **not authorized** for this run | DEFERRED (owner: owner, by: Phase R task F1 — same window as engine release 1; external probe by the first paying customer) |
 | H2 | F2 — *40-thread Starlette pool vs `DB_POOL_SIZE=5`* | engine `34c3677`, `1dae342` | `API_THREAD_POOL_SIZE=8`, `DB_POOL_SIZE` 5→8, `DB_MAX_OVERFLOW` 2→4; startup hook `apps/api/app/thread_pool.py:configure_thread_pool` sets the anyio limiter; `tests/unit/test_api_thread_pool.py` 3 tests incl. a TestClient boot asserting the limiter | **Prod Railway pins `DB_POOL_SIZE=5` / `DB_MAX_OVERFLOW=2` explicitly on all five engine services**, overriding the new defaults — must be raised or unset at engine release 1 or the fix does nothing | CLOSED pending prod proof (Phase R: A5) |
 | H3 | B4 — *efficiency levers shipped but OFF (`JOBS_COALESCING_ENABLED`, `SCHEDULER_FAIR_QUEUE_ENABLED`)* | engine `b88236e` | `JOBS_COALESCING_ENABLED` default flipped to `True` (`config.py:820`); `SCHEDULER_FAIR_QUEUE_ENABLED` stays `False` (`config.py:768`); both pinned by `tests/unit/test_w4_flag_defaults.py` incl. env override | Confirm the prod values carry the new default after engine release 2 (prod sets every flag NULL today, so code defaults rule) | Coalescing: CLOSED pending prod proof (Phase R: B6). Fair queue: DEFERRED (owner: owner, by: 3+ tenants) |
-| H4 | B1 (micro-USD ledger), B2 (price by bytes / browser seconds), B4 (cap re-seeding note) — *cost model wrong by 47×–2,174× from the one-cent floor* | engine `04acd4b`, `d2728f2`, `b88236e` | Phase B gate PASS. 15 (table, column) pairs migrated to µUSD by `b7c1d2e3f4a5` (one head, `ALTER … USING`, downgrade reverses); the reviewer re-derived the pricing arithmetic independently (PROXY 113,900 B → 107 µUSD; BROWSER 2,530,000 B + 7.7 s → 2,504; DIRECT → None); `MICRO_UNITS_PER_USD` single definition, residual `cost_minor_units` = 0; suite 3,911 passed | Data migration + cap re-seeding are engine release 2 steps; the netledger Redis buffer must be drained first (payload keys renamed) | CLOSED pending prod proof (Phase R: B6) |
+| H4 | B1 (micro-USD ledger), B2 (price by bytes / browser seconds), B4 (cap re-seeding note) — *cost model wrong by 47×–2,174× from the one-cent floor* | engine `04acd4b`, `d2728f2`, `b88236e` | Phase B gate PASS. 15 (table, column) pairs migrated to µUSD by alembic revision `b7c1d2e3f4a5` (an alembic revision id, not a git SHA; one head, `ALTER … USING`, downgrade reverses); the reviewer re-derived the pricing arithmetic independently (PROXY 113,900 B → 107 µUSD; BROWSER 2,530,000 B + 7.7 s → 2,504; DIRECT → None); `MICRO_UNITS_PER_USD` single definition, residual `cost_minor_units` = 0; suite 3,911 passed | Data migration + cap re-seeding are engine release 2 steps; the netledger Redis buffer must be drained first (payload keys renamed) | CLOSED pending prod proof (Phase R: B6) |
 | H5 | F3 — *unit suite not runnable standalone (5 tests need the `pgbouncer` host)* | engine `c49619f` | `integration` marker registered in `pyproject.toml`; exactly 5 tests marked; `-m integration --collect-only` → `5/3811 collected (3806 deselected)`; CI runs `-m "not integration"`; suite 3,787 passed / 5 deselected | none needed | CLOSED (code + unit proof). Residual: CI never runs those 5 tests (documented gap) |
 | H6 | F4 — *release manifest drift (`source.dirty: true`, stale SaaS SHA)* | engine `ef141b5` | `scripts/write_release_manifest.py` records `source.engine_sha` / `source.saas_sha` / `source.dirty` and exits 2 unless cleanliness is confirmed; `build_deployment_attestation.py::load_and_verify_manifest` raises on `source.dirty is True` (independent second gate); `docs/DEPLOY-ROLLBACK.md` Step 0 added | Only a real deploy proves the manifest regenerates | CLOSED pending prod proof (Phase R: A5) |
 | H7 | F5 — *SaaS production env validated lazily, not at boot* | saas `dcb2c8b` | `setup.ts:16-18` calls `assertProductionEnv(); resolveAiProvider(); announceBoot();` in that order; `assertProductionEnv` throws synchronously; `setup.test.ts` covers missing-key-rejects, full-env-resolves, non-production-tolerant | Boot behaviour changes on the next SaaS release — and `STRIPE_PRICE_*` now falls under the same assertion (see §3) | CLOSED pending prod proof (Phase R: SaaS release) |
@@ -111,15 +115,25 @@ Two provisional flags are still `true` and must be flipped at release:
 `COGS_IS_PROVISIONAL` (`cogs.ts:172`; flip together with `PROXY_BROWSER`
 2,400 → 250 after the B5 canary).
 
-### The Stripe owner gate
+### The Stripe owner gate — it binds the FIRST SaaS release, not D6
 `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_GROWTH` and `STRIPE_PRICE_SCALE` are now
 asserted at boot by `serverEnv.ts`. **Any SaaS deploy from this branch at or
 after `4d0409d` refuses to start until all three are set in Railway.** Only a
-deploy pinned at or before `7fd7e49` escapes the gate. The values come from an
-owner-run `STRIPE_API_KEY=… npx vite-node src/scripts/stripeSeedPrices.ts --
---run` — live Stripe seeding and price archiving were **not authorized** for
-this run, so D6 and E10 are owner-gated. The seeder never archives; a price
-mismatch is a manual money decision (bump `LOOKUP_KEY_VERSION`).
+deploy pinned at or before `7fd7e49` escapes the gate.
+
+**The first such deploy is SaaS release 1 (task C5), not D6.** C5 carries the
+C3 fix `e8b36e6`, and `git merge-base --is-ancestor 4d0409d e8b36e6` is true —
+`4d0409d` is already in its history. `BLOCKERS.md` records the gate as binding
+"the SaaS release that carries 4d0409d (D6)"; that note went stale the moment
+`e8b36e6` landed on top of `4d0409d`. Following the old ordering literally would
+crash-loop the SaaS server on the C5 release. The owner step is therefore placed
+before C5 in §5.
+
+The values come from an owner-run `STRIPE_API_KEY=… npx vite-node
+src/scripts/stripeSeedPrices.ts -- --run` — live Stripe seeding and price
+archiving were **not authorized** for this run, so every SaaS release from C5
+onward (C5, D6, E10) is owner-gated on this step. The seeder never archives; a
+price mismatch is a manual money decision (bump `LOOKUP_KEY_VERSION`).
 
 Business signal, not a test artifact: **Project M's margin is 85.47 %, below the
 150 % floor**, re-derived by the Phase D reviewer from the calibrated rates.
@@ -187,14 +201,17 @@ Carries F2/F3/F4 + A1–A4 (engine `1dae342` … `6ce4d0e`).
 engine release 2 ships transport counters.** The sequencing is documented only —
 there is no runtime guard. If the counters arrive first, the nightly
 `marginReportJob`'s `createMany` fails and the whole project-day cost-event
-batch is lost. Either run `prisma migrate deploy` by hand, or order a SaaS
-release carrying `aa99721` ahead of engine release 2 (note that the Stripe gate
-in §3 applies to any SaaS build at or after `4d0409d`).
+batch is lost. Either run `prisma migrate deploy` by hand — the safe option if
+no SaaS release is ready yet — or order a SaaS release carrying `aa99721` ahead
+of engine release 2. **If you choose the release, the Stripe owner gate below
+must be done first**: every SaaS build on this branch except one pinned at or
+before `7fd7e49` contains `4d0409d` and will not boot without
+`STRIPE_PRICE_STARTER/GROWTH/SCALE`.
 
 ### Engine release 2 (task B6) — money truth, cap seeding, canary
 Carries B1/B2/B3-engine/B4/B5 (engine `04acd4b` … `dccb4f5`).
 - **Drain the netledger Redis buffer before deploying** — B1 renamed the payload keys.
-- Alembic `b7c1d2e3f4a5` rescales 15 columns via `ALTER … USING` (a real data migration). **Upgrade straight to head**: `c4b19e7a2f08` imports live model SQL constants, so stopping at an intermediate revision leaves a trigger naming columns that no longer exist (proven by G4's scratch run).
+- Alembic revision `b7c1d2e3f4a5` (an alembic revision id, not a git SHA) rescales 15 columns via `ALTER … USING` — a real data migration. **Upgrade straight to head**: alembic revision `c4b19e7a2f08` imports live model SQL constants, so stopping at an intermediate revision leaves a trigger naming columns that no longer exist (proven by G4's scratch run).
 - After the deploy, seed the caps (owner step B4, from the engine repo with prod DB access — run each with `--propose` first):
   ```
   python scripts/seed_fleet_budget_cap.py --monthly-cap-usd 75 --scope-key proxy   --months-ahead 1 --apply
@@ -210,9 +227,22 @@ Carries B1/B2/B3-engine/B4/B5 (engine `04acd4b` … `dccb4f5`).
 - `tests/integration/test_control_plane_rls.py` (engine) — collects but has never executed; needs Postgres plus the C1 migration.
 - The C4 live contract test (SaaS) — 11 tests skip without `ENGINE_CONTRACT_BASE_URL` **and** `SAAS_SERVICE_TOKEN` pointed at a real engine stack.
 
+### Owner gate — Stripe price keys, BEFORE the first SaaS release
+**This must happen before SaaS release 1 (C5), not at D6.** C5 carries
+`e8b36e6`, which has `4d0409d` in its history, and `4d0409d` made the three
+price keys required at boot. Skip this and the C5 SaaS deploy crash-loops.
+1. Run `STRIPE_API_KEY=… npx vite-node src/scripts/stripeSeedPrices.ts -- --run`.
+   It prints the three `STRIPE_PRICE_*=price_…` lines. It creates only missing
+   prices and never archives — a mismatch is a manual money decision
+   (`LOOKUP_KEY_VERSION` bump), and archiving old prices stays manual.
+2. Set `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_GROWTH` and `STRIPE_PRICE_SCALE`
+   on the SaaS server service in Railway.
+3. Only a SaaS deploy pinned at or before `7fd7e49` escapes this gate — no
+   release in this runbook is.
+
 ### Engine release 3 + SaaS release 1 (task C5) — control plane live
 Carries C1/C2 (engine `da19005`, `053ceea`, `565d90d`) and C3/C4 (saas
-`0029517`, `7fd7e49`, `e8b36e6`).
+`0029517`, `7fd7e49`, `e8b36e6`). **Prerequisite: the Stripe owner gate above.**
 - Operator check after the first reconcile window: grep the logs for
   `entitlement push was IGNORED as stale evidence`. Repeated hits for one tenant
   = a KILLED tenant (expected, see the `saas_status` deferred item) or two
@@ -224,9 +254,9 @@ Carries C1/C2 (engine `da19005`, `053ceea`, `565d90d`) and C3/C4 (saas
   the SaaS pricing release; the next drift tick does it.
 
 ### SaaS release 2 (task D6) — pricing live
-- **Owner gate first:** run `stripeSeedPrices … --run`, then set
-  `STRIPE_PRICE_STARTER/GROWTH/SCALE` in Railway. The server refuses to boot
-  otherwise.
+- The Stripe price keys are already set — that gate was cleared before C5. If
+  C5 was skipped or rolled back, do it now: the server refuses to boot without
+  `STRIPE_PRICE_STARTER/GROWTH/SCALE`.
 - Run `planMigration2026_09.ts` dry-run, then `--apply`. **No plan-change email
   template exists** — the script logs "scheduled but NOT emailed"; contact the
   listed ids by hand (expected today: none, since the only tenant is

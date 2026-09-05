@@ -16,6 +16,18 @@ was collected by EPA task G5 from `BLOCKERS.md` and the phase reviews of run
 [`PRODUCTION_READINESS_SCORE_2026-09.md`](./PRODUCTION_READINESS_SCORE_2026-09.md)
 for the scored checklist those findings came from.
 
+## 2026-09-05 — `BLOCKERS.md` records a stale SaaS release-ordering note
+
+The run's `BLOCKERS.md` says `STRIPE_PRICE_STARTER/GROWTH/SCALE` must be set
+"BEFORE the SaaS release that carries 4d0409d (D6)". That was true when written
+and went stale when `e8b36e6` landed on top of `4d0409d`:
+`git merge-base --is-ancestor 4d0409d e8b36e6` is now true, so the **first** SaaS
+release (C5) already carries it and would crash-loop without the keys. The
+runbook in `PRODUCTION_READINESS_SCORE_2026-09.md` §5 carries the corrected
+order; `BLOCKERS.md` itself is a run artifact outside this repo and was not
+edited. Owner: owner. Trigger: reading `BLOCKERS.md` while planning Phase R —
+prefer the §5 runbook where the two disagree.
+
 ## 2026-09-05 — Cost lever: Amazon HTTP-leg extraction research
 
 The 2026-09-03 cost report ranks this the single largest remaining cost lever:
@@ -309,6 +321,7 @@ Single-tenant fleet in production today — weighted fair queuing
 (`app_shared.scheduling.fair_queue`) has nothing to arbitrate fairly
 between when there is only one workspace generating scheduler load.
 Revisit at 3+ tenants. (EPA plan task B4.)
+Owner: engine maintainer. Trigger: a third tenant generating scheduler load.
 
 ## 2026-09-03 — `UsageSnapshotArchive` (SaaS) not extended with the B3 proxy counters
 
@@ -319,6 +332,8 @@ archived snapshot copies of a usage row drop the three counters. Live
 `/v1/admin/usage` rows are unaffected; this only affects historical
 snapshots taken via the archive path. (Finding carried over from an
 earlier task; recorded here per EPA plan task B4.)
+Owner: SaaS maintainer. Trigger: the first time an archived usage snapshot is
+read for a report or a billing dispute.
 
 ## 2026-09-04 — Owner step B4: seed the fleet monthly budget caps after this release deploys
 
@@ -345,3 +360,5 @@ Then export DataImpulse's usage for the month and run
 scheduled call site and `libs/shared/app_shared/netledger/reconcile.py`
 for the function contract) so the fleet ledger's estimated costs get
 their first real settlement pass under the new caps.
+Owner: owner. Trigger: immediately after engine release 2 (task B6) migrates to
+production.
