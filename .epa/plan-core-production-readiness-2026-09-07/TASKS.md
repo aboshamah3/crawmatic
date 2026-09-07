@@ -2,10 +2,10 @@
 
 | ID | Phase | Packet | Task | Depends on | Model | Status | Attempts | Report |
 |----|-------|--------|------|-----------|-------|--------|----------|--------|
-| 0.1 | 0 | P0-1 | Backup inventory for selective disk relief (F21) | - | sonnet | running | 1 | - |
-| 0.2 | 0 | P0-1 | Fast-forward engine `main` to `7a26c54` — OWNER GATE | - | sonnet | running | 1 | - |
-| 0.3 | 0 | P0-2 | Release identity manifest and configuration diff (F20 part 1) | - | opus | pending | 0 | - |
-| 0.4 | 0 | P0-2 | Isolated unit-test environment (audit §2) | - | opus | pending | 0 | - |
+| 0.1 | 0 | P0-1 | Backup inventory for selective disk relief (F21) | - | sonnet | done-dev | 1 | reports/0.1.md |
+| 0.2 | 0 | P0-1 | Fast-forward engine `main` to `7a26c54` — OWNER GATE | - | sonnet | done-dev | 1 | reports/0.2.md |
+| 0.3 | 0 | P0-2 | Release identity manifest and configuration diff (F20 part 1) | - | opus | done-dev | 1 | reports/0.3.md |
+| 0.4 | 0 | P0-2 | Isolated unit-test environment (audit §2) | - | opus | done-dev | 1 | reports/0.4.md |
 | A1 | A | PA-1 | Browser egress enforced at connection time (F01, P0) | 0.4 | opus | pending | 0 | - |
 | A2 | A | PA-2 | Regex execution with a hard timeout (F02) | 0.4 | opus | pending | 0 | - |
 | A3 | A | PA-3 | Component-scoped credentials and grants (F03) | 0.4 | sonnet | pending | 0 | - |

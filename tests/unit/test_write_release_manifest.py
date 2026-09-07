@@ -354,3 +354,133 @@ def test_no_git_binary_is_not_silently_treated_as_clean(
     )
     assert result.returncode == 2
     assert not out.exists()
+
+
+# --------------------------------------------------------------------------
+# F20 part 1 — release identity extras (buffer/spool/blocklist versions,
+# `alembic heads`, image toolchain, config NAMES)
+# --------------------------------------------------------------------------
+
+
+def test_manifest_carries_buffer_spool_and_blocklist_versions(tmp_path: Path) -> None:
+    """The three on-disk/wire schema versions that change behaviour without
+    changing the source digest. `scrape_result_spool_version` is an explicit
+    `null` until plan task B1 introduces the spool — present-and-null, so the
+    manifest shape does not change when B1 lands."""
+    from app_shared.netledger.buffer import BUFFER_SCHEMA_VERSION
+    from app_shared.profiles.browser_resource_policy import BLOCKLIST_VERSION
+
+    engine_repo = tmp_path / "engine"
+    _init_repo(engine_repo)
+    out = tmp_path / "release_manifest.json"
+
+    result = _run_script(
+        "write_release_manifest.py", "--out", str(out), "--engine-repo", str(engine_repo)
+    )
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(out.read_text(encoding="utf-8"))
+
+    versions = manifest["buffer_versions"]
+    assert versions["netledger_buffer_schema_version"] == BUFFER_SCHEMA_VERSION
+    assert versions["blocklist_version"] == BLOCKLIST_VERSION
+    assert "scrape_result_spool_version" in versions
+    assert versions["scrape_result_spool_version"] is None
+
+
+def test_manifest_carries_toolchain_and_config_names(tmp_path: Path) -> None:
+    """Toolchain versions come from the image build definition in the engine
+    repo under attestation (base-image line + `uv.lock`), and are overridable
+    by a builder that knows the exact value. `config_names` is the flat NAME
+    vocabulary `scripts/config_diff_railway.py` diffs a service against —
+    names only, never values."""
+    engine_repo = tmp_path / "engine"
+    _init_repo(engine_repo)
+    (engine_repo / "apps" / "api").mkdir(parents=True)
+    (engine_repo / "apps" / "api" / "Dockerfile").write_text(
+        "FROM python:3.13.5-slim-bookworm\n", encoding="utf-8"
+    )
+    (engine_repo / "uv.lock").write_text(
+        '[[package]]\nname = "playwright"\nversion = "1.61.0"\n', encoding="utf-8"
+    )
+    _git(engine_repo, "add", "-A")
+    _git(engine_repo, "commit", "-q", "-m", "image build definition")
+
+    out = tmp_path / "release_manifest.json"
+    result = _run_script(
+        "write_release_manifest.py", "--out", str(out), "--engine-repo", str(engine_repo)
+    )
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(out.read_text(encoding="utf-8"))
+
+    assert manifest["toolchain"]["python"] == "3.13.5"
+    assert manifest["toolchain"]["playwright"] == "1.61.0"
+    # Chromium is installed by playwright at image build; unknown beats a guess.
+    assert manifest["toolchain"]["chromium"] is None
+
+    names = manifest["config_names"]
+    assert "DATABASE_URL" in names
+    assert names == sorted(names)
+    assert names == [field["name"] for field in manifest["config_schema"]["fields"]]
+
+
+def test_chromium_version_override_is_recorded(tmp_path: Path) -> None:
+    engine_repo = tmp_path / "engine"
+    _init_repo(engine_repo)
+    out = tmp_path / "release_manifest.json"
+
+    result = _run_script(
+        "write_release_manifest.py",
+        "--out",
+        str(out),
+        "--engine-repo",
+        str(engine_repo),
+        "--chromium-version",
+        "141.0.7390.37",
+        "--python-version",
+        "3.13.5",
+        "--playwright-version",
+        "1.61.0",
+    )
+    assert result.returncode == 0, result.stderr
+    toolchain = json.loads(out.read_text(encoding="utf-8"))["toolchain"]
+
+    assert toolchain["chromium"] == "141.0.7390.37"
+    assert toolchain["chromium_source"] == "explicit --chromium-version"
+    assert toolchain["python"] == "3.13.5"
+    assert toolchain["playwright"] == "1.61.0"
+
+
+def test_alembic_heads_are_resolved_from_the_repo_under_attestation(tmp_path: Path) -> None:
+    """`alembic heads` is the command `scripts/check_single_head.sh` enforces
+    the single-head invariant with, so the manifest attests to what IT says.
+    A repo that is not an alembic project records `null` (unknown), never a
+    fabricated head."""
+    wrm = _load_script("write_release_manifest.py")
+
+    engine_repo = tmp_path / "engine"
+    _init_repo(engine_repo)
+    assert wrm.resolve_alembic_heads(engine_repo) is None
+
+    # The real engine repo resolves to exactly one head.
+    heads = wrm.resolve_alembic_heads(_REPO_ROOT)
+    assert heads is not None and len(heads) == 1, heads
+
+
+def test_new_sections_are_covered_by_the_self_hash(tmp_path: Path) -> None:
+    """Editing `toolchain` or `buffer_versions` after the fact must invalidate
+    `manifest_id` — an unhashed identity block would be worse than none."""
+    brm = _load_script("build_release_manifest.py")
+    engine_repo = tmp_path / "engine"
+    _init_repo(engine_repo)
+    out = tmp_path / "release_manifest.json"
+
+    result = _run_script(
+        "write_release_manifest.py", "--out", str(out), "--engine-repo", str(engine_repo)
+    )
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(out.read_text(encoding="utf-8"))
+
+    assert brm.compute_manifest_id(manifest) == manifest["manifest_id"]
+    tampered = json.loads(json.dumps(manifest))
+    tampered["toolchain"]["python"] = "2.7.18"
+    assert brm.compute_manifest_id(tampered) != manifest["manifest_id"]

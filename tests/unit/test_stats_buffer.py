@@ -4,9 +4,11 @@
 No Docker daemon in this build env (project memory) -- these tests MUST
 actually run and pass, not skip. Per the project convention (mirrors
 ``tests/unit/test_rate_limiter.py``/``test_match_lock.py``'s
-``_FakeRedis``/``_BrokenRedis`` pair), against a real ephemeral Redis when
-``REDIS_URL`` is set, else a small hand-rolled in-memory double
-(``fakeredis`` is not a dependency anywhere in this repo).
+``_FakeRedis``/``_BrokenRedis`` pair), against a small hand-rolled
+in-memory double (``fakeredis`` is not a dependency anywhere in this
+repo). Set ``CRAWMATIC_TEST_REDIS_URL`` to run the same assertions
+against a real ephemeral Redis; ``REDIS_URL`` is deliberately NOT
+consulted -- see ``_redis_client`` below.
 
 The fake does not interpret Lua text; it recognizes the one production
 script in ``stats_buffer.py`` (``drain``) by its embedded marker comment
@@ -153,9 +155,22 @@ class _BrokenRedis:
 
 
 def _redis_client() -> Any:
-    """Real ephemeral Redis if `REDIS_URL` is set (per project convention),
-    else the in-memory fake -- these tests must always actually run."""
-    url = os.environ.get("REDIS_URL")
+    """The in-memory fake, unless a real Redis is EXPLICITLY offered.
+
+    Opt-in is `CRAWMATIC_TEST_REDIS_URL`, deliberately not `REDIS_URL`.
+    Keying off `REDIS_URL` made which client these tests exercise a
+    property of the ambient environment: unset (a bare CI runner) meant the
+    fake, set meant whatever server that variable happened to name. Since
+    `tests/conftest.py` now points `REDIS_URL` at a dead port for every unit
+    session (production-readiness audit §2), that opt-in reads as "connect
+    to 127.0.0.1:1" and the whole file fails on `ConnectionError` — the
+    right response is a dedicated opt-in variable, not a weaker fixture.
+    The fake is the deterministic default everywhere; running the same
+    assertions against a real server is a deliberate act::
+
+        CRAWMATIC_TEST_REDIS_URL=redis://127.0.0.1:6379/15 uv run pytest tests/unit/test_stats_buffer.py
+    """
+    url = os.environ.get("CRAWMATIC_TEST_REDIS_URL")
     if url:
         import redis as redis_pkg
 
