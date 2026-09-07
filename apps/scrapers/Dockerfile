@@ -22,6 +22,11 @@ COPY . .
 
 RUN uv sync --locked --package scrapers --no-dev
 
+# Software inventory baked into the image (F04): pip freeze, dpkg -l — no
+# browser on this image, so `image_inventory.py`'s browser section records
+# `available: false` here, which is correct, not a gap.
+RUN python scripts/security/image_inventory.py --out /app/packages.json
+
 WORKDIR /app/apps/scrapers
 RUN mkdir -p eggs logs dbs items \
     && chmod +x docker-entrypoint.sh
@@ -32,7 +37,7 @@ RUN mkdir -p eggs logs dbs items \
 # (SCRAPER_FIXES_REPORT_2026-07-27 operational gotcha) — until then the
 # node answered every schedule.json with "project not found".
 RUN mkdir -p eggs/price_monitor \
-    && uvx --from scrapyd-client scrapyd-deploy --build-egg eggs/price_monitor/1_0.egg
+    && uvx --from scrapyd-client==2.0.3 scrapyd-deploy --build-egg eggs/price_monitor/1_0.egg
 
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \

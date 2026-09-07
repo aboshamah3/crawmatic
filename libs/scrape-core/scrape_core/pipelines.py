@@ -98,11 +98,12 @@ from app_shared.enums import (
 )
 from app_shared.ids import new_uuid7
 from app_shared.jobs.cancellation import LATE_AFTER_CANCEL_REASON, cancelled_scrape_job_ids
-from app_shared.jobs.targets import mark_target
+from app_shared.jobs.targets import mark_target, stamp_target_timestamps
 from app_shared.limiter.locks import release_match_lock
 from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
 from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.outbox import write_outbox_message
+from app_shared.profiles.repository import record_regex_timeout
 from app_shared.redis_client import get_redis_client
 from app_shared.strategy.stats_buffer import record_attempt
 from app_shared.strategy.methods import is_method_health_failure
@@ -424,6 +425,12 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             RequestAttempt(
                 workspace_id=item.workspace_id,
                 created_at=moment,
+                # EPA A5: the producer-side attempt identity. Generated
+                # here when the producer did not mint one, rather than
+                # left to the column's `gen_random_uuid()` server default
+                # -- a server-generated value is not readable in this
+                # process, so nothing could correlate the row afterwards.
+                attempt_uuid=item.attempt_id or new_uuid7(),
                 scrape_job_id=item.scrape_job_id,
                 match_id=item.match_id,
                 strategy_method_id=item.strategy_method_id,
@@ -440,6 +447,14 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 proxy_country=item.proxy_country,
                 status_code=item.status_code,
                 response_time_ms=item.response_time_ms,
+                # EPA A5: `response_time_ms` split into the four phases
+                # that have four different owners (proxy / site / page
+                # weight / our own extraction). All default `None` --
+                # "not measured for this attempt", never 0 ms.
+                connect_ms=item.connect_ms,
+                ttfb_ms=item.ttfb_ms,
+                read_ms=item.read_ms,
+                extract_ms=item.extract_ms,
                 success=item.success,
                 error_code=item.error_code,
                 error_message=item.error_message,
@@ -656,6 +671,25 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
         # target STARTED and a later success may still complete it.  The
         # existing mark_target terminal-state guard continues to reject
         # genuinely late results after a real terminal outcome.
+        # EPA A5: one `persisted_at` for the whole flush. Every item in
+        # this batch becomes durable at the same instant (one COMMIT), so
+        # stamping each row with its own `now()` would invent a spread
+        # that never happened and skew the
+        # `first_network_to_persisted` p95 by the loop's own runtime.
+        persisted_at = datetime.now(UTC)
+
+        def _phase_kwargs(result: ScrapeResult) -> dict[str, Any]:
+            """The A5 phase boundaries this item observed, plus the flush
+            instant. Absent (`None`) boundaries are passed through as
+            `None` and are then simply not written -- see
+            `app_shared.jobs.targets._phase_timestamp_values`."""
+            return {
+                "first_network_at": result.first_network_at,
+                "document_received_at": result.document_received_at,
+                "extraction_finished_at": result.extraction_finished_at,
+                "persisted_at": persisted_at,
+            }
+
         for index, item in enumerate(batch):
             if item.scrape_job_id is None:
                 continue
@@ -689,6 +723,7 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                     match_id=item.match_id,
                     status=ScrapeTargetStatus.DEFERRED,
                     error_code=item.error_code,
+                    **_phase_kwargs(item),
                 )
                 target_row.current_strategy_method_id = item.next_strategy_method_id
                 target_row.strategy_attempt_ordinal = item.strategy_attempt_ordinal + 1
@@ -751,6 +786,19 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 # Observation + request-attempt rows above are deliberately
                 # retained for audit/stats.  There is simply no target
                 # transition or premature finalize trigger for this item.
+                #
+                # EPA A5: it still HAPPENED, though -- an intermediate
+                # attempt in a strategy chain fetched a document and spent
+                # money doing it. Its phase boundaries are recorded
+                # without a status transition, so the per-phase p95s see
+                # the whole chain rather than only its final link.
+                stamp_target_timestamps(
+                    session,
+                    workspace_id=item.workspace_id,
+                    scrape_job_id=item.scrape_job_id,
+                    match_id=item.match_id,
+                    **_phase_kwargs(item),
+                )
                 continue
             else:
                 target_status = ScrapeTargetStatus.FAILED
@@ -761,6 +809,7 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 match_id=item.match_id,
                 status=target_status,
                 error_code=None if item.success else item.error_code,
+                **_phase_kwargs(item),
             )
             affected_job_ids[item.scrape_job_id] = None
 
@@ -777,6 +826,24 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             _write_needs_review_classifications(
                 session, list(needs_review_match_ids), effective_at=datetime.now(UTC)
             )
+
+        # A2/F02: a REGEX_TIMEOUT attempt counts against the profile whose
+        # regex blew its deadline, in the same transaction that records the
+        # attempt. At `EXTRACTION_REGEX_QUARANTINE_AFTER` the profile's regex
+        # strategy is quarantined and the extraction chain stops running it.
+        # Deduped per (workspace, profile) within the batch: one page's four
+        # regex rules are one offence, not four.
+        regex_timeout_profiles: dict[tuple[Any, Any], None] = {}
+        for index, item in enumerate(batch):
+            if index in fenced_items:
+                continue
+            if item.error_code != ScrapeErrorCode.REGEX_TIMEOUT:
+                continue
+            if item.scrape_profile_id is None:
+                continue
+            regex_timeout_profiles[(item.workspace_id, item.scrape_profile_id)] = None
+        for workspace_id, profile_id in regex_timeout_profiles:
+            record_regex_timeout(session, workspace_id, profile_id)
 
         # --- post-commit follow-ups, recorded IN this transaction --------
         #

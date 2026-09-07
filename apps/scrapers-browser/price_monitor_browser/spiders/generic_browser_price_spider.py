@@ -58,7 +58,12 @@ from app_shared.redis_client import get_redis_client
 
 from scrape_core.browser.byte_capture import ByteAccumulator
 from scrape_core.browser.domain_profile_registry import set_domain_profile, set_domain_transport
+from scrape_core.browser.egress_guard import (
+    UpstreamProxy,
+    get_process_guard,
+)
 from scrape_core.browser.page import build_page_methods, effective_timeout
+from scrape_core.browser.ssrf import clear_subresource_dns_cache
 from scrape_core.browser.variant import VariantConfigError
 from scrape_core.adapters import (
     AdapterContext,
@@ -182,6 +187,11 @@ def _variant_selectors(target: "SpiderTarget") -> set[str]:
             selectors.add(settle_selector)
     return selectors
 
+
+#: Sentinel for "no dispatch has happened yet" in
+#: `_last_playwright_context` — `None` is a real context name (the default,
+#: unproxied context), so it cannot serve as the initial value.
+_NO_CONTEXT_YET = object()
 
 _PROXY_FAILURE_MARKERS = ("proxy", "err_tunnel", "err_no_supported_proxies")
 
@@ -333,6 +343,14 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         self._visible_providers: VisibleProviders = {}
         self._provider_rows: dict[uuid.UUID, ProxyProvider] = {}
         self._provider_passwords: dict[uuid.UUID, str | None] = {}
+        # READY F01: the `meta["playwright_context"]` name the previous
+        # dispatch used, so `_browser_request_for` can spot a browser
+        # CONTEXT switch and drop `scrape_core.browser.ssrf`'s per-host
+        # sub-resource DNS memo at that boundary (see there). The initial
+        # sentinel is deliberately not `None`: `None` is the real name of
+        # the default (unproxied) context, and the first dispatch should
+        # start from an empty memo either way.
+        self._last_playwright_context: Any = _NO_CONTEXT_YET
 
     def _admission_context(self) -> AdmissionContext:
         """The small bundle :func:`~scrape_core.targets.dispatch_admission`
@@ -586,6 +604,17 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         user_agent = self.settings.get("USER_AGENT")
         if user_agent:
             context_kwargs["user_agent"] = user_agent
+        # READY F01: a service worker outlives the page that registered it
+        # and re-issues fetches from its own context, where no
+        # `PLAYWRIGHT_ABORT_REQUEST` route hook is attached -- so it is the
+        # one browser feature that can egress without passing the route
+        # layer at all. Blocked at context creation (`"block"`, the shipped
+        # default of `BROWSER_SERVICE_WORKERS`); the setting exists only
+        # for a diagnostic run against a site that will not render without
+        # one. The connection-time guard still sees such a fetch even when
+        # this is set to `"allow"` -- this closes the *route*-layer hole,
+        # the guard closes the connection-layer one.
+        context_kwargs["service_workers"] = settings.BROWSER_SERVICE_WORKERS
         if permission is not None:
             meta["semaphore_key"] = permission.semaphore_key
             meta["semaphore_token"] = permission.semaphore_token
@@ -597,17 +626,66 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             provider = self._provider_rows.get(proxy_assignment.provider_id)
             if provider is not None:
                 host, port = _parse_host_port(provider.base_url)
-                proxy_kwargs: dict[str, Any] = {"server": f"http://{host}:{port}"}
+                upstream_server = f"http://{host}:{port}"
+                upstream_username: str | None = None
+                upstream_password: str | None = None
                 if provider.username:
                     # Already decrypted off-reactor by `load_targets`
                     # (never here, never logged) -- see docstring.
-                    password = self._provider_passwords.get(proxy_assignment.provider_id) or ""
+                    upstream_password = (
+                        self._provider_passwords.get(proxy_assignment.provider_id) or ""
+                    )
                     # Issue 5 parity with the HTTP spider: DataImpulse
                     # sticky sessions ride the username (`;sessid.<id>`).
-                    proxy_kwargs["username"] = sticky_proxy_username(
+                    upstream_username = sticky_proxy_username(
                         provider.username, provider.base_url, proxy_assignment.sticky_key
                     )
-                    proxy_kwargs["password"] = password
+                # READY F01: a per-context `proxy` REPLACES the launch-level
+                # `--proxy-server=http://127.0.0.1:<guard port>`, so a
+                # proxied context pointed straight at DataImpulse would take
+                # the whole proxied leg back outside the guard -- exactly
+                # the leg where a redirect to an internal address matters
+                # most. Point the context at a loopback listener the guard
+                # binds FOR THIS UPSTREAM instead: the guard holds the real
+                # upstream (sticky username included, built above and never
+                # rebuilt there) and forwards `CONNECT` on that port only
+                # after the same hostname validation. Chromium therefore
+                # never sees the provider credential at all.
+                #
+                # A port and not proxy credentials: Chromium does not send
+                # `Proxy-Authorization` preemptively (Playwright answers a
+                # `407` challenge, which this guard cannot issue because the
+                # same listener also serves unproxied contexts), so a
+                # credential-selected leg silently degrades to a DIRECT dial
+                # from the fleet IP while the ledger still books PROXY. The
+                # accepting socket cannot fail to be presented.
+                #
+                # `get_process_guard()` (never `ensure_process_guard()`):
+                # the question is whether the *settings module* launched
+                # Chromium behind a guard. When it did not -- a unit test
+                # driving this method directly -- there is no launch
+                # argument to override either, so the pre-F01 direct kwargs
+                # (straight to the provider, still a real proxied leg) are
+                # the correct wiring. Registration itself is never
+                # swallowed: if the guard is running and cannot bind the
+                # leg, this raises rather than quietly egressing direct.
+                guard = get_process_guard()
+                if guard is not None:
+                    leg_port = guard.register_upstream(
+                        UpstreamProxy(
+                            server=upstream_server,
+                            username=upstream_username,
+                            password=upstream_password,
+                        )
+                    )
+                    proxy_kwargs: dict[str, Any] = {
+                        "server": f"http://127.0.0.1:{leg_port}"
+                    }
+                else:
+                    proxy_kwargs = {"server": upstream_server}
+                    if upstream_username is not None:
+                        proxy_kwargs["username"] = upstream_username
+                        proxy_kwargs["password"] = upstream_password or ""
                 # Per-provider context name (never the shared default
                 # context) so concurrent targets on different providers
                 # never share a browser context/proxy -- scrapy-playwright
@@ -638,6 +716,22 @@ class GenericBrowserPriceSpider(scrapy.Spider):
             urlsplit(adapter_request.url).hostname,
             "PROXY" if is_proxied(meta) else "DIRECT",
         )
+
+        # READY F01: `scrape_core.browser.ssrf`'s sub-resource DNS-safety
+        # cache is a 60 s per-host memo, and its lifetime must not outlive
+        # the browser CONTEXT it was populated in -- a new context is a new
+        # (possibly proxied, possibly differently-resolving) network view,
+        # and carrying a stale "this host resolves publicly" verdict across
+        # that boundary is exactly the rebinding window the memo would
+        # otherwise open. scrapy-playwright keys its context pool by
+        # `meta["playwright_context"]`, so a change in that name IS a
+        # context switch -- and clearing only on a switch keeps the memo
+        # doing its job (one lookup per host, not one per sub-resource)
+        # inside a context.
+        dispatch_context = meta.get("playwright_context")
+        if dispatch_context != self._last_playwright_context:
+            clear_subresource_dns_cache()
+            self._last_playwright_context = dispatch_context
 
         return scrapy.Request(
             url=adapter_request.url,

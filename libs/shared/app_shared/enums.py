@@ -413,6 +413,19 @@ class ScrapeErrorCode(StrEnum):
     #: No ``ALTER TYPE``: like every member above, this column is an
     #: app-validated ``VARCHAR(32)`` (``enum_column``), not a PG enum.
     JOB_DEADLINE_EXCEEDED = "JOB_DEADLINE_EXCEEDED"
+    #: EPA A2/F02 (2026-09-07). A profile-supplied regex
+    #: (``price_regex``/``old_price_regex``/``currency_regex``/``stock_regex``)
+    #: hit its hard execution deadline, so the REGEX strategy was abandoned
+    #: mid-page. Deliberately not ``TIMEOUT`` (which asserts the *fetch*
+    #: timed out — a network verdict the strategy optimizer and the
+    #: access-policy tuner both learn from) and not ``PRICE_NOT_FOUND``
+    #: (which asserts the page was fully read and carried no price). This
+    #: code asserts something narrower: our own extraction configuration was too
+    #: expensive to run, the fetch itself was fine, and the offending
+    #: profile — not the domain — is what needs fixing. It is what drives
+    #: ``scrape_profiles.regex_timeout_count`` / ``regex_quarantined_at``.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    REGEX_TIMEOUT = "REGEX_TIMEOUT"
 
 
 class ScrapeScope(StrEnum):

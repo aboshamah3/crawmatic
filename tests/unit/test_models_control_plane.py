@@ -254,9 +254,21 @@ def test_the_grant_is_role_conditional_so_a_role_less_database_can_migrate() -> 
     assert "SELECT FROM pg_roles WHERE rolname = 'crawmatic_app'" in sql
 
 
-def test_alembic_reports_exactly_one_head_and_it_is_this_revision() -> None:
+def test_alembic_reports_exactly_one_head_and_this_revision_is_in_its_history() -> None:
+    """One head, and this revision is still on the path to it.
+
+    Originally this asserted the head *was* ``c8d2e3f4a5b6``. That made the
+    test a statement about which migration happens to be newest, so the next
+    migration to land — A2's ``a2f0217c9d43`` — failed it while breaking
+    nothing. What actually matters, and what this now asserts, is the linear
+    history invariant (`scripts/check_single_head.sh`, FR-012) plus the fact
+    that this revision has not been orphaned off the chain.
+    """
     result = _run_alembic("heads")
     assert result.returncode == 0, result.stderr
     heads = [line for line in result.stdout.splitlines() if line.strip()]
     assert len(heads) == 1, heads
-    assert heads[0].startswith("c8d2e3f4a5b6"), heads
+
+    history = _run_alembic("history", "-r", "base:head")
+    assert history.returncode == 0, history.stderr
+    assert "c8d2e3f4a5b6" in history.stdout

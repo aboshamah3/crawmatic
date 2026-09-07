@@ -14,8 +14,19 @@ import asyncio
 
 import pytest
 
-from scrape_core.browser.ssrf import abort_unsafe_request
+from scrape_core.browser.ssrf import abort_unsafe_request, clear_subresource_dns_cache
 from scrape_core.safety.rejection_registry import was_recently_rejected
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_subresource_dns_memo() -> None:
+    """READY F01 added a 60 s per-host memo to the sub-resource DNS check.
+
+    It is process-global by design (the spider drops it per browser
+    context), so without this every test would inherit the previous test's
+    verdict for a shared hostname.
+    """
+    clear_subresource_dns_cache()
 
 _PUBLIC_IP = "93.184.216.34"  # real, globally-routable IPv4 -- never actually
 # dialed here (the injected resolver is a fake returning a canned string; no
@@ -62,12 +73,20 @@ def _raising_resolver(exc: Exception):
 # --- navigation-vs-subresource gating ---------------------------------------
 
 
-def test_subresource_request_passes_without_any_resolver_call() -> None:
-    """A non-navigation resource outside the cost-blocked set (script/xhr/...)
-    is never checked -- `is_navigation_request()` False AND `resource_type`
-    not "document"."""
-    resolver = _resolver(["10.0.0.5"])  # would be rejected if ever consulted
+def test_subresource_resolving_privately_is_aborted() -> None:
+    """READY F01: a sub-resource whose host RESOLVES to a private address is
+    aborted, even though its URL looks perfectly public.
+
+    This test previously asserted the opposite -- that a non-navigation
+    request "is never checked" -- which was the hole F01 closes: the
+    no-DNS URL check `evaluate_request` runs passes
+    `http://private.test/x.js` whenever `private.test` merely resolves to
+    10.0.0.5, and a `<script src=...>` is exactly how an SSRF reaches a
+    metadata endpoint from inside a rendered page.
+    """
     for resource_type in ("script", "xhr", "fetch", "other"):
+        clear_subresource_dns_cache()
+        resolver = _resolver(["10.0.0.5"])
         request = _FakeRequest(
             "https://shop.example.com/app.js",
             is_navigation=False,
@@ -76,8 +95,28 @@ def test_subresource_request_passes_without_any_resolver_call() -> None:
 
         result = asyncio.run(abort_unsafe_request(request, resolver=resolver))
 
-        assert result is False
-        assert resolver.calls == []  # type: ignore[attr-defined]  -- no resolve attempted
+        assert result is True, resource_type
+        assert resolver.calls == ["shop.example.com"]  # type: ignore[attr-defined]
+
+
+def test_public_subresource_resolves_once_per_host_not_once_per_asset() -> None:
+    """The DNS-aware sub-resource check is memoised per host (60 s TTL).
+
+    A rendered page pulls dozens of assets from a handful of hosts; a
+    resolve per asset would be a real cost regression, which is why the
+    memo exists -- and why the spider drops it at every context switch.
+    """
+    resolver = _resolver([_PUBLIC_IP])
+    for path in ("/a.js", "/b.js", "/c.js"):
+        request = _FakeRequest(
+            f"https://assets.example.com{path}",
+            is_navigation=False,
+            resource_type="script",
+        )
+
+        assert asyncio.run(abort_unsafe_request(request, resolver=resolver)) is False
+
+    assert resolver.calls == ["assets.example.com"]  # type: ignore[attr-defined]
 
 
 def test_heavy_asset_subresource_aborted_without_resolver_or_registry() -> None:

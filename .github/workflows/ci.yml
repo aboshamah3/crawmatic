@@ -374,13 +374,13 @@ jobs:
   #
   # Severity: pip-audit's OSV-backed JSON report has no reliable
   # cross-ecosystem CVSS field (see scripts/security/pip_audit_gate.py's
-  # docstring), so the gate fails ONLY on an advisory id present in the
-  # owner-maintained `scripts/security/known_critical_advisories.txt`
-  # (seeded empty) and WARNS on everything else via the job summary — never
-  # silently dropped. Run against this repo's real locked deps on
-  # 2026-08-26 this surfaced 3 genuine, non-critical findings (cryptography
-  # 49.0.0, setuptools 80.10.2, pytest 8.4.2 — see the W5.5-GA task report);
-  # zero were critical, so the job is green today.
+  # docstring), so the gate does not attempt to auto-classify "critical."
+  # Instead (EPA A4/F04) EVERY finding must have a matching, unexpired
+  # entry in the owner-maintained `scripts/security/advisory_triage.yaml`
+  # ledger (`{id, decision: accept|fix, owner, expires, reason}`), or the
+  # job fails. Seeded empty on 2026-09-07 — the first run after this
+  # change fails closed until the owner triages whatever pip-audit finds,
+  # which is the intended behavior of "every advisory triaged."
   dependency-audit:
     name: dependency-audit (pip-audit fail-critical/warn-rest + CycloneDX SBOM)
     runs-on: ubuntu-latest
@@ -421,11 +421,11 @@ jobs:
           uvx pip-audit==2.10.1 -r /tmp/requirements-audit.txt \
             -f json -o /tmp/pip-audit-report.json || true
 
-      - name: Gate on critical advisories, warn on the rest
+      - name: Gate on advisory triage (every finding triaged, none expired)
         run: |
           uv run python scripts/security/pip_audit_gate.py \
             --input /tmp/pip-audit-report.json \
-            --allowlist scripts/security/known_critical_advisories.txt \
+            --triage scripts/security/advisory_triage.yaml \
             --summary-out "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SBOM

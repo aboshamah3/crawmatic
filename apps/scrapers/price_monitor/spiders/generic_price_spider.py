@@ -118,6 +118,7 @@ from scrape_core.errors import (
     classify_exception,
     classify_http_status,
 )
+from scrape_core.extraction.regex import regex_deadline_tripped, regex_deadline_watch
 from scrape_core.items import ScrapeResult
 from scrape_core.limiter import LockGrant, Permission, acquire_lock, release_lock, release_slot
 from scrape_core.result_builder import build_scrape_result
@@ -696,23 +697,39 @@ class GenericPriceSpider(scrapy.Spider):
         final_url = response.url
         if 300 <= response.status < 400 and response.headers.get("Location"):
             final_url = response.urljoin(response.headers["Location"].decode("utf-8"))
-        adapter_result = get_adapter(adapter_key).adapt(
-            AdapterResponse(
-                body=response.body,
-                final_url=final_url,
-                requested_url=response.meta.get("adapter_requested_url", response.request.url),
-                status=response.status,
-            ),
-            AdapterContext.from_target(target),
-            preferred_method=(
-                target.strategy_start.extraction_method
-                if target.strategy_start is not None
-                else None
-            ),
-        )
+        # A2/F02: the extraction chain runs inside a deadline watch. A
+        # profile regex that blows `EXTRACTION_REGEX_TIMEOUT_SECONDS` (or the
+        # 4x per-page budget) is swallowed four layers down —
+        # `extract_regex` returns None so the page keeps its other four
+        # readings — and surfaces here, where the failure is classified. It
+        # is recorded as REGEX_TIMEOUT rather than PRICE_NOT_FOUND because
+        # the two say different things: PRICE_NOT_FOUND asserts the page was
+        # read and carried no price, REGEX_TIMEOUT asserts our own profile
+        # configuration was too expensive to finish. Only the latter must
+        # drive the profile quarantine (see the persistence pipeline).
+        with regex_deadline_watch():
+            adapter_result = get_adapter(adapter_key).adapt(
+                AdapterResponse(
+                    body=response.body,
+                    final_url=final_url,
+                    requested_url=response.meta.get(
+                        "adapter_requested_url", response.request.url
+                    ),
+                    status=response.status,
+                ),
+                AdapterContext.from_target(target),
+                preferred_method=(
+                    target.strategy_start.extraction_method
+                    if target.strategy_start is not None
+                    else None
+                ),
+            )
+            regex_deadline = regex_deadline_tripped()
         candidate = adapter_result.candidate
         if adapter_result.outcome is not AdapterOutcome.FOUND or candidate is None:
             error_code = _adapter_error_code(adapter_result.outcome)
+            if regex_deadline is not None and error_code is ScrapeErrorCode.PRICE_NOT_FOUND:
+                error_code = ScrapeErrorCode.REGEX_TIMEOUT
             canonical_url = (
                 adapter_result.canonical_url
                 if adapter_result.outcome is AdapterOutcome.REPAIRED
@@ -726,7 +743,10 @@ class GenericPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=error_code,
                 error_message=(
-                    adapter_result.message
+                    f"profile regex exceeded its "
+                    f"{regex_deadline['timeout']}s execution deadline"
+                    if error_code is ScrapeErrorCode.REGEX_TIMEOUT and regex_deadline
+                    else adapter_result.message
                     or "adapter found no exact, identity-valid price"
                 ),
                 final_url=adapter_result.final_url,

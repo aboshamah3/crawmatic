@@ -1,59 +1,86 @@
 #!/usr/bin/env python3
-"""Gate wrapper around a `pip-audit -f json` report (EPA W5.5-GA, item A).
+"""Gate wrapper around a `pip-audit -f json` report (EPA A4/F04, replaces
+the W5.5-GA item A two-tier design).
 
 `pip-audit`'s OSV-backed JSON output does not carry a reliable, cross-
 ecosystem CVSS/severity field (see the report schema: each finding is
 `{"id", "fix_versions", "aliases", "description"}` — no `severity` key).
-That makes an automatic "fail only on CRITICAL" gate impossible to build
-honestly from the report alone without either (a) a paid vuln-intel feed
-or (b) a second network round-trip per finding against a severity source
-that may itself be incomplete for a given advisory.
+The original design (fail only on an owner-maintained "known critical"
+allowlist, WARN forever on everything else) made that limitation honest,
+but it also meant a real, unreviewed finding could sit as a permanent WARN
+indefinitely — nothing ever forced a second look.
 
-So this gate is a deliberately conservative, two-tier design instead of a
-prettier one that would silently overclaim precision:
+This gate inverts that default. Every finding `pip-audit` reports MUST
+have a matching entry in the owner-maintained triage ledger at
+`scripts/security/advisory_triage.yaml`
+(``{id, decision: accept|fix, owner, expires: YYYY-MM-DD, reason}``), or
+the gate FAILS. A triaged entry only keeps passing while `expires` is in
+the future — a lapsed triage is treated exactly like no triage at all,
+because the owner's last look at it is now stale.
 
-* **FAIL** — a finding whose advisory id OR any of its aliases (CVE/GHSA/
-  PYSEC/...) appears in the owner-maintained allowlist at
-  `scripts/security/known_critical_advisories.txt`. Seeded empty; the
-  owner adds an id here after triaging a WARN finding as actually
-  critical for this system. This is a real, auditable gate — not a
-  rubber stamp — but it starts empty on purpose rather than guessing.
-* **WARN** — every other finding. Always printed in full (package,
-  installed version, advisory id + aliases, available fix version) to
-  both stdout and the job summary, never dropped silently. The build
-  stays green; a human triages.
+Three outcomes per finding:
 
-Run against the engine's actual locked dependency set on 2026-08-26
-(`uv export --frozen --all-packages --format requirements.txt --no-hashes`
-piped through `pip-audit`), this surfaced 3 real, non-allowlisted findings
-(cryptography 49.0.0, setuptools 80.10.2, pytest 8.4.2 — see the W5.5-GA
-task report) — all WARN, none CRITICAL, which is the correct classification
-for a timing side-channel needing a specific S/MIME-gateway shape, a build-
-time sdist-packing bug, and a `pytest`-owned `/tmp` race, none of which are
-`known_critical_advisories.txt` material without owner triage.
+* **untriaged** — no entry in the ledger (by id or alias) — FAIL.
+* **expired**   — an entry exists but `expires` is today or in the past —
+  FAIL.
+* **valid**     — an entry exists and `expires` is in the future — PASS
+  (for that finding); printed in the summary either way so a human can
+  see what is currently accepted and when it needs review again.
 
-Exit code: 1 iff at least one CRITICAL (allowlisted) finding exists.
-Exit code: 0 otherwise (including "some WARN findings, zero CRITICAL").
+`decision: accept` vs `decision: fix` do not change gate logic — both pass
+identically while valid. The field exists for human triage tracking (has
+the owner accepted the risk, or committed to removing it) and is echoed in
+the summary, never used as a leniency switch.
+
+Exit code: 1 if any finding is untriaged or expired, or if the report
+itself is missing/empty/invalid. Exit code: 0 iff every finding has a
+currently-valid triage entry (including the "no findings at all" case).
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import pathlib
 import sys
 
+import yaml
 
-def load_allowlist(path: pathlib.Path) -> set[str]:
+
+def load_triage(path: pathlib.Path) -> dict[str, dict]:
+    """Return ``{advisory_id: entry}`` for every id/alias listed in the ledger.
+
+    A single entry with ``id: GHSA-xxxx`` is indexed only under that one
+    id — matching against a finding's aliases is done by the caller
+    (:func:`classify`), which checks the finding's own id AND aliases
+    against this map's keys. Keeping the map keyed by the ledger's literal
+    ``id`` (rather than pre-expanding aliases the ledger doesn't itself
+    enumerate) keeps this loader a pure, mechanical parse of the file with
+    nothing invented.
+    """
     if not path.exists():
-        return set()
-    ids: set[str] = set()
-    for raw_line in path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        return {}
+    raw = yaml.safe_load(path.read_text()) or {}
+    entries = raw.get("advisories") or []
+    by_id: dict[str, dict] = {}
+    for entry in entries:
+        eid = entry.get("id")
+        if not eid:
             continue
-        ids.add(line)
-    return ids
+        for required in ("decision", "owner", "expires", "reason"):
+            if required not in entry:
+                raise ValueError(
+                    f"advisory_triage.yaml entry {eid!r} is missing required "
+                    f"field {required!r}"
+                )
+        if entry["decision"] not in ("accept", "fix"):
+            raise ValueError(
+                f"advisory_triage.yaml entry {eid!r} has decision "
+                f"{entry['decision']!r} — must be 'accept' or 'fix'"
+            )
+        by_id[eid] = entry
+    return by_id
 
 
 def collect_findings(report: dict) -> list[dict]:
@@ -85,34 +112,65 @@ def collect_findings(report: dict) -> list[dict]:
     return findings
 
 
-def classify(findings: list[dict], critical_ids: set[str]) -> tuple[list[dict], list[dict]]:
-    criticals: list[dict] = []
-    warns: list[dict] = []
+def classify(
+    findings: list[dict], triage: dict[str, dict], *, today: _dt.date
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split findings into (untriaged, expired, valid) — in that order."""
+    untriaged: list[dict] = []
+    expired: list[dict] = []
+    valid: list[dict] = []
     for finding in findings:
         ids = {finding["id"], *finding["aliases"]}
-        if ids & critical_ids:
-            criticals.append(finding)
+        matched_id = next((i for i in ids if i in triage), None)
+        if matched_id is None:
+            untriaged.append(finding)
+            continue
+        entry = triage[matched_id]
+        expires = entry["expires"]
+        if isinstance(expires, str):
+            expires = _dt.date.fromisoformat(expires)
+        finding_with_entry = {**finding, "triage": entry, "matched_id": matched_id}
+        if expires <= today:
+            expired.append(finding_with_entry)
         else:
-            warns.append(finding)
-    return criticals, warns
+            valid.append(finding_with_entry)
+    return untriaged, expired, valid
 
 
-def render_summary(findings: list[dict], criticals: list[dict]) -> str:
+def render_summary(
+    findings: list[dict],
+    untriaged: list[dict],
+    expired: list[dict],
+    valid: list[dict],
+) -> str:
     lines = [
-        "# pip-audit gate",
-        f"- {len(findings)} finding(s) total, {len(criticals)} on the critical allowlist",
+        "# pip-audit gate (advisory triage)",
+        f"- {len(findings)} finding(s) total: {len(untriaged)} untriaged, "
+        f"{len(expired)} expired, {len(valid)} validly triaged",
         "",
     ]
-    critical_ids = {f["id"] for f in criticals}
     if not findings:
         lines.append("No known vulnerabilities in the audited dependency set.")
-    for f in findings:
-        tag = "CRITICAL" if f["id"] in critical_ids else "warn"
+    for f in untriaged:
         aliases = ", ".join(f["aliases"]) or "none"
         fixes = ", ".join(f["fix_versions"]) or "no fix published"
         lines.append(
-            f"- [{tag}] {f['package']}=={f['version']} — {f['id']} "
+            f"- [UNTRIAGED] {f['package']}=={f['version']} — {f['id']} "
             f"(aliases: {aliases}; fix: {fixes})"
+        )
+    for f in expired:
+        entry = f["triage"]
+        lines.append(
+            f"- [EXPIRED] {f['package']}=={f['version']} — {f['id']} "
+            f"(matched {f['matched_id']}, decision={entry['decision']}, "
+            f"owner={entry['owner']}, expired {entry['expires']})"
+        )
+    for f in valid:
+        entry = f["triage"]
+        lines.append(
+            f"- [triaged:{entry['decision']}] {f['package']}=={f['version']} — "
+            f"{f['id']} (matched {f['matched_id']}, owner={entry['owner']}, "
+            f"expires {entry['expires']})"
         )
     return "\n".join(lines) + "\n"
 
@@ -121,9 +179,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="pip-audit `-f json` report path")
     parser.add_argument(
-        "--allowlist",
+        "--triage",
         required=True,
-        help="path to the owner-maintained known-critical advisory id list",
+        help="path to the owner-maintained advisory_triage.yaml ledger",
     )
     parser.add_argument(
         "--summary-out",
@@ -147,28 +205,23 @@ def main(argv: list[str] | None = None) -> int:
 
     report = json.loads(report_path.read_text())
     findings = collect_findings(report)
-    critical_ids = load_allowlist(pathlib.Path(args.allowlist))
-    criticals, warns = classify(findings, critical_ids)
+    triage = load_triage(pathlib.Path(args.triage))
+    untriaged, expired, valid = classify(findings, triage, today=_dt.date.today())
 
-    summary = render_summary(findings, criticals)
+    summary = render_summary(findings, untriaged, expired, valid)
     print(summary)
     if args.summary_out:
         with open(args.summary_out, "a", encoding="utf-8") as fh:
             fh.write(summary)
 
-    if criticals:
+    if untriaged or expired:
         print(
-            f"::error::{len(criticals)} finding(s) matched the critical-advisory "
-            "allowlist — failing the audit job",
+            f"::error::{len(untriaged)} untriaged and {len(expired)} expired "
+            "finding(s) — failing the audit job. Add or renew an entry in "
+            "advisory_triage.yaml.",
             file=sys.stderr,
         )
         return 1
-    if warns:
-        print(
-            f"::warning::{len(warns)} non-critical finding(s) — see the job "
-            "summary; not blocking",
-            file=sys.stderr,
-        )
     return 0
 
 

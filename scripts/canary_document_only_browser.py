@@ -122,18 +122,27 @@ __all__ = [
     "DEFAULT_OUT",
     "DEFAULT_SAMPLE_SIZE",
     "DOCUMENT_ONLY_DOMAIN",
+    "MAX_UNKNOWN_PCT",
+    "MIN_COMPARABLE_PARENTS",
     "PROXY_BYTES_PER_PAGE_CEILING",
     "SUCCESS_RATE_TOLERANCE_POINTS",
     "Acceptance",
+    "CalculatorSummary",
     "Check",
+    "CoverageVerdict",
+    "PageOperation",
     "PageRow",
     "PhaseSummary",
     "build_parser",
+    "calculator_summary_to_phase_summary",
     "evaluate_acceptance",
+    "evaluate_coverage",
     "main",
+    "page_operation_from_mapping",
     "page_row_from_operation",
     "percentile",
     "render_report",
+    "summarize",
     "summarize_phase",
 ]
 
@@ -310,6 +319,207 @@ def _phase_table(summary: PhaseSummary) -> str:
     )
 
 
+# --- parent/child/price/provider-aware calculator (deep dive §8.1) -----------
+#
+# `PageRow`/`summarize_phase` above treat every `network_operations` row as
+# one page: a browser navigation plus its ~99 subresource children reads as
+# "100 pages" with a fabricated 0 ms latency (the children carry no
+# `duration_ms`) and a 1/100th-scale bytes/page average. On the 2026-08-28
+# job this over-counted 335 real pages as 1,328. The fix is not "coerce
+# children to 0" — that hides the defect behind a different wrong number —
+# it is to know which rows are pages, attach every other row to its page by
+# `parent_operation_id` regardless of which host served it, and keep missing
+# facts missing so a caller can tell "no page did this" from "we didn't
+# measure this".
+
+
+@dataclass(frozen=True)
+class PageOperation:
+    """One `network_operations` row, carrying enough identity for
+    :func:`summarize` to tell a PAGE (`parent_operation_id is None`) from a
+    child fetch attached to one, plus the provider/price-outcome dimensions
+    the old per-row `PageRow` had no room for.
+
+    `duration_ms`/`bytes_compressed` are `None` when unmeasured — NEVER
+    coerced to `0` — so :func:`summarize` can report `unknown_durations`/
+    `unknown_bytes` instead of silently manufacturing a real-looking number.
+    `price_ok` is the row's terminal price-extraction outcome (only
+    meaningful on a page row; a subresource has no attempt of its own).
+    """
+
+    network_request_id: str
+    parent_operation_id: str | None
+    provider: str | None
+    duration_ms: int | None
+    bytes_compressed: int | None
+    price_ok: bool | None
+    proxy_provider_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CalculatorSummary:
+    """The numbers :func:`summarize` produces for one phase's operations."""
+
+    pages: int
+    price_success: int
+    p50_ms: float
+    p95_ms: float
+    bytes_per_page: float
+    unknown_durations: int
+    unknown_bytes: int
+    providers: tuple[str, ...]
+
+
+def page_operation_from_mapping(row: Mapping[str, Any]) -> PageOperation:
+    """One row of :data:`_OPERATIONS_SQL` -> one :class:`PageOperation`."""
+
+    def _opt_str(value: Any) -> str | None:
+        return None if value is None else str(value)
+
+    def _opt_int(value: Any) -> int | None:
+        return None if value is None else int(value)
+
+    return PageOperation(
+        network_request_id=str(row["network_request_id"]),
+        parent_operation_id=_opt_str(row.get("parent_operation_id")),
+        provider=row.get("provider"),
+        proxy_provider_id=_opt_str(row.get("proxy_provider_id")),
+        duration_ms=_opt_int(row.get("duration_ms")),
+        bytes_compressed=_opt_int(row.get("bytes_compressed")),
+        price_ok=(None if row.get("price_ok") is None else bool(row["price_ok"])),
+    )
+
+
+def summarize(rows: Sequence[PageOperation]) -> CalculatorSummary:
+    """Aggregate one phase's raw operations into page-level numbers.
+
+    Pages are rows with no `parent_operation_id`; every other row is a
+    child attached to whichever page it names, regardless of the child's
+    own provider/hostname. `price_success` counts pages whose terminal
+    attempt actually produced a price — a page's children have no price
+    outcome of their own and are never asked for one. A `None`
+    `duration_ms`/`bytes_compressed` is preserved as "not measured": it is
+    counted in `unknown_durations`/`unknown_bytes`, never folded into the
+    percentile or the byte total as a `0`.
+    """
+    parents = [row for row in rows if row.parent_operation_id is None]
+    pages = len(parents)
+
+    durations: list[int] = []
+    unknown_durations = 0
+    for parent in parents:
+        if parent.duration_ms is None:
+            unknown_durations += 1
+        else:
+            durations.append(parent.duration_ms)
+
+    bytes_total = 0
+    unknown_bytes = 0
+    for row in rows:
+        if row.bytes_compressed is None:
+            unknown_bytes += 1
+        else:
+            bytes_total += row.bytes_compressed
+
+    price_success = sum(1 for parent in parents if parent.price_ok)
+    providers = tuple(sorted({row.provider for row in rows if row.provider}))
+
+    return CalculatorSummary(
+        pages=pages,
+        price_success=price_success,
+        p50_ms=percentile(durations, 50),
+        p95_ms=percentile(durations, 95),
+        bytes_per_page=(bytes_total / pages) if pages else 0.0,
+        unknown_durations=unknown_durations,
+        unknown_bytes=unknown_bytes,
+        providers=providers,
+    )
+
+
+#: Coverage-refusal thresholds (deep dive §8.1: "reject comparisons with
+#: insufficient coverage").
+MIN_COMPARABLE_PARENTS = 50
+MAX_UNKNOWN_PCT = 5.0
+
+
+@dataclass(frozen=True)
+class CoverageVerdict:
+    """Whether a baseline/candidate pair is even comparable, before either
+    is judged against the acceptance rule."""
+
+    ok: bool
+    reasons: tuple[str, ...]
+
+
+def evaluate_coverage(
+    baseline: CalculatorSummary,
+    candidate: CalculatorSummary,
+    *,
+    baseline_target_ids: frozenset[str] = frozenset(),
+    candidate_target_ids: frozenset[str] = frozenset(),
+    baseline_strategy_profile_id: str | None = None,
+    candidate_strategy_profile_id: str | None = None,
+    min_parents: int = MIN_COMPARABLE_PARENTS,
+    max_unknown_pct: float = MAX_UNKNOWN_PCT,
+) -> CoverageVerdict:
+    """Refuse a comparison that cannot be trusted, before computing it.
+
+    Both arms need >= `min_parents` pages (a handful of pages is noise, not
+    evidence) and <= `max_unknown_pct` unknown duration/byte records
+    (unmeasured rows dilute both numbers the report is judged on). The two
+    arms must also have measured the SAME target set under the SAME
+    resolved strategy profile — a comparison across different targets or a
+    profile the resolver swapped mid-run is not measuring the setting under
+    test.
+    """
+    reasons: list[str] = []
+    for label, summary in (("baseline", baseline), ("candidate", candidate)):
+        if summary.pages < min_parents:
+            reasons.append(
+                f"{label} has {summary.pages} parent pages, fewer than the "
+                f"required minimum of {min_parents}"
+            )
+        denominator = max(summary.pages, 1)
+        unknown_pct = 100.0 * (summary.unknown_durations + summary.unknown_bytes) / denominator
+        if unknown_pct > max_unknown_pct:
+            reasons.append(
+                f"{label} has {unknown_pct:.1f}% unknown duration/bytes records, "
+                f"over the {max_unknown_pct:.0f}% ceiling"
+            )
+    if baseline_target_ids and candidate_target_ids and baseline_target_ids != candidate_target_ids:
+        reasons.append("baseline and candidate did not measure the same target set")
+    if (
+        baseline_strategy_profile_id is not None
+        and candidate_strategy_profile_id is not None
+        and baseline_strategy_profile_id != candidate_strategy_profile_id
+    ):
+        reasons.append(
+            "baseline and candidate resolved different strategy profiles "
+            f"({baseline_strategy_profile_id!r} != {candidate_strategy_profile_id!r})"
+        )
+    return CoverageVerdict(ok=not reasons, reasons=tuple(reasons))
+
+
+def calculator_summary_to_phase_summary(
+    label: str, summary: CalculatorSummary, *, policy_version: int
+) -> PhaseSummary:
+    """Bridge the new calculator's numbers into the existing `PhaseSummary`
+    shape so the acceptance rule and report renderer (which judge success
+    rate and bytes/page, not raw page counts) need no changes of their own.
+    """
+    return PhaseSummary(
+        label=label,
+        policy_version=policy_version,
+        pages=summary.pages,
+        successes=summary.price_success,
+        success_pct=(100.0 * summary.price_success / summary.pages) if summary.pages else 0.0,
+        p50_wall_ms=summary.p50_ms,
+        p95_wall_ms=summary.p95_ms,
+        proxy_bytes_total=round(summary.bytes_per_page * summary.pages),
+        proxy_bytes_per_page=summary.bytes_per_page,
+    )
+
+
 _ACCEPTANCE_RULE_TEXT = (
     "1. candidate success rate is **within 3 percentage points** of the baseline's; AND\n"
     "2. candidate proxy bytes per page are **<= 0.4 MB** "
@@ -435,15 +645,56 @@ def _policy_version() -> int:
 
 # --- database shell (never reached by --dry-run) ------------------------------
 
+# Fixed per deep dive §8.1. `page_ops` finds the PARENT pages on the target
+# domain (the denominator); the outer query then pulls every operation that
+# either IS one of those pages or names one as `parent_operation_id` —
+# regardless of the child's OWN domain, so other-host CDN/subresource
+# traffic that is part of the page is no longer silently excluded. `price_ok`
+# joins the terminal `request_attempts` row for the operation (by
+# `network_request_id`, C1's operation identity) — `request_attempts.success`
+# IS the price outcome (FR-013: exactly one row per attempted target,
+# `success=False` on e.g. `PRICE_NOT_FOUND`/`EXTRACTION_FAILED`, not merely a
+# transport failure) — so a page whose browser fetch transported fine but
+# never yielded a price is correctly `price_ok=False`, not folded into
+# transport success the way the old predicate did.
 _OPERATIONS_SQL = """
-SELECT failure_reason,
-       response_status,
-       duration_ms,
-       bytes_compressed
-FROM network_operations
-WHERE scrape_job_id = CAST(:job_id AS uuid)
+WITH page_ops AS (
+    SELECT network_request_id
+    FROM network_operations
+    WHERE scrape_job_id = CAST(:job_id AS uuid)
+      AND transport::text = 'BROWSER'
+      AND parent_operation_id IS NULL
+      AND (domain = :domain OR domain LIKE :domain_suffix)
+)
+SELECT n.network_request_id,
+       n.parent_operation_id,
+       n.provider,
+       n.duration_ms,
+       n.bytes_compressed,
+       a.proxy_provider_id,
+       a.success AS price_ok
+FROM network_operations n
+LEFT JOIN request_attempts a ON a.network_operation_id = n.network_request_id
+WHERE n.scrape_job_id = CAST(:job_id AS uuid)
   AND transport::text = 'BROWSER'
-  AND (domain = :domain OR domain LIKE :domain_suffix)
+  AND (
+        n.network_request_id IN (SELECT network_request_id FROM page_ops)
+        OR n.parent_operation_id IN (SELECT network_request_id FROM page_ops)
+      )
+"""
+
+#: The dimensions a comparison must agree on across arms (deep dive §8.1:
+#: "require the same target set and resolved profile"). `request_attempts`
+#: has no `strategy_profile_id` column — the nearest real analog is
+#: `scrape_profile_id`, the resolved profile a target's fetch ran under.
+_DIMENSIONS_SQL = """
+SELECT DISTINCT a.match_id, a.scrape_profile_id
+FROM request_attempts a
+JOIN network_operations n ON n.network_request_id = a.network_operation_id
+WHERE n.scrape_job_id = CAST(:job_id AS uuid)
+  AND n.transport::text = 'BROWSER'
+  AND n.parent_operation_id IS NULL
+  AND (n.domain = :domain OR n.domain LIKE :domain_suffix)
 """
 
 
@@ -457,13 +708,56 @@ def _open_session(db_url: str | None):
 
 
 def load_phase_rows(session, job_id: str, *, domain: str) -> list[PageRow]:
+    """Legacy per-row loader, kept only for callers still on the old
+    (over-counting) `PageRow`/`summarize_phase` path. Live comparisons use
+    :func:`load_phase_operations` + :func:`summarize` instead (deep dive
+    §8.1) — see :func:`main`."""
+    from sqlalchemy import text
+
+    rows = session.execute(
+        text(
+            """
+            SELECT failure_reason, response_status, duration_ms, bytes_compressed
+            FROM network_operations
+            WHERE scrape_job_id = CAST(:job_id AS uuid)
+              AND transport::text = 'BROWSER'
+              AND (domain = :domain OR domain LIKE :domain_suffix)
+            """
+        ),
+        {"job_id": job_id, "domain": domain, "domain_suffix": f"%.{domain}"},
+    ).mappings().all()
+    return [page_row_from_operation(dict(row)) for row in rows]
+
+
+def load_phase_operations(session, job_id: str, *, domain: str) -> list[PageOperation]:
+    """Pages + attached children (regardless of hostname) for one phase,
+    as :class:`PageOperation` rows ready for :func:`summarize`."""
     from sqlalchemy import text
 
     rows = session.execute(
         text(_OPERATIONS_SQL),
         {"job_id": job_id, "domain": domain, "domain_suffix": f"%.{domain}"},
     ).mappings().all()
-    return [page_row_from_operation(dict(row)) for row in rows]
+    return [page_operation_from_mapping(dict(row)) for row in rows]
+
+
+def load_phase_dimensions(
+    session, job_id: str, *, domain: str
+) -> tuple[frozenset[str], str | None]:
+    """The target set (distinct `match_id`) and resolved profile (the
+    single `scrape_profile_id` the phase's pages ran under, or `None` if
+    the phase mixed more than one / recorded none) for the coverage check
+    (:func:`evaluate_coverage`)."""
+    from sqlalchemy import text
+
+    rows = session.execute(
+        text(_DIMENSIONS_SQL),
+        {"job_id": job_id, "domain": domain, "domain_suffix": f"%.{domain}"},
+    ).mappings().all()
+    target_ids = frozenset(str(row["match_id"]) for row in rows if row.get("match_id") is not None)
+    profile_ids = {str(row["scrape_profile_id"]) for row in rows if row.get("scrape_profile_id") is not None}
+    strategy_profile_id = next(iter(profile_ids)) if len(profile_ids) == 1 else None
+    return target_ids, strategy_profile_id
 
 
 def build_amazon_target_set(
@@ -575,16 +869,48 @@ def main(argv: list[str] | None = None) -> int:
     if args.baseline_job_id and args.candidate_job_id:
         session = _open_session(args.db_url)
         try:
-            baseline_rows = load_phase_rows(session, args.baseline_job_id, domain=args.domain)
-            candidate_rows = load_phase_rows(session, args.candidate_job_id, domain=args.domain)
+            baseline_ops = load_phase_operations(session, args.baseline_job_id, domain=args.domain)
+            candidate_ops = load_phase_operations(session, args.candidate_job_id, domain=args.domain)
+            baseline_targets, baseline_profile = load_phase_dimensions(
+                session, args.baseline_job_id, domain=args.domain
+            )
+            candidate_targets, candidate_profile = load_phase_dimensions(
+                session, args.candidate_job_id, domain=args.domain
+            )
         finally:
             session.close()
 
+        baseline_calc = summarize(baseline_ops)
+        candidate_calc = summarize(candidate_ops)
+        coverage = evaluate_coverage(
+            baseline_calc,
+            candidate_calc,
+            baseline_target_ids=baseline_targets,
+            candidate_target_ids=candidate_targets,
+            baseline_strategy_profile_id=baseline_profile,
+            candidate_strategy_profile_id=candidate_profile,
+        )
+        if not coverage.ok:
+            reasons = "\n".join(f"- {reason}" for reason in coverage.reasons)
+            _write(
+                out,
+                "# Canary — comparison REFUSED\n\n"
+                "The comparison did not meet the minimum coverage bar (deep dive "
+                "§8.1) and was not computed:\n\n"
+                f"{reasons}\n",
+            )
+            for reason in coverage.reasons:
+                print(f"REFUSED: {reason}", file=sys.stderr)
+            print(f"Wrote {out}")
+            return 1
+
         policy_version = _policy_version()
-        baseline = summarize_phase("A baseline (unlisted)", baseline_rows,
-                                   policy_version=policy_version)
-        candidate = summarize_phase("B document-only (listed)", candidate_rows,
-                                    policy_version=policy_version)
+        baseline = calculator_summary_to_phase_summary(
+            "A baseline (unlisted)", baseline_calc, policy_version=policy_version
+        )
+        candidate = calculator_summary_to_phase_summary(
+            "B document-only (listed)", candidate_calc, policy_version=policy_version
+        )
         acceptance = evaluate_acceptance(baseline, candidate)
         _write(out, render_report(
             baseline=baseline, candidate=candidate, acceptance=acceptance,

@@ -1,0 +1,49 @@
+# scripts/security/advisory_triage.yaml — owner-maintained triage ledger for
+# `pip-audit` findings (EPA plan-core-production-readiness-2026-09-07, A4/F04).
+#
+# Replaces the old two-tier `known_critical_advisories.txt` allowlist
+# (fail-only-on-critical, warn-on-everything-else). That model let a real,
+# unreviewed finding sit as a permanent WARN forever — nobody was ever
+# forced to look at it again. This file inverts the default: EVERY finding
+# `pip-audit` reports must have an entry here, or the gate fails. There is
+# no more silent "warn and move on."
+#
+# Schema — one entry per triaged advisory:
+#
+#   - id:      <primary advisory id: CVE-..., GHSA-..., or PYSEC-...>
+#     decision: accept | fix
+#     owner:    <name or handle of the person who made the call>
+#     expires:  YYYY-MM-DD
+#     reason:   "<why accept, or what the fix plan is>"
+#
+# `decision: accept` — the owner has reviewed the finding and accepted the
+#   risk for this system until `expires`. `decision: fix` — the owner has
+#   committed to remediating (usually a dependency bump) by `expires`.
+# Both decisions pass the gate identically while `expires` is in the
+# future; `pip_audit_gate.py` does not treat `fix` as more lenient than
+# `accept` — the field is for human triage tracking, not gate logic. Either
+# way, once `expires` has passed without the entry being renewed (or the
+# finding actually resolved and removed), the gate FAILS — a lapsed triage
+# is exactly as bad as no triage, because the owner's last look is now
+# stale.
+#
+# A finding matches an entry if its OWN id OR any of its aliases
+# (CVE/GHSA/PYSEC/...) equals the entry's `id` — the same alias-aware
+# matching the old allowlist used, so one entry covers every name an
+# ecosystem gives the same advisory.
+#
+# Seeded EMPTY on purpose (2026-09-07): this file is a NEW, stricter
+# control and starts with no risk-acceptance decisions already made on the
+# owner's behalf. The first real `pip-audit` run against this tree after
+# this change ships will fail closed until the owner triages whatever it
+# finds — that is the intended behavior of "every advisory triaged," not a
+# bug in this seed.
+#
+# Example entry (do not uncomment — illustrative only):
+# - id: GHSA-xxxx-xxxx-xxxx
+#   decision: accept
+#   owner: security-owner
+#   expires: 2026-12-31
+#   reason: "Timing side-channel requiring a specific S/MIME-gateway shape we do not run."
+
+advisories: []

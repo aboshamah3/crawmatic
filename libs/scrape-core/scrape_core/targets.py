@@ -87,7 +87,7 @@ from app_shared.enums import (
     ScrapeTargetStatus,
     VariantStrategy,
 )
-from app_shared.jobs.targets import mark_target
+from app_shared.jobs.targets import mark_target, mark_targets_started
 from app_shared.limiter.limits import resolve_limits
 from app_shared.messaging import enqueue
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
@@ -491,6 +491,16 @@ def load_targets(
     independent line of defense (one cheap scoped ``IN`` query kills the
     entire class of duplicate-fetch bugs regardless of *why* dispatch
     misfired).
+
+    EPA A5 (2026-09-07): once the in-workspace matches are resolved, this
+    also performs the **pickup transition** — every non-terminal
+    (``PENDING``/``DEFERRED``) ``scrape_job_targets`` row for those
+    matches becomes ``STARTED`` with ``started_at`` set, in one statement,
+    inside this same transaction. Before this, nothing in production ever
+    wrote ``STARTED``, so every reader of "work is in flight" (the stale
+    target reaper, the STARTED age gauge, the deploy-survival proof) was
+    inert. A second load is a no-op: the update matches only non-terminal
+    rows and ``COALESCE``s ``started_at``.
     """
     if not match_ids:
         return _LoadedTargets(targets=[])
@@ -547,6 +557,52 @@ def load_targets(
         )
         if not matches:
             return _LoadedTargets(targets=[])
+
+        # --- EPA A5 (2026-09-07): the pickup transition ------------------
+        #
+        # Until this line, NO production code path ever moved a target to
+        # `STARTED`. Targets went `PENDING` -> terminal, `started_at` was
+        # always NULL, and everything that reads "work is in flight" --
+        # the stale-target reaper (`app.workers.tasks_jobs.reap_stale_
+        # targets`, which only reaps `STARTED` rows aged past a ceiling),
+        # the `crawmatic_target_oldest_age_seconds{status="STARTED"}`
+        # gauge, and the deploy-survival proof -- was reading a
+        # permanently empty bucket and reporting health it had not measured.
+        #
+        # Placed HERE, after the match load, deliberately:
+        #   * it is inside the SAME `workspace_txn` transaction as the
+        #     terminal-status filter above, so a target cannot be observed
+        #     half-picked-up (criterion: "in the same transaction");
+        #   * it marks only match_ids that actually resolved in-workspace
+        #     -- a match_id that does not exist here is not work anyone is
+        #     about to do, and claiming it started would be a lie;
+        #   * `mark_targets_started` is the BATCH form (exactly one
+        #     `UPDATE`, whatever `len(match_ids)`), so this bounded load
+        #     stays bounded (Principle IV) -- the per-match `mark_target`
+        #     shape would have added one statement per target to the
+        #     hottest path in the engine.
+        #
+        # Idempotent by construction: the statement's `status IN
+        # ('PENDING','DEFERRED')` predicate matches nothing on a second
+        # load (the rows are `STARTED` by then) and its
+        # `COALESCE(started_at, now())` cannot move a timestamp that is
+        # already set -- so a duplicate spider run leaves every
+        # `started_at` exactly where the first run put it.
+        if scrape_job_id is not None:
+            started = mark_targets_started(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=scrape_job_id,
+                match_ids=[match.id for match in matches],
+            )
+            if started:
+                log_event(
+                    logger,
+                    "dispatch.targets_started",
+                    workspace_id=workspace_id,
+                    scrape_job_id=scrape_job_id,
+                    started=started,
+                )
 
         groups = group_matches(matches)
         competitor_ids = {competitor_id for competitor_id, _url_pattern in groups}

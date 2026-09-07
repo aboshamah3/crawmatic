@@ -205,6 +205,54 @@ class Thresholds:
 DEFAULT_THRESHOLDS = Thresholds()
 
 
+# --------------------------------------------------------------------------
+# EPA A5 (deep dive §5) — thresholds for the baseline OUTCOME gauges
+#
+# The `Thresholds` dataclass above is consumed by the `RULES` table, and
+# every field in it has a rule that reads it. These five have no rule yet:
+# the gauges they judge (`crawmatic_attempts_per_valid_fresh_24h`,
+# `crawmatic_persistence_failures_1h`,
+# `crawmatic_dispatch_ambiguous_intents`,
+# `crawmatic_cost_model_drift_ratio` — see
+# `app_shared.opsmetrics.emit.BaselineMetrics`) are collected outside
+# `OpsSnapshot`, and `Rule.evaluate` takes an `OpsSnapshot`. Adding
+# unevaluated fields to `Thresholds` would make `DEFAULT_THRESHOLDS`
+# claim coverage that does not exist, so they are module constants until
+# B9 wires the collection into the snapshot and can promote them.
+#
+# They are stated NOW, here, for the same reason the A7 ledger-coverage
+# thresholds are stated in `emit`: "what counts as bad" is a judgement
+# made while the measurement is fresh in mind, and re-deriving it months
+# later from a dashboard is how thresholds end up meaning nothing.
+# --------------------------------------------------------------------------
+
+#: More than this many fetch attempts per freshly-priced match means the
+#: escalation ladder is burning money without producing outcomes. Set
+#: against the measured 2026-09-03 baseline, where a healthy domain sits
+#: near 1-2 and a broken one runs the whole ladder for every match.
+ATTEMPTS_PER_VALID_FRESH_MAX: float = 6.0
+
+#: A fetch that succeeded on the wire and persisted nothing is a defect,
+#: not noise — money was spent and no durable row came out of it. A
+#: handful within one hour is a broken write path.
+PERSISTENCE_FAILURES_1H_MAX: int = 5
+
+#: `POSTED` is the ONE genuinely ambiguous dispatch state (the run may or
+#: may not exist on the node). Any intent still sitting there past the
+#: collector's 5-minute window is unresolved work: either it will never
+#: run, or it may run twice. Zero is the only defensible ceiling.
+DISPATCH_AMBIGUOUS_INTENTS_MAX: int = 0
+
+#: Our ledger's proxied byte count may legitimately differ from the
+#: provider's billed figure (compression, CONNECT/TLS overhead, redirect
+#: chains) — but a factor of two in either direction is a cost model that
+#: no longer describes what we are being charged for. NOTE: the gauge is
+#: NULL (never 0) when no provider figure has been imported, so a missing
+#: reconciliation must be alerted on as *absence*, never read as 0 drift.
+COST_MODEL_DRIFT_RATIO_MIN: float = 0.5
+COST_MODEL_DRIFT_RATIO_MAX: float = 2.0
+
+
 @dataclass(frozen=True)
 class Alert:
     """One firing rule instance."""

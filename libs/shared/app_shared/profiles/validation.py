@@ -19,6 +19,9 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+import regex as regex_engine
+
+from app_shared.config import get_settings
 from app_shared.enums import AdapterKey, ScrapeProfileMode, VariantStrategy
 from app_shared.money import parse_money
 
@@ -29,7 +32,7 @@ class ProfileValidationError(ValueError):
     """A structured, field-specific profile-validation rejection (SC-006).
 
     ``code`` is one of: ``INVALID_ENUM``, ``REGEX_UNCOMPILABLE``,
-    ``REGEX_CATASTROPHIC``, ``FORBIDDEN_COOKIE``, ``INVALID_CURRENCY``,
+    ``REGEX_CATASTROPHIC``, ``REGEX_TOO_LONG``, ``FORBIDDEN_COOKIE``, ``INVALID_CURRENCY``,
     ``INVALID_MONEY``, ``MIN_GT_MAX``, ``INVALID_TEXT_LIST``,
     ``CONFIDENCE_OUT_OF_RANGE``, ``INVALID_SHAPE``.
     """
@@ -106,13 +109,70 @@ def _catastrophic_backtracking_risk(pattern: str) -> bool:
     return False
 
 
-def compile_regex_or_reject(pattern: str, *, field: str) -> None:
-    """``re.compile(pattern)`` + the catastrophic-backtracking heuristic (FR-006).
+#: Shipped default for `EXTRACTION_REGEX_MAX_PATTERN_CHARS`, used only when
+#: the process cannot build a `Settings` at all (the unit suite's
+#: deliberately incomplete environment). A validator that raised on missing
+#: config would reject every profile write instead of validating it, which is
+#: strictly worse than validating against the documented default.
+_DEFAULT_MAX_PATTERN_CHARS = 512
 
-    An uncompilable pattern raises ``REGEX_UNCOMPILABLE``; a pattern
-    matching the heuristic screen raises ``REGEX_CATASTROPHIC`` (a
-    best-effort screen, not a formal safety proof).
+
+def _max_pattern_chars() -> int:
+    try:
+        return int(get_settings().EXTRACTION_REGEX_MAX_PATTERN_CHARS)
+    except Exception:  # noqa: BLE001 - see _DEFAULT_MAX_PATTERN_CHARS
+        return _DEFAULT_MAX_PATTERN_CHARS
+
+
+#: Write-time probe subjects (A2/F02 step 3). Two shapes, chosen because they
+#: are the classic blowup inputs for the two families the W3.2 heuristic
+#: screens for: a run of one character followed by a non-matching sentinel
+#: (nested-quantifier backtracking, ``(a+)+$``), and a run of digits (money
+#: patterns, ``(\d+)*``). Both are 64 characters — long enough that an
+#: exponential pattern cannot finish inside the probe budget, short enough
+#: that every sane pattern finishes in microseconds.
+_PROBE_SUBJECTS: tuple[str, ...] = ("a" * 64 + "!", "9" * 64)
+
+#: Probe wall-clock budget per (pattern, subject). Deliberately independent of
+#: the live-path ``EXTRACTION_REGEX_TIMEOUT_SECONDS``: this runs once, at
+#: write time, on a request thread, and 100 ms is already ~400x what any
+#: legitimate price pattern needs on a 64-character subject.
+_PROBE_TIMEOUT_SECONDS = 0.1
+
+
+def compile_regex_or_reject(pattern: str, *, field: str) -> None:
+    """Length cap + compile + the catastrophic-backtracking heuristic + a live probe (FR-006, A2/F02).
+
+    Four gates, cheapest first:
+
+    1. **Length** — longer than ``EXTRACTION_REGEX_MAX_PATTERN_CHARS``
+       raises ``REGEX_TOO_LONG``. A pattern nobody can read is a pattern
+       nobody can audit, and pattern length is the one ReDoS input we can
+       bound exactly.
+    2. **Compile** — an uncompilable pattern raises ``REGEX_UNCOMPILABLE``.
+    3. **Heuristic screen** (W3.2, unchanged) — a nested-quantifier or
+       overlapping-alternation shape raises ``REGEX_CATASTROPHIC``. Kept
+       because it is a *static* verdict: it refuses shapes that are
+       dangerous on inputs the probe below never sees.
+    4. **Probe** — the pattern is actually run, under a 100 ms deadline,
+       against two adversarial subjects. Blowing the deadline raises
+       ``REGEX_CATASTROPHIC``: whatever the shape screen thinks, a pattern
+       that cannot finish 64 characters in 100 ms must never reach a live
+       page.
+
+    Neither 3 nor 4 is a formal safety proof; together they are the write-time
+    half of the containment whose runtime half is the scraping-side library's
+    ``search_with_deadline`` (named indirectly: this package must not
+    reference that library even in a docstring, see
+    ``tests/unit/test_import_boundaries.py``).
     """
+    max_chars = int(_max_pattern_chars())
+    if len(pattern) > max_chars:
+        raise ProfileValidationError(
+            field,
+            "REGEX_TOO_LONG",
+            f"pattern is {len(pattern)} characters, over the {max_chars}-character cap",
+        )
     try:
         re.compile(pattern)
     except re.error as exc:
@@ -125,6 +185,28 @@ def compile_regex_or_reject(pattern: str, *, field: str) -> None:
             "REGEX_CATASTROPHIC",
             f"{pattern!r} matches the catastrophic-backtracking heuristic screen",
         )
+    try:
+        compiled = regex_engine.compile(pattern)
+    except (regex_engine.error, ValueError) as exc:
+        # `regex` is stricter than `re` on a handful of constructs. A pattern
+        # the live engine cannot compile is unusable regardless of what `re`
+        # thinks, so it is refused here rather than silently finding nothing
+        # on every page forever.
+        raise ProfileValidationError(
+            field,
+            "REGEX_UNCOMPILABLE",
+            f"{pattern!r} does not compile on the execution engine: {exc}",
+        ) from exc
+    for subject in _PROBE_SUBJECTS:
+        try:
+            compiled.search(subject, timeout=_PROBE_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            raise ProfileValidationError(
+                field,
+                "REGEX_CATASTROPHIC",
+                f"{pattern!r} did not finish a {len(subject)}-character probe "
+                f"within {_PROBE_TIMEOUT_SECONDS}s",
+            ) from exc
 
 
 def _validate_regex_fields(payload: Mapping[str, Any]) -> None:

@@ -1,6 +1,8 @@
 """Regex Product extractor + the single-number heuristic (contracts/extraction.md #3, SPEC-07 US3 T033).
 
-Pure ``parsel`` (for text-node segmentation) + stdlib ``re`` — no
+Pure ``parsel`` (for text-node segmentation) + the ``regex`` engine for
+every DB-supplied pattern (stdlib ``re`` is kept only for this module's own
+hard-coded expressions, which cannot backtrack pathologically) — no
 reactor. Two independent paths:
 
 1. **DB regex rules** (``price_regex``/``old_price_regex``/``currency_regex``/
@@ -18,17 +20,29 @@ reactor. Two independent paths:
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import re
+import time
+from collections.abc import Iterator
 from typing import Any
 
+import regex as regex_engine
 from parsel import Selector
 
+from app_shared.config import get_settings
 from app_shared.enums import ExtractionMethod, StockStatus
 from app_shared.profiles.confidence import resolve_confidence_rules
 
 from scrape_core.extraction.result import ExtractionCandidate
 
-__all__ = ["extract_regex"]
+__all__ = [
+    "RegexDeadlineExceeded",
+    "extract_regex",
+    "regex_deadline_tripped",
+    "regex_deadline_watch",
+    "search_with_deadline",
+]
 
 # <script>/<style> text is never "visible page text" — excluded from the
 # single-number heuristic's scan (a script full of numbers is not "one
@@ -79,23 +93,136 @@ _IN_STOCK_TOKENS = frozenset({"instock", "lowstock", "limitedavailability"})
 #      page (6,932 on a live amazon.sa page, per the note above), so a
 #      per-node cap alone is not a budget.
 #
-#: Master switch. DEFAULT OFF — see the block above. Flip to True only after
-#: reading the stored-profile pre-flight report (EPA W5.5-L1 item 3), which
-#: found 0 of 12 stored production patterns would be refused.
-REGEX_BOUNDS_ENABLED = False
+# A2/F02 (2026-09-07): the three bounds below are now
+# `app_shared.config.Settings` fields — `EXTRACTION_REGEX_BOUNDS_ENABLED`,
+# `EXTRACTION_REGEX_BOUNDS_MAX_NODE_CHARS` and
+# `EXTRACTION_REGEX_BOUNDS_MAX_TOTAL_CHARS` (the TODO(config) that used to
+# stand here is discharged). They stay DEFAULT OFF: `search_with_deadline`
+# below is the primary containment now, and it is unconditional.
+#
+# The module-level names are kept as read-through accessors rather than
+# constants so `get_settings()` (cached, env-overridable) is the single
+# source of truth and no import-time snapshot can go stale.
 
-#: Longest single text node any bounded pattern may see.
-REGEX_BOUNDS_MAX_NODE_CHARS = 65_536
 
-#: Total characters one bounded pattern may scan across every node on a page.
-REGEX_BOUNDS_MAX_TOTAL_CHARS = 1_048_576
+#: Shipped defaults, duplicated from `app_shared.config.Settings` on purpose.
+#: They are what `_setting` falls back to when a process cannot build a
+#: `Settings` at all — which in practice means only the unit suite, whose
+#: environment is deliberately incomplete (`tests/conftest.py`). Every real
+#: process validates its configuration at startup, long before a page is
+#: extracted, so the fallback never decides anything in production; it exists
+#: so that "config is unavailable" degrades to the documented default instead
+#: of costing the page an exception from inside a text-node loop.
+_DEFAULTS: dict[str, Any] = {
+    "EXTRACTION_REGEX_TIMEOUT_SECONDS": 0.25,
+    "EXTRACTION_REGEX_BOUNDS_ENABLED": False,
+    "EXTRACTION_REGEX_BOUNDS_MAX_NODE_CHARS": 65_536,
+    "EXTRACTION_REGEX_BOUNDS_MAX_TOTAL_CHARS": 1_048_576,
+}
 
-# TODO(config): promote `REGEX_BOUNDS_ENABLED` /
-# `REGEX_BOUNDS_MAX_NODE_CHARS` / `REGEX_BOUNDS_MAX_TOTAL_CHARS` to
-# `app_shared.config.Settings` fields
-# (`EXTRACTION_REGEX_BOUNDS_ENABLED` / `..._MAX_NODE_CHARS` /
-# `..._MAX_TOTAL_CHARS`). They are module constants rather than settings only
-# because `config.py` was held by a concurrent worker when this landed.
+
+def _setting(name: str) -> Any:
+    try:
+        return getattr(get_settings(), name)
+    except Exception:  # noqa: BLE001 - see _DEFAULTS
+        return _DEFAULTS[name]
+
+
+def _bounds_enabled() -> bool:
+    return bool(_setting("EXTRACTION_REGEX_BOUNDS_ENABLED"))
+
+
+def _bounds_max_node_chars() -> int:
+    return int(_setting("EXTRACTION_REGEX_BOUNDS_MAX_NODE_CHARS"))
+
+
+def _bounds_max_total_chars() -> int:
+    return int(_setting("EXTRACTION_REGEX_BOUNDS_MAX_TOTAL_CHARS"))
+
+
+def _regex_timeout_seconds() -> float:
+    return float(_setting("EXTRACTION_REGEX_TIMEOUT_SECONDS"))
+
+
+# ---------------------------------------------------------------------------
+# Hard execution deadline (A2/F02)
+# ---------------------------------------------------------------------------
+
+
+class RegexDeadlineExceeded(Exception):
+    """A profile-supplied regex ran past its wall-clock deadline.
+
+    Carries the offending ``pattern`` and the ``timeout`` (seconds) it blew,
+    so the caller can name the profile field in a ``REGEX_TIMEOUT``
+    observation without re-deriving anything.
+    """
+
+    def __init__(self, pattern: str, timeout: float) -> None:
+        self.pattern = pattern
+        self.timeout = timeout
+        super().__init__(f"regex {pattern!r} exceeded its {timeout}s deadline")
+
+
+def search_with_deadline(
+    pattern: str, subject: str, *, timeout: float
+) -> regex_engine.Match | None:
+    """``pattern.search(subject)`` that cannot run longer than ``timeout``.
+
+    Uses the third-party ``regex`` engine, whose ``search()`` accepts a
+    ``timeout=`` and raises :class:`TimeoutError`; CPython's stdlib ``re``
+    offers no such thing (no timeout, no signal, no thread interrupts a
+    catastrophic backtrack), which is exactly why every DB-supplied pattern
+    goes through here.
+
+    Raises :class:`RegexDeadlineExceeded` on deadline. A pattern that does
+    not compile raises ``regex.error`` — callers on the live path treat that
+    the same way they always treated ``re.error``: the rule simply finds
+    nothing.
+    """
+    compiled = regex_engine.compile(pattern)
+    try:
+        return compiled.search(subject, timeout=timeout)
+    except TimeoutError as exc:
+        raise RegexDeadlineExceeded(pattern, timeout) from exc
+
+
+# The signal the *caller* (the spider) reads to record
+# `ScrapeErrorCode.REGEX_TIMEOUT` instead of `PRICE_NOT_FOUND`. A ContextVar
+# rather than a threaded-through parameter because the deadline is raised
+# four layers below the classification site (`extract_regex` ->
+# `pipeline.extract` -> `adapters/html.adapt` -> the spider's `parse`) and
+# every one of those signatures is public API pinned by its own tests.
+_DEADLINE_TRIPPED: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "scrape_core_regex_deadline_tripped", default=None
+)
+
+
+@contextlib.contextmanager
+def regex_deadline_watch() -> Iterator[None]:
+    """Scope in which a regex deadline is recorded rather than lost.
+
+    Inside the block, :func:`regex_deadline_tripped` returns the offending
+    ``{"pattern": ..., "timeout": ...}`` once a deadline has fired, else
+    ``None``. The token is reset on exit, so nesting and reuse across
+    requests on the same thread/task are safe.
+    """
+    token = _DEADLINE_TRIPPED.set(None)
+    try:
+        yield
+    finally:
+        _DEADLINE_TRIPPED.reset(token)
+
+
+def regex_deadline_tripped() -> dict[str, Any] | None:
+    """The deadline recorded in the current :func:`regex_deadline_watch`, if any."""
+    return _DEADLINE_TRIPPED.get()
+
+
+def _record_deadline(exc: RegexDeadlineExceeded) -> None:
+    try:
+        _DEADLINE_TRIPPED.set({"pattern": exc.pattern, "timeout": exc.timeout})
+    except LookupError:  # pragma: no cover - ContextVar has a default
+        pass
 
 
 def _pattern_refused(pattern: str) -> bool:
@@ -166,29 +293,53 @@ def _text_nodes(html: str, *, exclude_tags: frozenset[str] = frozenset()) -> lis
 def _first_regex_match(nodes: list[str], pattern: str) -> tuple[str, str] | None:
     """``(matched_group, matched_text_node)`` for the first node matching ``pattern``, else ``None``.
 
-    When ``REGEX_BOUNDS_ENABLED`` is on, the pattern is pre-flighted once
-    through the W3.2 bounded engine and the text it may scan is capped —
-    see the bounds block above. With the flag off this is the original,
-    unbounded function.
+    Every node is searched through :func:`search_with_deadline`, so no single
+    node can cost more than ``EXTRACTION_REGEX_TIMEOUT_SECONDS``. On top of
+    that per-node deadline there is a **cumulative per-page budget of
+    ``4 x timeout``**: a real product page has thousands of text nodes
+    (6,932 on a live amazon.sa page), so a per-node cap alone is not a
+    budget. Either bound firing raises :class:`RegexDeadlineExceeded` —
+    ``extract_regex`` turns that into ``None`` and the deadline is recorded
+    for the caller (see :func:`regex_deadline_watch`).
+
+    When ``EXTRACTION_REGEX_BOUNDS_ENABLED`` is on, the pattern is
+    additionally pre-flighted once through the W3.2 bounded engine and the
+    text it may scan is capped — see the bounds block above.
     """
-    if REGEX_BOUNDS_ENABLED and _pattern_refused(pattern):
+    bounds_on = _bounds_enabled()
+    if bounds_on and _pattern_refused(pattern):
         # Fail closed: a refused pattern finds nothing. Not an exception —
         # the page's other four readings must still happen.
         return None
     try:
-        compiled = re.compile(pattern)
-    except re.error:
+        regex_engine.compile(pattern)
+    except (regex_engine.error, re.error, ValueError):
         return None
-    budget = REGEX_BOUNDS_MAX_TOTAL_CHARS
+
+    per_node_timeout = _regex_timeout_seconds()
+    page_budget = 4 * per_node_timeout
+    spent = 0.0
+    char_budget = _bounds_max_total_chars()
+    max_node_chars = _bounds_max_node_chars()
+
     for node in nodes:
-        if REGEX_BOUNDS_ENABLED:
-            if budget <= 0:
+        if bounds_on:
+            if char_budget <= 0:
                 return None
-            subject = node[: min(REGEX_BOUNDS_MAX_NODE_CHARS, budget)]
-            budget -= len(subject)
+            subject = node[: min(max_node_chars, char_budget)]
+            char_budget -= len(subject)
         else:
             subject = node
-        match = compiled.search(subject)
+
+        remaining = page_budget - spent
+        if remaining <= 0:
+            raise RegexDeadlineExceeded(pattern, page_budget)
+        started = time.monotonic()
+        match = search_with_deadline(
+            pattern, subject, timeout=min(per_node_timeout, remaining)
+        )
+        spent += time.monotonic() - started
+
         if match:
             value = match.group(1) if match.groups() else match.group(0)
             # The FULL node is still the returned `matched_text`: it is
@@ -225,6 +376,17 @@ def _stock_from_text(text: str | None) -> StockStatus | None:
     if any(phrase in lowered for phrase in _IN_STOCK_PHRASES):
         return StockStatus.IN_STOCK
     return StockStatus.UNKNOWN
+
+
+def _regex_quarantined(profile: Any) -> bool:
+    """``True`` when this profile's regex strategy is quarantined (A2/F02).
+
+    Reads ``regex_quarantined_at`` off the resolved profile row. Absent
+    attribute (a stub/dict-shaped profile in a test, or a pre-migration
+    row) means "not quarantined" — this must never fail closed on a
+    profile that simply predates the column.
+    """
+    return getattr(profile, "regex_quarantined_at", None) is not None
 
 
 def _extract_via_price_regex(
@@ -304,8 +466,25 @@ def extract_regex(html: str, *, profile: Any = None) -> ExtractionCandidate | No
 
     price_regex = getattr(profile, "price_regex", None) if profile is not None else None
     if price_regex:
+        if _regex_quarantined(profile):
+            # A2/F02 step 4: the profile's regex strategy is quarantined
+            # (it blew its deadline `EXTRACTION_REGEX_QUARANTINE_AFTER`
+            # times). Skip the DB rules entirely — the page still gets the
+            # single-number heuristic and, through the pipeline, its other
+            # four readings.
+            return _extract_single_number(html, confidence_rules["single_number"])
         nodes = _text_nodes(html)
-        candidate = _extract_via_price_regex(nodes, profile, price_regex, confidence_rules["regex"])
+        try:
+            candidate = _extract_via_price_regex(
+                nodes, profile, price_regex, confidence_rules["regex"]
+            )
+        except RegexDeadlineExceeded as exc:
+            # Never raised at the caller: a blown deadline costs this page
+            # its REGEX reading, not the other four. The deadline is
+            # recorded so the spider stamps `REGEX_TIMEOUT` rather than
+            # `PRICE_NOT_FOUND` if nothing else reads a price.
+            _record_deadline(exc)
+            return None
         if candidate is not None:
             return candidate
 

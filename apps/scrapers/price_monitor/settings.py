@@ -127,10 +127,17 @@ DOWNLOADER_MIDDLEWARES = {
     # leaves an operation row behind; on the response path -- which Scrapy
     # walks in DESCENDING priority -- it is strictly *after* the built-in
     # HttpCompressionMiddleware (590), which is the only position where
-    # `bytes_decompressed` is measurable at all. The compressed count is
-    # position-independent: it comes from Scrapy's `bytes_received`
-    # signal, the raw transport bytes.
+    # `bytes_decompressed` is measurable at all. The compressed count
+    # comes from `scrape_core.middlewares.wire_bytes.WireBytesMiddleware`
+    # (585, just below), with the pre-EPA-A7 `bytes_received`-signal total
+    # kept only as a fallback for the rare case a response never reaches
+    # 585 (e.g. a mid-download exception).
     "scrape_core.netledger_middleware.NetLedgerMiddleware": 130,
+    # EPA A7 (deep dive §8.2): one priority below `HttpCompressionMiddleware`
+    # (590) so it sees the response BEFORE decompression rewrites
+    # `response.body` in place -- see the middleware's own module
+    # docstring for why 585 specifically.
+    "scrape_core.middlewares.wire_bytes.WireBytesMiddleware": 585,
     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
 }
 

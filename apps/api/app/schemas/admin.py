@@ -178,3 +178,17 @@ class TargetReconciliationResponse(BaseModel):
     job_status_before: str
     job_status_projected: str | None
     applied_count: int
+
+
+class ProfileRegexUnquarantineResponse(BaseModel):
+    """Result of releasing a scrape profile's regex quarantine (A2/F02).
+
+    `was_quarantined` reports the state the call *found*, so an operator can
+    tell a real release from a no-op re-run without a second request; both
+    are 200 (the endpoint is idempotent).
+    """
+
+    scrape_profile_id: uuid.UUID
+    was_quarantined: bool
+    quarantined_at: datetime | None
+    regex_timeout_count: int

@@ -16,7 +16,7 @@ configuration is parsed exactly once per process.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -204,6 +204,34 @@ class Settings(BaseSettings):
 
     # --- Scrape-profile resolution cache (SPEC-06 FR-019) ---
     PROFILE_RESOLUTION_CACHE_TTL_SECONDS: int = 30
+
+    # --- Customer-supplied regex execution bounds (A2/F02) ---
+    # `price_regex`/`old_price_regex`/`currency_regex`/`stock_regex` are
+    # DB-supplied, learned, competitor-page-influenced text. They run on the
+    # live scraping path through `regex.compile(...).search(..., timeout=)`
+    # (the `regex` package — CPython's stdlib `re` cannot be interrupted
+    # mid-match), so a catastrophic backtrack costs a bounded slice of one
+    # page instead of pinning a scraper core forever.
+    #: Per-pattern, per-node wall-clock deadline. The whole-page budget the
+    #: extraction module applies is 4x this value across every text node.
+    EXTRACTION_REGEX_TIMEOUT_SECONDS: float = 0.25
+    #: Write-time cap on a profile regex's source length (validation refuses
+    #: anything longer before it is ever compiled).
+    EXTRACTION_REGEX_MAX_PATTERN_CHARS: int = 512
+    #: Consecutive-window REGEX_TIMEOUT count (per rolling 24 h) after which a
+    #: scrape profile's regex strategy is quarantined.
+    EXTRACTION_REGEX_QUARANTINE_AFTER: int = 3
+    # Promoted from module constants in the scraping-side library's regex
+    # extraction module (named indirectly: this package must not reference
+    # that library even in a comment - see
+    # `tests/unit/test_import_boundaries.py`). They are the W3.2 pattern
+    # pre-flight + input-truncation bounds, and they stay DEFAULT OFF: the
+    # per-pattern execution deadline above is the primary containment now.
+    EXTRACTION_REGEX_BOUNDS_ENABLED: bool = False
+    #: Longest single text node any bounded pattern may see.
+    EXTRACTION_REGEX_BOUNDS_MAX_NODE_CHARS: int = 65_536
+    #: Total characters one bounded pattern may scan across every node.
+    EXTRACTION_REGEX_BOUNDS_MAX_TOTAL_CHARS: int = 1_048_576
 
     # --- Batched persistence flush knobs (SPEC-07 FR-017, Principle VIII) ---
     # The scraping runtime's batched persistence pipeline (consumed via
@@ -623,6 +651,34 @@ class Settings(BaseSettings):
     # is a plain comma-separated string, never JSON.
     BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS: Annotated[tuple[str, ...], NoDecode] = ()
 
+    # --- Connection-time browser egress guard (READY F01, plan task A1,
+    # Principle IV — env-tunable, never a hardcoded literal). Chromium
+    # performs its own DNS and follows redirects internally, so the
+    # `PLAYWRIGHT_ABORT_REQUEST` route hook only ever sees the FIRST
+    # request of a chain; the browser egress guard (in the scraping-core
+    # library, module `browser.egress_guard` -- deliberately NOT named in
+    # full here: `tests/unit/test_import_boundaries.py` forbids that
+    # package's name anywhere under `app_shared`, comments included, so the
+    # reverse dependency edge cannot be reintroduced by a lazy import) is
+    # the enforcement point that every connection (redirect hop,
+    # sub-resource, worker, popup, WebSocket) must pass through, because
+    # Chromium is launched with `--proxy-server=http://127.0.0.1:<port>`.
+    #
+    # ON by default and intended to stay on: with it off, the browser node
+    # is back to route-hook-only coverage, which is the exact gap F01
+    # exists to close. The switch exists so an operator can prove a
+    # production incident is or is not the guard, not as a routine knob.
+    BROWSER_EGRESS_GUARD_ENABLED: bool = True
+    # Wall clock for the guard's own upstream dial (origin or proxy leg).
+    # Bounds a black-holed destination without waiting out the OS SYN
+    # retry ladder; the navigation timeout above still bounds the page.
+    BROWSER_EGRESS_GUARD_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    # Service workers persist past the page that registered them and can
+    # re-issue fetches with no route hook attached, so they are blocked at
+    # context creation. `"allow"` exists only for a diagnostic run against
+    # a site that genuinely will not render without one.
+    BROWSER_SERVICE_WORKERS: Literal["block", "allow"] = "block"
+
     # --- Retention, rollups & partition maintenance tuning (SPEC-15,
     # data-model.md §6, Principle IV — env/DB-tunable, never a hardcoded
     # literal). Five per-table retention windows, three maintenance-task
@@ -673,6 +729,21 @@ class Settings(BaseSettings):
     # number from observed spend and prints its full derivation.
     FLEET_BUDGET_MONTHLY_CAP_USD_PROXY: float | None = None
     FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER: float | None = None
+
+    # --- Proxy billing unit (EPA A8, deep dive §8.3). `costauth.pricing`
+    # used to divide by a bare `2**30` literal named `BYTES_PER_GIB` —
+    # a real ambiguity, because the September 3 pricing note itself
+    # confuses `$/GB` with `$/GiB` twice, and a provider contract that
+    # actually bills decimal GB would silently under/over-price every
+    # proxied byte by ~7.4% with no setting anywhere to point at. Named
+    # here so the unit is a visible, overridable choice rather than an
+    # implicit constant: default `1073741824` (2**30, one GiB — the
+    # DataImpulse pool rate this repo has actually recorded) reproduces
+    # today's numbers bit-for-bit; a provider whose contract says decimal
+    # `GB` sets this to `1000000000` and every downstream price recomputes
+    # from the same rate.
+    PROXY_BILLING_UNIT_BYTES: int = 1_073_741_824
+
     # Raised 1 -> 3 in the 2026-08-15 readiness cycle. With a lookahead of
     # 1 the entire safety margin between "maintenance stops working" and
     # "every INSERT into four partitioned tables fails" is however many

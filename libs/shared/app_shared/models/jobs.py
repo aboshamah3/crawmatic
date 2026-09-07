@@ -223,6 +223,46 @@ class ScrapeJobTarget(Base, WorkspaceScopedBase):
     completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     error_code: Mapped[ScrapeErrorCode | None] = enum_column(ScrapeErrorCode, nullable=True)
 
+    # --- EPA A5 (2026-09-07): per-phase lifecycle timestamps -----------------
+    #
+    # `status` alone answers "where is this target now"; it cannot answer
+    # "where did the time go". These six columns split the wall-clock life
+    # of a target into the phases that have different owners and different
+    # failure modes, so a slow run can be attributed instead of guessed at:
+    #
+    #   created_at -> dispatched_at        the planner/queue (due-to-dispatch)
+    #   claimed_at -> remote_accepted_at   the Scrapyd POST round trip
+    #   first_network_at                   the first byte on the wire
+    #   document_received_at               the response the extractor sees
+    #   extraction_finished_at             adapters/extraction done
+    #   persisted_at                       the observation is durable
+    #
+    # ALL nullable with no server default, and never coerced to a
+    # fabricated value: NULL means "this phase was not reached, or was not
+    # instrumented for this target" (every row written before this
+    # migration, every never-dispatched target, every transport that does
+    # not report a given boundary). A NULL here is an honest gap, not a
+    # zero-length phase -- the `crawmatic_target_phase_p95_seconds` gauge
+    # in `app_shared.opsmetrics.emit` filters them out rather than
+    # counting them as instantaneous.
+    #
+    # Written ONLY through `app_shared.jobs.targets` (`mark_target` /
+    # `stamp_target_timestamps`), which stamps each one with COALESCE
+    # semantics -- first writer wins, so a retried attempt can never move
+    # a boundary that already happened backwards or forwards.
+    #: The dispatcher decided this target's work (intent planned, B2).
+    claimed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: Scrapyd confirmed the run for this target (intent CONFIRMED, B2).
+    remote_accepted_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: First byte actually on the wire for this target's fetch.
+    first_network_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: The document the extractor will read finished arriving.
+    document_received_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: Extraction/adapters finished for this target's attempt.
+    extraction_finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    #: The persistence pipeline committed this target's rows.
+    persisted_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
     # Durable strategy-chain cursor.  A target can hand off between HTTP
     # and browser nodes without losing which versioned candidate is next;
     # the token also makes duplicate deliveries distinguishable from a new

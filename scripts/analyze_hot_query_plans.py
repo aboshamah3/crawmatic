@@ -1,5 +1,6 @@
 """Read-only production probe for audit risks M2 (extraction vocabulary) and M3
-(hot maintenance-query plans).
+(hot maintenance-query plans), plus a `pg_stat_statements` delta report
+(deep dive §7.4).
 
 Standalone: takes a libpq URL on the command line or in ``ANALYZE_DATABASE_URL``
 and prints (a) per-domain extraction outcomes and (b) ``EXPLAIN (ANALYZE,
@@ -11,12 +12,24 @@ statement runs, and every probe is a ``SELECT``. It creates nothing and writes
 nothing. It is safe to point at production.
 
     uv run python scripts/analyze_hot_query_plans.py "postgresql://..."
+
+`--from-pg-stat-statements --window-minutes N` switches to a different report:
+snapshot `pg_stat_statements`, sleep N minutes, snapshot again, and print the
+deltas ordered by total time, with calls and temp bytes. Requires the
+extension to already be installed -- see `docs/ops/QUERY_STATS.md` for the
+one-time owner setup step. Still read-only (`pg_stat_statements` is a view;
+only the two `SELECT`s against it run).
+
+    uv run python scripts/analyze_hot_query_plans.py "postgresql://..." \\
+        --from-pg-stat-statements --window-minutes 10
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
+import time
 from typing import Any
 
 import psycopg
@@ -136,6 +149,188 @@ HOT_PREDICATES: list[tuple[str, str, dict[str, Any]]] = [
 ]
 
 
+# --- pg_stat_statements delta report (deep dive §7.4) ------------------------
+# `total_exec_time` and `temp_blks_*` are the PG13+ column names (compose runs
+# postgres:17.5-bookworm; production's actual major is unconfirmed -- see
+# docs/ops/QUERY_STATS.md).
+PG_STAT_STATEMENTS_SNAPSHOT = """
+SELECT queryid, query, calls, total_exec_time, temp_blks_read, temp_blks_written
+FROM pg_stat_statements
+"""
+
+# PostgreSQL's fixed page size; temp_blks_read/written are counted in these.
+TEMP_BLOCK_SIZE_BYTES = 8192
+
+
+def _snapshot_pg_stat_statements(cur: psycopg.Cursor) -> dict[Any, dict[str, Any]]:
+    """One read of `pg_stat_statements`, keyed by `queryid`."""
+    cur.execute(PG_STAT_STATEMENTS_SNAPSHOT)
+    snapshot: dict[Any, dict[str, Any]] = {}
+    for queryid, query, calls, total_exec_time, temp_read, temp_written in cur.fetchall():
+        snapshot[queryid] = {
+            "query": query,
+            "calls": calls or 0,
+            "total_exec_time": total_exec_time or 0.0,
+            "temp_blks_read": temp_read or 0,
+            "temp_blks_written": temp_written or 0,
+        }
+    return snapshot
+
+
+def compute_query_stat_deltas(
+    before: dict[Any, dict[str, Any]],
+    after: dict[Any, dict[str, Any]],
+    *,
+    top_n: int = 20,
+) -> dict[str, list[dict[str, Any]]]:
+    """Delta two `pg_stat_statements` snapshots keyed by `queryid`.
+
+    Pure function -- no I/O, no sleep -- so the arithmetic, ordering, and the
+    missing-query case are all unit-testable on fake snapshots.
+
+    Returns ``{"top": [...], "dropped": [...]}``:
+
+    - ``top``: every queryid present in *after*, delta'd against its row in
+      *before* (a queryid that is new in *after* is delta'd against a zero
+      baseline, i.e. reported in full), ordered by ``total_time_delta_ms``
+      descending, capped at ``top_n``.
+    - ``dropped``: queryids present in *before* but missing from *after*
+      (evicted from the stats cache, or a stats reset in between) -- reported
+      here rather than raised, so the report never crashes on a query that
+      disappeared mid-window.
+    """
+    zero_row = {
+        "calls": 0,
+        "total_exec_time": 0.0,
+        "temp_blks_read": 0,
+        "temp_blks_written": 0,
+    }
+
+    rows: list[dict[str, Any]] = []
+    for queryid, after_row in after.items():
+        before_row = before.get(queryid, zero_row)
+
+        calls_delta = after_row["calls"] - before_row["calls"]
+        total_time_delta = after_row["total_exec_time"] - before_row["total_exec_time"]
+        temp_read_delta = after_row["temp_blks_read"] - before_row["temp_blks_read"]
+        temp_written_delta = after_row["temp_blks_written"] - before_row["temp_blks_written"]
+
+        # A stats reset between the two snapshots makes an existing queryid's
+        # counters go backwards. Report the raw after-value rather than a
+        # meaningless negative delta.
+        if calls_delta < 0:
+            calls_delta = after_row["calls"]
+            total_time_delta = after_row["total_exec_time"]
+            temp_read_delta = after_row["temp_blks_read"]
+            temp_written_delta = after_row["temp_blks_written"]
+
+        rows.append(
+            {
+                "queryid": queryid,
+                "query": after_row.get("query"),
+                "calls_delta": calls_delta,
+                "total_time_delta_ms": total_time_delta,
+                "temp_bytes_delta": (temp_read_delta + temp_written_delta)
+                * TEMP_BLOCK_SIZE_BYTES,
+            }
+        )
+
+    rows.sort(key=lambda r: r["total_time_delta_ms"], reverse=True)
+
+    dropped = [
+        {"queryid": queryid, "query": row.get("query")}
+        for queryid, row in before.items()
+        if queryid not in after
+    ]
+
+    return {"top": rows[:top_n], "dropped": dropped}
+
+
+def _run_pg_stat_statements_report(url: str, window_minutes: float, top_n: int) -> int:
+    """Snapshot, sleep, snapshot, report. Read-only throughout."""
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET default_transaction_read_only = on")
+            try:
+                before = _snapshot_pg_stat_statements(cur)
+            except psycopg.Error as exc:
+                print(f"pg_stat_statements is not queryable: {exc}", file=sys.stderr)
+                print(
+                    "See docs/ops/QUERY_STATS.md for the one-time owner setup step.",
+                    file=sys.stderr,
+                )
+                conn.rollback()
+                return 2
+            conn.rollback()
+
+        print(f"[snapshot 1 taken ({len(before)} queries); sleeping {window_minutes} minute(s)]")
+        time.sleep(window_minutes * 60)
+
+        with conn.cursor() as cur:
+            cur.execute("SET default_transaction_read_only = on")
+            after = _snapshot_pg_stat_statements(cur)
+            conn.rollback()
+
+    result = compute_query_stat_deltas(before, after, top_n=top_n)
+
+    print(
+        f"\n=== pg_stat_statements deltas over {window_minutes} minute(s) "
+        f"(top {top_n} by total time) ==="
+    )
+    print("calls_delta | total_time_delta_ms | temp_bytes_delta | query")
+    for row in result["top"]:
+        query_preview = (row["query"] or "").replace("\n", " ").strip()[:120]
+        print(
+            f"{row['calls_delta']} | {row['total_time_delta_ms']:.2f} | "
+            f"{row['temp_bytes_delta']} | {query_preview}"
+        )
+
+    dropped = result["dropped"]
+    if dropped:
+        noun = "query" if len(dropped) == 1 else "queries"
+        print(
+            f"\n=== {len(dropped)} {noun} present in the first snapshot but missing "
+            "from the second (evicted from pg_stat_statements, or a stats reset "
+            "in between) ==="
+        )
+        for row in dropped:
+            query_preview = (row["query"] or "").replace("\n", " ").strip()[:120]
+            print(f"- {query_preview}")
+
+    return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="libpq URL; falls back to ANALYZE_DATABASE_URL",
+    )
+    parser.add_argument(
+        "--from-pg-stat-statements",
+        action="store_true",
+        help=(
+            "Snapshot pg_stat_statements, sleep --window-minutes, snapshot "
+            "again, and report the deltas instead of running the M2/M3 probes."
+        ),
+    )
+    parser.add_argument(
+        "--window-minutes",
+        type=float,
+        default=5.0,
+        help="Minutes to sleep between the two pg_stat_statements snapshots (default: 5).",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=20,
+        help="Queries to report, ordered by total time delta descending (default: 20).",
+    )
+    return parser.parse_args(argv)
+
+
 def _fetch_probe_params(cur: psycopg.Cursor) -> dict[str, Any]:
     """Resolve the workspace/job/variant/day the plan probes bind to."""
     cur.execute("SELECT id FROM workspaces LIMIT 1")
@@ -169,16 +364,22 @@ def _print_table(cur: psycopg.Cursor, title: str) -> None:
 
 
 def main(argv: list[str]) -> int:
-    url = argv[1] if len(argv) > 1 else os.environ.get("ANALYZE_DATABASE_URL", "")
+    args = parse_args(argv[1:])
+    url = args.url or os.environ.get("ANALYZE_DATABASE_URL", "")
     if not url:
         print(
-            "usage: analyze_hot_query_plans.py <libpq-url>  "
+            "usage: analyze_hot_query_plans.py <libpq-url> "
+            "[--from-pg-stat-statements --window-minutes N]  "
             "(or set ANALYZE_DATABASE_URL)",
             file=sys.stderr,
         )
         return 2
     # SQLAlchemy-style URLs are accepted for convenience; psycopg wants plain libpq.
     url = url.replace("postgresql+psycopg://", "postgresql://")
+
+    if args.from_pg_stat_statements:
+        return _run_pg_stat_statements_report(url, args.window_minutes, args.top_n)
+
     since = os.environ.get("ANALYZE_SINCE", "2026-08-10")
 
     with psycopg.connect(url) as conn:

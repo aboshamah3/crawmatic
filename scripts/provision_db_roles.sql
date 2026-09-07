@@ -26,16 +26,19 @@
 -- `ALL TABLES IN SCHEMA public`. It is deliberately a superset and is
 -- safe to run after them.
 --
--- THE ROLE MODEL (three roles, one privilege each)
--- ------------------------------------------------
+-- THE ROLE MODEL (four roles, component-scoped privileges — EPA A3/F03)
+-- -----------------------------------------------------------------
 --   crawmatic_app      LOGIN, NOSUPERUSER, **NOBYPASSRLS**. The ordinary
 --                      tenant connection (`DATABASE_URL`) used by api /
---                      worker / scheduler / scrapers for every
---                      workspace-owned read and write. Owns nothing.
---                      Confined by FORCE ROW LEVEL SECURITY plus the
---                      per-transaction `app.workspace_id` GUC that
+--                      worker / scheduler for every workspace-owned read
+--                      and write. Owns nothing. Confined by FORCE ROW
+--                      LEVEL SECURITY plus the per-transaction
+--                      `app.workspace_id` GUC that
 --                      `app_shared.database.set_workspace_context`
---                      sets with `SET LOCAL` semantics.
+--                      sets with `SET LOCAL` semantics, AND (as of A3)
+--                      by an explicit per-table privilege set — see
+--                      `scripts/sql/grants_expected.yaml` — rather than
+--                      the old blanket `GRANT ... ON ALL TABLES`.
 --
 --   crawmatic_auth     LOGIN, NOSUPERUSER, **BYPASSRLS**. The narrow
 --                      system role for the three structurally
@@ -58,6 +61,21 @@
 --                      deployed name is kept; `crawmatic_system` is
 --                      this role.
 --
+--   crawmatic_scraper  NEW (EPA A3/F03). LOGIN, NOSUPERUSER,
+--                      **NOBYPASSRLS**. The scrapyd services' narrow
+--                      ingestion role: write access to exactly the
+--                      fleet-ingestion tables a spider run produces
+--                      (`request_attempts`, `price_observations`,
+--                      `network_operations` INSERT; `scrape_job_targets`
+--                      UPDATE), read access to the profile/match data a
+--                      spider needs, nothing on budgets/entitlements/
+--                      users. Not yet wired into any deployed service's
+--                      `DATABASE_URL` — the scrapyd services still run
+--                      as `crawmatic_app` until the owner cuts over
+--                      (tracked as A10; see
+--                      `docs/ops/SECRETS_BY_COMPONENT.md`). Owns
+--                      nothing.
+--
 --   crawmatic_migrate  LOGIN, NOSUPERUSER, NOBYPASSRLS, but holds
 --                      CREATE on schema public: the DDL owner that
 --                      `alembic upgrade head` authenticates as
@@ -67,7 +85,14 @@
 --                      `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`
 --                      and `DROP POLICY` — i.e. an owner that is also a
 --                      live service login can switch off its own
---                      isolation. See section 8.
+--                      isolation. See section 8. Deliberately
+--                      NOCREATEROLE: this file, not a migration, is
+--                      what creates `crawmatic_scraper` (see section
+--                      3a) — Alembic authenticates as this role in
+--                      production, and a migration attempting
+--                      `CREATE ROLE` would fail against it exactly the
+--                      way "WHY THIS IS NOT AN ALEMBIC MIGRATION" above
+--                      already explains for the other three roles.
 --
 -- PASSWORD CONTRACT
 -- -----------------
@@ -183,73 +208,374 @@ END
 $$;
 
 -- ---------------------------------------------------------------------
--- 4. Connect + schema usage.
+-- 3a. crawmatic_scraper — the scrapyd ingestion role (EPA A3/F03, new).
 --
---    Both runtime roles get USAGE only — never CREATE: a tenant-facing
---    connection must not be able to add a table (an unpolicied table it
---    owns would be a hole) or to shadow one via a new schema.
---    crawmatic_migrate gets CREATE because creating tables is its job.
+--     NOBYPASSRLS like crawmatic_app: it is an ordinary tenant
+--     connection, just a narrower one. Created HERE (not by the
+--     `<rev>_tenant_usage_view_and_scraper_role.py` Alembic migration
+--     the plan describes) for the same reason the other three roles
+--     are — see "WHY THIS IS NOT AN ALEMBIC MIGRATION" and
+--     `crawmatic_migrate`'s NOCREATEROLE note above. The migration
+--     creates the `workspace_usage_v` view only.
 -- ---------------------------------------------------------------------
 DO $$
+DECLARE
+    pw text := nullif(current_setting('provision_db_roles.scraper_password', true), '');
 BEGIN
-    EXECUTE format(
-        'GRANT CONNECT ON DATABASE %I TO crawmatic_app, crawmatic_auth, crawmatic_migrate',
-        current_database()
-    );
-END
-$$;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crawmatic_scraper') THEN
+        EXECUTE 'CREATE ROLE crawmatic_scraper LOGIN';
+        RAISE NOTICE 'created role crawmatic_scraper';
+    END IF;
 
-GRANT USAGE ON SCHEMA public TO crawmatic_app, crawmatic_auth;
-REVOKE CREATE ON SCHEMA public FROM crawmatic_app, crawmatic_auth;
-GRANT USAGE, CREATE ON SCHEMA public TO crawmatic_migrate;
+    EXECUTE 'ALTER ROLE crawmatic_scraper '
+            'LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION INHERIT';
 
--- ---------------------------------------------------------------------
--- 5. Table + sequence privileges for the two runtime roles.
---
---    Plain DML only. No DDL, no TRUNCATE, no REFERENCES:
---
---      * TRUNCATE is NOT filtered by row-level policies at all — a
---        tenant connection holding it could erase every workspace's
---        rows in one statement while RLS looked on.
---      * REFERENCES lets a role create an FK against a table it cannot
---        read, which leaks existence through constraint violations.
---      * DDL would let the role drop its own policies.
---
---    alembic_version is read-only for both (`GET /version` reads it);
---    only crawmatic_migrate writes it.
--- ---------------------------------------------------------------------
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON ALL TABLES IN SCHEMA public
-    TO crawmatic_app, crawmatic_auth;
-
-GRANT USAGE, SELECT
-    ON ALL SEQUENCES IN SCHEMA public
-    TO crawmatic_app, crawmatic_auth;
-
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relname = 'alembic_version'
-    ) THEN
-        EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON public.alembic_version '
-                'FROM crawmatic_app, crawmatic_auth';
+    IF pw IS NOT NULL THEN
+        EXECUTE format('ALTER ROLE crawmatic_scraper PASSWORD %L', pw);
     END IF;
 END
 $$;
 
 -- ---------------------------------------------------------------------
--- 6. Default privileges, so a table created by a FUTURE migration is
---    reachable without re-running this file.
+-- 4. Connect + schema usage.
 --
---    Default ACLs are recorded per GRANTING role and apply to objects
---    created BY the role named in FOR ROLE. Two entries are registered:
---    one for whoever is running this file (today's owner, commonly
---    `postgres` or a bootstrap owner) and one for `crawmatic_migrate`
---    (tomorrow's owner, after section 8). Registering both means the
---    ownership migration does not silently strip the runtime roles'
---    access to newly created tables.
+--    All three runtime roles get USAGE only — never CREATE: a
+--    tenant-facing connection must not be able to add a table (an
+--    unpolicied table it owns would be a hole) or to shadow one via a
+--    new schema. crawmatic_migrate gets CREATE because creating tables
+--    is its job.
+-- ---------------------------------------------------------------------
+DO $$
+BEGIN
+    EXECUTE format(
+        'GRANT CONNECT ON DATABASE %I TO crawmatic_app, crawmatic_auth, crawmatic_scraper, crawmatic_migrate',
+        current_database()
+    );
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO crawmatic_app, crawmatic_auth, crawmatic_scraper;
+REVOKE CREATE ON SCHEMA public FROM crawmatic_app, crawmatic_auth, crawmatic_scraper;
+GRANT USAGE, CREATE ON SCHEMA public TO crawmatic_migrate;
+
+-- ---------------------------------------------------------------------
+-- 5. Table + sequence privileges — component-scoped (EPA A3/F03).
+--
+--    Replaces the old blanket GRANT ... ON ALL TABLES IN SCHEMA public
+--    TO crawmatic_app, crawmatic_auth. Every (role, table) privilege
+--    set below is EXPLICIT and generated from the reviewed manifest at
+--    scripts/sql/grants_expected.yaml — the source of truth
+--    scripts/verify_grants.py diffs a live database against. Keep the
+--    two in sync: a change here with no matching manifest update (or
+--    vice versa) is exactly the drift verify_grants.py exists to
+--    catch, and tests/integration/test_grants_manifest.py runs both
+--    against the same compose database.
+--
+--    Still no DDL, no TRUNCATE-privilege, no REFERENCES, for the same
+--    three reasons as before:
+--
+--      * the TRUNCATE privilege is NOT filtered by row-level policies
+--        at all — a tenant connection holding it could erase every
+--        workspace's rows in one statement while RLS looked on.
+--      * REFERENCES lets a role create an FK against a table it cannot
+--        read, which leaks existence through constraint violations.
+--      * DDL would let the role drop its own policies.
+--
+--    Each table's privileges are applied as a REVOKE of every privilege
+--    that role holds on it, followed by a GRANT of the explicit set —
+--    the REVOKE runs first because GRANT is additive: re-running this
+--    file after the manifest narrows a role's access must actually
+--    narrow it, not just add to whatever the role held before. A table
+--    named in the manifest that does not exist yet in this database
+--    (a manifest edited ahead of its migration, or a stale/partial
+--    database) is skipped with a WARNING rather than aborting the
+--    whole idempotent run.
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    tbl text;
+    child record;
+BEGIN
+    -- ---- crawmatic_app ----
+    FOREACH tbl IN ARRAY ARRAY['access_policies', 'api_keys', 'competitor_product_matches', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_strategy_methods', 'domain_strategy_profiles', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'outbox_messages', 'price_alert_events', 'price_observations', 'product_group_items', 'product_groups', 'product_variants', 'products', 'proxy_providers', 'refresh_rules', 'refresh_tokens', 'request_attempts', 'scrape_job_targets', 'scrape_jobs', 'scrape_profile_revisions', 'scrape_profiles', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        -- Apply to the table itself AND every partition child of it
+        -- (pg_inherits), because a partition is an INDEPENDENT
+        -- relation with its own ACL -- exactly the same reason
+        -- app_shared.models.rls.PARTITION_RLS_INHERITANCE_SQL exists
+        -- for POLICIES. A direct `SELECT * FROM t_2026_08` is checked
+        -- against the CHILD's own grants, never the parent's.
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_app', child.ident);
+            EXECUTE format('GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_app', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'domain_lifecycle_audit', 'domain_playbooks', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'proxy_circuit_breakers', 'rollup_watermarks', 'workspaces'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_app', child.ident);
+            EXECUTE format('GRANT DELETE, INSERT, SELECT ON TABLE %I TO crawmatic_app', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['network_operation_settlements', 'provider_usage_records'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_app', child.ident);
+            -- crawmatic_app gets no privileges on this table (see grants_expected.yaml)
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'network_operations'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_app', child.ident);
+            EXECUTE format('GRANT SELECT ON TABLE %I TO crawmatic_app', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['api_abuse_limit_counters'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_app', child.ident);
+            EXECUTE format('GRANT INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_app', child.ident);
+        END LOOP;
+    END LOOP;
+
+    -- ---- crawmatic_auth ----
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'api_abuse_limit_counters', 'competitor_product_matches', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'domain_strategy_profiles', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'network_operations', 'outbox_messages', 'price_alert_events', 'price_observations', 'product_group_items', 'product_groups', 'product_variants', 'provider_usage_records', 'proxy_circuit_breakers', 'refresh_rules', 'refresh_tokens', 'request_attempts', 'rollup_watermarks', 'scrape_job_targets', 'scrape_jobs', 'scrape_profile_revisions', 'scrape_profiles', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_method_switches', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_auth', child.ident);
+            EXECUTE format('GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_auth', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'api_keys', 'proxy_providers', 'users', 'webhook_endpoints'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_auth', child.ident);
+            EXECUTE format('GRANT SELECT ON TABLE %I TO crawmatic_auth', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['products'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_auth', child.ident);
+            EXECUTE format('GRANT DELETE, INSERT, SELECT ON TABLE %I TO crawmatic_auth', child.ident);
+        END LOOP;
+    END LOOP;
+
+    -- ---- crawmatic_scraper ----
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rules', 'refresh_tokens', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_scraper', child.ident);
+            -- crawmatic_scraper gets no privileges on this table (see grants_expected.yaml)
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['network_operations', 'price_observations', 'request_attempts'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_scraper', child.ident);
+            EXECUTE format('GRANT INSERT ON TABLE %I TO crawmatic_scraper', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['competitor_product_matches', 'domain_strategy_profiles', 'scrape_profiles'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_scraper', child.ident);
+            EXECUTE format('GRANT SELECT ON TABLE %I TO crawmatic_scraper', child.ident);
+        END LOOP;
+    END LOOP;
+    FOREACH tbl IN ARRAY ARRAY['scrape_job_targets'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
+            CONTINUE;
+        END IF;
+        FOR child IN
+            SELECT tbl AS ident
+            UNION ALL
+            SELECT c.relname FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent
+            WHERE p.relname = tbl AND p.relnamespace = 'public'::regnamespace
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_scraper', child.ident);
+            EXECUTE format('GRANT UPDATE ON TABLE %I TO crawmatic_scraper', child.ident);
+        END LOOP;
+    END LOOP;
+END
+$$;
+
+-- Sequences: only crawmatic_app and crawmatic_auth ever need one (every
+-- ORM model's surrogate key is a Python-side UUIDv7 default, per
+-- app_shared.ids.new_uuid7 — no bigserial/identity column exists in this
+-- schema today — so this grants no crawmatic_scraper-visible capability
+-- that doesn't already exist for the two broader roles; kept exactly as
+-- before so a future serial/identity column is covered without a second
+-- manifest).
+GRANT USAGE, SELECT
+    ON ALL SEQUENCES IN SCHEMA public
+    TO crawmatic_app, crawmatic_auth;
+
+-- ---------------------------------------------------------------------
+-- 5a. workspace_usage_v — repeat the grant made by the creating migration
+--     (<rev>_tenant_usage_view_and_scraper_role.py), idempotently and
+--     independent of deploy ORDER.
+--
+--     The migration's own GRANT is guarded on `crawmatic_app` already
+--     existing at MIGRATION time, which is correct the FIRST time a
+--     brand-new database is provisioned (migrate-then-provision: the
+--     role does not exist yet, so that GRANT is a no-op) but would
+--     otherwise leave the view ungranted until BOTH steps had run at
+--     least once in EITHER order. This repair runs every time this file
+--     runs — which is required after every deploy regardless — so the
+--     view's grant converges the same way every base-table grant above
+--     does, regardless of whether migrations or role provisioning ran
+--     first. Not a table in `scripts/rls_table_manifest.txt` (it is a
+--     view, not a physical relation with its own RLS posture to review),
+--     so it is not part of the REVOKE-then-GRANT loops above or of
+--     `scripts/sql/grants_expected.yaml` — this one line is its
+--     complete, standalone grant statement.
+-- ---------------------------------------------------------------------
+DO $$
+BEGIN
+    IF to_regclass('public.workspace_usage_v') IS NOT NULL THEN
+        GRANT SELECT ON workspace_usage_v TO crawmatic_app;
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------
+-- 6. Default privileges (EPA A3/F03: TABLES intentionally NOT covered).
+--
+--    Before A3 this section auto-granted every runtime role blanket
+--    SELECT/INSERT/UPDATE/DELETE on any table a FUTURE migration
+--    created, so a new table was reachable without re-running this
+--    file. That is exactly the unreviewed-blanket-grant pattern section
+--    5 above now closes for every EXISTING table — auto-granting it to
+--    every NEW table would just reopen the hole one migration at a
+--    time. A table created by a future migration therefore gets NO
+--    privileges for any runtime role until a human adds it to BOTH
+--    `scripts/rls_table_manifest.txt` (the isolation review) and
+--    `scripts/sql/grants_expected.yaml` (the privilege review) and
+--    re-runs this file — the same two-file review `provision_db_roles.
+--    py --verify` and `verify_grants.py` already require, now also
+--    enforced by omission rather than by an auto-grant a reviewer could
+--    forget to narrow.
+--
+--    Sequences are the one exception, kept exactly as before: no ORM
+--    model in this schema uses a bigserial/identity column (every
+--    surrogate key is a Python-side UUIDv7 default), so this default
+--    grants no capability that exists today — it is a no-op safety net
+--    for a future serial column, not a live blanket grant.
 -- ---------------------------------------------------------------------
 DO $$
 DECLARE
@@ -257,12 +583,6 @@ DECLARE
 BEGIN
     FOREACH granting_role IN ARRAY ARRAY[current_user, 'crawmatic_migrate']
     LOOP
-        EXECUTE format(
-            'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
-            'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES '
-            'TO crawmatic_app, crawmatic_auth',
-            granting_role
-        );
         EXECUTE format(
             'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
             'GRANT USAGE, SELECT ON SEQUENCES TO crawmatic_app, crawmatic_auth',

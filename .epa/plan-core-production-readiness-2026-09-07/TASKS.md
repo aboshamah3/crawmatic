@@ -6,16 +6,16 @@
 | 0.2 | 0 | P0-1 | Fast-forward engine `main` to `7a26c54` — OWNER GATE | - | sonnet | done-dev | 1 | reports/0.2.md |
 | 0.3 | 0 | P0-2 | Release identity manifest and configuration diff (F20 part 1) | - | opus | done-dev | 1 | reports/0.3.md |
 | 0.4 | 0 | P0-2 | Isolated unit-test environment (audit §2) | - | opus | done-dev | 1 | reports/0.4.md |
-| A1 | A | PA-1 | Browser egress enforced at connection time (F01, P0) | 0.4 | opus | pending | 0 | - |
-| A2 | A | PA-2 | Regex execution with a hard timeout (F02) | 0.4 | opus | pending | 0 | - |
-| A3 | A | PA-3 | Component-scoped credentials and grants (F03) | 0.4 | sonnet | pending | 0 | - |
-| A4 | A | PA-3 | Advisory triage gate and pinned build tools (F04) | A1 | sonnet | pending | 0 | - |
-| A5 | A | PA-4 | Target lifecycle truth — STARTED transition, phase timestamps, baseline metrics | A3 | opus | pending | 0 | - |
-| A6 | A | PA-5 | Canary calculator counts pages, prices and provider dimension | 0.4 | sonnet | pending | 0 | - |
-| A7 | A | PA-6 | Ledger coverage and bytes at the transport boundary | 0.4 | sonnet | pending | 0 | - |
-| A8 | A | PA-5 | Cost artifacts and watchdog corrected | A2 | sonnet | pending | 0 | - |
-| A9 | A | PA-7 | Query statistics in production | 0.4 | sonnet | pending | 0 | - |
-| A10 | A | PA-8 | Engine release 1 — OWNER GATE (F20) | A1-A9 | sonnet | pending | 0 | - |
+| A1 | A | PA-1 | Browser egress enforced at connection time (F01, P0) | 0.4 | opus | done-dev | 1 | reports/A1.md |
+| A2 | A | PA-2 | Regex execution with a hard timeout (F02) | 0.4 | opus | done-dev | 1 | reports/A2.md |
+| A3 | A | PA-3 | Component-scoped credentials and grants (F03) | 0.4 | sonnet | done-dev (MATERIAL: grants kept, owner decision at A10) | 1 | reports/A3.md |
+| A4 | A | PA-3 | Advisory triage gate and pinned build tools (F04) | A1 | sonnet | done | 1 | reports/A4.md |
+| A5 | A | PA-4 | Target lifecycle truth — STARTED transition, phase timestamps, baseline metrics | A3 | opus | done-dev | 1 | reports/A5.md |
+| A6 | A | PA-5 | Canary calculator counts pages, prices and provider dimension | 0.4 | sonnet | done-dev | 1 | reports/A6.md |
+| A7 | A | PA-6 | Ledger coverage and bytes at the transport boundary | 0.4 | sonnet | done-dev | 1 | reports/A7.md |
+| A8 | A | PA-5 | Cost artifacts and watchdog corrected | A2 | sonnet | done-dev | 1 | reports/A8.md |
+| A9 | A | PA-7 | Query statistics in production | 0.4 | sonnet | done-dev | 1 | reports/A9.md |
+| A10 | A | PA-8 | Engine release 1 — OWNER GATE (F20) | A1-A9 | sonnet | done-dev (step 3 owner, deferred) | 1 | reports/A10.md |
 | B1 | B | PB-1 | Durable result spool with idempotent persistence and backpressure (F05) | A5, A10 | opus | pending | 0 | - |
 | B2 | B | PB-2 | Dispatch intent committed before the POST; stable remote job id; outbox (F06) | B1 | opus | pending | 0 | - |
 | B3 | B | PB-3 | Atomic due-time claim, unique occurrences, per-rule isolation, fair mode on (F07) | B2, B4 | opus | pending | 0 | - |

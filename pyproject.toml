@@ -16,9 +16,17 @@ dev = [
     "pytest>=8.3,<9",
     "httpx>=0.28,<1",
     "alembic>=1.13,<2",
+    # Pinned build tool (EPA A4/F04): both scrapyd Dockerfiles invoke this
+    # via `uvx --from scrapyd-client==2.0.3` directly (uvx's ephemeral env
+    # does not read this group), so this entry exists to keep uv.lock's
+    # dependency graph and hashes for the pin auditable/reproducible from
+    # the workspace side too, and to let a dev venv run scrapyd-deploy
+    # locally without a separate uvx install.
+    "scrapyd-client==2.0.3",
 ]
 
 [tool.pytest.ini_options]
 markers = [
     "integration: needs the docker-compose DB/pgbouncer stack; skipped by -m 'not integration'",
+    "browser: needs a real Chromium (playwright install chromium); run inside the scrapers-browser image",
 ]
