@@ -1,0 +1,5 @@
+# Blockers: plan-core-production-readiness-2026-09-07
+
+- 2026-09-07 14:08 — **Task 0.2 (owner gate) partially done by orchestrator on owner instruction.** Engine `main` fast-forwarded to 7a26c54 and pushed; local tag `v2026.09.03-readiness` points at 7a26c54. The **remote** tag still points at eb23dff (created before the merge; force-push blocked for the orchestrator). Owner: `cd /srv/crawmatic/crawmatic && git push --force origin refs/tags/v2026.09.03-readiness`.
+- 2026-09-07 14:06 — `git stash@{0}` ("epa-0.2: stray 7a26c54-content copies…") exists on the engine repo; its content is byte-identical to 7a26c54 and can be dropped: `git stash drop stash@{0}`. Harmless if left.
+- 2026-09-07 14:03 — Disk on `/` at 97% (2.5 GB free). Docker compose / image builds may hit ENOSPC; per Pre-Flight, such failures are logged here and the affected verification marked deferred, not failed.
