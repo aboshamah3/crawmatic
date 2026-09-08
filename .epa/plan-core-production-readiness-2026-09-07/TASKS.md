@@ -25,7 +25,7 @@
 | B7 | B | PB-7 | Non-blocking API middleware with deadlines everywhere (F15) | B1 | sonnet | done-dev (abuse_limit kept, see ASSUMPTIONS) | 1 | reports/B7.md |
 | B8 | B | PB-8 | Readiness probes that cannot pile up; liveness/dependency/scraping split (F16) | A10 | sonnet | done-dev | 1 | reports/B8.md |
 | B9 | B | PB-8 | Heartbeats for every process class and alerts to an owner (F22) | A5, A7 | sonnet | done-dev (rules gauge wiring follow-up) | 1 | reports/B9.md |
-| B10 | B | PB-9 | Engine release 2 — OWNER GATE | B1-B9 | sonnet | pending | 0 | - |
+| B10 | B | PB-9 | Engine release 2 — OWNER GATE | B1-B9 | sonnet | running | 1 | - |
 | C1 | C | PC-1 | Per-target deadline, physical attempt budget, failure classes, method suppression (F08) | B5, B10 | opus | pending | 0 | - |
 | C2 | C | PC-2 | Amazon HTTP-leg investigation with the resolved production profile — spend ≤ $1 | C1 | sonnet | pending | 0 | - |
 | C3 | C | PC-2 | Document-only browser canary with the fixed calculator — spend ≤ $3 | A6, C1 | sonnet | pending | 0 | - |
