@@ -54,7 +54,20 @@ class HtmlPipelineAdapter:
             return AdapterResult(outcome, response.final_url, identity, message=identity.reason)
 
         body = response.body.decode("utf-8", errors="replace") if isinstance(response.body, bytes) else response.body
-        candidate = extract(body, context.profile, preferred_method=preferred_method)
+        # EPA C5 (F19): `url`/`profile_version` are correlation for the
+        # ranker's SHADOW record only -- neither affects extraction, and
+        # the returned candidate is byte-for-byte what it was before.
+        # Passed here because this adapter is the live path's single
+        # entry into the chain: without them every shadow event on real
+        # traffic would land with a NULL domain, and the C11 gate is
+        # decided per domain against the C4 labeled sets.
+        candidate = extract(
+            body,
+            context.profile,
+            preferred_method=preferred_method,
+            url=response.final_url or response.requested_url or context.target_url,
+            profile_version=getattr(context.profile, "version", None),
+        )
         return AdapterResult(
             AdapterOutcome.FOUND if candidate else AdapterOutcome.NOT_FOUND,
             response.final_url,

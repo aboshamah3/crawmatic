@@ -117,8 +117,14 @@ from app_shared.ids import new_uuid7
 from app_shared.jobs.cancellation import LATE_AFTER_CANCEL_REASON, cancelled_scrape_job_ids
 from app_shared.jobs.targets import mark_target, stamp_target_timestamps
 from app_shared.limiter.locks import release_match_lock
-from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.observations import (
+    ExtractionShadowEvent,
+    MatchCurrentPrice,
+    PriceObservation,
+    RequestAttempt,
+)
 from app_shared.models.jobs import ScrapeJobTarget
+from app_shared.observations.evidence_store import store_dir_from_settings, store_evidence
 from app_shared.outbox import write_outbox_message
 from app_shared.profiles.repository import record_regex_timeout
 from app_shared.redis_client import get_redis_client
@@ -133,6 +139,7 @@ from app_shared.task_names import (
 )
 
 from scrape_core.db import run_in_thread, workspace_txn
+from scrape_core.extraction.pipeline import drain_shadow_events
 from scrape_core.items import ScrapeResult
 from scrape_core.observability import log_event
 from scrape_core.result_spool import ResultSpool, SpooledBatch
@@ -207,9 +214,61 @@ def _current_price_key(row: dict[str, Any]) -> tuple[Any, Any]:
 # FR-014), so `excluded.observation_id IS NOT NULL` makes it lose every
 # tie instead of comparing against NULL -- also deterministic, and in the
 # safe direction (the row keeps its last known price).
-def _monotonic_conflict_where(stmt: Any) -> Any:
+#: EPA C5 (F19). How much newer an incoming observation must be before it
+#: may overwrite a MORE confident current price. The escape hatch exists
+#: because "never downgrade confidence" alone is absorbing: a page that
+#: once yielded a JSON-LD reading and now only yields a regex fallback
+#: (the site changed) would otherwise keep its old price forever, and a
+#: stale correct-looking price is worse than a fresh imprecise one.
+#: A day is the shortest window that is unambiguously "this is not a
+#: straggler from the same refresh".
+CURRENT_PRICE_CONFIDENCE_OVERRIDE_HOURS = 24
+
+
+def _confidence_conflict_where(stmt: Any) -> Any:
+    """The C5 half of the guard: a worse reading does not replace a better one.
+
+    READY-013-g's clause below is about *when* an observation was taken.
+    It is silent on *how well* it was read, so a low-confidence
+    single-number fallback taken one second after an authoritative
+    JSON-LD reading wins on recency alone and the customer's dashboard
+    quietly degrades from a price to a guess.
+
+    Expressed as "the update may proceed when the incoming reading is at
+    least as good" rather than as a negated refusal, so the whole
+    predicate stays a positive permission the way the rest of this WHERE
+    clause reads, and so the NULL cases below are explicit rather than
+    implied by three-valued negation.
+
+    NULL on EITHER side never blocks. ``NULL`` means *unmeasured* (the
+    ``offer_observation`` rule: unknown is never zero), and an unmeasured
+    confidence is not evidence that the incoming reading is worse — it is
+    the absence of evidence either way. Blocking on it would freeze the
+    current price of every match whose producer does not report
+    confidence, which is every pre-C5 writer, and would turn this guard
+    from a quality floor into an outage.
+
+    Same compare-and-set shape as its sibling: evaluated by Postgres
+    inside the UPDATE, so two concurrent flushes cannot both read the
+    stored row, both conclude they may write, and let the later COMMIT
+    win.
+    """
     excluded = stmt.excluded
     return or_(
+        MatchCurrentPrice.extraction_confidence.is_(None),
+        excluded.extraction_confidence.is_(None),
+        MatchCurrentPrice.extraction_confidence <= excluded.extraction_confidence,
+        # ...or the incoming observation is old enough that keeping the
+        # better-read price would be keeping a stale one.
+        excluded.scraped_at
+        > MatchCurrentPrice.scraped_at
+        + func.make_interval(0, 0, 0, 0, CURRENT_PRICE_CONFIDENCE_OVERRIDE_HOURS),
+    )
+
+
+def _monotonic_conflict_where(stmt: Any) -> Any:
+    excluded = stmt.excluded
+    monotonic = or_(
         MatchCurrentPrice.scraped_at < excluded.scraped_at,
         and_(
             MatchCurrentPrice.scraped_at == excluded.scraped_at,
@@ -220,6 +279,11 @@ def _monotonic_conflict_where(stmt: Any) -> Any:
             ),
         ),
     )
+    # AND, never OR: the confidence rule is an ADDITIONAL veto, not an
+    # alternative route to writing. ORing them would make "my reading is
+    # more confident" a way to write a STALE price, which is exactly the
+    # defect READY-013-g's clause exists to prevent.
+    return and_(monotonic, _confidence_conflict_where(stmt))
 
 
 def _observation_order(row: dict[str, Any]) -> tuple[Any, bool, Any]:
@@ -407,6 +471,235 @@ def _insert_ignoring_replays(
     session.execute(stmt.on_conflict_do_nothing(index_elements=list(index_elements)))
 
 
+# ---------------------------------------------------------------------------
+# EPA C5 (F19): the structured offer contract on the live path
+# ---------------------------------------------------------------------------
+
+#: The closed vocabulary of `price_observations.availability_state`.
+#: Enforced HERE, at the write boundary, rather than by a DB `CHECK`:
+#: `price_observations` is partitioned and a validated constraint
+#: recurses into every partition, so the cheap place to refuse a bad
+#: value is before it exists. Same posture as `offer_seller_type`.
+AVAILABILITY_STATES: tuple[str, ...] = (
+    "available",
+    "unavailable",
+    "blocked",
+    "stale",
+    "conditional",
+)
+
+#: Error codes that mean "the site refused us", as distinct from "we
+#: read the page and found no price". The difference is the whole point
+#: of `availability_state`: a blocked fetch tells you nothing about
+#: whether the product is in stock, and collapsing it into
+#: `stock_status = UNKNOWN` is what made an unavailable product
+#: indistinguishable from a failed scrape.
+_BLOCKED_ERROR_CODES = frozenset(
+    {
+        ScrapeErrorCode.BLOCKED,
+        ScrapeErrorCode.POLICY_BLOCKED,
+        ScrapeErrorCode.HTTP_403,
+        ScrapeErrorCode.HTTP_429,
+        ScrapeErrorCode.LEGAL_REVIEW_REQUIRED,
+    }
+)
+
+
+def availability_state_for(item: ScrapeResult) -> str | None:
+    """Derive `availability_state` from what this attempt actually knows.
+
+    Ordered most-specific-first, and every branch is a POSITIVE claim —
+    a state is returned only when the attempt has evidence for it.
+    ``None`` (a timeout, a `PRICE_NOT_FOUND` on a page that said nothing
+    about availability) is the honest answer for "we do not know", and is
+    never coerced to `unavailable`: telling a customer a competitor is
+    out of stock because our fetch timed out is a pricing error with a
+    plausible-looking cause, which is the worst kind.
+
+    ``stale``/``conditional`` come from the offer contract rather than
+    from the fetch: an offer whose `expires_at` has passed is a real
+    reading of a price that is no longer on sale, and one whose promotion
+    carries a coupon/bundle/quantity condition is a price that exists
+    only for a buyer who satisfies it. Both are cases where the number is
+    correct and using it directly would still be wrong.
+    """
+    offer = item.offer
+    if offer is not None:
+        expires_at = offer.expires_at
+        if expires_at is not None and expires_at <= datetime.now(UTC):
+            return "stale"
+        promotion = offer.promotion
+        if promotion is not None and any(
+            (
+                promotion.coupon_code,
+                promotion.coupon_requirement,
+                promotion.bundle_condition,
+                promotion.quantity_condition,
+            )
+        ):
+            return "conditional"
+    if item.error_code in _BLOCKED_ERROR_CODES:
+        return "blocked"
+    if item.stock_status == StockStatus.OUT_OF_STOCK:
+        return "unavailable"
+    if item.success:
+        return "available"
+    return None
+
+
+def _offer_evidence_hash(item: ScrapeResult, store_dir: Any) -> str | None:
+    """Store the raw bytes and return their content address, or ``None``.
+
+    Three cases, in order of authority:
+
+    1. The item carries raw bytes AND a store is configured -> write them
+       (idempotently — the same page stored twice is one file) and use
+       the resulting hash. This is the only path that produces a hash
+       whose blob is guaranteed to exist.
+    2. The item carries no bytes but its `OfferObservation` already
+       carries a hash (a producer that stored evidence itself) -> pass it
+       through unchanged. Re-deriving it here would be a second answer to
+       a question that already has one.
+    3. Otherwise ``None``.
+
+    Case 1 requires BOTH halves. Bytes with no configured store yield
+    ``None``, never a computed-but-unstored hash: a content address for
+    bytes nobody kept is precisely the "a hash pointing at deleted data
+    proves nothing" failure `docs/RETENTION_POLICY.md` §2.1 is about, and
+    it is worse than a NULL because it looks like evidence.
+    """
+    if item.raw_evidence is not None and store_dir is not None:
+        return store_evidence(item.raw_evidence, store_dir=store_dir)
+    if item.offer is not None:
+        return item.offer.raw_evidence_hash
+    return None
+
+
+def _offer_column_values(item: ScrapeResult, store_dir: Any) -> dict[str, Any]:
+    """The `offer_*` + provenance columns for one item's observation row.
+
+    A projection, not a transformation: every value is either copied
+    straight off the validated `OfferObservation` (which already crossed
+    the money boundary and the currency/timezone validators) or is one of
+    the four provenance facts the item carries in its own right. Nothing
+    is computed here that the contract could have computed itself.
+    """
+    # Resolved ONCE: `_offer_evidence_hash` writes to the store, and the
+    # `offer.raw_evidence_hash` fallback below must not be able to
+    # overwrite the answer it already gave.
+    evidence_hash = _offer_evidence_hash(item, store_dir)
+    values: dict[str, Any] = {
+        "extractor_version": item.extractor_version,
+        # `0` on the item means "no profile was resolved"; the column's
+        # NULL says the same thing without claiming a version number
+        # that does not exist (profiles start at 1).
+        "profile_version": item.profile_version or None,
+        "confidence": item.confidence,
+        "provenance": item.provenance,
+        "availability_state": availability_state_for(item),
+        "offer_raw_evidence_hash": evidence_hash,
+    }
+
+    offer = item.offer
+    if offer is None:
+        return values
+
+    identity = offer.expected_identity
+    observed = offer.observed_identity
+    values.update(
+        offer_source_url=offer.source_url,
+        offer_canonical_url=offer.canonical_url,
+        offer_domain=offer.domain,
+        offer_market=offer.market,
+        offer_source_timezone=offer.source_timezone,
+        offer_expected_identity=identity.model_dump(mode="json") if identity else None,
+        offer_observed_identity=observed.model_dump(mode="json") if observed else None,
+        offer_seller_name=offer.seller_name,
+        offer_seller_type=offer.seller_type,
+        offer_fulfillment=offer.fulfillment,
+        offer_condition=offer.condition,
+        offer_item_price=offer.item_price,
+        offer_list_price=offer.list_price,
+        offer_shipping_cost=offer.shipping_cost,
+        offer_tax_included=offer.tax_included,
+        offer_fees=offer.fees,
+        offer_deposit=offer.deposit,
+        offer_unit_price=offer.unit_price,
+        offer_landed_total=offer.landed_total,
+        offer_promotion_facts=(
+            offer.promotion.model_dump(mode="json") if offer.promotion else None
+        ),
+        offer_access_method=(
+            str(offer.access_method) if offer.access_method is not None else None
+        ),
+        offer_profile_version=offer.profile_version,
+        offer_parser_version=offer.parser_version,
+        offer_strategy=offer.strategy,
+        offer_discovery_confidence=(
+            offer.confidence.discovery if offer.confidence else None
+        ),
+        offer_identity_confidence=(
+            offer.confidence.identity if offer.confidence else None
+        ),
+        offer_comparability_confidence=(
+            offer.confidence.comparability if offer.confidence else None
+        ),
+        offer_validation_reasons=offer.validation_reasons,
+        offer_expires_at=offer.expires_at,
+        offer_comparability_class=offer.comparability_class,
+        offer_rejection_reason=offer.rejection_reason,
+        offer_human_review_required=offer.human_review_required,
+    )
+    # NOTE: `offer_raw_evidence_hash` is deliberately absent from the
+    # `update()` above. `_offer_evidence_hash` already chose between the
+    # stored-bytes hash and the offer's own, and re-reading
+    # `offer.raw_evidence_hash` here would let a store-less deployment's
+    # `None` overwrite a hash that had just been written.
+    return values
+
+
+def _shadow_event_rows() -> list[ExtractionShadowEvent]:
+    """Drain the extraction shadow buffer into ORM rows.
+
+    Drained inside the persistence flush because that is this system's
+    ONE sanctioned off-reactor DB seam: the comparison itself runs on the
+    Scrapy reactor thread, where a write is forbidden, so the events wait
+    in a bounded in-process buffer until a flush is already in a
+    transaction.
+
+    A drain failure must never take the batch down with it — the events
+    are telemetry and the observations are the product — so the drain is
+    guarded and an error costs at most one buffer's worth of
+    measurements.
+    """
+    try:
+        events = drain_shadow_events()
+    except Exception:  # noqa: BLE001 - telemetry drain never fails a flush
+        logger.warning("extraction shadow drain failed", exc_info=True)
+        return []
+    return [
+        ExtractionShadowEvent(
+            observed_at=event.observed_at or datetime.now(UTC),
+            domain=event.domain,
+            url=event.url,
+            policy_version=event.policy_version,
+            extractor_version=event.extractor_version,
+            profile_version=event.profile_version,
+            disagreement_kind=event.disagreement_kind,
+            first_hit_method=event.first_hit_method,
+            first_hit_price=event.first_hit_price,
+            first_hit_currency=event.first_hit_currency,
+            ranked_outcome=event.ranked_outcome,
+            ranked_method=event.ranked_method,
+            ranked_price=event.ranked_price,
+            ranked_currency=event.ranked_currency,
+            page_evidence_hash=event.page_evidence_hash,
+            detail=event.detail,
+        )
+        for event in events
+    ]
+
+
 def _flush_batch(
     workspace_id: Any,
     batch: list[ScrapeResult],
@@ -479,6 +772,17 @@ def _flush_batch(
         if current is None or order > current[0]:
             winning_row_kind[key] = (order, kind)
 
+    # EPA C5: resolved ONCE per flush, not per item -- the store
+    # directory is a deployment fact, and re-reading it mid-batch would
+    # let half a batch's evidence land somewhere the other half's did
+    # not. `None` means the volume is not configured on this service, in
+    # which case no blob is written and no hash is recorded.
+    try:
+        evidence_store_dir = store_dir_from_settings(get_settings())
+    except Exception:  # noqa: BLE001 - a missing knob never fails a flush
+        logger.warning("could not resolve EVIDENCE_STORE_DIR", exc_info=True)
+        evidence_store_dir = None
+
     for item in batch:
         observation_id = new_uuid7()
         moment = item.scraped_at or datetime.now(UTC)
@@ -514,6 +818,11 @@ def _flush_batch(
                 extraction_method=item.extraction_method,
                 extraction_confidence=item.extraction_confidence,
                 selector_used=item.selector_used,
+                # EPA C5 (F19): the W3.1 `offer_*` superset -- which had
+                # columns, a validated contract, and no writer -- plus
+                # the four provenance facts that make the written row
+                # attributable afterwards.
+                **_offer_column_values(item, evidence_store_dir),
             )
         )
         attempts.append(
@@ -748,6 +1057,21 @@ def _flush_batch(
             attempts,
             ("workspace_id", "attempt_uuid", "created_at"),
         )
+
+        # EPA C5 (F19): the ranker's shadow disagreements, written in the
+        # SAME transaction as the observations they are about. Draining
+        # here (rather than on a timer of its own) is what makes them
+        # atomic with the prices they shadow: a flush that rolls back
+        # takes its measurements with it, so the recorded disagreement
+        # rate is always over prices that actually exist.
+        #
+        # Fleet-scoped rows on a workspace-scoped session, which is safe
+        # precisely because the table has no `workspace_id` and no RLS
+        # policy -- see `ExtractionShadowEvent`'s docstring for why it is
+        # classified that way.
+        shadow_rows = _shadow_event_rows()
+        if shadow_rows:
+            session.add_all(shadow_rows)
 
         if current_price_rows:
             # A batch may carry more than one successful observation for the

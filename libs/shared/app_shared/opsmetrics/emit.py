@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from app_shared.opsmetrics.rules import (
     ATTEMPTS_PER_VALID_FRESH_MAX,
@@ -214,6 +214,23 @@ FROM
     ) AS fresh
 """
 
+#: EPA C1 (F08): targets finalized in the last 24 h because they had
+#: spent every physical attempt their budget allowed
+#: (the scraping runtime's per-target attempt budget). Paired with
+#: `crawmatic_attempts_per_valid_fresh_24h` this is C1's KPI, and the
+#: pairing is the point: the amplification ratio alone cannot tell a
+#: fleet that got EFFICIENT from one that simply gave up. A falling ratio
+#: with a rising exhaustion count is the second thing, and it is a
+#: regression, not a win. Counted from `request_attempts` rather than
+#: `scrape_job_targets` so a target refused more than once (a redispatch)
+#: is visible as the repeated spend it is.
+ATTEMPT_BUDGET_EXHAUSTED_24H_SQL = """
+SELECT COUNT(*) AS attempt_budget_exhausted_24h
+FROM request_attempts
+WHERE created_at > now() - interval '24 hours'
+  AND error_code = 'ATTEMPT_BUDGET_EXHAUSTED'
+"""
+
 #: Attempts that SUCCEEDED on the wire in the last hour and yet left no
 #: observation behind for their match. That gap is the signature of a
 #: persistence failure -- money was spent, a page was fetched and parsed,
@@ -347,6 +364,12 @@ class BaselineMetrics:
     fresh_unique_matches_24h: int | None = None
     attempts_24h: int | None = None
     attempts_per_valid_fresh_24h: float | None = None
+    #: EPA C1 (F08). ``None`` means "could not be read", never zero --
+    #: the same discipline as every gauge here, and it matters more for
+    #: this one: an unreadable exhaustion count read as 0 would say "the
+    #: budget never fired", which is the exact opposite of "we do not
+    #: know".
+    attempt_budget_exhausted_24h: int | None = None
     persistence_failures_1h: int | None = None
     dispatch_ambiguous_intents: int | None = None
     queue_oldest_pending_seconds: float | None = None
@@ -365,6 +388,7 @@ class BaselineMetrics:
             "fresh_unique_matches_24h": self.fresh_unique_matches_24h,
             "attempts_24h": self.attempts_24h,
             "attempts_per_valid_fresh_24h": self.attempts_per_valid_fresh_24h,
+            "attempt_budget_exhausted_24h": self.attempt_budget_exhausted_24h,
             "persistence_failures_1h": self.persistence_failures_1h,
             "dispatch_ambiguous_intents": self.dispatch_ambiguous_intents,
             "queue_oldest_pending_seconds": self.queue_oldest_pending_seconds,
@@ -421,6 +445,10 @@ def collect_baseline_metrics(session: Any) -> BaselineMetrics:
         values["fresh_unique_matches_24h"] = _as_int(row.fresh_unique_matches_24h)
         values["attempts_24h"] = _as_int(row.attempts_24h)
         values["attempts_per_valid_fresh_24h"] = _as_float(row.attempts_per_valid_fresh_24h)
+
+    row = _read("attempt_budget", ATTEMPT_BUDGET_EXHAUSTED_24H_SQL)
+    if row is not None:
+        values["attempt_budget_exhausted_24h"] = _as_int(row.attempt_budget_exhausted_24h)
 
     row = _read("persistence_failures", PERSISTENCE_FAILURES_1H_SQL)
     if row is not None:
@@ -481,6 +509,10 @@ def render_baseline_metrics_prometheus(metrics: BaselineMetrics) -> str:
     for name, value in (
         ("crawmatic_fresh_unique_matches_24h", metrics.fresh_unique_matches_24h),
         ("crawmatic_attempts_per_valid_fresh_24h", metrics.attempts_per_valid_fresh_24h),
+        (
+            "crawmatic_attempt_budget_exhausted_24h",
+            metrics.attempt_budget_exhausted_24h,
+        ),
         ("crawmatic_persistence_failures_1h", metrics.persistence_failures_1h),
         ("crawmatic_dispatch_ambiguous_intents", metrics.dispatch_ambiguous_intents),
         ("crawmatic_queue_oldest_pending_seconds", metrics.queue_oldest_pending_seconds),
@@ -499,6 +531,48 @@ def render_baseline_metrics_prometheus(metrics: BaselineMetrics) -> str:
     _family("crawmatic_target_phase_p95_seconds", phase_samples)
 
     return ("\n".join(lines) + "\n") if lines else ""
+
+
+def render_costauth_denials_prometheus(
+    counts: Mapping[str, int] | None = None,
+) -> str:
+    """Prometheus exposition of `costauth_denials_by_reason` (EPA C6/F18).
+
+    Standalone, for the same reason `render_ledger_coverage_prometheus`
+    is: a caller that already renders the main exposition concatenates
+    this onto it, and the fact it reports is process-local rather than a
+    database query, so it does not belong inside `collect_snapshot`.
+
+    `counts` defaults to the live tally in
+    `app_shared.costauth.service`. It is a parameter at all so a test can
+    render a known tally without reaching into module state, and so an
+    aggregator that has collected several workers' tallies can render the
+    sum.
+
+    Unlike the gauges above, a zero here IS a fact: `costauth` pre-seeds
+    every `DenialReason` at zero, and a reason that has never fired must
+    still be a present series -- a dashboard cannot alert on the absence
+    of a series it has never seen. Every reason is therefore emitted,
+    zeros included. The import is function-local so this module stays
+    import-light and `opsmetrics` does not pull the reservation ledger in
+    at import time.
+    """
+    if counts is None:
+        from app_shared.costauth.service import (  # local: keeps this module light
+            costauth_denials_by_reason,
+        )
+
+        counts = costauth_denials_by_reason()
+    if not counts:
+        return ""
+    name = "crawmatic_costauth_denials_total"
+    kind, help_text = _PROM_HELP[name]
+    lines = [f"# HELP {name} {help_text}", f"# TYPE {name} {kind}"]
+    lines.extend(
+        f'{name}{{reason="{_esc(reason)}"}} {_fmt(float(counts[reason]))}'
+        for reason in sorted(counts)
+    )
+    return "\n".join(lines) + "\n"
 
 
 def emit_alerts(alerts: Iterable[Alert]) -> int:
@@ -595,6 +669,14 @@ _PROM_HELP: dict[str, tuple[str, str]] = {
         "gauge",
         "Fraction of 24h proxied network_operations with a null bytes_compressed",
     ),
+    # EPA C6 (F18) -- see `render_costauth_denials_prometheus` below. A
+    # COUNTER, not a gauge: the value only ever grows within a process
+    # and the scraper differentiates it, so a worker restart reads as a
+    # reset rather than as a cliff in the denial rate.
+    "crawmatic_costauth_denials_total": (
+        "counter",
+        "Cost authorizations refused, by denial reason",
+    ),
     # EPA A5 (deep dive §5) -- see `render_baseline_metrics_prometheus` above.
     # These names are a contract consumed by B9 and D5; do not rename them.
     "crawmatic_fresh_unique_matches_24h": (
@@ -604,6 +686,11 @@ _PROM_HELP: dict[str, tuple[str, str]] = {
     "crawmatic_attempts_per_valid_fresh_24h": (
         "gauge",
         "Fetch attempts spent per freshly-priced match, 24h",
+    ),
+    # EPA C1 (F08) -- read WITH the ratio above, never instead of it.
+    "crawmatic_attempt_budget_exhausted_24h": (
+        "gauge",
+        "Attempts refused because the target's physical attempt budget was spent, 24h",
     ),
     "crawmatic_persistence_failures_1h": (
         "gauge",
@@ -626,7 +713,215 @@ _PROM_HELP: dict[str, tuple[str, str]] = {
         "gauge",
         "p95 seconds per target lifecycle phase, over targets created in 24h",
     ),
+    # EPA C9 (F14) -- see `render_storage_metrics_prometheus` below. These
+    # five are the STORAGE half of the readiness picture: the four gauges
+    # above say whether the fleet is producing value, these say whether it
+    # is producing value at a cost per unit that stays flat as it grows.
+    "crawmatic_bytes_per_physical_attempt": (
+        "gauge",
+        "Ledger bytes divided by physical network operations, 24h",
+    ),
+    "crawmatic_bytes_per_logical_target": (
+        "gauge",
+        "Ledger bytes divided by logical request attempts, 24h",
+    ),
+    "crawmatic_dead_tuple_fraction": (
+        "gauge",
+        "Dead tuples as a fraction of live+dead, per table",
+    ),
+    "crawmatic_index_bytes": ("gauge", "Total index size in bytes, per table"),
+    "crawmatic_partition_maintenance_seconds": (
+        "gauge",
+        "Wall seconds the last partition-maintenance pass took",
+    ),
 }
+
+
+# --------------------------------------------------------------------------
+# Storage & per-unit-cost metrics (EPA C9, F14, deep dive §9.1)
+#
+# The A5 block above measures OUTCOME (matches refreshed, attempts spent
+# per fresh match). These five measure the thing that decides whether
+# that outcome is affordable at ten times the size:
+#
+#   * the two RATIOS are the unit economics of the wire -- bytes per
+#     PHYSICAL operation and bytes per LOGICAL target. They are separate
+#     gauges, not one, precisely because the gap between them is the
+#     coalescing win: one browser navigation serving two workspaces makes
+#     bytes-per-logical-target fall while bytes-per-physical-attempt
+#     stays flat, and a single blended number would hide exactly that.
+#   * `dead_tuple_fraction` and `index_bytes` are the two ways a table
+#     stops being affordable without anyone noticing: bloat that vacuum
+#     is not keeping up with, and indexes that grow faster than the heap.
+#     Both are per-table LABELS because the answer is never fleet-wide --
+#     it is always one table, and knowing which one is the whole point.
+#   * `partition_maintenance_seconds` is the clock on the job that makes
+#     the whole retention design work. If it starts climbing, the monthly
+#     drop is turning into something that needs a window.
+#
+# Kept out of `OpsSnapshot`/`collect_snapshot` for the same reason the A5
+# and A7 blocks are: `snapshot.py` is shared with other EPA tasks, and a
+# self-contained function here means the two modules are never edited on
+# the same lines at once. Like `collect_baseline_metrics`, this degrades
+# PER METRIC -- one missing table must not blind the other four.
+# --------------------------------------------------------------------------
+
+#: Bytes moved per PHYSICAL operation, 24h. `NULLIF(...,0)` so a window
+#: with no operations reports NULL ("no signal") rather than a fabricated
+#: 0 -- the same honesty rule the A5 ratios follow.
+BYTES_PER_PHYSICAL_ATTEMPT_SQL = """
+SELECT SUM(COALESCE(bytes_compressed, 0))::float8
+       / NULLIF(COUNT(*), 0) AS bytes_per_physical_attempt
+FROM network_operations
+WHERE created_at > now() - interval '24 hours'
+"""
+
+#: Bytes moved per LOGICAL target, 24h. The denominator is
+#: `request_attempts`, not `network_operations`: a retry and a shared
+#: navigation are extra PHYSICAL work for the same logical target, and
+#: the ratio of these two gauges is what coalescing actually buys.
+BYTES_PER_LOGICAL_TARGET_SQL = """
+SELECT (
+    SELECT SUM(COALESCE(bytes_compressed, 0))
+    FROM network_operations
+    WHERE created_at > now() - interval '24 hours'
+)::float8 / NULLIF((
+    SELECT COUNT(*)
+    FROM request_attempts
+    WHERE created_at > now() - interval '24 hours'
+), 0) AS bytes_per_logical_target
+"""
+
+#: Per-table bloat and index size, straight from the statistics/catalog
+#: views. `pg_indexes_size` over `relname` rather than a hand-rolled sum
+#: of `pg_class.relpages` so a partitioned parent's own (empty) entry
+#: does not read as "this table has no indexes".
+TABLE_STORAGE_SQL = """
+SELECT relname AS table_name,
+       n_dead_tup::float8 / NULLIF(n_live_tup + n_dead_tup, 0)
+           AS dead_tuple_fraction,
+       pg_indexes_size(relid) AS index_bytes
+FROM pg_stat_user_tables
+WHERE schemaname = 'public'
+"""
+
+
+@dataclass(frozen=True)
+class StorageMetrics:
+    """The five EPA C9 storage gauges. ``None`` means UNMEASURED."""
+
+    bytes_per_physical_attempt: float | None = None
+    bytes_per_logical_target: float | None = None
+    #: ``{table: fraction}`` -- only tables the statistics view knows.
+    dead_tuple_fraction: dict[str, float] = field(default_factory=dict)
+    #: ``{table: bytes}``.
+    index_bytes: dict[str, int] = field(default_factory=dict)
+    #: Wall seconds of the last partition-maintenance pass, supplied by
+    #: the caller (the maintenance task times itself; this module does not
+    #: run the job). ``None`` until a pass has been timed.
+    partition_maintenance_seconds: float | None = None
+
+
+def collect_storage_metrics(
+    session: Any,
+    *,
+    tables: Iterable[str] | None = None,
+    partition_maintenance_seconds: float | None = None,
+) -> StorageMetrics:
+    """Collect the five C9 gauges on an already-open session.
+
+    Degrades per metric: every read is independently guarded, so a
+    database missing `network_operations` still reports table bloat, and
+    a `pg_stat_user_tables` a restricted role cannot read still leaves
+    the two ratios intact. A metric that could not be read is absent, NOT
+    zero -- see `render_storage_metrics_prometheus`.
+
+    ``tables`` restricts the per-table labels; ``None`` means every table
+    the statistics view returns. Restricting is the normal case for a
+    scrape (label cardinality is a cost), and the retention families'
+    tables are the set worth watching.
+    """
+    from sqlalchemy import text  # local: keeps this module import-light
+
+    wanted = set(tables) if tables is not None else None
+
+    def _scalar(sql: str) -> float | None:
+        try:
+            return _as_float(session.execute(text(sql)).scalar())
+        except Exception:
+            return None
+
+    dead: dict[str, float] = {}
+    index_bytes: dict[str, int] = {}
+    try:
+        for name, fraction, idx_bytes in session.execute(text(TABLE_STORAGE_SQL)):
+            if wanted is not None and name not in wanted:
+                continue
+            value = _as_float(fraction)
+            if value is not None:
+                dead[str(name)] = value
+            size = _as_int(idx_bytes)
+            if size is not None:
+                index_bytes[str(name)] = size
+    except Exception:
+        pass
+
+    return StorageMetrics(
+        bytes_per_physical_attempt=_scalar(BYTES_PER_PHYSICAL_ATTEMPT_SQL),
+        bytes_per_logical_target=_scalar(BYTES_PER_LOGICAL_TARGET_SQL),
+        dead_tuple_fraction=dead,
+        index_bytes=index_bytes,
+        partition_maintenance_seconds=partition_maintenance_seconds,
+    )
+
+
+def render_storage_metrics_prometheus(metrics: StorageMetrics) -> str:
+    """Prometheus text exposition for the five C9 gauges, standalone.
+
+    Same contract as the A5/A7 renderers: a ``None`` value emits NO
+    sample rather than a ``0``, so "could not measure" never masquerades
+    as "measured zero" -- which for `dead_tuple_fraction` in particular
+    is the difference between a healthy table and an unreadable one.
+    """
+    lines: list[str] = []
+
+    def _family(name: str, samples: list[str]) -> None:
+        if not samples:
+            return
+        kind, help_text = _PROM_HELP[name]
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {kind}")
+        lines.extend(samples)
+
+    for name, value in (
+        ("crawmatic_bytes_per_physical_attempt", metrics.bytes_per_physical_attempt),
+        ("crawmatic_bytes_per_logical_target", metrics.bytes_per_logical_target),
+        (
+            "crawmatic_partition_maintenance_seconds",
+            metrics.partition_maintenance_seconds,
+        ),
+    ):
+        if value is None:
+            continue
+        _family(name, [f"{name} {_fmt(float(value))}"])
+
+    _family(
+        "crawmatic_dead_tuple_fraction",
+        [
+            f'crawmatic_dead_tuple_fraction{{table="{_esc(table)}"}} '
+            f"{_fmt(float(value))}"
+            for table, value in sorted(metrics.dead_tuple_fraction.items())
+        ],
+    )
+    _family(
+        "crawmatic_index_bytes",
+        [
+            f'crawmatic_index_bytes{{table="{_esc(table)}"}} {_fmt(float(value))}'
+            for table, value in sorted(metrics.index_bytes.items())
+        ],
+    )
+
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def _fmt(value: float) -> str:
@@ -767,6 +1062,7 @@ __all__ = [
     "ALL_CLEAR_EVENT",
     "SNAPSHOT_EVENT",
     "ATTEMPTS_PER_VALID_FRESH_24H_SQL",
+    "ATTEMPT_BUDGET_EXHAUSTED_24H_SQL",
     "ATTEMPTS_PER_VALID_FRESH_MAX",
     "BaselineMetrics",
     "COST_MODEL_DRIFT_RATIO_MAX",
@@ -789,6 +1085,13 @@ __all__ = [
     "emit_snapshot",
     "ledger_linked_attempt_fraction",
     "ledger_bytes_missing_fraction",
+    "BYTES_PER_LOGICAL_TARGET_SQL",
+    "BYTES_PER_PHYSICAL_ATTEMPT_SQL",
+    "StorageMetrics",
+    "TABLE_STORAGE_SQL",
+    "collect_storage_metrics",
+    "render_storage_metrics_prometheus",
+    "render_costauth_denials_prometheus",
     "render_ledger_coverage_prometheus",
     "render_prometheus",
 ]

@@ -45,8 +45,10 @@ def _compiled(stmt) -> str:
 # --- PARTITIONED_TABLES shape (FR-001) --------------------------------------
 
 
-def test_partitioned_tables_has_exactly_four_entries() -> None:
-    assert len(PARTITIONED_TABLES) == 4
+def test_partitioned_tables_has_exactly_five_entries() -> None:
+    # Four until EPA C9 (F14) added `network_operations`, which the
+    # `a5e0c74b13d9` swap turned into a monthly-partitioned parent.
+    assert len(PARTITIONED_TABLES) == 5
     assert all(isinstance(entry, PartitionedTable) for entry in PARTITIONED_TABLES)
 
 
@@ -57,11 +59,13 @@ def test_partitioned_tables_names_and_partition_keys() -> None:
         "request_attempts",
         "price_alert_events",
         "webhook_events",
+        "network_operations",
     }
     assert by_name["price_observations"].partition_key == "scraped_at"
     assert by_name["request_attempts"].partition_key == "created_at"
     assert by_name["price_alert_events"].partition_key == "created_at"
     assert by_name["webhook_events"].partition_key == "created_at"
+    assert by_name["network_operations"].partition_key == "created_at"
 
 
 def test_feeds_rollups_true_only_for_price_observations() -> None:
@@ -88,10 +92,13 @@ def test_retention_days_resolves_each_entry_via_settings(monkeypatch) -> None:
     settings = Settings(_env_file=None)
 
     expected = {
-        "price_observations": 90,
+        # 180, not 90: EPA C9 / owner decision 11 raised the observation
+        # window above the dispute horizon (docs/RETENTION_POLICY.md §2.3).
+        "price_observations": 180,
         "request_attempts": 90,
         "price_alert_events": 365,
         "webhook_events": 90,
+        "network_operations": 730,
     }
     for entry in PARTITIONED_TABLES:
         assert retention_days(entry, settings) == expected[entry.name]
@@ -102,10 +109,10 @@ def test_retention_days_reflects_settings_override(monkeypatch) -> None:
     the `Settings` value changes what `retention_days` resolves, proving
     the lookup is by attribute name rather than a baked-in constant."""
     _set_required_env(monkeypatch)
-    monkeypatch.setenv("RETENTION_PRICE_OBSERVATIONS_DAYS", "180")
+    monkeypatch.setenv("RETENTION_PRICE_OBSERVATIONS_DAYS", "365")
     settings = Settings(_env_file=None)
     entry = next(e for e in PARTITIONED_TABLES if e.name == "price_observations")
-    assert retention_days(entry, settings) == 180
+    assert retention_days(entry, settings) == 365
 
 
 # --- table_exists gate is built against to_regclass (FR-002, research R4) --

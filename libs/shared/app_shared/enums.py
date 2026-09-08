@@ -442,6 +442,65 @@ class ScrapeErrorCode(StrEnum):
     #: way — admission pressure counted separately from host blocking.
     #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
     FLEET_LIMITED = "FLEET_LIMITED"
+    #: EPA C1/F08 (2026-09-07). The three phases ``TIMEOUT`` never
+    #: distinguished, split because they blame three different parties
+    #: and A5 already measures the boundary between them
+    #: (``request_attempts.connect_ms``/``ttfb_ms``/``read_ms``):
+    #:
+    #:   ``CONNECT_TIMEOUT`` -- TCP/TLS (or the proxy CONNECT) never
+    #:       completed, so the request was never written. Evidence about
+    #:       the network path -- usually the PROXY vendor -- and never
+    #:       about the page.
+    #:   ``TTFB_TIMEOUT`` -- the request was written and the host never
+    #:       sent a first byte. Evidence about the HOST (or a silent
+    #:       block that never became a 403).
+    #:   ``READ_TIMEOUT`` -- first byte arrived, the body did not finish.
+    #:       Evidence about page weight/bandwidth, and the one phase
+    #:       where a longer timeout is a legitimate fix.
+    #:
+    #: Plain ``TIMEOUT`` stays valid and stays the fallback for any
+    #: transport that reports no phase; nothing re-classifies history.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    CONNECT_TIMEOUT = "CONNECT_TIMEOUT"
+    TTFB_TIMEOUT = "TTFB_TIMEOUT"
+    READ_TIMEOUT = "READ_TIMEOUT"
+    #: EPA C1/F08 (2026-09-07). A 200 that carried no product identity at
+    #: all -- no title, no name, nothing that says a product page was
+    #: served. Deliberately NOT ``PRICE_NOT_FOUND``, which is a much
+    #: stronger claim: that we fetched THIS product's genuine page and it
+    #: carried no price (a listing verdict the strategy optimizer,
+    #: rediscovery and the domain scorecard all learn from). This code
+    #: asserts the opposite -- we cannot tell what we fetched, so the
+    #: response is evidence about our access path (an interstitial, a
+    #: consent wall, a soft-404, a JS shell we never rendered) and about
+    #: nothing else. Deep dive §6.1: "200 and fast is not success".
+    #: It is what makes ``AttemptBudget.suppress`` refuse to retry the
+    #: same method on the same target in the same refresh.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    EXTRACTION_FAILED = "EXTRACTION_FAILED"
+    #: EPA C1/F08 (2026-09-07). This target had already spent its
+    #: ``SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS`` physical attempts in this
+    #: refresh, so the ladder refused the next one
+    #: (the scraping runtime's per-target attempt-budget gate).
+    #: Deliberately not ``LIMIT_REACHED`` (an entitlement/quota verdict
+    #: about the WORKSPACE) and not ``RATE_LIMITED``/``FLEET_LIMITED``
+    #: (pacing verdicts that expect a later retry to succeed). Like
+    #: ``JOB_DEADLINE_EXCEEDED`` this is a statement about OUR budget,
+    #: never about the domain: nothing downstream may read it as
+    #: evidence for or against a method, a strategy or a listing.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    ATTEMPT_BUDGET_EXHAUSTED = "ATTEMPT_BUDGET_EXHAUSTED"
+    #: EPA C1/F08 (2026-09-07). This TARGET ran past its own
+    #: ``SCRAPE_TARGET_DEADLINE_SECONDS`` wall-clock deadline, so it was
+    #: finalized without another fetch. The per-target sibling of
+    #: ``JOB_DEADLINE_EXCEEDED`` (whose deadline is the whole job's
+    #: ``SCRAPE_JOB_MAX_RUNTIME_SECONDS``): one slow target may not hold
+    #: a refresh open, and one target's deadline says nothing about the
+    #: job's. Carries the same "we never found out" weakness -- the
+    #: attempt may never have been made, so it is not evidence about the
+    #: domain, the strategy or the URL.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    TARGET_DEADLINE_EXCEEDED = "TARGET_DEADLINE_EXCEEDED"
 
 
 class ScrapeScope(StrEnum):

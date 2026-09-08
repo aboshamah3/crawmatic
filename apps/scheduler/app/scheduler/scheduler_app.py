@@ -146,6 +146,8 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_FLEET_BUDGET_ROLLFORWARD,
     CADENCE_PARTITION_CREATE,
     CADENCE_RECONCILE_PROVIDER_USAGE,
+    CADENCE_EVIDENCE_RETENTION,
+    CADENCE_LEDGER_SUMMARIZE_CHILDREN,
     CADENCE_RETENTION_DROP,
 )
 from app_shared.models.refresh_rule_occurrences import refresh_rule_occurrences
@@ -178,6 +180,8 @@ from app_shared.task_names import (
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
+    MAINTENANCE_EVIDENCE_RETENTION,
+    MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -416,6 +420,44 @@ def _enqueue_retention_drop() -> None:
         enqueue(MAINTENANCE_RETENTION_DROP, queue="maintenance")
     except Exception:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_RETENTION_DROP)
+
+
+def _enqueue_evidence_retention() -> None:
+    """Fire-and-forget `MAINTENANCE_EVIDENCE_RETENTION` on the
+    `maintenance` queue (EPA C5, F19) -- the age-AND-reference gated
+    sweep of the raw-evidence blob store, closing the deletion gap
+    `docs/RETENTION_POLICY.md` §2.1 records.
+
+    Errors logged and swallowed, same as every sibling here: a missed
+    tick means blobs are swept on the next interval, and evidence
+    retained one day too long is the safe direction of that failure.
+    """
+    try:
+        enqueue(MAINTENANCE_EVIDENCE_RETENTION, queue="maintenance")
+    except Exception:
+        logger.exception(
+            "scheduler: failed to enqueue %s", MAINTENANCE_EVIDENCE_RETENTION
+        )
+
+
+def _enqueue_ledger_summarize_children() -> None:
+    """Fire-and-forget `MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN` on the
+    `maintenance` queue (EPA C9, F14) -- compress a settled browser
+    navigation's subresource children into one
+    `network_operation_resource_summaries` row and delete them.
+
+    Errors logged and swallowed, same as every sibling here. The failure
+    direction is safe by construction: a missed tick means the children
+    survive one more day, and the task itself does nothing at all until
+    the owner names `network_operation_children` in
+    `RETENTION_ENABLED_CLASSES`.
+    """
+    try:
+        enqueue(MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN, queue="maintenance")
+    except Exception:
+        logger.exception(
+            "scheduler: failed to enqueue %s", MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN
+        )
 
 
 def _enqueue_outbox_drain() -> None:
@@ -657,6 +699,28 @@ _DURABLE_CADENCES = (
         CADENCE_DISPATCH_RECONCILE,
         "DISPATCH_RECONCILE_INTERVAL_SECONDS",
         _enqueue_dispatch_reconcile,
+    ),
+    # EPA C5 2026-09-08 (F19). Its OWN knob
+    # (`EVIDENCE_RETENTION_INTERVAL_SECONDS`, daily) rather than sharing
+    # `RETENTION_INTERVAL_SECONDS` with the partition drop: the two jobs
+    # delete different kinds of thing with different reversibility, and
+    # an operator who needs to pause irreversible blob deletion must not
+    # have to stop ordinary partition retention to do it.
+    (
+        CADENCE_EVIDENCE_RETENTION,
+        "EVIDENCE_RETENTION_INTERVAL_SECONDS",
+        _enqueue_evidence_retention,
+    ),
+    # EPA C9 2026-09-08 (F14). Its OWN knob
+    # (`LEDGER_SUMMARIZE_INTERVAL_SECONDS`, daily) rather than sharing
+    # `RETENTION_INTERVAL_SECONDS`: this job's work is gated on a
+    # provider settlement having arrived, so an operator tuning how often
+    # to chase newly-settled operations is making a different decision
+    # from how often to drop an expired partition.
+    (
+        CADENCE_LEDGER_SUMMARIZE_CHILDREN,
+        "LEDGER_SUMMARIZE_INTERVAL_SECONDS",
+        _enqueue_ledger_summarize_children,
     ),
 )
 

@@ -208,6 +208,9 @@ def test_usage_returns_the_frozen_contract_fields():
         "proxied_http_attempted",
         "proxied_browser_attempted",
         "proxy_bytes",
+        # Task C6/F17 (2026-09-08): additive, the workspace's OWN share of
+        # the physical operations the cycle used (`cost_allocations`).
+        "allocated_cost_micro_units",
     }
 
 

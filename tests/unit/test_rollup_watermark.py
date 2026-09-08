@@ -37,6 +37,8 @@ from app_shared.maintenance.rollups import (
     run_rollup_catchup,
 )
 
+from unit._rollup_batch_fake import evaluate_batch, is_batch_statement
+
 _NOW = datetime(2026, 8, 26, 6, 0, tzinfo=timezone.utc)
 #: `default_target_date(_NOW)` — the most recently completed UTC day.
 _YESTERDAY = date(2026, 8, 25)
@@ -160,9 +162,11 @@ class _FakeSession:
         # Durable state.
         self.rollups: dict[tuple, dict] = {}
         self.watermark: dict | None = None
+        self.completion: dict = {}
         # Uncommitted state.
         self._pending_rollups: dict[tuple, dict] = {}
         self._pending_watermark: dict | None = None
+        self._pending_completion: dict = {}
         # Observability for the tests.
         self.upsert_calls = 0
         self.commits = 0
@@ -173,8 +177,10 @@ class _FakeSession:
         self.rollups.update(self._pending_rollups)
         if self._pending_watermark is not None:
             self.watermark = self._pending_watermark
+        self.completion.update(self._pending_completion)
         self._pending_rollups = {}
         self._pending_watermark = None
+        self._pending_completion = {}
         self.commits += 1
 
     # -- statements -------------------------------------------------------
@@ -187,51 +193,71 @@ class _FakeSession:
         if "rollup_watermarks" in sql:
             return self._watermark_stmt(sql, stmt)
 
-        if "DISTINCT" in sql and "price_observations" in sql:
-            params = stmt.compile().params
-            rows = self._in_day(params["day_start"], params["day_end"])
-            seen: list[tuple] = []
-            for obs in rows:
-                key = (obs.workspace_id, obs.product_variant_id, obs.product_id)
-                if key not in seen:
-                    seen.append(key)
-            return _FakeResult(
-                [
-                    SimpleNamespace(
-                        workspace_id=ws, product_variant_id=variant, product_id=product
-                    )
-                    for ws, variant, product in seen
-                ]
-            )
+        if "rollup_completion" in sql:
+            return self._completion_stmt(sql, stmt)
 
-        if "variant_price_states" in sql:
-            params = stmt.compile().params
-            state = self.states.get(
-                (params["workspace_id"], params["product_variant_id"])
-            )
-            return _FakeResult([state] if state is not None else [])
+        # The EPA C7 set-based batch statement: one statement that does
+        # the driver scan, the latest-eligible-per-match collapse, the
+        # aggregate, the client-state join and the upsert. Evaluated over
+        # the in-memory rows using the statement's OWN bind parameters.
+        if is_batch_statement(sql):
+            params = dict(stmt.compile().params)
+            dry_run = "INSERT" not in sql
 
-        if "price_observations" in sql:
-            params = stmt.compile().params
-            return _FakeResult(
-                [
-                    obs
-                    for obs in self._in_day(params["day_start"], params["day_end"])
-                    if obs.workspace_id == params["workspace_id"]
-                    and obs.product_variant_id == params["product_variant_id"]
-                ]
-            )
+            def _upsert(values: dict) -> None:
+                # Keyed on the real conflict arbiter, and ABSOLUTE (not
+                # `count + delta`) — which is exactly why re-running a
+                # day cannot double-count.
+                key = (
+                    values["workspace_id"],
+                    values["product_variant_id"],
+                    values["date"],
+                )
+                self._pending_rollups[key] = values
+                self.upsert_calls += 1
 
-        # The `variant_price_daily_rollups` upsert. Keyed on the real
-        # conflict arbiter, and ABSOLUTE (not `count + delta`) — which is
-        # exactly why re-running a day cannot double-count.
-        params = dict(stmt.compile().params)
-        key = (params["workspace_id"], params["product_variant_id"], params["date"])
-        self._pending_rollups[key] = params
-        self.upsert_calls += 1
-        day = params["date"].isoformat()
-        if day in self.crash_before_commit_on:
-            raise _CrashNow(f"simulated crash while rolling up {day}")
+            outcome = evaluate_batch(
+                params,
+                dry_run=dry_run,
+                observations=self.observations,
+                states=self.states,
+                upsert=_upsert,
+            )
+            if not dry_run:
+                day = params["target_date"].isoformat()
+                if day in self.crash_before_commit_on:
+                    raise _CrashNow(f"simulated crash while rolling up {day}")
+            return _FakeResult([outcome])
+
+        raise AssertionError(f"unexpected statement: {sql[:120]}")
+
+    def _completion_stmt(self, sql: str, stmt):
+        """The per-day checkpoint. Uncommitted like everything else."""
+        params = stmt.compile().params
+        if sql.strip().upper().startswith("SELECT"):
+            current = {
+                **self.completion,
+                **self._pending_completion,
+            }.get(params["day"])
+            if current is None:
+                return _FakeResult([])
+            return _FakeResult([SimpleNamespace(**current)])
+        if "complete = FALSE" in sql:
+            self._pending_completion[params["day"]] = {
+                "date": params["day"],
+                "last_key_workspace_id": None,
+                "last_key_variant_id": None,
+                "complete": False,
+                "updated_at": params["now"],
+            }
+            return _FakeResult([])
+        self._pending_completion[params["day"]] = {
+            "date": params["day"],
+            "last_key_workspace_id": params["last_workspace_id"],
+            "last_key_variant_id": params["last_variant_id"],
+            "complete": params["complete"],
+            "updated_at": params["now"],
+        }
         return _FakeResult([])
 
     def _watermark_stmt(self, sql: str, stmt):
@@ -465,6 +491,15 @@ def test_catchup_processes_at_most_max_days_and_reports_the_remainder(
 def test_each_day_commits_separately_so_progress_is_durable_mid_batch(
     three_day_session: _FakeSession,
 ) -> None:
+    """Progress is durable at a granularity FINER than the day.
+
+    Since EPA C7 each day is walked in keyset batches that each commit,
+    so a three-day catch-up commits twice per day (the day's single
+    batch, then its watermark advance) rather than once. The property
+    that matters is unchanged and is asserted directly: after the run,
+    every day's rows AND the cursor are durable, and nothing is left
+    pending.
+    """
     session = three_day_session
     session.watermark = {
         "key": wm.WATERMARK_DAILY_ROLLUP,
@@ -472,8 +507,20 @@ def test_each_day_commits_separately_so_progress_is_durable_mid_batch(
         "last_advanced_at": None,
         "advance_count": 0,
     }
-    run_rollup_catchup(session, now_utc=_NOW, max_days=7)
-    assert session.commits == 3, "one committed transaction per window"
+    report = run_rollup_catchup(session, now_utc=_NOW, max_days=7)
+
+    assert report.days_processed == ["2026-08-23", "2026-08-24", "2026-08-25"]
+    # At least one commit per day, and strictly more than one transaction
+    # in total -- a single all-or-nothing transaction for the batch would
+    # lose every day on any failure.
+    assert session.commits >= len(report.days_processed)
+    assert session.watermark["last_complete_date"] == _YESTERDAY
+    assert session._pending_rollups == {}
+    assert session._pending_watermark is None
+    # Every processed day is marked complete in the durable checkpoint --
+    # what C8's retention gate reads.
+    for day in (date(2026, 8, 23), date(2026, 8, 24), date(2026, 8, 25)):
+        assert session.completion[day]["complete"] is True
 
 
 def test_a_day_with_no_observations_still_advances_the_cursor(

@@ -133,6 +133,10 @@ crawmatic_app:
   - INSERT
   - SELECT
   - UPDATE
+  extraction_shadow_events:
+  - DELETE
+  - INSERT
+  - SELECT
   fleet_cost_budgets:
   - DELETE
   - INSERT
@@ -170,9 +174,11 @@ crawmatic_app:
   - INSERT
   - SELECT
   - UPDATE
+  network_operation_resource_summaries: []
   network_operation_settlements: []
   network_operations:
   - SELECT
+  network_operations_pre_partition: []
   outbox_messages:
   - DELETE
   - INSERT
@@ -237,6 +243,10 @@ crawmatic_app:
   - INSERT
   - SELECT
   - UPDATE
+  rollup_completion:
+  - DELETE
+  - INSERT
+  - SELECT
   rollup_watermarks:
   - DELETE
   - INSERT
@@ -396,6 +406,11 @@ crawmatic_auth:
   - INSERT
   - SELECT
   - UPDATE
+  extraction_shadow_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
   fleet_cost_budgets:
   - DELETE
   - INSERT
@@ -436,6 +451,10 @@ crawmatic_auth:
   - INSERT
   - SELECT
   - UPDATE
+  network_operation_resource_summaries:
+  - DELETE
+  - INSERT
+  - SELECT
   network_operation_settlements:
   - DELETE
   - INSERT
@@ -446,6 +465,7 @@ crawmatic_auth:
   - INSERT
   - SELECT
   - UPDATE
+  network_operations_pre_partition: []
   outbox_messages:
   - DELETE
   - INSERT
@@ -508,6 +528,11 @@ crawmatic_auth:
   - SELECT
   - UPDATE
   request_attempts:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  rollup_completion:
   - DELETE
   - INSERT
   - SELECT
@@ -612,6 +637,8 @@ crawmatic_scraper:
   domain_strategy_methods: []
   domain_strategy_profiles:
   - SELECT
+  extraction_shadow_events:
+  - INSERT
   fleet_cost_budgets: []
   fleet_network_cost_rollups: []
   maintenance_cadences: []
@@ -620,9 +647,11 @@ crawmatic_scraper:
   match_current_prices: []
   network_cost_rollups: []
   network_operation_allocations: []
+  network_operation_resource_summaries: []
   network_operation_settlements: []
   network_operations:
   - INSERT
+  network_operations_pre_partition: []
   outbox_messages: []
   price_alert_events: []
   price_observations:
@@ -639,6 +668,7 @@ crawmatic_scraper:
   refresh_tokens: []
   request_attempts:
   - INSERT
+  rollup_completion: []
   rollup_watermarks: []
   scrape_job_targets:
   - UPDATE

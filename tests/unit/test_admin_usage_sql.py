@@ -227,7 +227,18 @@ def test_query_reports_proxied_transport_facts_from_network_operations() -> None
     assert "'BROWSER'" in sql
     # Joined on the physical-operation identity, not by workspace/product
     # columns network_operations does not have (it is fleet-owned, C1).
-    assert "network_operations.network_request_id = request_attempts.network_operation_id" in sql
+    # Task C6 routes that join through the shared `attempt_scan` CTE (the
+    # single scan of the partitioned table) rather than naming
+    # `request_attempts` twice, and follows children as well as the
+    # attempt's own operation.
+    assert (
+        "network_operations.network_request_id = attempt_scan.network_operation_id"
+        in sql
+    )
+    assert (
+        "network_operations.parent_operation_id = attempt_scan.network_operation_id"
+        in sql
+    )
 
 
 def test_query_still_single_scan_of_request_attempts_with_transport_join() -> None:
@@ -244,8 +255,13 @@ def test_query_sums_bytes_compressed_over_both_proxy_and_browser_transports() ->
     sql = _sql_with_values(
         build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
     )
-    assert "sum(network_operations.bytes_compressed)" in sql.lower()
-    assert "coalesce" in sql.lower()
+    lowered = sql.lower()
+    # Task C6: bytes are summed over `per_op` -- one row per DISTINCT
+    # physical operation -- not once per logical attempt, so an operation
+    # three matches shared contributes its bytes exactly once.
+    assert "network_operations.bytes_compressed as bytes_compressed" in lowered
+    assert "sum(per_op.bytes_compressed) filter (where per_op.proxied)" in lowered
+    assert "coalesce" in lowered
 
 
 def test_query_casts_proxied_sums_to_integer_not_left_as_numeric() -> None:
@@ -292,3 +308,96 @@ def test_cycle_ts_expression_is_identical_in_select_and_group_by() -> None:
     assert len(renderings) <= 2, sorted(renderings)
     for rendering in renderings:
         assert "'hour'" in rendering, rendering
+
+
+# --- Task C6 (F17): provider dimension, distinct physical operations ---
+
+
+def test_proxied_is_the_provider_dimension_not_the_transport() -> None:
+    """A direct browser navigation costs no proxy money. `transport` says
+    how a fetch was shaped, `provider`/`proxy_provider_id` say who was
+    paid -- so the paid predicate is the conjunction, and `transport IN
+    ('PROXY','BROWSER')` must no longer appear as the discriminator."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert "network_operations.provider != 'direct'" in sql
+    assert "attempt_scan.proxy_provider_id IS NOT NULL" in sql
+    # The old discriminator: an IN-list over the two transports used as
+    # the *paid* test. Transport survives only as the HTTP/browser split
+    # inside the already-proxied set (`per_op.proxied AND ... = 'PROXY'`).
+    assert "transport IN ('PROXY', 'BROWSER')" not in sql
+    assert "per_op.proxied AND per_op.transport = 'PROXY'" in sql
+    assert "per_op.proxied AND per_op.transport = 'BROWSER'" in sql
+
+
+def test_proxied_counts_are_over_distinct_physical_operations() -> None:
+    """One physical fetch shared by three matches is ONE operation. The
+    counters must be `COUNT(DISTINCT network_request_id)`, never a
+    per-match `COUNT(*)` re-summed in the outer aggregate."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert sql.count("count(DISTINCT per_op.network_request_id)") == 2
+    # `per_op` folds to one row per operation before anything is summed.
+    assert "GROUP BY attempt_scan.workspace_id, attempt_scan.product_id, " in sql
+    assert "network_operations.network_request_id" in sql
+
+
+def test_child_operations_are_included_via_parent_operation_id() -> None:
+    """A browser page's subresources are `network_operations` rows with a
+    `parent_operation_id` and no `request_attempts` row of their own --
+    an equi-join on `network_operation_id` alone loses every one."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert "network_operations.parent_operation_id = attempt_scan.network_operation_id" in sql
+
+
+def test_cost_is_allocated_through_cost_allocations_not_summed_per_attempt() -> None:
+    """Money comes from `network_operation_allocations` -- the only table
+    that says what share of one physical operation a workspace owes --
+    joined on (operation, workspace), and is exposed as
+    `allocated_cost_micro_units`."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    assert "network_operation_allocations" in sql
+    assert (
+        "network_operation_allocations.operation_id = "
+        "network_operations.network_request_id" in sql
+    )
+    assert (
+        "network_operation_allocations.workspace_id = attempt_scan.workspace_id"
+        in sql
+    )
+    assert "allocated_cost_micro_units" in sql
+
+
+def test_operation_facts_are_maxed_not_resummed_across_matches() -> None:
+    """`op_totals` holds at most one row per (workspace, product, cycle),
+    so the outer aggregate takes MAX of it. A SUM there would multiply
+    every physical fact by the cycle's match count -- the exact
+    over-count F17 removes."""
+    sql = _sql_with_values(
+        build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
+    )
+    for column in (
+        "proxied_http_attempted",
+        "proxied_browser_attempted",
+        "proxy_bytes",
+        "allocated_cost_micro_units",
+    ):
+        assert f"max(op_totals.{column})" in sql, column
+        assert f"sum(op_totals.{column})" not in sql, column
+
+
+def test_query_still_reads_the_partitioned_table_exactly_once() -> None:
+    """Two CTEs now read the attempt scan (`per_link`, `per_op`), but the
+    scan itself is built once -- the risk-P2 partition-pruning guarantee
+    is a property of `FROM request_attempts` appearing once."""
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
+    assert sql.count("FROM request_attempts") == 1, sql
+    # `per_link` and `per_op` both read the scan -- twice from the CTE,
+    # once from the table. That is the point of hoisting the scan out.
+    assert sql.count("FROM attempt_scan") == 2, sql

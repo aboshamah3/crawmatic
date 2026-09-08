@@ -67,6 +67,21 @@ class DomainRule(Base, TimestampMixin):
     #: Physical requests per minute the WHOLE fleet may make against this
     #: domain. ``NULL`` -> ``Settings.FLEET_HOST_RATE_PER_MINUTE_DEFAULT``.
     fleet_rate_per_minute: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    #: EPA C1/F08 (2026-09-07). Seconds this domain's requests may run
+    #: before they are abandoned. ``NULL`` -> ``Settings
+    #: .SCRAPE_DOWNLOAD_TIMEOUT_SECONDS`` (60), same "NULL means use the
+    #: setting" rule as the two columns above.
+    #:
+    #: Unlike them this one is normally written by a JOB, not an
+    #: operator: ``maintenance.domain_timeout_tune``
+    #: (``app_shared.maintenance.domain_timeouts``) sets it to
+    #: ``clamp(1.5 x p95(successful attempt duration, 7 d), 10 s, 60 s)``.
+    #: The deep dive measured a 46.9 s average on proxied HTTP, which is
+    #: a measurement of the 60 s global default rather than of any
+    #: domain: every doomed fetch pays the full ceiling before anyone
+    #: learns anything. A domain with too few successes to measure is
+    #: left ``NULL`` — an invented timeout is worse than the default.
+    request_timeout_seconds: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     #: Why this override exists (e.g. "host 429s above 30 rpm, measured
     #: 2026-09-07"). Operator notes only — nothing reads it.
     notes: Mapped[str | None] = mapped_column(Text(), nullable=True)

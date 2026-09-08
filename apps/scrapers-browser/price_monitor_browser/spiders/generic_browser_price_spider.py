@@ -781,6 +781,23 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         # attempt's page will ever produce has already reached the
         # accumulator -- safe to finalize now.
         attempt_kwargs.update(_byte_kwargs_from_meta(response.meta))
+        # EPA C5 (F19): the raw bytes this result was extracted from,
+        # carried to `_flush_batch`, which writes them into the
+        # content-addressed evidence store and keeps the hash on the
+        # observation row (`offer_raw_evidence_hash`). Attached HERE, on
+        # `attempt_kwargs`, because every result this method emits --
+        # HTTP-status failure, adapter miss, validation rejection and
+        # success alike -- already spreads it, and an evidence hash that
+        # only appeared on successes would be missing exactly where a
+        # human most wants to replay the page.
+        #
+        # `response.body` on this spider is the POST-JS rendered DOM
+        # scrapy-playwright produced, not the pre-render HTML -- which is
+        # the right evidence here, because it is what the extractor
+        # actually read. Bounded by Scrapy's own `DOWNLOAD_MAXSIZE`; deliberately NOT spooled (see
+        # `scrape_core.result_spool._NON_SPOOLED_FIELDS`). Nothing is
+        # written unless `EVIDENCE_STORE_DIR` is configured.
+        attempt_kwargs["raw_evidence"] = response.body or None
 
         adapter_key = response.meta.get("adapter_key", AdapterKey.PLAYWRIGHT_RENDERED)
         status_error_code = classify_http_status(response.status)

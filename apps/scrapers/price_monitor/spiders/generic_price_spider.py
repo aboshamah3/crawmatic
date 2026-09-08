@@ -148,6 +148,7 @@ from scrape_core.targets import (
     overflow_to_dispatch,
     prepare_dispatch_with_backoff,
     redispatch_job,
+    resolve_request_timeout_seconds,
     sticky_proxy_username,
     next_strategy_method,
 )
@@ -611,11 +612,24 @@ class GenericPriceSpider(scrapy.Spider):
             # before any homepage extractor runs.
             meta["dont_redirect"] = True
             meta["handle_httpstatus_all"] = True
-        if target.access_policy is not None and target.access_policy.timeout_ms:
-            # Issue 4: the resolved policy timeout was never translated
-            # into the request -- Scrapy's 180 s DOWNLOAD_TIMEOUT applied
-            # instead (546 s noon hangs). `download_timeout` is seconds.
-            meta["download_timeout"] = target.access_policy.timeout_ms / 1000.0
+        # Issue 4: the resolved policy timeout was never translated into
+        # the request -- Scrapy's 180 s DOWNLOAD_TIMEOUT applied instead
+        # (546 s noon hangs). `download_timeout` is seconds.
+        #
+        # EPA C4 closes C1's second carry-forward here: the per-domain
+        # LEARNED timeout (`domain_rules.request_timeout_seconds`, written
+        # by `maintenance.domain_timeout_tune` since C1) had no reader, so
+        # every fetch still paid the global ceiling.
+        # `resolve_request_timeout_seconds` is the single precedence rule
+        # -- learned value, else the policy's `timeout_ms`, else `None`
+        # meaning "leave it to Scrapy's DOWNLOAD_TIMEOUT", which is
+        # already `SCRAPE_DOWNLOAD_TIMEOUT_SECONDS`. It is pure, so it is
+        # safe on the reactor thread here, and a target with neither
+        # source still carries NO `download_timeout` key, exactly as
+        # before.
+        request_timeout_seconds = resolve_request_timeout_seconds(target)
+        if request_timeout_seconds is not None:
+            meta["download_timeout"] = request_timeout_seconds
         if permission is not None:
             # SPEC-11 US1 (T014): threaded through so `parse`/`errback`
             # can release this fetch's concurrency slot as soon as the
@@ -689,6 +703,24 @@ class GenericPriceSpider(scrapy.Spider):
         # read from `response.meta` (stamped by `_request_for` at dispatch
         # time) -- never the pre-SPEC-10 hardcoded `DIRECT_HTTP`.
         attempt_kwargs = _attempt_kwargs_from_meta(response.meta)
+        # EPA C5 (F19): the raw bytes this result was extracted from,
+        # carried to `_flush_batch`, which writes them into the
+        # content-addressed evidence store and keeps the hash on the
+        # observation row (`offer_raw_evidence_hash`). Attached HERE, on
+        # `attempt_kwargs`, because every result this method emits --
+        # HTTP-status failure, adapter miss, validation rejection and
+        # success alike -- already spreads it, and an evidence hash that
+        # only appeared on successes would be missing exactly where a
+        # human most wants to replay the page.
+        #
+        # `response.body` is bytes already held by this response object,
+        # so this is a reference, not a copy: siblings riding the same
+        # fetch share it, and `store_evidence` is content-addressed, so N
+        # sibling rows produce ONE blob. Bounded by Scrapy's own
+        # `DOWNLOAD_MAXSIZE`; deliberately NOT spooled (see
+        # `scrape_core.result_spool._NON_SPOOLED_FIELDS`). Nothing is
+        # written unless `EVIDENCE_STORE_DIR` is configured.
+        attempt_kwargs["raw_evidence"] = response.body or None
 
         adapter_key = response.meta.get("adapter_key", AdapterKey.DEFAULT_HTTP)
         status_error_code = classify_http_status(response.status)

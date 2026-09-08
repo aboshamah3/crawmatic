@@ -234,6 +234,58 @@ class Settings(BaseSettings):
     #: Total characters one bounded pattern may scan across every node.
     EXTRACTION_REGEX_BOUNDS_MAX_TOTAL_CHARS: int = 1_048_576
 
+    # --- Ranked-extraction rollout flag (EPA C5, F19) -------------------
+    # The W3.2 ranked path (`collect_extraction_candidates` ->
+    # `rank`) has existed, tested, since 2026-08-26 and has never
+    # decided a live price: turning it on is a pricing-behaviour change,
+    # not a refactor, so it stayed opt-in per call.
+    #
+    #   `off`     the historical first-hit chain, nothing else runs.
+    #   `shadow`  the first hit is STILL what the caller gets and what
+    #             gets persisted; the ranker also runs and every
+    #             material disagreement is recorded as an
+    #             `extraction_shadow_events` row. This is how the
+    #             disagreement rate becomes a measured number instead of
+    #             an argument.
+    #   `v1`      the ranker decides. **An OWNER decision at C11**, taken
+    #             only if the shadow disagreement rate is < 1% on the C4
+    #             labeled sets AND the ranker wins >= 99% of labeled
+    #             conflicts (`scripts/run_offer_benchmark.py
+    #             --from-shadow-events`).
+    #
+    # `shadow` is the default because a rollout flag whose default is
+    # `off` produces no evidence, and one whose default is `v1` changes
+    # prices before anybody has any.
+    EXTRACTION_RANKING_POLICY: Literal["off", "shadow", "v1"] = "shadow"
+
+    # --- Raw-evidence blob store (EPA C5 / W3.1, F19) -------------------
+    # Where `app_shared.observations.evidence_store` writes the bytes an
+    # observation's `offer_raw_evidence_hash` names. In production this
+    # is a Railway VOLUME mounted on both scraper services — the store is
+    # content-addressed, so two services writing the same page write the
+    # same path with the same content, and a replay from either resolves.
+    #
+    # `None` is not a default location, it is "evidence storage is not
+    # configured": the pipeline then writes NO blob and leaves
+    # `offer_raw_evidence_hash` NULL. That is deliberate. A container's
+    # ephemeral filesystem would accept every write and lose them on the
+    # next deploy, leaving a table full of content addresses that resolve
+    # to nothing — exactly the "a hash pointing at deleted data proves
+    # nothing" failure `docs/RETENTION_POLICY.md` §2.1 is about. A NULL
+    # column is an honest absence; a dangling hash is a false claim.
+    EVIDENCE_STORE_DIR: str | None = None
+    #: How long a blob is kept once nothing needs it any more. The sweep
+    #: (`MAINTENANCE_EVIDENCE_RETENTION`) is age-AND-reference gated: a
+    #: blob past this window is still kept while any observation inside
+    #: `RETENTION_PRICE_OBSERVATIONS_DAYS` still references its hash.
+    EVIDENCE_RETENTION_DAYS: int = 30
+    #: Cadence of that sweep. Daily, like every other retention job.
+    EVIDENCE_RETENTION_INTERVAL_SECONDS: int = 86400
+    #: Blobs one sweep run may delete. Bounds the run's wall clock and
+    #: the number of reference queries it issues; a truncated run simply
+    #: continues on the next tick (the report says `truncated=True`).
+    EVIDENCE_RETENTION_MAX_BLOBS_PER_RUN: int = 5000
+
     # --- Batched persistence flush knobs (SPEC-07 FR-017, Principle VIII) ---
     # The scraping runtime's batched persistence pipeline (consumed via
     # get_settings(), never imported the other way — app_shared MUST NOT
@@ -360,6 +412,38 @@ class Settings(BaseSettings):
     # a bound a persistently blocked domain cycles forever and its job
     # never finalizes.
     SCRAPE_MAX_DEFER_CYCLES: int = 3
+
+    # --- EPA C1 (F08): per-TARGET deadline + physical attempt budget ------
+    # `SCRAPE_JOB_MAX_RUNTIME_SECONDS` (12h) and `SCRAPE_MAX_DEFER_CYCLES`
+    # bound the JOB and the DEFER loop respectively. Neither bounds what
+    # ONE target may spend on physical fetches, which is where the money
+    # goes: a target that escalates DIRECT -> IMPERSONATE -> PROXY ->
+    # BROWSER and then retries each of those pays for every one of them,
+    # and the deep dive found targets doing exactly that for the whole
+    # job window.
+    #
+    # Wall-clock seconds one TARGET may stay non-terminal before it is
+    # finalized `FAILED`/`TARGET_DEADLINE_EXCEEDED` WITHOUT another
+    # fetch. Deliberately far below `SCRAPE_JOB_MAX_RUNTIME_SECONDS`:
+    # one slow target may not hold a whole refresh open, and 15 minutes
+    # is already ~20x the p95 target lifetime A5 measures.
+    SCRAPE_TARGET_DEADLINE_SECONDS: int = 900
+    # Physical fetches (one HTTP request or one browser navigation each;
+    # a retry counts again) one target may spend in ONE refresh across
+    # every method on its ladder. The 5th is refused
+    # `ATTEMPT_BUDGET_EXHAUSTED`. 4 is the full ladder once with one
+    # retry -- past that the evidence says the target is not gettable
+    # today, and paying for a 5th attempt buys nothing.
+    SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS: int = 4
+    # Fraction of targets whose cheap method has been suppressed by a
+    # DOMAIN-level rule that still get one sampled recovery probe with
+    # it. Without this a domain-wide suppression is permanent by
+    # construction: the cheap method is never tried again, so it can
+    # never produce the success that would lift the suppression. 5% is a
+    # deliberate, bounded cost paid to keep the suppression falsifiable.
+    # Per-TARGET suppression (this target, this refresh) is never probed
+    # -- it is a fact about this fetch, not a standing rule.
+    SCRAPE_RECOVERY_PROBE_FRACTION: float = 0.05
 
     # Domains whose fetches go through the scraping runtime's
     # Chrome-impersonating TLS transport (2026-08-05) instead of the
@@ -789,7 +873,13 @@ class Settings(BaseSettings):
     # cadence intervals, and the partition create-ahead lookahead. Reused
     # unchanged: SYSTEM_DATABASE_URL (-> AUTH_DATABASE_URL fallback) — no
     # new session knob added here. ---
-    RETENTION_PRICE_OBSERVATIONS_DAYS: int = 90
+    # 180, not 90 (EPA C9 / owner decision 11, 2026-09-07): the raw
+    # observation is the evidence a pricing decision traces back to, and
+    # a 90-day window put it BELOW the 180-day dispute horizon the policy
+    # doc now records. Changed in place rather than re-declared in C9's
+    # append block below because two contradictory declarations of one
+    # knob is a landmine, not a merge strategy.
+    RETENTION_PRICE_OBSERVATIONS_DAYS: int = 180
     RETENTION_REQUEST_ATTEMPTS_DAYS: int = 90
     RETENTION_PRICE_ALERT_EVENTS_DAYS: int = 365
     RETENTION_WEBHOOK_EVENTS_DAYS: int = 90
@@ -1112,6 +1202,156 @@ class Settings(BaseSettings):
         if any(delay < 0 for delay in parsed):
             raise ValueError("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS delays must be >= 0")
         return parsed
+
+    # --- BEGIN EPA C7 (F12) APPEND BLOCK -- set-based daily rollups ------
+    #
+    # Appended here rather than beside the other `ROLLUP_*` fields above
+    # so this task could land alongside a concurrent edit to the same
+    # file without either side rewriting the other's region. Pydantic
+    # collects annotated class attributes regardless of where they sit
+    # relative to the validators, so these are ordinary `Settings` fields.
+    #
+    #: Keyset window: how many `(workspace_id, product_variant_id)` pairs
+    #: ONE rollup statement covers. Each batch is its own transaction and
+    #: its own durable checkpoint, so this is the granularity at which a
+    #: killed invocation loses work -- and the granularity at which it
+    #: resumes. 5,000 amortises the per-statement planning cost while
+    #: keeping one transaction short.
+    ROLLUP_BATCH_SIZE: int = 5000
+    #: Wall-clock budget for ONE `MAINTENANCE_DAILY_ROLLUP` invocation,
+    #: checked BETWEEN batches. Deliberately below the task's 1,800 s
+    #: Celery `time_limit` (`apps/workers/app/workers/celery_app.py`,
+    #: `_ROLLUP_LIMITS`) so the task stops itself cleanly and re-enqueues
+    #: instead of being SIGKILLed mid-transaction: a self-stop keeps the
+    #: last batch's checkpoint, a SIGKILL rolls it back. The 300 s of
+    #: slack is one batch's worth of headroom on a slow day.
+    ROLLUP_INVOCATION_BUDGET_SECONDS: int = 1500
+    # --- END EPA C7 (F12) APPEND BLOCK -----------------------------------
+
+    # --- BEGIN EPA C9 (F14) APPEND BLOCK -- retention per data class -----
+    #
+    # Appended (not interleaved with the SPEC-15 retention block above)
+    # for the same reason C7's block is: this file is edited by several
+    # concurrent tasks and an append cannot conflict with theirs.
+    #
+    # The three windows the plan re-states -- `RETENTION_REQUEST_ATTEMPTS_DAYS`
+    # (90), `RETENTION_PRICE_OBSERVATIONS_DAYS` (180) and
+    # `RETENTION_VARIANT_PRICE_DAILY_ROLLUPS_DAYS` (730) -- are NOT
+    # re-declared here: they already exist above and the only one whose
+    # value changed (price observations, 90 -> 180) was edited in place
+    # so there is exactly one declaration of each knob.
+    #
+    #: Browser SUBRESOURCE operations (`network_operations` rows carrying a
+    #: `parent_operation_id`). 30 days, deliberately the shortest window in
+    #: this block: a subresource is a means, not evidence. What must survive
+    #: is the PARENT's exact totals, and
+    #: `app_shared.maintenance.ledger_summaries` preserves those by writing
+    #: one `network_operation_resource_summaries` row before the children go
+    #: -- summarised, never merely deleted.
+    RETENTION_NETWORK_OPERATION_CHILDREN_DAYS: int = 30
+    #: Parent (non-child) physical operations. 730 days because this is the
+    #: fleet's own cost evidence: it is what a provider invoice is
+    #: reconciled against, and a financial record's window is set by the
+    #: longest applicable obligation, not by storage cost.
+    RETENTION_NETWORK_OPERATIONS_DAYS: int = 730
+    #: `network_operation_allocations` -- the tenant-visible half of the
+    #: same fact. Deliberately EQUAL to `RETENTION_NETWORK_OPERATIONS_DAYS`:
+    #: an allocation outliving its operation is an orphan, and an operation
+    #: outliving its allocations is a cost nobody owns. Two knobs rather
+    #: than one because a future jurisdiction may demand tenant-side
+    #: deletion earlier than fleet-side; if they ever diverge the
+    #: allocation window must be the SHORTER one.
+    RETENTION_COST_ALLOCATIONS_DAYS: int = 730
+    #: `scrape_job_targets` -- per-target execution state. 90 days: it is
+    #: operational telemetry whose durable outcome already lives in
+    #: `price_observations`/`match_current_prices`.
+    RETENTION_SCRAPE_JOB_TARGETS_DAYS: int = 90
+    #: `dispatch_intents` -- the commit-before-send protocol's in-flight
+    #: record. 30 days: a TERMINAL intent older than the reconcile window
+    #: (`DISPATCH_RECONCILE_INTERVAL_SECONDS`, 5 min) by four orders of
+    #: magnitude answers no question anyone can still ask.
+    RETENTION_DISPATCH_INTENTS_DAYS: int = 30
+    #: `cost_reservations` -- one row per C3 authorization grant. 30 days
+    #: past SETTLED/RELEASED. The money fact it produced is on
+    #: `cost_budgets` and in the ledger; the reservation itself is a lease.
+    RETENTION_COSTAUTH_RESERVATIONS_DAYS: int = 30
+    #: **The owner-ratification switch, and the reason nothing above can
+    #: delete anything today.** Empty means EVERY retention family is
+    #: inert: `app_shared.maintenance.retention.run_retention` and
+    #: `app_shared.maintenance.ledger_summaries` both consult
+    #: `app_shared.maintenance.registry.retention_class_enabled` before any
+    #: DROP, DELETE or summarisation, and report the family as skipped
+    #: instead. A window above is therefore a PROPOSED default, not a live
+    #: policy, until the owner signs the matching "Ratified by owner on
+    #: ____" line in `docs/RETENTION_POLICY.md` and names the class here.
+    #:
+    #: Values are the `RetentionFamily.class_key` strings in
+    #: `app_shared.maintenance.registry.RETENTION_FAMILIES` (e.g.
+    #: `"price_observations"`); `"*"` enables every registered family at
+    #: once and exists so a post-ratification deployment is one value
+    #: rather than nine. An UNKNOWN class name raises at `Settings`
+    #: construction: a typo'd class must fail the deploy, never silently
+    #: leave a family disabled that the owner believes they enabled.
+    #:
+    #: Env form is the repo's comma-separated pool convention (`NoDecode` +
+    #: the validator below), never JSON.
+    RETENTION_ENABLED_CLASSES: Annotated[list[str], NoDecode] = []
+    #: How many parent operations one `MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN`
+    #: invocation summarises. Each parent is its own transaction, so this
+    #: bounds the invocation, not the lock.
+    LEDGER_SUMMARIZE_BATCH_SIZE: int = 500
+    #: Cadence for that task. Daily, like every other retention-shaped job.
+    LEDGER_SUMMARIZE_INTERVAL_SECONDS: int = 86400
+    #: How many rows ONE bounded retention `DELETE` removes
+    #: (`app_shared.maintenance.retention._delete_expired_rows`). Each
+    #: batch is its own transaction, so this is the granularity at which a
+    #: killed invocation stops -- and the size of the largest lock and WAL
+    #: record it can produce.
+    RETENTION_ROW_DELETE_BATCH_SIZE: int = 5000
+    #: How many such batches ONE `MAINTENANCE_RETENTION_DROP` invocation
+    #: runs per family before leaving the rest to the next tick. 200 x
+    #: 5,000 = one million rows per family per day, which clears any
+    #: realistic day's arrivals while keeping the task far inside its
+    #: Celery time limit even on the first (backlog-clearing) run.
+    RETENTION_ROW_DELETE_MAX_BATCHES: int = 200
+
+    @field_validator("RETENTION_ENABLED_CLASSES", mode="before")
+    @classmethod
+    def _parse_retention_enabled_classes(cls, value: object) -> object:
+        """``"price_observations,request_attempts"`` -> ``[...]``.
+
+        Comma-separated, the same convention as the Scrapyd URL pools --
+        never JSON. An empty/whitespace value is the DEFAULT posture
+        (nothing enabled), not an error: "delete nothing" is always a
+        valid configuration of a deletion switch.
+        """
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return value
+
+    @field_validator("RETENTION_ENABLED_CLASSES", mode="after")
+    @classmethod
+    def _validate_retention_enabled_classes(cls, value: list[str]) -> list[str]:
+        """Reject a class name no registry family answers to.
+
+        Imported lazily inside the validator: `app_shared.maintenance.
+        registry` imports `Settings` from this module, so a module-level
+        import here would be circular.
+        """
+        from app_shared.maintenance.registry import RETENTION_CLASS_KEYS
+
+        unknown = [item for item in value if item != "*" and item not in RETENTION_CLASS_KEYS]
+        if unknown:
+            raise ValueError(
+                "RETENTION_ENABLED_CLASSES names unknown retention classes "
+                f"{unknown!r}; known classes are {sorted(RETENTION_CLASS_KEYS)!r} "
+                "(or '*' for all)"
+            )
+        return value
+
+    # --- END EPA C9 (F14) APPEND BLOCK -----------------------------------
 
     @field_validator("STRATEGY_PROFILE_SCOPE")
     @classmethod

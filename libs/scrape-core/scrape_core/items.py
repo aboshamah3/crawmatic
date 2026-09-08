@@ -23,8 +23,56 @@ from datetime import datetime
 from decimal import Decimal
 
 from app_shared.enums import AdapterKey, AccessMethod, ExtractionMethod, ScrapeErrorCode, StockStatus
+from app_shared.observations.offer_observation import OfferObservation
 
-__all__ = ["ScrapeResult"]
+#: EPA C5 (F19). The version of the EXTRACTION CONTRACT this library
+#: produces — the ordered chain, the money boundary it crosses, and the
+#: shape of the candidate it emits — stamped onto every observation so a
+#: price read months ago can be attributed to the extractor that read it.
+#:
+#: Deliberately NOT a package version: a dependency bump that changes no
+#: extraction behaviour must not invalidate the attribution of every
+#: historical row. Bump this string only when the chain's *output* for
+#: the same bytes can change.
+#:
+#: It lives here, on the transport item, rather than in
+#: `scrape_core.extraction.pipeline`, because `items` is the module both
+#: the extractor and the persistence pipeline already depend on;
+#: importing the extraction chain from here would make the transport
+#: dataclass drag `app_shared.strategy.candidate_ranking` into every
+#: process that merely wants to construct a result.
+EXTRACTOR_VERSION = "scrape-core-extraction-1"
+
+#: Where the PERSISTED price came from. Distinct from
+#: `extraction_method` (which strategy read it) — this says which
+#: *policy* decided that reading was the one to keep, which is the fact
+#: an audit of a repricing decision needs and the fact that changes when
+#: `EXTRACTION_RANKING_POLICY` is flipped at C11.
+PROVENANCE_FIRST_HIT = "first_hit"
+#: The W3.2 ranked path picked this reading (`EXTRACTION_RANKING_POLICY`
+#: = `'v1'`). Never produced while the flag stays `'shadow'` — in shadow
+#: mode the ranker runs but does not decide, so the row still says
+#: `first_hit`.
+PROVENANCE_RANKED_V1 = "ranked_v1"
+#: No extraction produced this result at all (a failure/skip row). NOT
+#: an unknown-provenance placeholder: it is a positive statement that
+#: nothing was read.
+PROVENANCE_NONE = "none"
+
+PROVENANCE_VALUES: tuple[str, ...] = (
+    PROVENANCE_FIRST_HIT,
+    PROVENANCE_RANKED_V1,
+    PROVENANCE_NONE,
+)
+
+__all__ = [
+    "EXTRACTOR_VERSION",
+    "PROVENANCE_FIRST_HIT",
+    "PROVENANCE_NONE",
+    "PROVENANCE_RANKED_V1",
+    "PROVENANCE_VALUES",
+    "ScrapeResult",
+]
 
 
 @dataclass
@@ -207,3 +255,66 @@ class ScrapeResult:
     ttfb_ms: int | None = None
     read_ms: int | None = None
     extract_ms: int | None = None
+
+    # --- EPA C5 (2026-09-08, F19): the structured offer contract on the
+    # live path ---------------------------------------------------------
+    #
+    # `offer` is the W3.1 canonical observation
+    # (`app_shared.observations.offer_observation.OfferObservation`) —
+    # seller, shipping, fees, promotion facts, per-dimension confidence —
+    # which until now existed as a validated contract and a set of
+    # `price_observations.offer_*` columns that NOTHING on the live
+    # scrape path ever wrote. `scrape_core.pipelines._flush_batch` reads
+    # this field to populate those columns. `None` (the default) leaves
+    # every `offer_*` column NULL exactly as before, so a producer that
+    # does not build one is unaffected.
+    offer: OfferObservation | None = None
+
+    # The RAW BYTES the extraction read, carried only as far as
+    # `_flush_batch`, which writes them into the content-addressed store
+    # (`app_shared.observations.evidence_store.store_evidence`) and keeps
+    # the resulting hash on the row. NOT persisted itself and never
+    # logged: it is a whole competitor page.
+    #
+    # It is bytes, not the decoded string, because the hash must name
+    # what actually arrived on the wire — a decoded-then-re-encoded page
+    # is a different byte sequence and would produce an address for
+    # bytes that never existed.
+    #
+    # `None` means "this attempt has no replayable evidence" (a
+    # never-dispatched skip, or a producer not yet wired). The store is
+    # only written when `Settings.EVIDENCE_STORE_DIR` is configured —
+    # recording a hash for bytes nobody stored is the exact failure
+    # `docs/RETENTION_POLICY.md` §2.1 warns about.
+    raw_evidence: bytes | None = None
+
+    # The three provenance facts that make a persisted price
+    # attributable, all non-optional because all three are always
+    # knowable by the producer (unlike the fields above, where NULL is a
+    # real state):
+    #
+    #   `extractor_version` — which extraction contract read it.
+    #   `profile_version`   — which revision of the scrape profile
+    #       configured that read. `0` is not "unknown": it means "no
+    #       scrape profile was resolved for this target" (an unprofiled
+    #       or never-dispatched attempt), which is a different fact from
+    #       a profile at version 0 — there is no such version, profiles
+    #       start at 1.
+    #   `provenance`        — which POLICY chose the reading that got
+    #       persisted (`PROVENANCE_*` above). In `shadow` mode this stays
+    #       `first_hit` even though the ranker also ran, because the
+    #       first hit is what was written.
+    extractor_version: str = EXTRACTOR_VERSION
+    profile_version: int = 0
+    provenance: str = PROVENANCE_NONE
+
+    # The extraction's own confidence, as an exact `Decimal` in [0, 1].
+    # `Decimal("0")` on a failure/skip row is a positive statement, not a
+    # placeholder: nothing was read, so nothing is trusted. It is the
+    # value `pipelines._monotonic_conflict_where` compares when refusing
+    # to let a worse reading overwrite a better one.
+    #
+    # Distinct from `extraction_confidence` above only in that this one
+    # is never NULL; the two carry the same number for a candidate-bearing
+    # result.
+    confidence: Decimal = Decimal("0")

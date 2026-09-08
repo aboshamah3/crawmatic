@@ -110,12 +110,20 @@ def _partition_exists(name: str) -> bool:
 
 
 def _drop_partition(name: str) -> None:
-    from sqlalchemy import text
+    """Teardown through the production seam (EPA C9/F14).
 
+    A raw statement here fails on exactly the databases that are
+    provisioned CORRECTLY: `provision_db_roles.sql` §8 makes
+    `crawmatic_migrate` own every relation, and this session is
+    `crawmatic_auth`, which is not the owner. §9's helper is what the
+    maintenance job itself uses, and reusing it keeps this fixture from
+    needing a privilege the real job does not have.
+    """
     from app_shared.database import get_system_sessionmaker
+    from app_shared.maintenance.partitions import drop_partition
 
     with get_system_sessionmaker()() as session:
-        session.execute(text(f"DROP TABLE IF EXISTS {name}"))
+        drop_partition(session, name)
         session.commit()
 
 

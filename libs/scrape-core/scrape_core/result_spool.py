@@ -310,11 +310,41 @@ def _scan_limit(wanted: set[int]) -> int:
 # this module.
 
 
+#: EPA C5 (F19). Fields that are DELIBERATELY not spooled -- written as
+#: an explicit `null` so `_decode` restores the dataclass default rather
+#: than tripping over a type this codec does not speak.
+#:
+#: The spool exists to make the OBSERVATION durable across a crash
+#: between buffering and COMMIT. Neither of these is part of that row's
+#: substance:
+#:
+#:   `raw_evidence` is a whole competitor page. Base64ing every page into
+#:       a local SQLite file would triple the on-disk cost of a fan-out
+#:       (one copy per sibling riding the same fetch) for bytes whose
+#:       durable home is the content-addressed evidence store -- and a
+#:       replay only happens when the flush that would have STORED them
+#:       failed, so the blob would not exist to be referenced anyway.
+#:   `offer` is a pydantic model, not a JSON scalar. Lowering it here
+#:       would put a second, divergent serializer for the
+#:       `OfferObservation` contract in a module whose job is a crash
+#:       spool.
+#:
+#: A replayed batch therefore writes the same price with a NULL offer
+#: projection and a NULL evidence hash. That is a real (small) loss of
+#: enrichment on an already-rare path, and it is the honest outcome:
+#: NULL says "this replayed row has no evidence", which is true.
+_NON_SPOOLED_FIELDS = frozenset({"offer", "raw_evidence"})
+
+
 def _encode(result: ScrapeResult) -> dict[str, Any]:
     return {
         _ENVELOPE_VERSION_KEY: SPOOL_SCHEMA_VERSION,
         _ENVELOPE_RESULT_KEY: {
-            field.name: _encode_value(getattr(result, field.name))
+            field.name: (
+                None
+                if field.name in _NON_SPOOLED_FIELDS
+                else _encode_value(getattr(result, field.name))
+            )
             for field in fields(result)
         },
     }

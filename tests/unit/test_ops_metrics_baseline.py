@@ -38,6 +38,7 @@ import pytest
 
 from app_shared.opsmetrics import emit as emit_mod
 from app_shared.opsmetrics.emit import (
+    ATTEMPT_BUDGET_EXHAUSTED_24H_SQL,
     ATTEMPTS_PER_VALID_FRESH_24H_SQL,
     COST_MODEL_DRIFT_RATIO_SQL,
     DISPATCH_AMBIGUOUS_INTENTS_SQL,
@@ -51,10 +52,15 @@ from app_shared.opsmetrics.emit import (
     render_baseline_metrics_prometheus,
 )
 
-#: The seven gauge names. This tuple IS the contract B9/D5 consume.
+#: The gauge names. This tuple IS the contract B9/D5 consume.
+#: `crawmatic_attempt_budget_exhausted_24h` joined the original seven in
+#: EPA C1 (F08) and is read WITH the amplification ratio above it, never
+#: instead of it: a falling ratio alongside a rising exhaustion count is a
+#: fleet that gave up, not a fleet that got efficient.
 _GAUGE_NAMES = (
     "crawmatic_fresh_unique_matches_24h",
     "crawmatic_attempts_per_valid_fresh_24h",
+    "crawmatic_attempt_budget_exhausted_24h",
     "crawmatic_persistence_failures_1h",
     "crawmatic_dispatch_ambiguous_intents",
     "crawmatic_queue_oldest_pending_seconds",
@@ -111,6 +117,7 @@ def _healthy_rows(**overrides: Any) -> dict[str, Any]:
             fresh_unique_matches_24h=300,
             attempts_per_valid_fresh_24h=3.0,
         ),
+        "attempt_budget_exhausted_24h": _Row(attempt_budget_exhausted_24h=7),
         "persistence_failures_1h": _Row(persistence_failures_1h=0),
         "dispatch_ambiguous_intents": _Row(dispatch_ambiguous_intents=2),
         "queue_oldest_pending_seconds": _Row(queue_oldest_pending_seconds=41.5),
@@ -142,6 +149,10 @@ def _healthy_rows(**overrides: Any) -> dict[str, Any]:
         (
             ATTEMPTS_PER_VALID_FRESH_24H_SQL,
             ("request_attempts", "match_current_prices", "NULLIF"),
+        ),
+        (
+            ATTEMPT_BUDGET_EXHAUSTED_24H_SQL,
+            ("request_attempts", "'ATTEMPT_BUDGET_EXHAUSTED'", "24 hours"),
         ),
         (
             PERSISTENCE_FAILURES_1H_SQL,
@@ -208,6 +219,7 @@ def test_collect_reads_every_gauge() -> None:
     assert metrics.fresh_unique_matches_24h == 300
     assert metrics.attempts_24h == 900
     assert metrics.attempts_per_valid_fresh_24h == 3.0
+    assert metrics.attempt_budget_exhausted_24h == 7
     assert metrics.persistence_failures_1h == 0
     assert metrics.dispatch_ambiguous_intents == 2
     assert metrics.queue_oldest_pending_seconds == 41.5
@@ -218,7 +230,7 @@ def test_collect_reads_every_gauge() -> None:
         "first_network_to_persisted": 8.25,
     }
     assert metrics.unavailable_reasons == {}
-    assert len(session.executed) == 6
+    assert len(session.executed) == 7
 
 
 def test_zero_is_reported_as_zero_not_dropped() -> None:
@@ -325,7 +337,7 @@ def test_collect_never_raises_even_when_everything_fails() -> None:
 
     metrics = collect_baseline_metrics(session)
 
-    assert len(metrics.unavailable_reasons) == 6
+    assert len(metrics.unavailable_reasons) == 7
     assert metrics.as_dict()["fresh_unique_matches_24h"] is None
 
 

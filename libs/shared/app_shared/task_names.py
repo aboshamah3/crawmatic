@@ -75,6 +75,45 @@ MAINTENANCE_PARTITION_CREATE = "maintenance.partition_create"
 MAINTENANCE_DAILY_ROLLUP = "maintenance.daily_rollup"
 MAINTENANCE_RETENTION_DROP = "maintenance.retention_drop"
 
+# --- Evidence-blob retention (EPA C5, F19) ---------------------------------
+# The FILESYSTEM half of retention, and the only retention job in this
+# system whose objects are not rows: the content-addressed raw-evidence
+# store behind `price_observations.offer_raw_evidence_hash`.
+#
+# It is a separate task from `MAINTENANCE_RETENTION_DROP` rather than a
+# step inside it because the two have opposite failure modes. A partition
+# drop that does not run costs disk; a blob deletion that runs when it
+# should not costs the evidence a price was ever justified by, and is
+# irreversible. Keeping them apart means the gated, irreversible one can
+# be paused, rate-limited or dry-run without touching the routine one.
+#
+# `maintenance` queue, daily (`EVIDENCE_RETENTION_INTERVAL_SECONDS`),
+# consumed by `apps/workers/app/workers/tasks_maintenance.py`. Closes the
+# gap `docs/RETENTION_POLICY.md` §2.1 records as "No deletion mechanism
+# exists today".
+MAINTENANCE_EVIDENCE_RETENTION = "maintenance.evidence_retention"
+
+# --- Ledger child summarization (EPA C9, F14) ------------------------------
+# The LEDGER half of retention, and the only retention job here that
+# COMPRESSES rather than deletes: for a settled browser navigation older
+# than `RETENTION_NETWORK_OPERATION_CHILDREN_DAYS`, it writes one
+# `network_operation_resource_summaries` row carrying the children's
+# totals and deletes the children in the same transaction
+# (`app_shared.maintenance.ledger_summaries`).
+#
+# Its own task rather than a step inside `MAINTENANCE_RETENTION_DROP`
+# for the same reason `MAINTENANCE_EVIDENCE_RETENTION` is: the partition
+# drop is bounded, cheap and reversible-by-restore, while this one reads
+# and rewrites a fan-out that can be hundreds of rows per parent and is
+# gated on a provider settlement having ARRIVED. An operator who needs to
+# pause one must not have to pause the other.
+#
+# `maintenance` queue, daily (`LEDGER_SUMMARIZE_INTERVAL_SECONDS`),
+# consumed by `apps/workers/app/workers/tasks_maintenance.py`. Inert
+# until the owner names `network_operation_children` in
+# `RETENTION_ENABLED_CLASSES`.
+MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN = "maintenance.ledger_summarize_children"
+
 # --- Webhook events (SPEC-16 FR-008, FR-009) ---
 # Enqueued via the same ``app_shared.messaging.enqueue`` producer seam by
 # three existing sources (alert transitions, job finalization, strategy
@@ -174,6 +213,18 @@ MAINTENANCE_BREAKER_EVALUATE = "maintenance.breaker_evaluate"
 # month every 6h, carrying the last cap forward when no explicit one is
 # configured. See ``app_shared.costauth.fleet_budget_policy``.
 MAINTENANCE_FLEET_BUDGET_ROLLFORWARD = "maintenance.fleet_budget_rollforward"
+
+# --- Per-domain request timeout tuner (EPA C1/F08, 2026-09-07) ---
+# Rewrites ``domain_rules.request_timeout_seconds`` for every domain with
+# enough successful attempts to measure: ``clamp(1.5 x p95(successful
+# attempt duration, 7 d), 10 s, 60 s)``. Bounds the 46.9 s average
+# proxied-HTTP attempt the deep dive found -- a number that measures the
+# 60 s GLOBAL default rather than any domain, because every doomed fetch
+# pays the full ceiling before anyone learns anything. Reads a 7-day
+# aggregate and writes at most one row per domain, so it is cheap and
+# strictly idempotent within a window. See
+# ``app_shared.maintenance.domain_timeouts``.
+MAINTENANCE_DOMAIN_TIMEOUT_TUNE = "maintenance.domain_timeout_tune"
 
 # --- STARTED-target reaper + hard job deadline (EPA A3/B2, 2026-09-03) ---
 # Enqueued by the scheduler on the same 60s maintenance tick as

@@ -52,10 +52,13 @@ from app_shared.task_names import (
     MAINTENANCE_BREAKER_EVALUATE,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_DOMAIN_TIMEOUT_TUNE,
     MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
+    MAINTENANCE_EVIDENCE_RETENTION,
+    MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -249,7 +252,23 @@ app.conf.task_routes = {
     # the same reason as every sweep above — a call that omits `queue=`
     # still has to land where a consumer is listening.
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD: {"queue": "maintenance"},
+    # EPA C1 (F08): the per-domain request-timeout tuner. Same
+    # reasoning as its siblings -- routed explicitly so an operator
+    # `.delay()` that omits `queue=` still reaches a consumer.
+    MAINTENANCE_DOMAIN_TIMEOUT_TUNE: {"queue": "maintenance"},
     MAINTENANCE_RETENTION_DROP: {"queue": "maintenance"},
+    # EPA C5 (F19): the filesystem half of retention -- an age-AND-
+    # reference gated sweep of the raw-evidence blob store. Same queue
+    # and same BYPASSRLS system session as its row-shaped sibling above;
+    # a separate task because a blob deletion that runs when it should
+    # not is irreversible, and that risk should be pausable on its own.
+    MAINTENANCE_EVIDENCE_RETENTION: {"queue": "maintenance"},
+    # EPA C9 (F14): the ledger child summarizer. Same queue and same
+    # BYPASSRLS system session as the two retention siblings above; its
+    # own task because it is gated on a provider settlement having
+    # ARRIVED, so pausing it is a different decision from pausing a
+    # partition drop.
+    MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN: {"queue": "maintenance"},
     CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},
     # Audit H1: both outbox passes are ordinary `maintenance` sweeps —
     # bounded DB work on the BYPASSRLS system session, no blocking fetch.
@@ -325,7 +344,17 @@ app.conf.task_annotations = {
     DISPATCH_RECONCILE_INTENTS: _REAPER_LIMITS,
     MAINTENANCE_PARTITION_CREATE: _REAPER_LIMITS,
     MAINTENANCE_RETENTION_DROP: _REAPER_LIMITS,
+    MAINTENANCE_EVIDENCE_RETENTION: _REAPER_LIMITS,
+    # EPA C9 (F14). Reaper-shaped, not rollup-shaped: one bounded
+    # `LEDGER_SUMMARIZE_BATCH_SIZE` slice of parents per invocation, each
+    # its own transaction, and the sweep resumes from wherever it stopped
+    # because a summarised parent is no longer eligible. Nothing here
+    # needs the 1,800 s a full-day rollup does.
+    MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN: _REAPER_LIMITS,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD: _REAPER_LIMITS,
+    # EPA C1 (F08): one 7-day aggregate + at most one UPSERT per
+    # domain -- a reaper-shaped sweep, so the 300s reaper budget.
+    MAINTENANCE_DOMAIN_TIMEOUT_TUNE: _REAPER_LIMITS,
     STRATEGY_LIGHT_RECHECK: _REAPER_LIMITS,
     STRATEGY_STATS_FLUSH: _REAPER_LIMITS,
     STRATEGY_DISCOVERY_SCAN: _REAPER_LIMITS,

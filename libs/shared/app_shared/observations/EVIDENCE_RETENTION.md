@@ -38,10 +38,15 @@ integrity check, not the backing filesystem.
    place. A corrected/re-extracted observation gets a NEW hash (new
    bytes hash to a different name); the old object is not overwritten.
 2. **No silent deletion.** Nothing in this module deletes evidence.
-   Until a retention-by-age sweep ships (W5.5), evidence accumulates —
-   acceptable for a minimal policy because the alternative (deleting
-   evidence with no expiry mechanism at all) breaks the "a hash proves
-   something" invariant this contract exists to guarantee.
+   **EPA C5 (2026-09-08) ships that sweep**: `sweep_evidence_retention`
+   in `evidence_store.py`, run daily as `MAINTENANCE_EVIDENCE_RETENTION`.
+   It is gated on TWO conditions, not one — the blob is older than
+   `EVIDENCE_RETENTION_DAYS` (30) AND no observation younger than
+   `RETENTION_PRICE_OBSERVATIONS_DAYS` (90) still references its hash —
+   precisely so ageing evidence out cannot break the "a hash proves
+   something" invariant this contract exists to guarantee. A sweep that
+   cannot prove a blob is unreferenced (a database error) deletes
+   nothing.
 3. **Integrity is checked on every read, not just on write.**
    `resolve_hash`/`replay` re-hash the bytes they read back and raise
    `EvidenceIntegrityError` if the content no longer matches its own
@@ -75,10 +80,9 @@ uv run python -m app_shared.observations.evidence_store replay <hash> \
 
 ## What W5.5 adds later
 
-- A retention-by-age sweep (drop evidence past a configurable window),
-  paired with the retention-by-drop tolerance the observation tables
-  already assume for soft references (`contracts/models-observations.md`
-  §22).
+- ~~A retention-by-age sweep (drop evidence past a configurable
+  window)~~ — **SHIPPED, EPA C5 2026-09-08**, and reference-gated rather
+  than age-only; see rule 2 above and `docs/RETENTION_POLICY.md` §2.1.
 - Off-box/durable storage instead of local filesystem.
 - A capability flag gating which callers (e.g. the SaaS promotion UI)
   may trigger a replay, since replay reads raw scraped content that may

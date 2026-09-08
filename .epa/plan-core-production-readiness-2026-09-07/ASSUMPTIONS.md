@@ -34,3 +34,4 @@
 | D4 staged rollout | pending owner | - |
 
 - 2026-09-08 (delegated, orchestrator): B10's rehearsal bugs are fixed at source (uncommitted migration b6e5d1c94a72 amended in place, provision_db_roles.sql grant arrays extended) rather than shipped as manual pre/post-migrate SQL in RELEASE_2. Rationale: the plan requires the migration and grants to be correct; the migration is not yet committed on this branch so amending it creates no second revision.
+- 2026-09-08 (delegated, orchestrator): C9's FK/uniqueness trade and empty RETENTION_ENABLED_CLASSES are accepted as the shipped default because both are fail-closed and the irreversible steps (partition swap, deletions) are owner-run per Pre-Flight. C11's release-3 doc must present both for ratification; the final report lists them as deferred owner gates.

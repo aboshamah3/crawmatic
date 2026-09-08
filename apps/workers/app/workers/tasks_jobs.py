@@ -26,7 +26,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -37,14 +37,14 @@ from app.workers.celery_app import app
 from app.workers.tasks_dispatch import DispatchedBatch, stamp_targets_dispatched
 from app_shared.config import get_settings
 from app_shared.costauth import (
-    FLEET_PROVIDER_BROWSER,
-    FLEET_PROVIDER_PROXY,
     AuthorizationPurpose,
     AuthorizationRequest,
     CostAuthorizationService,
+    FirstRungReservation,
     authorize_or_none,
-    estimate_bytes,
-    estimate_reservation_micro_units,
+    escalation_reservation,
+    first_rung_reservation,
+    reservation_rung,
 )
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.domains.lifecycle import unsupported_target_outcome
@@ -75,13 +75,18 @@ from app_shared.messaging import enqueue
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.netledger.recorder import canonical_url_hash
-from app_shared.models.domain_playbooks import DomainState
+from app_shared.models.domain_playbooks import DomainPlaybook, DomainState
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.models.strategy import DomainStrategyMethod, DomainStrategyProfile
 from app_shared.outbox import write_outbox_message
 from app_shared.repository import scoped_get, scoped_select
-from app_shared.strategy.methods import mode_for_access_method, resolve_method_candidate
+from app_shared.redis_client import get_redis_client
+from app_shared.strategy.methods import (
+    PlaybookStrategy,
+    mode_for_access_method,
+    resolve_next_physical_attempt,
+)
 from app_shared.scrapyd import (
     DispatchIdentity,
     ScrapydDispatchClient,
@@ -99,6 +104,11 @@ from app_shared.task_names import (
     STRATEGY_STATS_FLUSH,
 )
 from app_shared.webhooks.payloads import build_job_event
+# EPA C4: the per-target physical-attempt gate C1 built. `apps/workers`
+# already declares `scrape_core` as a dependency (its pyproject) and this
+# module is stdlib + `app_shared.enums` only -- no Scrapy/Twisted enters
+# the worker's import closure through it.
+from scrape_core.attempt_budget import AttemptBudget
 
 logger = logging.getLogger(__name__)
 
@@ -332,25 +342,42 @@ def _batch_authorization_request(
     purpose: AuthorizationPurpose,
     identity: DispatchIdentity,
 ) -> AuthorizationRequest:
-    """The C3 authorization one batch needs, derived from the plan (EPA C3).
+    """The C3 authorization one batch needs, derived from the plan (EPA C3/C6).
 
-    Two things the planner genuinely knows are used, and nothing is
+    Three things the planner genuinely knows are used, and nothing is
     invented beyond them:
 
-    * **transport/provider** come from the batch's MODE. A ``BROWSER``
-      batch is a browser navigation (the expensive path, and the only one
-      that costs browser-seconds); everything else is authorized as
-      ``PROXY``. Authorizing an HTTP batch as paid even though its
-      strategy chain may resolve to a DIRECT step is the FAIL-CLOSED
-      choice: the planner cannot know which rung the spider will land on,
-      and over-reserving is corrected at settlement while under-reserving
-      is money spent outside any ceiling.
-    * **size** comes from the batch's own match count, priced by the
-      MEASURED unit the provider actually bills — proxied bytes, plus
-      browser CPU-seconds for a BROWSER batch (``costauth.pricing``,
-      H4/B2). It is deliberately no longer a per-DOMAIN request rate:
-      what a fetch costs is what it weighs, and the same domain weighs
-      ten times more through a browser than over plain HTTP.
+    * **transport/provider** come from the batch's FIRST RUNG (EPA C6,
+      F18) — ``batch.initial_transport``, the ``AccessMethod`` the
+      strategy ladder already selected, whose cheap end is the playbook's
+      ``cheap_path``. A ``DIRECT`` rung reserves zero bytes and zero
+      money, and is *still authorized*: the breaker, the workspace
+      entitlement and the concurrency cap all apply to free traffic too.
+      Before F18 this was derived from ``mode`` alone and every HTTP
+      batch was authorized as ``PROXY`` fail-closed, because the planner
+      could not then know the rung. Over-reserving is not free — it burns
+      a byte and money ceiling on traffic that never touches a provider,
+      denying real paid work later in the same period. When the rung is
+      unknown (a batch planned by a caller that attaches no transport —
+      every pre-C6 site, including existing tests) the OLD fail-closed
+      mode derivation is used unchanged.
+    * **size** is the COALESCED count of unique physical requests
+      (``batch.unique_physical_requests``), not the match count: three
+      matches sharing one canonical URL under one coalescing key are one
+      fetch. Falls back to ``len(match_ids)`` when no target carried a
+      coalescing identity. It is priced by the MEASURED unit the provider
+      actually bills — proxied bytes, plus browser wall-seconds for a
+      BROWSER rung (``costauth.pricing``, H4/B2) — never a per-DOMAIN
+      request rate: what a fetch costs is what it weighs.
+    * **purpose** is the caller's, *upgraded* to an escalation purpose
+      when this dispatch is a climb: ``initial_transport`` is a paid rung
+      and differs from the playbook's ``cheap_transport``. Escalation
+      reserves SEPARATELY, at the full cost of the escalated rung — never
+      as a top-up mutating the cheap rung's live grant, which would make
+      one grant describe two different physical transports. A
+      ``RETRY`` keeps its own purpose: a stall re-POST is a second
+      attempt on the rung already authorized, not a new climb, and
+      relabelling it would change which C2 degradation rules can deny it.
 
     ``dedupe_key`` is the batch's dispatch identity key (EPA B1). That is
     exactly the right grain: a duplicate/at-least-once delivery of the
@@ -359,22 +386,88 @@ def _batch_authorization_request(
     same property, on the money side, that the identity already gives the
     POST side.
     """
-    is_browser = batch.mode == ScrapeProfileMode.BROWSER
-    requests = max(1, len(batch.match_ids))
+    escalation_purpose, rung = _batch_first_rung_reservation(batch)
+    if escalation_purpose is not None and purpose is not AuthorizationPurpose.RETRY:
+        purpose = escalation_purpose
     return AuthorizationRequest(
         workspace_id=workspace_id,
         domain=batch.domain,
-        transport="BROWSER" if is_browser else "PROXY",
-        provider=FLEET_PROVIDER_BROWSER if is_browser else FLEET_PROVIDER_PROXY,
-        estimated_bytes=estimate_bytes(requests),
-        estimated_cost_micro_units=estimate_reservation_micro_units(
-            transport="BROWSER" if is_browser else "PROXY", requests=requests
-        ),
+        transport=rung.transport,
+        provider=rung.provider,
+        estimated_bytes=rung.estimated_bytes,
+        estimated_cost_micro_units=rung.estimated_cost_micro_units,
         purpose=purpose,
-        estimated_requests=requests,
-        estimated_browser_seconds=requests * 30 if is_browser else 0,
+        estimated_requests=rung.estimated_requests,
+        estimated_browser_seconds=rung.estimated_browser_seconds,
         scrape_job_id=scrape_job_id,
         dedupe_key=identity.key,
+    )
+
+
+def _batch_unique_requests(batch: Batch) -> int:
+    """The batch's coalesced physical-request count, at least 1 (EPA C6).
+
+    ``plan_batches`` computes it from the same ``coalescing_key`` the
+    clustering pass uses; ``None`` means no target carried a coalescing
+    identity, and the conservative fallback is then one request per match
+    — exactly the pre-C6 number.
+    """
+    coalesced = batch.unique_physical_requests
+    if coalesced is None:
+        coalesced = len(batch.match_ids)
+    return max(1, int(coalesced))
+
+
+def _batch_first_rung_reservation(
+    batch: Batch,
+) -> tuple[AuthorizationPurpose | None, FirstRungReservation]:
+    """``(escalation purpose or None, amounts)`` for one batch (EPA C6/F18).
+
+    The escalation purpose is non-``None`` only when BOTH facts are known
+    and they disagree — the batch's resolved rung is paid and is not the
+    playbook's ``cheap_path``. An unknown ``cheap_transport`` yields
+    ``None`` (no upgrade), so a domain with no playbook keeps the caller's
+    purpose exactly as it had it before C6.
+
+    An ``initial_transport`` the reservation vocabulary does not recognise
+    is treated as unknown, not as an error: a strategy row carrying a
+    transport this build has never heard of must degrade to the
+    fail-closed paid reservation, not crash the dispatch pass.
+    """
+    requests = _batch_unique_requests(batch)
+    rung_name: str | None = None
+    if batch.initial_transport is not None:
+        try:
+            rung_name = reservation_rung(batch.initial_transport)
+        except ValueError:
+            logger.warning(
+                "dispatch: unknown initial_transport=%r on domain=%s -- reserving "
+                "fail-closed from mode instead",
+                batch.initial_transport,
+                batch.domain,
+            )
+    if rung_name is None:
+        # Pre-F18 fail-closed derivation: the planner does not know the
+        # rung, so it assumes the paid one.
+        rung_name = (
+            "BROWSER" if batch.mode == ScrapeProfileMode.BROWSER else "PROXY"
+        )
+        return None, first_rung_reservation(
+            initial_transport=rung_name, unique_requests=requests
+        )
+
+    cheap_name: str | None = None
+    if batch.cheap_transport is not None:
+        try:
+            cheap_name = reservation_rung(batch.cheap_transport)
+        except ValueError:
+            cheap_name = None
+    if cheap_name is not None and rung_name != cheap_name and rung_name != "DIRECT":
+        return escalation_reservation(
+            to_transport=rung_name, unique_requests=requests
+        )
+    return None, first_rung_reservation(
+        initial_transport=rung_name, unique_requests=requests
     )
 
 
@@ -468,10 +561,107 @@ def _strategy_method_label(method: DomainStrategyMethod | None) -> str:
     return f"{access}/{extraction or '-'}/v{method.method_version}"
 
 
+#: Statuses a budget/deadline refusal may finalize. Deliberately the two
+#: NON-terminal pickup states only: a target that already reached
+#: COMPLETED/FAILED/SKIPPED keeps the outcome it earned — a refusal is a
+#: reason not to START work, never a reason to overwrite a finished
+#: result (`mark_target`'s `only_if_status` is the same guard the rest of
+#: this module uses for exactly that reason).
+_BUDGET_REFUSAL_ELIGIBLE_STATUSES = (
+    ScrapeTargetStatus.PENDING,
+    ScrapeTargetStatus.DEFERRED,
+)
+
+
+def _target_attempt_budget(
+    redis: Any | None,
+    *,
+    settings: Any,
+    scrape_job_id: uuid.UUID | None,
+    target: ScrapeJobTarget,
+    domain: str,
+    playbook: PlaybookStrategy | None,
+) -> AttemptBudget | None:
+    """This target's physical-attempt gate, or `None` when unwired.
+
+    EPA C4, closing C1's carry-forward. `None` (no Redis client, or a
+    caller with no job id) means the ladder runs exactly as it did before
+    C1 — the gate is absent, not permissive-by-accident.
+
+    The deadline is anchored on the target's OWN clock (`started_at`,
+    else `created_at`, else now), not on the job's: `SCRAPE_TARGET_DEADLINE_
+    SECONDS` is a per-target bound, and anchoring it on a 12-hour job
+    would make it unreachable. A re-plan therefore re-derives the SAME
+    deadline instead of granting a fresh one, which is the whole point of
+    a wall-clock bound.
+
+    `recovery_probe_fraction` prefers the domain's own playbook value over
+    the fleet setting: a domain under active repair wants a different
+    probe rate from the fleet default, and that is precisely what the
+    C4 column exists to express.
+    """
+    if redis is None or scrape_job_id is None:
+        return None
+    anchor = (
+        getattr(target, "started_at", None)
+        or getattr(target, "created_at", None)
+        or datetime.now(timezone.utc)
+    )
+    fraction = (
+        playbook.recovery_probe_fraction
+        if playbook is not None and playbook.recovery_probe_fraction is not None
+        else settings.SCRAPE_RECOVERY_PROBE_FRACTION
+    )
+    return AttemptBudget(
+        redis,
+        job_id=scrape_job_id,
+        match_id=target.match_id,
+        max_physical=settings.SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS,
+        deadline_at=anchor + timedelta(seconds=settings.SCRAPE_TARGET_DEADLINE_SECONDS),
+        domain=domain,
+        recovery_probe_fraction=fraction,
+    )
+
+
+def _load_playbook_strategies(
+    session: Session, domains: Iterable[str]
+) -> dict[str, PlaybookStrategy]:
+    """`{domain: PlaybookStrategy}` for `domains`, in ONE bounded query.
+
+    EPA C4. `domain_playbooks` is fleet-wide, operator-curated reference
+    data with no `workspace_id` (see `app_shared.models.domain_playbooks`),
+    so this is a plain `select` — the sanctioned path for that table, the
+    same one `app_shared.strategy.resolution` already uses.
+
+    One query for the whole dispatch pass, never one per target
+    (Principle IV): a job routinely carries thousands of targets across a
+    handful of domains. A domain with no row is simply absent from the
+    result, and the ladder then runs with no strategy hints — which is
+    exactly the pre-C4 behaviour.
+    """
+    wanted = {domain for domain in domains if domain}
+    if not wanted:
+        return {}
+    strategies: dict[str, PlaybookStrategy] = {}
+    for row in (
+        session.execute(select(DomainPlaybook).where(DomainPlaybook.domain.in_(wanted)))
+        .scalars()
+        .all()
+    ):
+        strategy = PlaybookStrategy.from_row(row)
+        if strategy is not None:
+            strategies[row.domain] = strategy
+    return strategies
+
+
 def _resolve_domains_and_modes(
     session: Session,
     workspace_id: uuid.UUID | str,
     targets: list[ScrapeJobTarget],
+    *,
+    scrape_job_id: uuid.UUID | None = None,
+    redis: Any | None = None,
+    settings: Any | None = None,
 ) -> tuple[list[ResolvedTarget], bool]:
     """Resolve each target's `competitor_domain` + `mode` + strategy rung, set-based.
 
@@ -491,6 +681,29 @@ def _resolve_domains_and_modes(
     re-resolves identical cursors reports False and therefore reuses the
     persisted generation, producing the same dispatch identity and one
     POST rather than two.
+
+    **EPA C4 — the attempt budget and the versioned strategy.** C1 built
+    the per-target physical-attempt gate but left it inert: nothing
+    constructed an `AttemptBudget`, so `budget=None` reached the ladder
+    from every call site (`reports/C1.md`, "Wiring is deliberately partial").
+    This is one of the two sites that fixes that. When `redis` and
+    `scrape_job_id` are supplied, each target with no durable cursor gets
+    a budget built from `SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS`, its own
+    deadline (`started_at`/`created_at` + `SCRAPE_TARGET_DEADLINE_SECONDS`)
+    and its domain's `recovery_probe_fraction`, and the ladder both
+    charges and gates against it. A terminal refusal
+    (`ATTEMPT_BUDGET_EXHAUSTED`/`TARGET_DEADLINE_EXCEEDED`) marks the
+    target FAILED with that exact code and drops it from the plan — a
+    target that may not fetch must not be dispatched, and it must say why.
+
+    They are OPTIONAL parameters, not required ones, so the reaper's
+    re-plan path and every existing unit test keep working with
+    `budget=None`: an unwired caller gets exactly the pre-C4 behaviour
+    (the deadline is the bound that matters and it is re-derived every
+    pass), rather than a crash or a silently different plan.
+
+    The playbook lookup is one query for the whole pass
+    (:func:`_load_playbook_strategies`), never one per target.
     """
     if not targets:
         return [], False
@@ -588,6 +801,10 @@ def _resolve_domains_and_modes(
         ):
             methods_by_profile.setdefault(method.domain_strategy_profile_id, []).append(method)
 
+    # EPA C4: one bounded read for every domain in this pass.
+    playbooks = _load_playbook_strategies(session, domains.values())
+    settings = settings if settings is not None else get_settings()
+
     resolved: list[ResolvedTarget] = []
     cursor_advanced = False
     for target in targets:
@@ -597,6 +814,7 @@ def _resolve_domains_and_modes(
         domain = domains.get(match.competitor_id)
         if domain is None:
             continue
+        playbook = playbooks.get(domain)
         selected_method = current_methods.get(target.current_strategy_method_id)
         if selected_method is None:
             # Domain-scoped strategy profiles are the current default; an
@@ -608,11 +826,49 @@ def _resolve_domains_and_modes(
                 (match.competitor_id, domain, match.url_pattern)
             )
             if strategy_profile is not None:
-                selection = resolve_method_candidate(
+                budget = _target_attempt_budget(
+                    redis,
+                    settings=settings,
+                    scrape_job_id=scrape_job_id,
+                    target=target,
+                    domain=domain,
+                    playbook=playbook,
+                )
+                decision = resolve_next_physical_attempt(
                     methods_by_profile.get(strategy_profile.id, ()),
                     preferred_method_id=strategy_profile.preferred_method_id,
                     current_attempt_ordinal=target.strategy_attempt_ordinal,
+                    budget=budget,
+                    playbook=playbook,
                 )
+                if decision.refusal is not None:
+                    # Terminal for the TARGET (EPA C1's codes): it has
+                    # spent its physical-attempt budget or run past its
+                    # own deadline. Finalize it with that exact code and
+                    # drop it from the plan -- dispatching a target the
+                    # ladder just refused would spend the money the
+                    # budget exists to stop, and finalizing it silently
+                    # would leave the strategy optimizer with no reason.
+                    logger.info(
+                        "tasks_jobs: attempt_budget_refusal job=%s match=%s "
+                        "domain=%s code=%s strategy_version=%s",
+                        scrape_job_id,
+                        target.match_id,
+                        domain,
+                        decision.refusal.value,
+                        decision.strategy_version,
+                    )
+                    mark_target(
+                        session,
+                        workspace_id=workspace_id,
+                        scrape_job_id=target.scrape_job_id,
+                        match_id=target.match_id,
+                        status=ScrapeTargetStatus.FAILED,
+                        error_code=decision.refusal,
+                        only_if_status=_BUDGET_REFUSAL_ELIGIBLE_STATUSES,
+                    )
+                    continue
+                selection = decision.selection
                 if selection is not None:
                     selected_method = selection.method  # type: ignore[assignment]
                     target.current_strategy_method_id = selected_method.id
@@ -648,6 +904,44 @@ def _resolve_domains_and_modes(
                 # Only `cluster_for_coalescing`, called behind
                 # `JOBS_COALESCING_ENABLED` below, ever reads it.
                 canonical_url_hash=canonical_url_hash(match.normalized_competitor_url),
+                # EPA C4: the rest of the coalescing equivalence key that
+                # this layer can honestly answer for. `workspace_id` makes
+                # the key complete (and lets `coalesced_groups` refuse a
+                # mixed-workspace input); `transport` splits clusters whose
+                # resolved rungs would not have produced the same bytes.
+                # `region`/`currency`/`proxy_country`/`variant_selector_hash`
+                # are resolved further down (the spider's access-policy and
+                # variant resolution, `scrape_core.targets.load_targets`) and
+                # are deliberately left `None` here rather than guessed --
+                # an invented component would MERGE nothing but could make
+                # two genuinely different fetches look alike.
+                workspace_id=(
+                    workspace_id
+                    if isinstance(workspace_id, uuid.UUID)
+                    else uuid.UUID(str(workspace_id))
+                ),
+                transport=(
+                    getattr(
+                        selected_method.access_method,
+                        "value",
+                        selected_method.access_method,
+                    )
+                    if selected_method is not None
+                    else None
+                ),
+                # EPA C6 (F18): the playbook's cheap rung for this domain,
+                # carried so the dispatch site can tell a FIRST attempt
+                # (reserve the cheap rung — zero bytes when it is DIRECT)
+                # from an ESCALATION (a separate grant, under its own
+                # purpose). `None` when the domain has no playbook, which
+                # keeps the pre-F18 fail-closed reservation.
+                cheap_path=(
+                    None
+                    if playbook is None or playbook.cheap_path is None
+                    else str(
+                        getattr(playbook.cheap_path, "value", playbook.cheap_path)
+                    )
+                ),
             )
         )
 
@@ -744,7 +1038,14 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             job.started_at = datetime.now(timezone.utc)
 
         resolved_targets, cursor_advanced = _resolve_domains_and_modes(
-            session, workspace_uuid, targets
+            session,
+            workspace_uuid,
+            targets,
+            # EPA C4: wire C1's attempt budget (it was inert until a
+            # caller passed one) and this domain's versioned strategy.
+            scrape_job_id=job.id,
+            redis=get_redis_client(),
+            settings=settings,
         )
 
         # --- the durable planning generation (EPA B1) -------------------------
@@ -1503,7 +1804,18 @@ def recover_stalled_batches() -> None:
                 continue
 
             resolved_targets, _ = _resolve_domains_and_modes(
-                session, workspace_id, stalled_targets
+                session,
+                workspace_id,
+                stalled_targets,
+                # A stall re-plan is dispatch too, and the budget/deadline
+                # must bound it exactly as they bound the first pass --
+                # otherwise a target could escape its ceiling simply by
+                # stalling. The deadline is anchored on the TARGET's own
+                # clock, so a re-plan re-derives the same instant rather
+                # than granting a fresh window.
+                scrape_job_id=job.id,
+                redis=get_redis_client(),
+                settings=settings,
             )
 
             # A stall re-plan IS a durable, explicit replan transition, so

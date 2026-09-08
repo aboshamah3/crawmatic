@@ -334,7 +334,7 @@ BEGIN
             EXECUTE format('GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_app', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'domain_lifecycle_audit', 'domain_playbooks', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'proxy_circuit_breakers', 'refresh_rule_occurrences', 'rollup_watermarks', 'strategy_discovery_state', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'domain_lifecycle_audit', 'domain_playbooks', 'extraction_shadow_events', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'proxy_circuit_breakers', 'refresh_rule_occurrences', 'rollup_completion', 'rollup_watermarks', 'strategy_discovery_state', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -351,7 +351,7 @@ BEGIN
             EXECUTE format('GRANT DELETE, INSERT, SELECT ON TABLE %I TO crawmatic_app', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['network_operation_settlements', 'provider_usage_records'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['network_operation_resource_summaries', 'network_operation_settlements', 'network_operations_pre_partition', 'provider_usage_records'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -404,7 +404,7 @@ BEGIN
     END LOOP;
 
     -- ---- crawmatic_auth ----
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'api_abuse_limit_counters', 'competitor_product_matches', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'domain_strategy_profiles', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'network_operations', 'outbox_messages', 'price_alert_events', 'price_observations', 'product_group_items', 'product_groups', 'product_variants', 'provider_usage_records', 'proxy_circuit_breakers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'request_attempts', 'rollup_watermarks', 'scrape_job_targets', 'scrape_jobs', 'scrape_profile_revisions', 'scrape_profiles', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'api_abuse_limit_counters', 'competitor_product_matches', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'domain_strategy_profiles', 'extraction_shadow_events', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'network_operations', 'outbox_messages', 'price_alert_events', 'price_observations', 'product_group_items', 'product_groups', 'product_variants', 'provider_usage_records', 'proxy_circuit_breakers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'request_attempts', 'rollup_completion', 'rollup_watermarks', 'scrape_job_targets', 'scrape_jobs', 'scrape_profile_revisions', 'scrape_profiles', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -438,7 +438,7 @@ BEGIN
             EXECUTE format('GRANT SELECT ON TABLE %I TO crawmatic_auth', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['products'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['network_operation_resource_summaries', 'products'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -456,8 +456,21 @@ BEGIN
         END LOOP;
     END LOOP;
 
+    -- EPA C9 (F14): the transient pre-swap copy of the ledger. Every
+    -- role loses everything on it -- the grants would otherwise survive
+    -- the RENAME and leave a frozen, unreadable-by-design shadow of the
+    -- ledger readable by the same roles the live table is. The owner
+    -- drops this table after verifying the swap.
+    FOREACH tbl IN ARRAY ARRAY['network_operations_pre_partition'] LOOP
+        IF to_regclass('public.' || tbl) IS NULL THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format('REVOKE ALL ON TABLE %I FROM crawmatic_auth', tbl);
+        -- crawmatic_auth gets no privileges on this table (see grants_expected.yaml)
+    END LOOP;
+
     -- ---- crawmatic_scraper ----
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_resource_summaries', 'network_operation_settlements', 'network_operations_pre_partition', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'rollup_completion', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -474,7 +487,7 @@ BEGIN
             -- crawmatic_scraper gets no privileges on this table (see grants_expected.yaml)
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['network_operations', 'price_observations', 'request_attempts'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['extraction_shadow_events', 'network_operations', 'price_observations', 'request_attempts'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -697,5 +710,246 @@ BEGIN
     END LOOP;
 
     RAISE NOTICE 'ownership adopted into crawmatic_migrate for % relation(s)', moved;
+END
+$$;
+
+-- ---------------------------------------------------------------------
+-- 9. The partition-maintenance seam (EPA C9, F14).
+--
+--    WHAT THIS FIXES. Section 8 says, in its own words, that "the
+--    maintenance job's partition creation is granted explicitly rather
+--    than by making a runtime role the owner" — and then grants no such
+--    thing. The EPA C8 rehearsal found the consequence: on a database
+--    provisioned exactly as intended, `crawmatic_auth` (the role
+--    `MAINTENANCE_PARTITION_CREATE` and `MAINTENANCE_RETENTION_DROP`
+--    actually run as) can neither create nor reclaim a partition,
+--    because PostgreSQL requires OWNERSHIP of the parent for both and
+--    section 8 correctly moved ownership to `crawmatic_migrate`.
+--    Partition creation and retention were therefore both broken by
+--    design, silently, on any correctly provisioned deployment.
+--
+--    WHY NOT ROLE MEMBERSHIP. `GRANT crawmatic_migrate TO crawmatic_auth`
+--    is one line and would work. It also hands a runtime login every
+--    owner privilege on every table — including `ALTER TABLE ... NO
+--    FORCE ROW LEVEL SECURITY` and removing policies, which is precisely
+--    the exposure section 8 exists to close. Undoing section 8 to make
+--    section 8's own stated intent work is not a fix.
+--
+--    THE SEAM. Two SECURITY DEFINER functions owned by the table owner,
+--    with EXECUTE granted only to `crawmatic_auth`. They are the
+--    "explicit grant" section 8 promised: the maintenance role gets
+--    exactly two operations on exactly the relations that are already
+--    partitions of an already-partitioned parent, and nothing else.
+--
+--    THEY ARE NOT A GENERIC DDL HOLE. Both validate against
+--    `pg_catalog` before executing anything:
+--      * create — the parent must exist and be `relkind = 'p'` (already
+--        a partitioned table), and the child name must be the parent's
+--        name plus a `_YYYY_MM` suffix;
+--      * reclaim — the target must currently BE a partition
+--        (`relispartition`).
+--    So neither can touch an ordinary table, a view, another schema, or
+--    anything the maintenance job would not have created itself.
+--    `search_path` is pinned and every catalog reference is
+--    schema-qualified, the standard SECURITY DEFINER hardening.
+--
+--    OWNERSHIP. The functions are reassigned to `crawmatic_migrate` so
+--    the definer is the role section 8 makes the table owner. On a
+--    database where ownership adoption has NOT been run, the definer is
+--    not the owner and these functions fail exactly as the direct DDL
+--    does — deliberately: they grant the maintenance role the owner's
+--    partition rights, they do not manufacture rights nobody has.
+--
+--    CALLER. `app_shared.maintenance.partitions` probes for these two
+--    functions (`to_regprocedure`) and routes through them when they
+--    exist, falling back to direct DDL when they do not — so a database
+--    provisioned before this section still behaves exactly as it did.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION crawmatic_create_partition(
+    parent_name text,
+    child_name  text,
+    range_start text,
+    range_end   text
+) RETURNS void AS $$
+DECLARE
+    parent_kind  "char";
+    parent_oid   oid;
+    parent_rls   boolean;
+    grant_row    record;
+    pol          record;
+    roles_clause text;
+    stmt         text;
+BEGIN
+    SELECT c.relkind INTO parent_kind
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = parent_name;
+
+    IF parent_kind IS NULL OR parent_kind <> 'p' THEN
+        RAISE EXCEPTION
+            'crawmatic_create_partition: % is not a partitioned table in public',
+            parent_name;
+    END IF;
+
+    IF child_name !~ ('^' || parent_name || '_[0-9]{4}_[0-9]{2}$') THEN
+        RAISE EXCEPTION
+            'crawmatic_create_partition: % is not a <parent>_YYYY_MM child of %',
+            child_name, parent_name;
+    END IF;
+
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.%I '
+        'FOR VALUES FROM (%L) TO (%L)',
+        child_name, parent_name, range_start, range_end);
+
+    -- Copy the PARENT's grants onto the new child. Not optional, and the
+    -- reason is subtle enough to spell out: PostgreSQL checks privileges
+    -- on the relation a query NAMES, and a partition does NOT inherit its
+    -- parent's ACL. Ordinary reads name the parent and are unaffected —
+    -- but retention's own verify-before-drop gate scans the CHILD by name
+    -- (`retention.py::_rollups_cover_stmt`), and so does anything else
+    -- that touches one partition deliberately. Before this seam existed
+    -- the runtime-created child happened to be owned by the very role
+    -- that needed to read it, which hid the gap; now the definer owns it,
+    -- so the grant has to be real. `aclexplode` over `relacl` rather than
+    -- `information_schema` because the latter only shows rows the current
+    -- user granted or holds. `grantee <> 0` skips PUBLIC, which this
+    -- schema never grants to and which `pg_get_userbyid` cannot name.
+    FOR grant_row IN
+        SELECT pg_get_userbyid(a.grantee) AS grantee_name,
+               a.privilege_type
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          CROSS JOIN LATERAL aclexplode(c.relacl) AS a
+         WHERE n.nspname = 'public'
+           AND c.relname = parent_name
+           AND a.grantee <> 0
+    LOOP
+        EXECUTE format('GRANT %s ON TABLE public.%I TO %I',
+                       grant_row.privilege_type, child_name,
+                       grant_row.grantee_name);
+    END LOOP;
+
+    -- Give the child its parent's RLS posture, HERE, in the same
+    -- privileged step that created it. `ALTER TABLE ... ENABLE ROW LEVEL
+    -- SECURITY` and `CREATE POLICY` both require ownership, so
+    -- `app_shared.models.rls.PARTITION_RLS_INHERITANCE_SQL` — which the
+    -- caller used to issue directly — cannot run on the maintenance
+    -- session once ownership lives with `crawmatic_migrate`. This is the
+    -- same statement's logic narrowed to one child; the schema-wide
+    -- version still runs at provisioning time and in migrations, and
+    -- both are idempotent, so the two never disagree.
+    --
+    -- A partition of a parent with no policies (the fleet-owned ledger)
+    -- gets nothing, which is correct: FORCE RLS with no policy denies
+    -- every read.
+    SELECT c.oid, c.relrowsecurity
+      INTO parent_oid, parent_rls
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = parent_name;
+
+    IF parent_rls THEN
+        EXECUTE format(
+            'ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', child_name);
+        EXECUTE format(
+            'ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', child_name);
+
+        FOR pol IN
+            SELECT p.polname,
+                   p.polpermissive,
+                   p.polroles,
+                   CASE p.polcmd
+                       WHEN '*' THEN 'ALL'
+                       WHEN 'r' THEN 'SELECT'
+                       WHEN 'a' THEN 'INSERT'
+                       WHEN 'w' THEN 'UPDATE'
+                       WHEN 'd' THEN 'DELETE'
+                   END AS cmd_text,
+                   pg_get_expr(p.polqual, p.polrelid) AS using_expr,
+                   pg_get_expr(p.polwithcheck, p.polrelid) AS check_expr
+              FROM pg_catalog.pg_policy p
+             WHERE p.polrelid = parent_oid
+        LOOP
+            CONTINUE WHEN EXISTS (
+                SELECT 1 FROM pg_catalog.pg_policy q
+                 WHERE q.polrelid = format('public.%I', child_name)::regclass
+                   AND q.polname = pol.polname
+            );
+
+            SELECT string_agg(quote_ident(r.rolname), ', ')
+              INTO roles_clause
+              FROM pg_catalog.pg_roles r
+             WHERE r.oid = ANY (pol.polroles);
+
+            stmt := 'CREATE POLICY ' || quote_ident(pol.polname)
+                 || ' ON ' || format('public.%I', child_name)
+                 || CASE WHEN pol.polpermissive
+                         THEN ' AS PERMISSIVE' ELSE ' AS RESTRICTIVE' END
+                 || ' FOR ' || pol.cmd_text;
+            IF roles_clause IS NOT NULL THEN
+                stmt := stmt || ' TO ' || roles_clause;
+            END IF;
+            IF pol.using_expr IS NOT NULL THEN
+                stmt := stmt || ' USING (' || pol.using_expr || ')';
+            END IF;
+            IF pol.check_expr IS NOT NULL THEN
+                stmt := stmt || ' WITH CHECK (' || pol.check_expr || ')';
+            END IF;
+            EXECUTE stmt;
+        END LOOP;
+    END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp;
+
+CREATE OR REPLACE FUNCTION crawmatic_drop_partition(child_name text)
+RETURNS void AS $$
+DECLARE
+    is_partition boolean;
+BEGIN
+    SELECT c.relispartition INTO is_partition
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = child_name;
+
+    -- Absent is a no-op, not an error: retention's contract is
+    -- idempotent, and a re-run over an already-clean state must stay so
+    -- (FR-020).
+    IF is_partition IS NULL THEN
+        RETURN;
+    END IF;
+
+    IF NOT is_partition THEN
+        RAISE EXCEPTION
+            'crawmatic_drop_partition: % is not a partition — refusing', child_name;
+    END IF;
+
+    EXECUTE format('DROP TABLE IF EXISTS public.%I', child_name);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crawmatic_migrate') THEN
+        EXECUTE 'ALTER FUNCTION crawmatic_create_partition(text, text, text, text)'
+                ' OWNER TO crawmatic_migrate';
+        EXECUTE 'ALTER FUNCTION crawmatic_drop_partition(text) OWNER TO crawmatic_migrate';
+    END IF;
+END
+$$;
+
+-- PUBLIC gets EXECUTE on a new function by default; withdraw it first so
+-- the grant below is the whole access list, not an addition to it.
+REVOKE ALL ON FUNCTION crawmatic_create_partition(text, text, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION crawmatic_drop_partition(text) FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crawmatic_auth') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION'
+                ' crawmatic_create_partition(text, text, text, text) TO crawmatic_auth';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION crawmatic_drop_partition(text)'
+                ' TO crawmatic_auth';
+    END IF;
 END
 $$;

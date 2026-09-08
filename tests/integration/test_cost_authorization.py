@@ -75,6 +75,7 @@ from app_shared.models.cost_authorization import (
     CostBudget,
     CostReservation,
     EntitlementState,
+    FleetCostBudget,
     ReservationState,
     WorkspaceEntitlement,
 )
@@ -1132,3 +1133,95 @@ def test_a_grant_carries_the_decision_facts_it_was_issued_on(sessions) -> None:
     assert again.replayed is True
     assert again.entitlement_version == replay.entitlement_version
     assert again.breaker_decision == replay.breaker_decision
+
+
+# ---------------------------------------------------------------------------
+# 14. F18's zero-cost DIRECT first rung (EPA C6, closed by the phase-C review)
+# ---------------------------------------------------------------------------
+
+
+def test_a_direct_first_rung_is_authorized_with_no_direct_fleet_budget_row(
+    sessions,
+) -> None:
+    """A DIRECT/zero-cost reservation is GRANTED, not denied for a missing row.
+
+    C6 (F18) made `_batch_authorization_request` reserve for the rung the
+    batch will actually try first, so a playbook whose `cheap_path` is
+    DIRECT now authorizes with `provider="direct"`, zero bytes, zero money
+    and zero browser-seconds — a provider scope no deployment has ever
+    seeded a `fleet_cost_budgets` row for. `reports/C6-2.md` flagged the
+    consequence as UNTESTED and as the one that would matter: if the
+    absent fleet row denied, every free fetch in the fleet would stop.
+
+    It does not. `_get_or_create_budget_locked` materialises the scope's
+    row with NULL limits ("no ceiling"), and `_check_dimensions` skips a
+    NULL limit — so the request passes the budget gates while still being
+    subject to entitlement, breaker, domain and concurrency, which is
+    exactly what "still authorized for breaker/entitlement/concurrency"
+    has to mean. The request DIMENSION is deliberately non-zero: a direct
+    fetch is still a fetch.
+    """
+    workspace_id = _seed(sessions)
+    service = _service(sessions, workspace_id=workspace_id)
+
+    with sessions() as session:
+        assert (
+            session.execute(
+                select(FleetCostBudget).where(FleetCostBudget.scope_key == "direct")
+            ).scalar_one_or_none()
+            is None
+        ), "precondition: no fleet budget row exists for the direct scope"
+
+    grant = service.authorize(
+        _req(
+            workspace_id,
+            transport="DIRECT",
+            provider="direct",
+            estimated_bytes=0,
+            estimated_cost_micro_units=0,
+            estimated_requests=3,
+            estimated_browser_seconds=0,
+        )
+    )
+
+    assert grant.authorization_id is not None
+
+    with sessions() as session:
+        fleet = session.execute(
+            select(FleetCostBudget).where(FleetCostBudget.scope_key == "direct")
+        ).scalar_one()
+        # Materialised with no ceiling on any dimension, and counting.
+        assert fleet.limit_cost_micro_units is None
+        assert fleet.limit_bytes is None
+        assert fleet.reserved_cost_micro_units == 0
+        assert fleet.reserved_bytes == 0
+        assert fleet.reserved_requests == 3
+
+
+def test_a_direct_first_rung_still_obeys_the_breaker(sessions) -> None:
+    """Free traffic is cheap, not ungoverned.
+
+    The other half of the criterion: DIRECT reserving zero money must not
+    become DIRECT skipping the gates. A missing breaker row is the
+    fail-closed case `test_denies_when_the_breaker_row_is_missing_entirely`
+    pins for paid work; it must deny a zero-cost DIRECT request too.
+    """
+    workspace_id = _seed(sessions)
+    with sessions() as session:
+        session.execute(text("DELETE FROM proxy_circuit_breakers"))
+        session.commit()
+
+    service = _service(sessions, workspace_id=workspace_id)
+
+    with pytest.raises(CostAuthorizationDenied) as excinfo:
+        service.authorize(
+            _req(
+                workspace_id,
+                transport="DIRECT",
+                provider="direct",
+                estimated_bytes=0,
+                estimated_cost_micro_units=0,
+                estimated_requests=1,
+            )
+        )
+    assert excinfo.value.reason == DenialReason.BREAKER_EVIDENCE_STALE

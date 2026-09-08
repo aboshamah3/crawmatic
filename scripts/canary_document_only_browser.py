@@ -104,6 +104,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import random
 import sys
 import uuid
 from dataclasses import dataclass
@@ -125,6 +127,7 @@ __all__ = [
     "MAX_UNKNOWN_PCT",
     "MIN_COMPARABLE_PARENTS",
     "PROXY_BYTES_PER_PAGE_CEILING",
+    "PROXY_CANARY_USERNAME_ENV",
     "SUCCESS_RATE_TOLERANCE_POINTS",
     "Acceptance",
     "CalculatorSummary",
@@ -141,12 +144,14 @@ __all__ = [
     "page_operation_from_mapping",
     "page_row_from_operation",
     "percentile",
+    "proxy_canary_username_configured",
+    "randomized_execution_order",
     "render_report",
     "summarize",
     "summarize_phase",
 ]
 
-CANARY_TOOL_VERSION = "1"
+CANARY_TOOL_VERSION = "2"
 
 #: The domain the 2026-09 canary is about. Not hardcoded into the policy —
 #: the policy reads whatever an operator lists; this is just what the run
@@ -155,6 +160,19 @@ DOCUMENT_ONLY_DOMAIN = "amazon.sa"
 
 DEFAULT_SAMPLE_SIZE = 50
 DEFAULT_OUT = "evidence/canary-document-only-2026-09/REPORT.md"
+
+#: EPA C3 (2026-09-08): the environment variable NAME (never its value --
+#: no credential is ever read, printed, or written by this script) that
+#: must reference a dedicated canary-only proxy sub-account on the
+#: scrapers-browser service, so canary spend/reputation never mixes into
+#: production proxy billing or a production exit IP's reputation. This
+#: script only checks whether the name is SET in its own process (an
+#: advisory signal for `--dry-run`/the target-set draw, which run on this
+#: host, not on scrapers-browser); the real, load-bearing configuration is
+#: the owner setting it on the scrapers-browser service itself before
+#: Step 2, exactly like `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` already is
+#: (see `runbook_text`).
+PROXY_CANARY_USERNAME_ENV = "PROXY_CANARY_USERNAME"
 
 #: Acceptance rule 1: how far the candidate's success rate may fall below the
 #: baseline's, in PERCENTAGE POINTS. "Within 3" includes exactly 3.
@@ -317,6 +335,52 @@ def _phase_table(summary: PhaseSummary) -> str:
         f"{summary.success_pct:.1f}% | {summary.p50_wall_ms:.0f} ms | "
         f"{summary.p95_wall_ms:.0f} ms | {_mb(summary.proxy_bytes_per_page)} |"
     )
+
+
+# --- EPA C3: randomized paired ordering + dedicated proxy sub-account --------
+
+
+def randomized_execution_order(
+    targets: Sequence[Mapping[str, Any]], *, seed: str
+) -> list[dict[str, Any]]:
+    """Shuffle `targets` deterministically from `seed`.
+
+    "Paired" ordering: phase A and phase B both replay this SAME shuffled
+    list (the seed is fixed per canary run, not per phase), so whatever
+    position-dependent drift exists within a job -- proxy warm-up, a
+    rate-limit window, time-of-day -- lands on the SAME targets in the
+    SAME order in both phases and cancels out of the A/B comparison,
+    rather than confounding it. This is deliberately a SECOND-level
+    shuffle on top of `build_amazon_target_set`'s own selection-key sort:
+    that sort exists so the target SET is reproducible run over run; this
+    shuffle exists so the EXECUTION ORDER within one run is not the
+    selection key itself (which could correlate with e.g. when a match
+    was created).
+
+    Pure and deterministic: the same `targets` + `seed` always produce the
+    same order, so a re-run for review reproduces the exact plan without
+    needing to persist it separately. Never mutates `targets`.
+    """
+    rng = random.Random(f"{seed}:execution-order")
+    order = list(targets)
+    rng.shuffle(order)
+    return order
+
+
+def proxy_canary_username_configured() -> bool:
+    """Whether the dedicated canary proxy sub-account env var (see
+    :data:`PROXY_CANARY_USERNAME_ENV`) is SET in this process.
+
+    Advisory only: this process draws the target set / writes the runbook
+    on this host, never the scrapers-browser Railway service that
+    actually makes the proxied request -- so this check cannot itself
+    guarantee Step 2 uses the dedicated sub-account (that guarantee is
+    the owner's, on the service that runs the fetch). It exists so a
+    `--dry-run` invocation on the SAME host the owner intends to configure
+    can catch "the variable name is misspelled" or "nobody set it yet"
+    before the live run, without ever reading or logging the value.
+    """
+    return bool(os.environ.get(PROXY_CANARY_USERNAME_ENV, "").strip())
 
 
 # --- parent/child/price/provider-aware calculator (deep dive §8.1) -----------
@@ -527,24 +591,48 @@ _ACCEPTANCE_RULE_TEXT = (
 )
 
 
-def runbook_text(*, domain: str = DOCUMENT_ONLY_DOMAIN, sample_size: int = DEFAULT_SAMPLE_SIZE) -> str:
+def runbook_text(
+    *,
+    domain: str = DOCUMENT_ONLY_DOMAIN,
+    sample_size: int = DEFAULT_SAMPLE_SIZE,
+    max_usd: float | None = None,
+) -> str:
     """The two-phase runbook. Every step here is the OWNER's to perform."""
+    cap_line = (
+        f"Spend cap for this canary: **<= ${max_usd:.2f}** (`--max-usd`, required).\n\n"
+        if max_usd is not None
+        else ""
+    )
     return f"""\
 ### Two-phase runbook (owner-performed — this script performs none of it)
 
-`BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` is read once per Scrapyd
-scrapers-browser process via the cached `get_settings()` singleton, so the
-candidate phase requires a real configuration change and a redeploy of that
-service. There is deliberately no second, canary-only toggle.
+{cap_line}`BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` (or its EPA C3 alias,
+`BROWSER_DOCUMENT_ONLY_DOMAINS`) is read once per Scrapyd scrapers-browser
+process via the cached `get_settings()` singleton, so the candidate phase
+requires a real configuration change and a redeploy of that service. There
+is deliberately no second, canary-only toggle for that setting.
+
+**Dedicated proxy sub-account (EPA C3)** — before EITHER phase, set
+`{PROXY_CANARY_USERNAME_ENV}` on the scrapers-browser service to a proxy
+sub-account created FOR THIS CANARY, distinct from the production
+sub-account. This keeps the canary's proxy spend and any resulting IP-
+reputation impact from mixing into production's -- a canary that
+CAPTCHAs an exit IP must not be the reason production traffic starts
+seeing the same CAPTCHA. The variable's NAME is referenced here; its
+VALUE is never read, printed, or written by this script.
 
 1. **Phase A (baseline)** — confirm `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS`
    is UNSET on the scrapers-browser service, then enqueue ONE job over the
    {sample_size}-target `{domain}` set drawn by this script
-   (`target_set.json`, one workspace, one job). Record its `scrape_job_id`.
+   (`target_set.json`, one workspace, one job, in the RANDOMIZED PAIRED
+   ORDER recorded as `execution_order` in that file). Record its
+   `scrape_job_id`.
 2. **Phase B (candidate)** — set
    `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS={domain}` on the scrapers-browser
-   service, redeploy it, and enqueue the SAME target set again. Record its
-   `scrape_job_id`.
+   service, redeploy it, and enqueue the SAME target set again, in the
+   SAME `execution_order` (paired randomization: position-dependent drift
+   lands on the same targets in both phases and cancels out of the
+   comparison). Record its `scrape_job_id`.
 3. **Restore** — unset the variable and redeploy, whatever the outcome. The
    rule stays off until the owner decides on this report.
 4. **Compare** — re-run this script with
@@ -552,9 +640,10 @@ service. There is deliberately no second, canary-only toggle.
    `network_operations` (transport = BROWSER) for each job and writes this
    report.
 
-Both phases must run the same target set, and phase B must not be the first
-run of a target set that phase A also warmed — enqueue A and B in that order,
-close together, so the comparison is about the rule and not about the hour.
+Both phases must run the same target set in the same randomized order, and
+phase B must not be the first run of a target set that phase A also warmed —
+enqueue A and B in that order, close together, so the comparison is about
+the rule and not about the hour.
 """
 
 
@@ -568,6 +657,7 @@ def render_report(
     baseline_job_id: str | None = None,
     candidate_job_id: str | None = None,
     generated_at: str | None = None,
+    max_usd: float | None = None,
 ) -> str:
     """The evidence file. `None` phases render the DRY RUN plan instead."""
     stamp = generated_at or datetime.now(UTC).isoformat(timespec="seconds")
@@ -580,7 +670,12 @@ def render_report(
         f"- generated: {stamp}",
         f"- blocklist policy_version: {_policy_version()}",
         f"- sample size: {sample_size} pages per phase",
-        f"- setting under test: `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS={domain}`",
+        f"- setting under test: `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS={domain}` "
+        f"(alias: `BROWSER_DOCUMENT_ONLY_DOMAINS={domain}`)",
+        f"- spend cap: <= ${max_usd:.2f}" if max_usd is not None else "- spend cap: (not set)",
+        f"- dedicated proxy sub-account env `{PROXY_CANARY_USERNAME_ENV}` set on THIS host: "
+        f"{proxy_canary_username_configured()} (advisory only -- the load-bearing check is "
+        "on the scrapers-browser service, see the runbook)",
         "",
         "## Acceptance rule",
         "",
@@ -597,7 +692,7 @@ def render_report(
             "fetched and nothing was spent. This file records what the live run",
             "will do and the bar it will be judged against.",
             "",
-            runbook_text(domain=domain, sample_size=sample_size),
+            runbook_text(domain=domain, sample_size=sample_size, max_usd=max_usd),
         ]
         return "\n".join(lines) + "\n"
 
@@ -626,7 +721,7 @@ def render_report(
         f"Proxy bytes saved per page: "
         f"{_mb(baseline.proxy_bytes_per_page - candidate.proxy_bytes_per_page)}.",
         "",
-        runbook_text(domain=domain, sample_size=sample_size),
+        runbook_text(domain=domain, sample_size=sample_size, max_usd=max_usd),
     ]
     return "\n".join(lines) + "\n"
 
@@ -825,12 +920,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workspace", type=_workspace_uuid, default=None,
                         help="workspace UUID the target set is drawn from (one job, one workspace)")
-    parser.add_argument("--n", type=int, default=DEFAULT_SAMPLE_SIZE,
-                        help=f"pages per phase (default {DEFAULT_SAMPLE_SIZE})")
+    parser.add_argument("--targets", "--n", dest="n", type=int, default=DEFAULT_SAMPLE_SIZE,
+                        help=f"pages per phase (default {DEFAULT_SAMPLE_SIZE}); "
+                             "`--n` is the pre-C3 spelling, kept as an alias")
+    parser.add_argument("--max-usd", type=float, default=None, dest="max_usd",
+                        help="hard spend cap in USD for the live two-phase run -- REQUIRED "
+                             "for every invocation except --dry-run")
     parser.add_argument("--domain", default=DOCUMENT_ONLY_DOMAIN,
                         help=f"domain under test (default {DOCUMENT_ONLY_DOMAIN})")
     parser.add_argument("--seed", default="b5-document-only-2026-09",
-                        help="selection seed — same seed draws the same target set")
+                        help="selection seed — same seed draws the same target set AND "
+                             "the randomized paired execution order")
     parser.add_argument("--dry-run", action="store_true",
                         help="no database, no network: write the runbook and the acceptance rule")
     parser.add_argument("--baseline-job-id", default=None,
@@ -857,11 +957,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         _write(out, render_report(
             baseline=None, candidate=None, acceptance=None,
-            domain=args.domain, sample_size=args.n,
+            domain=args.domain, sample_size=args.n, max_usd=args.max_usd,
         ))
-        print(runbook_text(domain=args.domain, sample_size=args.n))
+        print(runbook_text(domain=args.domain, sample_size=args.n, max_usd=args.max_usd))
+        if not proxy_canary_username_configured():
+            print(
+                f"NOTE: {PROXY_CANARY_USERNAME_ENV} is not set on this host. This host "
+                "only draws the target set; the load-bearing setting is on the "
+                "scrapers-browser service before the live run (see the runbook).",
+                file=sys.stderr,
+            )
         print(f"DRY RUN — nothing measured, nothing spent. Wrote {out}")
         return 0
+
+    # Every non-dry-run invocation is spend-capable (it either draws a real
+    # target set for a live two-phase run, or reads a completed live run's
+    # rows) -- EPA C3 / ASSUMPTIONS.md answer 3: every money-capable script
+    # ships with a required cap even while the run itself stays deferred.
+    if args.max_usd is None:
+        parser.error("--max-usd is required (omit only together with --dry-run)")
 
     if bool(args.baseline_job_id) != bool(args.candidate_job_id):
         parser.error("--baseline-job-id and --candidate-job-id must be given together")
@@ -914,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
         acceptance = evaluate_acceptance(baseline, candidate)
         _write(out, render_report(
             baseline=baseline, candidate=candidate, acceptance=acceptance,
-            domain=args.domain, sample_size=args.n,
+            domain=args.domain, sample_size=args.n, max_usd=args.max_usd,
             baseline_job_id=args.baseline_job_id, candidate_job_id=args.candidate_job_id,
         ))
         for summary in (baseline, candidate):
@@ -942,6 +1056,12 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         session.close()
 
+    # EPA C3: the SET is drawn deterministically above (selection-key sort,
+    # reproducible run over run); the EXECUTION order both phases must
+    # replay is a separate, randomized-but-paired shuffle of that same set
+    # (see `randomized_execution_order`'s docstring for why).
+    execution_order = randomized_execution_order(targets, seed=args.seed)
+
     target_set_path = out.parent / "target_set.json"
     _write(target_set_path, json.dumps(
         {
@@ -953,13 +1073,23 @@ def main(argv: list[str] | None = None) -> int:
             "selection_seed": args.seed,
             "requested_size": args.n,
             "sample_size": len(targets),
+            "max_usd": args.max_usd,
+            "proxy_canary_username_env": PROXY_CANARY_USERNAME_ENV,
             "targets": targets,
+            "execution_order": execution_order,
         },
         indent=2, sort_keys=True,
     ) + "\n")
     print(f"targets={len(targets)} (requested {args.n})")
     print(f"Wrote {target_set_path}")
-    print(runbook_text(domain=args.domain, sample_size=args.n))
+    print(runbook_text(domain=args.domain, sample_size=args.n, max_usd=args.max_usd))
+    if not proxy_canary_username_configured():
+        print(
+            f"NOTE: {PROXY_CANARY_USERNAME_ENV} is not set on this host. This host only "
+            "draws the target set; the load-bearing setting is on the scrapers-browser "
+            "service before the live run (see the runbook).",
+            file=sys.stderr,
+        )
     if len(targets) < args.n:
         print(
             f"UNDERSIZED: only {len(targets)} ACTIVE {args.domain} targets in this "

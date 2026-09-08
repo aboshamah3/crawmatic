@@ -62,7 +62,12 @@ from app_shared.models.scrape_profiles import ScrapeProfile, ScrapeProfileRevisi
 # `from app_shared.models import PriceObservation, RequestAttempt,
 # MatchCurrentPrice`. Workspace-owned (unlike ScrapeProfile): registered
 # in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
-from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.observations import (
+    ExtractionShadowEvent,
+    MatchCurrentPrice,
+    PriceObservation,
+    RequestAttempt,
+)
 
 # The SPEC-08 jobs/orchestration models — re-exported so `Base.metadata`
 # sees both tables for Alembic autogenerate/offline-render
@@ -263,6 +268,20 @@ from app_shared.models.cost_authorization import (
 from app_shared.models.rollup_watermarks import RollupWatermark
 from app_shared.models.strategy_switches import StrategyMethodSwitch
 
+# EPA C7 (2026-09-08, F12): the per-day rollup completion checkpoint that
+# makes a daily rollup resumable and gates C8's retention drop.
+# Re-exported so `Base.metadata` sees the table for Alembic
+# autogenerate/offline-render (`target_metadata`). Global, no
+# workspace_id, no RLS — the `rollup_watermarks` shape (deliberately NOT
+# added to `app_shared.repository.WORKSPACE_OWNED_MODELS`). Not used by
+# the runtime path, which reads/writes it via raw `sqlalchemy.text`
+# behind a `to_regclass` capability probe (see
+# `app_shared.maintenance.rollup_sql`).
+from app_shared.models.network_operation_summaries import (
+    NetworkOperationResourceSummary,
+)
+from app_shared.models.rollup_completion import RollupCompletion
+
 # EPA C5 (2026-08-26): raw provider usage evidence — the OTHER side of
 # reconciliation against C1's ledger. Re-exported so `Base.metadata` sees
 # the table for Alembic autogenerate/offline-render (`target_metadata`).
@@ -346,6 +365,7 @@ __all__ = [
     "PriceObservation",
     "RequestAttempt",
     "MatchCurrentPrice",
+    "ExtractionShadowEvent",
     "ScrapeJob",
     "ScrapeJobTarget",
     "VariantPriceState",
@@ -390,6 +410,8 @@ __all__ = [
     "ReservationState",
     "WorkspaceEntitlement",
     "RollupWatermark",
+    "NetworkOperationResourceSummary",
+    "RollupCompletion",
     "StrategyMethodSwitch",
     "ProviderUsageRecord",
     "ProviderUsageGranularity",

@@ -74,6 +74,38 @@ is never coalesced with anything, including another ``None`` target —
 "we don't know this target's identity" must never collapse into "these
 two targets share an identity" by coincidence of both being unset.
 
+The equivalence key (EPA C4, plan §11 item 5)
+----------------------------------------------
+W4.3 keyed coalescing on ``canonical_url_hash`` alone. That is half an
+identity: two matches can share a canonical URL and still be different
+physical fetches. C4 widens it to :class:`CoalescingKey` —
+``(workspace_id, canonical_url_hash, region, currency, proxy_country,
+transport, variant_selector_hash)``, composed once in
+:func:`coalescing_key` — because each of the added components changes
+what comes back over the wire: a different proxy exit country gets a
+different storefront's prices, a different transport gets a different
+response body, a different variant selector reads a different offer off
+the same page. Folding those onto one fetch would fan a *wrong* price
+out to the siblings, which is strictly worse than paying twice.
+
+Every added component can only SPLIT clusters relative to W4.3's
+URL-only key; none of them can merge two that were separate. And each
+one defaults to ``None`` on :class:`~app_shared.jobs.batching.
+ResolvedTarget`, so a caller that attaches none of them gets exactly the
+pre-C4 grouping — this widening cannot regress a caller that has not
+adopted it.
+
+**Cross-workspace sharing stays OFF.** ``workspace_id`` is in the key so
+the key is complete and assertable, not as a step toward sharing:
+:func:`coalesced_groups` *raises*
+:class:`~app_shared.costauth.service.CrossWorkspaceCoalescingUnsupported`
+on a mixed-workspace input rather than grouping across it, matching the
+contract the cost-authorization service already enforces for the same
+reason (a fetch shared between tenants has no answer to whose budget
+paid for it). The audit's "up to 50 % of fetches are duplicates" upper
+bound came from a duplicate-heavy pilot data set and is not evidence for
+lifting that.
+
 What this module explicitly does NOT build: cache reuse
 ---------------------------------------------------------
 The plan distinguishes two mechanisms: concurrent-batch coalescing
@@ -102,13 +134,115 @@ import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 
+from app_shared.costauth.service import CrossWorkspaceCoalescingUnsupported
 from app_shared.jobs.batching import ResolvedTarget
 
 __all__ = [
+    "CoalescingKey",
+    "CrossWorkspaceCoalescingUnsupported",
     "cluster_for_coalescing",
     "coalesced_groups",
+    "coalescing_key",
     "is_within_freshness_window",
 ]
+
+
+class CoalescingKey(tuple):
+    """The equivalence key two targets must SHARE to become one fetch.
+
+    ``(workspace_id, canonical_url_hash, region, currency, proxy_country,
+    transport, variant_selector_hash)`` — EPA C4, plan §11 item 5.
+
+    A ``tuple`` subclass rather than a dataclass so it sorts, hashes and
+    compares with zero ceremony (this type is used as a dict key and as a
+    sort key on every planning pass) while still having a name a reader
+    can look up. Field order is the declared order above and is part of
+    the contract: :func:`cluster_for_coalescing` sorts on it, so changing
+    the order changes which targets end up adjacent.
+
+    Every component is nullable *except* the identity itself: a key whose
+    ``canonical_url_hash`` is ``None`` is never equal to any other key,
+    including another ``None`` one — see :func:`coalescing_key`.
+    """
+
+    __slots__ = ()
+
+    _FIELDS = (
+        "workspace_id",
+        "canonical_url_hash",
+        "region",
+        "currency",
+        "proxy_country",
+        "transport",
+        "variant_selector_hash",
+    )
+
+    @property
+    def workspace_id(self) -> str | None:
+        return self[0]
+
+    @property
+    def canonical_url_hash(self) -> str | None:
+        return self[1]
+
+    @property
+    def has_identity(self) -> bool:
+        """Whether this key names a fetch that MAY be shared at all."""
+        return not str(self[1]).startswith(_NO_IDENTITY_PREFIX)
+
+
+#: Prefix of the synthetic, per-target identity given to a target that
+#: carries no ``canonical_url_hash``. "We do not know this target's
+#: identity" must never collapse into "these two targets share an
+#: identity" by coincidence of both being unset (W4.3's rule, kept).
+_NO_IDENTITY_PREFIX = "__no_identity__:"
+
+
+def coalescing_key(target: ResolvedTarget) -> CoalescingKey:
+    """The full equivalence key for one resolved target (EPA C4).
+
+    Pure. Two targets are candidates for ONE physical fetch iff this
+    returns equal keys for both — which requires the same workspace, the
+    same canonical URL, the same region/currency, the same proxy exit
+    country, the same transport and the same variant selector. Any one of
+    those differing means the two fetches would not have returned the
+    same bytes, so folding them would fan a wrong price out to the
+    sibling. Every added component can only SPLIT clusters relative to
+    W4.3's URL-only key; none of them can merge two that were separate.
+
+    A target with no ``canonical_url_hash`` gets a synthetic key unique to
+    its ``match_id``, so it is never coalesced with anything (including
+    another identity-less target).
+    """
+    identity = target.canonical_url_hash
+    if identity is None:
+        identity = f"{_NO_IDENTITY_PREFIX}{target.match_id}"
+    workspace = target.workspace_id
+    return CoalescingKey(
+        (
+            None if workspace is None else str(workspace),
+            identity,
+            target.region,
+            target.currency,
+            target.proxy_country,
+            target.transport,
+            target.variant_selector_hash,
+        )
+    )
+
+
+def _sort_key(target: ResolvedTarget) -> tuple:
+    """Total order over :func:`coalescing_key`, ``None``s last and stable.
+
+    ``sorted`` cannot compare ``None`` with ``str``, and the key is full
+    of optional components, so each one is widened to
+    ``(is_none, value_or_empty)``. Identity-less targets keep sorting
+    after every identified target, exactly as in W4.3.
+    """
+    key = coalescing_key(target)
+    return (not key.has_identity,) + tuple(
+        (component is None, component or "") for component in key
+    )
 
 
 def cluster_for_coalescing(targets: Sequence[ResolvedTarget]) -> list[ResolvedTarget]:
@@ -130,34 +264,45 @@ def cluster_for_coalescing(targets: Sequence[ResolvedTarget]) -> list[ResolvedTa
     which is exactly today's behaviour and is what makes the flag-OFF
     path byte-identical without a separate code branch.
     """
-    return sorted(
-        targets,
-        key=lambda target: (
-            target.canonical_url_hash is None,
-            target.canonical_url_hash or "",
-        ),
-    )
+    return sorted(targets, key=_sort_key)
 
 
 def coalesced_groups(
     targets: Sequence[ResolvedTarget],
-) -> dict[str, list[uuid.UUID]]:
-    """Diagnostic/test helper: `match_id`s grouped by shared canonical identity.
+) -> dict[CoalescingKey, list[uuid.UUID]]:
+    """Diagnostic/test helper: `match_id`s grouped by :func:`coalescing_key`.
 
     Shows what :func:`cluster_for_coalescing` brings together (subject to
     the chunk-ceiling caveat in the module docstring) — not itself part
-    of the planning path. A target with no hash gets its own singleton
-    group keyed by its match_id, so "no identity" can never be mistaken
-    for "shares an identity with another no-identity target".
+    of the planning path. A target with no canonical hash gets its own
+    singleton group, so "no identity" can never be mistaken for "shares
+    an identity with another no-identity target".
+
+    **Cross-workspace sharing stays OFF.** If the input mixes two
+    workspaces this raises
+    :class:`~app_shared.costauth.service.CrossWorkspaceCoalescingUnsupported`
+    rather than silently producing groups that span them: the audit's
+    "up to 50 % duplicate" figure is a duplicate-heavy pilot artefact and
+    is not a reason to share a paid fetch — and a shared fetch across
+    tenants has no answer to "whose budget paid for it", which is exactly
+    what the cost-authorization service refuses for the same reason. The
+    check is a guard, not a filter: no caller in this codebase can reach
+    it (each resolves targets for one `workspace_id` at a time), so
+    tripping it means a NEW caller got the boundary wrong.
     """
-    groups: dict[str, list[uuid.UUID]] = {}
-    for target in targets:
-        key = (
-            target.canonical_url_hash
-            if target.canonical_url_hash is not None
-            else f"__no_identity__:{target.match_id}"
+    workspaces = {
+        target.workspace_id for target in targets if target.workspace_id is not None
+    }
+    if len(workspaces) > 1:
+        raise CrossWorkspaceCoalescingUnsupported(
+            "coalescing spans "
+            f"{len(workspaces)} workspaces; single-workspace coalescing only "
+            "(cross-workspace sharing is a separate, owner-gated decision "
+            "and has no answer to which workspace's budget paid for the fetch)"
         )
-        groups.setdefault(key, []).append(target.match_id)
+    groups: dict[CoalescingKey, list[uuid.UUID]] = {}
+    for target in targets:
+        groups.setdefault(coalescing_key(target), []).append(target.match_id)
     return groups
 
 

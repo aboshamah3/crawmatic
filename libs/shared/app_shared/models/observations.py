@@ -233,6 +233,64 @@ class PriceObservation(Base, WorkspaceScopedBase):
     offer_rejection_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
     offer_human_review_required: Mapped[bool | None] = mapped_column(Boolean(), nullable=True)
 
+    # --- EPA C5 (2026-09-08, F19): provenance on the LIVE path ----------
+    # W3.1 added the `offer_*` superset above and nothing on the scraping
+    # path ever wrote it. C5 wires that path, and these five columns are
+    # what make a written row *attributable* afterwards. They are
+    # deliberately NOT `offer_`-prefixed: the prefix marks the W3.1
+    # OfferObservation projection, and these describe the ACT of
+    # observing (which extractor, which profile revision, which policy
+    # decided, how well) rather than the offer that was observed.
+    #
+    # All nullable: every pre-C5 row legitimately has none of them, and
+    # `NULL` here means "this row predates the provenance contract",
+    # which is a different and more useful statement than a back-filled
+    # guess.
+    #
+    #: Which extraction contract read this price
+    #: (the scraping library's `EXTRACTOR_VERSION` constant on its
+    #: transport item -- named indirectly because this package must not
+    #: reference that library even in a comment, see
+    #: `tests/unit/test_import_boundaries.py`). Text, not a number: it
+    #: names a contract, and contracts get names.
+    extractor_version: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Which revision of the scrape profile configured that read.
+    #: Distinct from `offer_profile_version` above (Text, part of the
+    #: W3.1 pydantic projection, free-form) — this is the integer
+    #: `scrape_profiles.version` counter, comparable and orderable.
+    profile_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    #: The extraction's own confidence in [0, 1] — the same fraction
+    #: `extraction_confidence` carries, kept as its own column because
+    #: it is the one `match_current_prices`' C5 conflict guard compares
+    #: and a column that a guard depends on should not be one whose
+    #: meaning is "whatever the SPEC-07 extractor happened to record".
+    confidence: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=5, scale=4), nullable=True
+    )
+    #: Which POLICY chose the reading that was persisted —
+    #: the scraping library's `PROVENANCE_*` vocabulary
+    #: (`first_hit`/`ranked_v1`/`none`).
+    #: This is the column that answers "was this price chosen by the
+    #: chain or by the ranker?" after `EXTRACTION_RANKING_POLICY` is
+    #: flipped, which is the whole reason the flip can be audited.
+    provenance: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: `available` | `unavailable` | `blocked` | `stale` | `conditional`.
+    #: Availability as a FIRST-CLASS fact, separate from `stock_status`
+    #: (which only ever knew IN_STOCK/OUT_OF_STOCK/UNKNOWN): "we were
+    #: blocked", "the offer we have has expired" and "the price is
+    #: conditional on a coupon" are three different reasons a price is
+    #: not simply usable, and collapsing them into `UNKNOWN` is what
+    #: makes an unavailable product indistinguishable from a failed
+    #: scrape.
+    #:
+    #: TEXT with no DB `CHECK`, matching `offer_seller_type`'s precedent
+    #: on this same table: `price_observations` is partitioned, and
+    #: adding a validated constraint to a partitioned table recurses into
+    #: every partition. The vocabulary is enforced at the write boundary
+    #: (the persistence pipeline's `AVAILABILITY_STATES`), which is where a
+    #: bad value can still be rejected before it exists.
+    availability_state: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
 
 class RequestAttempt(Base, WorkspaceScopedBase):
     """``request_attempts`` — audit record of one HTTP fetch attempt. PARTITIONED.
@@ -267,11 +325,14 @@ class RequestAttempt(Base, WorkspaceScopedBase):
         # dispatch — not the operation's surrogate `id`, so a writer can
         # stamp the link onto attempt telemetry without first
         # round-tripping the operation insert.
-        ForeignKeyConstraint(
-            ["network_operation_id"],
-            ["network_operations.network_request_id"],
-            name="fk_request_attempts_network_operation_id_network_operations",
-        ),
+        # EPA C9 (F14): this FK was DROPPED by the `network_operations`
+        # partition swap. A foreign key must reference a UNIQUE
+        # constraint, and a partitioned table's unique constraint must
+        # include the partition key — so the target became
+        # `(network_request_id, created_at)`, which a `request_attempts`
+        # row does not carry (its own `created_at` is the attempt's, not
+        # the operation's). The link is now checked, not constrained:
+        # `app_shared.maintenance.ledger_summaries.find_orphan_references`.
         # EPA F05 / plan task B1: see the twin on `price_observations`.
         # A5 minted `attempt_uuid` for correlation only; B1 is what makes
         # it arbitrate, so a replayed flush cannot write a second attempt
@@ -447,3 +508,80 @@ class MatchCurrentPrice(Base, WorkspaceScopedBase, TimestampMixin):
         Numeric(precision=5, scale=4), nullable=True
     )
     scraped_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
+
+
+class ExtractionShadowEvent(Base):
+    """``extraction_shadow_events`` — one recorded disagreement between the
+    first-hit extraction chain and the W3.2 ranker (EPA C5, F19).
+
+    Written only while ``Settings.EXTRACTION_RANKING_POLICY`` is
+    ``'shadow'``, by the scraping library's persistence flush draining the
+    in-process buffer its extraction pipeline fills. It exists
+    to turn "would the ranker have priced this differently?" into a
+    counted number, which is the evidence the C11 owner gate needs before
+    the flag may move to ``'v1'``.
+
+    **FLEET-scoped: no ``workspace_id``, no RLS.** This is a deliberate
+    classification, not an omission. The row is evidence about an
+    EXTRACTION POLICY applied to a DOMAIN — which strategy read what off
+    a competitor's public page — and the decision it feeds is fleet-wide
+    (one flag, one fleet). Attaching a tenant would be inventing one:
+    the same page is read on behalf of every workspace that tracks it,
+    so any single ``workspace_id`` here would be an arbitrary pick among
+    them, and the sum over tenants is the only meaningful aggregation
+    anyway. Filed SYSTEM in ``scripts/rls_table_manifest.txt`` alongside
+    ``domain_playbooks``, granted to no tenant role beyond the ingestion
+    INSERT the scraper needs.
+
+    Append-only by convention: nothing updates or deletes a row here
+    except retention.
+    """
+
+    __tablename__ = "extraction_shadow_events"
+
+    #: When the comparison ran (producer clock), NOT when the row was
+    #: written — the two differ by a flush interval, and a rate computed
+    #: over write time would smear a burst across the wrong window.
+    observed_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False, index=True)
+
+    #: Registrable domain of the page. Nullable because a producer that
+    #: could not supply a URL still produced a real disagreement, and
+    #: dropping it would bias the measured rate toward whichever call
+    #: sites happen to be wired.
+    domain: Mapped[str | None] = mapped_column(Text(), nullable=True, index=True)
+    url: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    #: ``RankingPolicy.version`` the shadow run used ("v1" today) — the
+    #: gate is a statement about a specific policy, so a later policy
+    #: revision must not silently inherit this one's evidence.
+    policy_version: Mapped[str] = mapped_column(Text(), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(Text(), nullable=False)
+    profile_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+
+    #: ``price`` | ``currency`` | ``outcome``. A different *method*
+    #: reaching the same price is not a disagreement and produces no row
+    #: at all — see the extraction pipeline's `_shadow_disagreement`.
+    disagreement_kind: Mapped[str] = mapped_column(Text(), nullable=False)
+
+    first_hit_method: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: Money, not a float — the same ``NUMERIC(18,4)`` contract
+    #: ``price_observations.price`` uses, because these two numbers are
+    #: compared against each other and against labeled truth.
+    first_hit_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    first_hit_currency: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    #: ``winner`` | ``conflict`` | ``no_valid``.
+    ranked_outcome: Mapped[str] = mapped_column(Text(), nullable=False)
+    ranked_method: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    ranked_price: Mapped[Decimal | None] = mapped_column(Money(), nullable=True)
+    ranked_currency: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    #: Content address of the DECODED page text the extractor read. NOT
+    #: guaranteed equal to the observation's ``offer_raw_evidence_hash``
+    #: (raw bytes as received) — see the buffer's own field docstring.
+    page_evidence_hash: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TZDateTime(), nullable=False, server_default=text("now()")
+    )

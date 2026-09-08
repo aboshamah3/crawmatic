@@ -188,10 +188,45 @@ class TestLedgerShape:
         assert isinstance(columns["bytes_decompressed"].type, BigInteger)
 
     def test_network_request_id_is_the_unique_key(self) -> None:
+        """Unique PER MONTH since EPA C9 (F14), not globally.
+
+        `network_operations` is partitioned by `created_at`, and
+        PostgreSQL requires every partition-key column in a partitioned
+        table's unique constraint — so the pre-dispatch identity's
+        uniqueness is now `(network_request_id, created_at)`. The
+        weakening is real and deliberate: `network_request_id` is a
+        caller-minted UUIDv7, so a cross-month collision is not a thing
+        that happens, but it is no longer a thing the database forbids.
+        Asserted here rather than left to a migration docstring.
+        """
         column = _column(NetworkOperation, "network_request_id")
         assert isinstance(column.type, Uuid)
         assert column.nullable is False
-        assert column.unique is True
+        assert column.unique is not True
+
+        unique_cols = {
+            tuple(c.name for c in constraint.columns)
+            for constraint in NetworkOperation.__table__.constraints
+            if isinstance(constraint, sa.UniqueConstraint)
+        }
+        assert ("network_request_id", "created_at") in unique_cols
+
+        # The single-column lookup every ledger writer does must stay
+        # index-backed even though it is no longer unique.
+        assert "ix_network_operations_network_request_id" in {
+            ix.name for ix in NetworkOperation.__table__.indexes
+        }
+
+    def test_the_ledger_is_monthly_partitioned(self) -> None:
+        """EPA C9 (F14): the whole reason the key above changed shape."""
+        assert (
+            NetworkOperation.__table__.dialect_options["postgresql"]["partition_by"]
+            == "RANGE (created_at)"
+        )
+        assert {c.name for c in NetworkOperation.__table__.primary_key.columns} == {
+            "id",
+            "created_at",
+        }
 
     def test_transport_and_settlement_method_vocabularies(self) -> None:
         assert {t.value for t in NetworkTransport} == {"DIRECT", "PROXY", "BROWSER"}
@@ -234,12 +269,21 @@ class TestLedgerShape:
         assert column.nullable is True, (
             "the FK must be nullable — coverage is C3/C4's invariant, not this schema's"
         )
+        # The FK itself is GONE as of EPA C9 (F14). A foreign key must
+        # reference a UNIQUE constraint, and the ledger's only remaining
+        # one now includes `created_at` — which a `request_attempts` row
+        # does not carry (its own `created_at` is the attempt's, not the
+        # operation's). Re-establishing it would mean denormalising the
+        # parent's timestamp onto four tables, one of them this very
+        # partitioned hot path. The link is now CHECKED rather than
+        # constrained:
+        # `app_shared.maintenance.ledger_summaries.find_orphan_references`.
         targets = {
             fk.target_fullname
             for fk in RequestAttempt.__table__.foreign_keys
             if fk.parent.name == "network_operation_id"
         }
-        assert targets == {"network_operations.network_request_id"}
+        assert targets == set()
 
     def test_migration_applies_rls_to_allocations_only(self) -> None:
         source = MIGRATION_PATH.read_text(encoding="utf-8")

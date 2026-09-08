@@ -70,12 +70,28 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from sqlalchemy import BigInteger, Select, and_, cast, func, literal, select, tuple_
+from sqlalchemy import (
+    BigInteger,
+    Select,
+    and_,
+    cast,
+    distinct,
+    func,
+    literal,
+    or_,
+    select,
+    tuple_,
+)
 
+from app_shared.costauth.service import FLEET_PROVIDER_DIRECT
 from app_shared.enums import AccessMethod, RequestOrigin
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob
-from app_shared.models.network_operations import NetworkOperation, NetworkTransport
+from app_shared.models.network_operations import (
+    NetworkOperation,
+    NetworkOperationAllocation,
+    NetworkTransport,
+)
 from app_shared.models.observations import PriceObservation, RequestAttempt
 
 MAX_WINDOW_DAYS = 31
@@ -89,14 +105,23 @@ PROTECTED_ACCESS_METHODS = (
     AccessMethod.PLAYWRIGHT_PROXY.value,
 )
 
-#: `network_operations.transport` values billed against the fleet's proxy
-#: spend (B2) — the same two facts `proxied_http_attempted` /
-#: `proxied_browser_attempted` / `proxy_bytes` (Task B3) report per cycle.
-#: `DIRECT` is fleet egress with no proxy cost and is excluded.
+#: `network_operations.transport` values that *can* be paid (Task B3).
+#:
+#: Task C6 (F17) demoted this tuple from a discriminator to a **shape**:
+#: it still separates the HTTP-shaped proxied count from the browser-
+#: shaped one, but it no longer decides whether an operation was paid at
+#: all. `BROWSER` was the bug — a browser navigation made straight from
+#: the fleet's own egress IP costs no proxy money, and counting it as
+#: `proxied_browser_attempted` billed a customer for a free fetch.
 PROXIED_TRANSPORTS = (
     NetworkTransport.PROXY.value,
     NetworkTransport.BROWSER.value,
 )
+
+#: `network_operations.provider` for fleet egress. Anything else is a
+#: provider identity — `"proxy"`/`"browser"` for a fleet-class scope, or
+#: the concrete `proxy_providers.id` the spider resolved.
+DIRECT_PROVIDER = FLEET_PROVIDER_DIRECT
 
 
 class InvalidUsageCursor(ValueError):
@@ -212,25 +237,62 @@ def build_usage_query(
     `workspace_id, product_id, cycle_ts, links_total, links_succeeded,
     protected_links_attempted, protected_links_succeeded,
     check_successful` — the frozen §7.2 contract, positionally stable —
-    followed by three additive Task B3 columns: `proxied_http_attempted`,
-    `proxied_browser_attempted`, `proxy_bytes`. The three are per (cycle,
-    workspace, product) facts about the underlying `network_operations`
-    (B2) rather than about `request_attempts`: unlike `links_total` etc,
-    which fold retries per match (a link is billed once no matter how
-    many times it was retried), these three count every physical PROXY/
-    BROWSER operation the cycle actually made, retries included — that is
-    what the fleet was actually charged for. They are computed inside the
-    same `per_link` scan (one `LEFT OUTER JOIN` from `request_attempts` to
-    `network_operations` via `network_operation_id`, added BEFORE the
-    match-folding `GROUP BY`) and then re-summed across matches in the
-    outer aggregate, so this stays a single pass over `request_attempts`
-    (see `test_query_still_bounds_origin_as_a_partition_prunable_predicate`).
-    `SUM(bigint)` renders as Postgres `numeric`, which a driver decodes as
-    `Decimal` — every SUM here is `cast(..., BigInteger)`-wrapped, at both
-    the inner and outer aggregation level, so the JSON-facing value is a
-    plain Python `int`, never a `Decimal`, and `COALESCE(..., 0)` keeps it
-    `0` rather than `NULL` when a cycle's links carried no proxy/browser
-    operation at all.
+    followed by three additive Task B3 columns (`proxied_http_attempted`,
+    `proxied_browser_attempted`, `proxy_bytes`) and one additive Task C6
+    column (`allocated_cost_micro_units`).
+
+    **Task C6 (F17) — what changed and why.**
+
+    B3 answered "was this paid?" with `transport IN ('PROXY','BROWSER')`
+    and summed the answer once per *logical attempt*. Three separate
+    over-counts came out of that:
+
+    1. **A direct browser navigation was billed as proxied.** Transport
+       says how the fetch was *shaped*, not who was *paid*. The fleet
+       runs real browsers from its own egress IP; those cost browser
+       CPU, not proxy bytes. The paid predicate is now the conjunction
+       the ledger actually records — `network_operations.provider <>
+       'direct'` **and** `request_attempts.proxy_provider_id IS NOT
+       NULL`. Both halves are needed: `provider` alone still reads
+       `'browser'` for a direct navigation, and `proxy_provider_id`
+       alone is a logical-row hint with no physical operation behind it.
+    2. **A physical operation shared by N logical attempts was counted N
+       times.** One fetch of one competitor URL can satisfy three
+       matches of the same product; B3's per-match fold then re-summed
+       the same `network_request_id` three times in the outer aggregate.
+       Counting is now `COUNT(DISTINCT network_request_id)` over a CTE
+       that already holds one row per physical operation per (workspace,
+       product, cycle), so a shared operation contributes exactly once.
+    3. **Children were invisible.** A browser navigation's subresource
+       fetches are themselves `network_operations` rows carrying
+       `parent_operation_id` and no `request_attempts` row of their own,
+       so the equi-join on `network_operation_id` missed every one of
+       them — and they are where a browser page's bytes actually live.
+       The join now also follows `parent_operation_id`.
+
+    Money is reported through `network_operation_allocations`
+    (`cost_allocations`, C1) rather than by summing a physical cost per
+    logical attempt: the allocation table is the ONLY place that says
+    what share of one physical operation a given workspace owes, and its
+    per-operation rows sum to exactly the operation's
+    `estimated_cost_micro_units` (a deferred constraint trigger enforces
+    it). Summing the physical cost per attempt instead would bill each
+    of three co-tenants the whole fetch. The invariant the integration
+    fixtures assert is the one that falls out of this: **allocated cost
+    ≤ physical cost**, always, with equality only for a single-tenant
+    operation.
+
+    All of that rides ONE scan of the partitioned `request_attempts`
+    (`attempt_scan`), which `per_link` (link counters, folded per match)
+    and `per_op` (physical-operation facts, folded per operation) both
+    read — so the risk-P2 partition-pruning guarantee in this module's
+    docstring survives unchanged.
+
+    `SUM(bigint)` renders as Postgres `numeric`, which a driver decodes
+    as `Decimal` — every SUM here is `cast(..., BigInteger)`-wrapped, at
+    both aggregation levels, so the JSON-facing value is a plain Python
+    `int`, never a `Decimal`, and `COALESCE(..., 0)` keeps it `0` rather
+    than `NULL` when a cycle's links carried no physical operation at all.
     """
     is_protected = RequestAttempt.access_method.in_(PROTECTED_ACCESS_METHODS)
 
@@ -247,36 +309,19 @@ def build_usage_query(
         PriceObservation.scraped_at, ScrapeJob.created_at
     )
 
-    # --- inner: fold retries, one row per (cycle, workspace, product, match)
-    per_link = (
+    # --- the ONE scan of `request_attempts` (risk P2). Both downstream
+    # CTEs read this, so adding the physical-operation dimension does not
+    # add a second pass over the partitioned table.
+    attempt_scan = (
         select(  # noqa: workspace-scope
             RequestAttempt.workspace_id.label("workspace_id"),
             CompetitorProductMatch.product_id.label("product_id"),
             attempt_cycle_ts.label("cycle_ts"),
             RequestAttempt.match_id.label("match_id"),
-            func.bool_or(RequestAttempt.success).label("link_ok"),
-            func.bool_or(is_protected).label("protected"),
-            func.bool_or(and_(is_protected, RequestAttempt.success)).label(
-                "protected_ok"
-            ),
-            # Task B3: per-match physical-operation facts, folded the same
-            # way as the boolean flags above (one row per match_id) and
-            # re-summed across matches in the outer aggregate below.
-            func.count()
-            .filter(NetworkOperation.transport == PROXIED_TRANSPORTS[0])
-            .label("proxy_http_count"),
-            func.count()
-            .filter(NetworkOperation.transport == PROXIED_TRANSPORTS[1])
-            .label("proxy_browser_count"),
-            func.coalesce(
-                cast(
-                    func.sum(NetworkOperation.bytes_compressed).filter(
-                        NetworkOperation.transport.in_(PROXIED_TRANSPORTS)
-                    ),
-                    BigInteger,
-                ),
-                literal(0),
-            ).label("proxy_bytes"),
+            RequestAttempt.success.label("attempt_ok"),
+            is_protected.label("protected"),
+            RequestAttempt.network_operation_id.label("network_operation_id"),
+            RequestAttempt.proxy_provider_id.label("proxy_provider_id"),
         )
         .join(
             CompetitorProductMatch,
@@ -292,10 +337,6 @@ def build_usage_query(
                 ScrapeJob.workspace_id == RequestAttempt.workspace_id,
             ),
         )
-        .outerjoin(
-            NetworkOperation,
-            NetworkOperation.network_request_id == RequestAttempt.network_operation_id,
-        )
         .where(
             RequestAttempt.created_at >= since,
             RequestAttempt.created_at < until,
@@ -303,22 +344,144 @@ def build_usage_query(
             # ._probe_sample`) write `RequestAttempt` rows tagged
             # `origin='discovery'`, with real `match_id`s resolved from
             # `competitor_product_matches` -- internal COGS traffic, not
-            # customer activity. `per_link` is the sole source of every
+            # customer activity. This scan is the sole source of every
             # link/protected-link counter this export bills from, so
             # excluding non-scrape origins here (same WHERE, same
-            # partition-pruned scan -- no second pass over
-            # `request_attempts`) keeps discovery probing from silently
-            # inflating a customer's `links_total`/
+            # partition-pruned scan) keeps discovery probing from
+            # silently inflating a customer's `links_total`/
             # `protected_links_attempted`.
             RequestAttempt.origin == RequestOrigin.SCRAPE,
         )
+        .cte("attempt_scan")
+    )
+
+    # --- inner: fold retries, one row per (cycle, workspace, product, match)
+    per_link = (
+        select(
+            attempt_scan.c.workspace_id.label("workspace_id"),
+            attempt_scan.c.product_id.label("product_id"),
+            attempt_scan.c.cycle_ts.label("cycle_ts"),
+            attempt_scan.c.match_id.label("match_id"),
+            func.bool_or(attempt_scan.c.attempt_ok).label("link_ok"),
+            func.bool_or(attempt_scan.c.protected).label("protected"),
+            func.bool_or(
+                and_(attempt_scan.c.protected, attempt_scan.c.attempt_ok)
+            ).label("protected_ok"),
+        )
         .group_by(
-            RequestAttempt.workspace_id,
-            CompetitorProductMatch.product_id,
-            attempt_cycle_ts,
-            RequestAttempt.match_id,
+            attempt_scan.c.workspace_id,
+            attempt_scan.c.product_id,
+            attempt_scan.c.cycle_ts,
+            attempt_scan.c.match_id,
         )
         .cte("per_link")
+    )
+
+    # --- Task C6: one row per PHYSICAL operation per (workspace, product,
+    # cycle). Grouping by `network_request_id` here is what collapses an
+    # operation shared by N logical attempts to a single row *before*
+    # anything is summed; `transport`/`bytes_compressed` join the GROUP BY
+    # because `network_request_id` is unique-but-not-primary, so Postgres
+    # will not infer the functional dependency for us.
+    #
+    # The join follows the operation identity BOTH ways: an attempt's own
+    # operation (`network_request_id = network_operation_id`) and every
+    # child of it (`parent_operation_id = network_operation_id`) — a
+    # browser page's subresources have no `request_attempts` row of their
+    # own and are where its bytes live.
+    #
+    # `provider <> 'direct' AND proxy_provider_id IS NOT NULL` is the paid
+    # predicate (F17). Transport no longer decides it.
+    is_proxied = and_(
+        NetworkOperation.provider != DIRECT_PROVIDER,
+        attempt_scan.c.proxy_provider_id.is_not(None),
+    )
+    per_op = (
+        select(  # noqa: workspace-scope
+            attempt_scan.c.workspace_id.label("workspace_id"),
+            attempt_scan.c.product_id.label("product_id"),
+            attempt_scan.c.cycle_ts.label("cycle_ts"),
+            NetworkOperation.network_request_id.label("network_request_id"),
+            NetworkOperation.transport.label("transport"),
+            NetworkOperation.bytes_compressed.label("bytes_compressed"),
+            func.bool_or(is_proxied).label("proxied"),
+            # The workspace's OWN share of this physical operation. At
+            # most one allocation row exists per (operation, workspace)
+            # -- `uq_noa_operation_id_workspace_id` -- so MAX is an
+            # identity here, not a choice between values.
+            func.max(
+                NetworkOperationAllocation.allocated_cost_micro_units
+            ).label("allocated_cost_micro_units"),
+        )
+        .select_from(attempt_scan)
+        .join(
+            NetworkOperation,
+            or_(
+                NetworkOperation.network_request_id
+                == attempt_scan.c.network_operation_id,
+                NetworkOperation.parent_operation_id
+                == attempt_scan.c.network_operation_id,
+            ),
+        )
+        .outerjoin(
+            NetworkOperationAllocation,
+            and_(
+                NetworkOperationAllocation.operation_id
+                == NetworkOperation.network_request_id,
+                NetworkOperationAllocation.workspace_id
+                == attempt_scan.c.workspace_id,
+            ),
+        )
+        .group_by(
+            attempt_scan.c.workspace_id,
+            attempt_scan.c.product_id,
+            attempt_scan.c.cycle_ts,
+            NetworkOperation.network_request_id,
+            NetworkOperation.transport,
+            NetworkOperation.bytes_compressed,
+        )
+        .cte("per_op")
+    )
+
+    # --- Task C6: fold the distinct physical operations up to the export's
+    # grain. `COUNT(DISTINCT network_request_id)` is belt and braces on top
+    # of `per_op`'s grouping: it stays correct even if a future join makes
+    # `per_op` emit a physical operation twice for one (workspace, product,
+    # cycle). Bytes and allocated cost are plain SUMs *because* `per_op`
+    # already holds one row per operation — that is the whole point.
+    op_totals = (
+        select(
+            per_op.c.workspace_id.label("workspace_id"),
+            per_op.c.product_id.label("product_id"),
+            per_op.c.cycle_ts.label("cycle_ts"),
+            func.count(distinct(per_op.c.network_request_id))
+            .filter(
+                per_op.c.proxied,
+                per_op.c.transport == PROXIED_TRANSPORTS[0],
+            )
+            .label("proxied_http_attempted"),
+            func.count(distinct(per_op.c.network_request_id))
+            .filter(
+                per_op.c.proxied,
+                per_op.c.transport == PROXIED_TRANSPORTS[1],
+            )
+            .label("proxied_browser_attempted"),
+            func.coalesce(
+                cast(
+                    func.sum(per_op.c.bytes_compressed).filter(per_op.c.proxied),
+                    BigInteger,
+                ),
+                literal(0),
+            ).label("proxy_bytes"),
+            func.coalesce(
+                cast(
+                    func.sum(per_op.c.allocated_cost_micro_units), BigInteger
+                ),
+                literal(0),
+            ).label("allocated_cost_micro_units"),
+        )
+        .group_by(per_op.c.workspace_id, per_op.c.product_id, per_op.c.cycle_ts)
+        .cte("op_totals")
     )
 
     # --- observations: did this product actually yield a price this cycle?
@@ -364,20 +527,26 @@ def build_usage_query(
             func.coalesce(
                 func.bool_or(per_check.c.observed), literal(False)
             ).label("check_successful"),
-            # Task B3: re-sum the per-match physical-operation facts across
-            # every match in the cycle. `SUM(bigint)` renders as Postgres
-            # `numeric`; cast back to `BigInteger` so the driver hands back
-            # a plain `int`, and `COALESCE(..., 0)` so an all-zero cycle
-            # reports `0`, never `NULL`.
+            # `op_totals` holds AT MOST ONE row per (workspace, product,
+            # cycle), so `MAX` over the join is an identity, not a choice
+            # -- the same shape `bool_or(per_check.observed)` above uses.
+            # It is emphatically NOT a re-sum across matches: that is the
+            # over-count Task C6 exists to remove.
             func.coalesce(
-                cast(func.sum(per_link.c.proxy_http_count), BigInteger), literal(0)
+                cast(func.max(op_totals.c.proxied_http_attempted), BigInteger),
+                literal(0),
             ).label("proxied_http_attempted"),
             func.coalesce(
-                cast(func.sum(per_link.c.proxy_browser_count), BigInteger), literal(0)
+                cast(func.max(op_totals.c.proxied_browser_attempted), BigInteger),
+                literal(0),
             ).label("proxied_browser_attempted"),
             func.coalesce(
-                cast(func.sum(per_link.c.proxy_bytes), BigInteger), literal(0)
+                cast(func.max(op_totals.c.proxy_bytes), BigInteger), literal(0)
             ).label("proxy_bytes"),
+            func.coalesce(
+                cast(func.max(op_totals.c.allocated_cost_micro_units), BigInteger),
+                literal(0),
+            ).label("allocated_cost_micro_units"),
         )
         .select_from(per_link)
         .outerjoin(
@@ -386,6 +555,14 @@ def build_usage_query(
                 per_check.c.workspace_id == per_link.c.workspace_id,
                 per_check.c.product_id == per_link.c.product_id,
                 per_check.c.cycle_ts == per_link.c.cycle_ts,
+            ),
+        )
+        .outerjoin(
+            op_totals,
+            and_(
+                op_totals.c.workspace_id == per_link.c.workspace_id,
+                op_totals.c.product_id == per_link.c.product_id,
+                op_totals.c.cycle_ts == per_link.c.cycle_ts,
             ),
         )
         .group_by(per_link.c.workspace_id, per_link.c.product_id, per_link.c.cycle_ts)

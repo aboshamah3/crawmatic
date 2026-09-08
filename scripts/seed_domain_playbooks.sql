@@ -408,8 +408,70 @@ SET preferred_method_id = selected.id,
 FROM selected
 WHERE selected.domain_strategy_profile_id = dsp.id;
 
+-- ---------------------------------------------------------------------------
+-- EPA C4 (2026-09-08, F08 / plan §11 items 2 and 5): the VERSIONED DOMAIN
+-- STRATEGY columns added by migration a7c31d0f9e42.
+--
+-- SHAPE ONLY. Every value is deliberately left NULL for the owner to fill
+-- after the labeled canary has run (docs/ops/DOMAIN_STRATEGIES_2026-09.md
+-- §2 and §6): `fallback_cap_per_refresh` and `recovery_probe_fraction` are
+-- decisions about money, and nothing has yet measured how often the
+-- expensive rung actually rescues a target on these domains. Seeding an
+-- invented number would look like evidence and would not be.
+--
+-- The columns and what NULL means (full table in the runbook):
+--   strategy_version         INT      NOT NULL DEFAULT 1 -- bump it in the
+--                                     SAME statement that changes any value
+--                                     below; a shape change that keeps its
+--                                     old version number makes every attempt
+--                                     stamped with it a lie.
+--   cheap_path               TEXT     AccessMethod tried FIRST when nothing
+--                                     else pins the start. NULL = no hint.
+--   fallback_path            TEXT     the EXPENSIVE AccessMethod that gets
+--                                     rationed. NULL = nothing is rationed.
+--   fallback_cap_per_refresh INT      uses of fallback_path per target per
+--                                     refresh. NULL = uncapped (pre-C4
+--                                     behaviour), 0 = never.
+--   recovery_probe_fraction  NUMERIC  per-domain override of
+--                                     SCRAPE_RECOVERY_PROBE_FRACTION.
+--                                     NULL = use the setting.
+--
+-- Evidence-backed SUGGESTIONS for the two path columns (see the runbook
+-- table; still not applied here):
+--   amazon.sa  cheap PROXY_HTTP   fallback PLAYWRIGHT_PROXY
+--   noon.com   cheap PROXY_HTTP   fallback PLAYWRIGHT_PROXY   (direct is
+--              100% blocked at the TLS/HTTP2 layer -- B5, 8/8)
+--   stech.ink  cheap DIRECT_HTTP  fallback PROXY_HTTP
+--
+-- To seed, replace the NULLs below (and ONLY then bump strategy_version):
+--
+--   UPDATE domain_playbooks SET
+--       strategy_version         = 2,
+--       cheap_path               = 'PROXY_HTTP',
+--       fallback_path            = 'PLAYWRIGHT_PROXY',
+--       fallback_cap_per_refresh = 1,
+--       recovery_probe_fraction  = 0.05,
+--       updated_at               = now()
+--   WHERE domain = 'noon.com';
+--
+-- Idempotent as written: every row keeps the values it already has,
+-- because COALESCE(<new>, <current>) with a NULL <new> is the current
+-- value. Re-running this file therefore never resets a seeded strategy
+-- back to NULL -- which is the whole reason it is written this way rather
+-- than as a plain assignment.
+UPDATE domain_playbooks SET
+    strategy_version         = COALESCE(NULL::integer, strategy_version),
+    cheap_path               = COALESCE(NULL::text,    cheap_path),
+    fallback_path            = COALESCE(NULL::text,    fallback_path),
+    fallback_cap_per_refresh = COALESCE(NULL::integer, fallback_cap_per_refresh),
+    recovery_probe_fraction  = COALESCE(NULL::numeric, recovery_probe_fraction)
+WHERE domain IN ('amazon.sa', 'noon.com', 'stech.ink');
+
 COMMIT;
 
 -- Verify:
 --   SELECT domain, preferred_access_method, scrape_profile_name FROM domain_playbooks ORDER BY domain;
 --   SELECT name, workspace_id FROM scrape_profiles WHERE workspace_id IS NULL;
+--   SELECT domain, strategy_version, cheap_path, fallback_path,
+--          fallback_cap_per_refresh, recovery_probe_fraction
+--     FROM domain_playbooks ORDER BY domain;

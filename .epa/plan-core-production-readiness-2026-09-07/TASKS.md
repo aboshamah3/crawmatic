@@ -26,17 +26,17 @@
 | B8 | B | PB-8 | Readiness probes that cannot pile up; liveness/dependency/scraping split (F16) | A10 | sonnet | done-dev | 1 | reports/B8.md |
 | B9 | B | PB-8 | Heartbeats for every process class and alerts to an owner (F22) | A5, A7 | sonnet | done-dev (+B9-fix1 wired worker+scheduler emitters; rules gauge wiring follow-up) | 1 | reports/B9.md, reports/B9-fix1.md |
 | B10 | B | PB-9 | Engine release 2 — OWNER GATE | B1-B9 | sonnet | done (owner gate: release 2 deploy deferred to owner) | 1 | reports/B10.md |
-| C1 | C | PC-1 | Per-target deadline, physical attempt budget, failure classes, method suppression (F08) | B5, B10 | opus | pending | 0 | - |
-| C2 | C | PC-2 | Amazon HTTP-leg investigation with the resolved production profile — spend ≤ $1 | C1 | sonnet | pending | 0 | - |
-| C3 | C | PC-2 | Document-only browser canary with the fixed calculator — spend ≤ $3 | A6, C1 | sonnet | pending | 0 | - |
-| C4 | C | PC-3 | Noon and S-Tech labeled canaries; versioned domain strategy; safe coalescing key — spend ≤ $2 | C1 | opus | pending | 0 | - |
-| C5 | C | PC-4 | Structured offer contract on the live path; ranker shadow; durable evidence (F19) | C4 | opus | pending | 0 | - |
-| C6 | C | PC-5 | Usage aggregation by provider dimension; reservation by known first rung (F17, F18) | B10 | opus | pending | 0 | - |
-| C7 | C | PC-6 | Set-based daily rollups with keyset batches and checkpoints (F12) | C5 | opus | pending | 0 | - |
-| C8 | C | PC-7 | Retention gated on per-key coverage and the completion watermark (F13) | C7 | sonnet | pending | 0 | - |
-| C9 | C | PC-8 | Retention per data class; ledger child summarization; partitioning (F14) | C8 | opus | pending | 0 | - |
-| C10 | C | PC-9 | Backups from inside Railway, measured, encrypted, off-host (F21) | B10 | opus | pending | 0 | - |
-| C11 | C | PC-10 | Engine release 3 — OWNER GATE | C1-C10 | sonnet | pending | 0 | - |
+| C1 | C | PC-1 | Per-target deadline, physical attempt budget, failure classes, method suppression (F08) | B5, B10 | opus | done-dev (budget gate inert until C4 passes budget=) | 1 | reports/C1.md |
+| C2 | C | PC-2 | Amazon HTTP-leg investigation with the resolved production profile — spend ≤ $1 | C1 | sonnet | done-dev (spend step C2.2 owner-run) | 1 | reports/C2.md |
+| C3 | C | PC-2 | Document-only browser canary with the fixed calculator — spend ≤ $3 | A6, C1 | sonnet | done-dev (spend step C3.2 owner-run) | 1 | reports/C2.md |
+| C4 | C | PC-3 | Noon and S-Tech labeled canaries; versioned domain strategy; safe coalescing key — spend ≤ $2 | C1 | opus | done-dev (canary spend step C4.2 owner-run) | 1 | reports/C4.md |
+| C5 | C | PC-4 | Structured offer contract on the live path; ranker shadow; durable evidence (F19) | C4 | opus | done-dev (incl. spider raw_evidence continuation) | 1 | reports/C5.md |
+| C6 | C | PC-5 | Usage aggregation by provider dimension; reservation by known first rung (F17, F18) | B10 | opus | done (attempt 2) | 2 | reports/C6.md, reports/C6-2.md |
+| C7 | C | PC-6 | Set-based daily rollups with keyset batches and checkpoints (F12) | C5 | opus | done-dev (500k benchmark written, not run → D1) | 1 | reports/C7.md |
+| C8 | C | PC-7 | Retention gated on per-key coverage and the completion watermark (F13) | C7 | sonnet | done | 1 | reports/C8.md |
+| C9 | C | PC-8 | Retention per data class; ledger child summarization; partitioning (F14) | C8 | opus | done-dev (owner ratification: FK trade + RETENTION_ENABLED_CLASSES) | 1 | reports/C9.md |
+| C10 | C | PC-9 | Backups from inside Railway, measured, encrypted, off-host (F21) | B10 | opus | done-dev (owner gate step 3 deferred; backup-report route has no receiver) | 1 | reports/C10.md |
+| C11 | C | PC-10 | Engine release 3 — OWNER GATE | C1-C10 | sonnet | done (owner gate: release 3 deploy deferred) | 1 | reports/C11.md |
 | D1 | D | PD-1 | Controlled-origin fleet test at 100 × 5,000 in a temporary Railway staging environment | D5 | opus | pending | 0 | - |
 | D2 | D | PD-2 | Fault-injection matrix in staging | C11 | sonnet | pending | 0 | - |
 | D3 | D | PD-2 | Bounded real-domain canary with provider and container reconciliation — spend ≤ $3 | C11 | sonnet | pending | 0 | - |

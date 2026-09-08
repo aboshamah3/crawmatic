@@ -17,17 +17,39 @@ this module is the *mechanism*, not the policy statement.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+
+from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 
 #: Overridable via ``OFFER_EVIDENCE_STORE_DIR`` (never read from ``.env``
 #: — callers, including tests, pass ``base_dir`` explicitly; this is
 #: only a fallback default for ad-hoc/CLI use).
 DEFAULT_STORE_DIR_ENV_VAR = "OFFER_EVIDENCE_STORE_DIR"
 _DEFAULT_STORE_DIR = Path("var") / "evidence"
+
+#: EPA C5 (F19). How long an evidence blob is kept once nothing needs it
+#: any more — the *age* half of the two-part gate below. Mirrored by
+#: ``Settings.EVIDENCE_RETENTION_DAYS`` (the tunable a deployment
+#: actually reads); this module-level constant is the documented default
+#: and what a direct/CLI caller gets.
+EVIDENCE_RETENTION_DAYS = 30
+
+#: The observation retention window the *reference* half of the gate is
+#: measured against — the same number ``Settings.
+#: RETENTION_PRICE_OBSERVATIONS_DAYS`` carries, restated here so a
+#: direct caller of :func:`sweep_evidence_retention` gets the correct
+#: default without this stdlib-shaped module importing the settings
+#: object. A caller that has settings should pass the real value.
+DEFAULT_OBSERVATION_RETENTION_DAYS = 90
 
 #: The one hash algorithm this store speaks. Fixed (not configurable)
 #: so a hash string is self-describing without a prefix — widening this
@@ -50,6 +72,21 @@ def default_store_dir() -> Path:
     relative to the current working directory."""
     override = os.environ.get(DEFAULT_STORE_DIR_ENV_VAR)
     return Path(override) if override else _DEFAULT_STORE_DIR
+
+
+def store_dir_from_settings(settings: Any) -> Path | None:
+    """``Settings.EVIDENCE_STORE_DIR`` as a ``Path``, or ``None``.
+
+    ``None``/empty means "evidence storage is not configured on this
+    deployment" and every caller must treat that as *do not write and do
+    not record a hash* — never as "fall back to a local directory".
+    See that setting's own comment for why an ephemeral fallback is
+    worse than no store at all.
+    """
+    configured = getattr(settings, "EVIDENCE_STORE_DIR", None)
+    if not configured:
+        return None
+    return Path(str(configured))
 
 
 def compute_hash(data: bytes) -> str:
@@ -142,6 +179,200 @@ def replay(evidence_hash: str, *, store_dir: Path | None = None) -> ReplayResult
     the hash names."""
     data = resolve_hash(evidence_hash, store_dir=store_dir)
     return ReplayResult(evidence_hash=evidence_hash, data=data, verified=True)
+
+
+# ---------------------------------------------------------------------------
+# EPA C5 (F19): the age-AND-reference gated retention sweep
+# ---------------------------------------------------------------------------
+#
+# `docs/RETENTION_POLICY.md` §2.1 records this as an OPEN GAP -- "No
+# deletion mechanism exists today ... evidence currently accumulates
+# indefinitely" -- and prescribes the exact shape the mechanism must
+# take when it is built:
+#
+#     "filesystem object deletion keyed by hash, gated on no
+#      `price_observations.offer_raw_evidence_hash` row still
+#      referencing it (a hash referenced by a NOT-yet-retention-eligible
+#      observation must not be deleted out from under it)"
+#
+# That is why this is not a plain `find -mtime +30 -delete`. Evidence and
+# the observations that cite it age on DIFFERENT clocks: an observation
+# lives `RETENTION_PRICE_OBSERVATIONS_DAYS` (90) and a blob 30, so the
+# naive sweep would routinely leave a 60-day stretch of rows whose
+# content addresses resolve to nothing -- a table that LOOKS auditable
+# and is not, which is worse than one that never claimed to be.
+#
+# Both conditions must hold before a blob is removed:
+#   1. the blob itself is older than `retention_days`, and
+#   2. no observation younger than `observation_retention_days` still
+#      names its hash.
+#
+# The order matters for cost as much as for correctness: condition 1 is
+# a stat() and prunes the candidate set to (in steady state) almost
+# nothing, so condition 2 -- the only database work -- runs over a small,
+# bounded list of hashes rather than the whole store.
+
+
+@dataclass(frozen=True)
+class EvidenceRetentionReport:
+    """One sweep run's outcome, for the task's structured log line."""
+
+    #: Well-formed blobs found in the store (a non-hash file is not one).
+    blobs_scanned: int = 0
+    #: Of those, how many were past ``retention_days``.
+    blobs_expired: int = 0
+    #: Of those, how many were removed (or would be, under ``dry_run``).
+    blobs_deleted: int = 0
+    #: Expired blobs an in-window observation still references.
+    blobs_kept_referenced: int = 0
+    bytes_reclaimed: int = 0
+    #: ``True`` when ``max_blobs`` cut the run short — not an error; the
+    #: next tick continues where this one stopped.
+    truncated: bool = False
+    dry_run: bool = False
+    #: Blobs whose deletion raised (permissions, a racing reader). Counted
+    #: rather than fatal: one unremovable file must not abandon the run.
+    delete_errors: int = 0
+
+
+def iter_stored_hashes(store_dir: Path) -> Any:
+    """Yield ``(hash, path)`` for every well-formed blob in ``store_dir``.
+
+    A file whose NAME is not a sha256 content address is not a blob and
+    is never yielded — the store's two-level fan-out shares its directory
+    tree with whatever an operator drops in it (a ``README``, a
+    ``.tmp`` from an interrupted write), and a retention sweep that
+    deletes files it cannot identify is a data-loss bug waiting for its
+    first operator.
+    """
+    if not store_dir.is_dir():
+        return
+    for path in store_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if _HASH_RE.match(path.name) is None:
+            continue
+        yield path.name, path
+
+
+#: How many hashes one reference query asks about. Keeps the ``= ANY``
+#: array (and the resulting plan) bounded regardless of ``max_blobs``.
+_REFERENCE_QUERY_CHUNK = 500
+
+
+def _referenced_hashes(
+    session: Any, hashes: list[str], *, cutoff: datetime
+) -> set[str]:
+    """Which of ``hashes`` an observation newer than ``cutoff`` still names.
+
+    Cross-tenant by construction: one blob is referenced by whichever
+    workspaces happened to scrape that page, and a per-workspace answer
+    could not decide a fleet-wide filesystem deletion. Runs on the
+    BYPASSRLS system session the maintenance task opens, the same
+    posture as every other entry in ``app_shared.maintenance``.
+
+    The ``scraped_at >= cutoff`` predicate is doing two jobs: it IS the
+    "younger than its own retention" half of the gate, and it prunes the
+    partitioned scan to the handful of monthly partitions inside that
+    window.
+    """
+    found: set[str] = set()
+    for start in range(0, len(hashes), _REFERENCE_QUERY_CHUNK):
+        chunk = hashes[start : start + _REFERENCE_QUERY_CHUNK]
+        result = session.execute(  # noqa: workspace-scope - fleet-wide sweep
+            text(
+                "SELECT DISTINCT offer_raw_evidence_hash FROM price_observations "
+                "WHERE scraped_at >= :cutoff "
+                "AND offer_raw_evidence_hash = ANY(:hashes)"
+            ),
+            {"cutoff": cutoff, "hashes": chunk},
+        )
+        found.update(row for row in result.scalars().all() if row)
+    return found
+
+
+def sweep_evidence_retention(
+    session: Any,
+    *,
+    store_dir: Path,
+    now: datetime | None = None,
+    retention_days: int = EVIDENCE_RETENTION_DAYS,
+    observation_retention_days: int = DEFAULT_OBSERVATION_RETENTION_DAYS,
+    max_blobs: int = 5000,
+    dry_run: bool = False,
+) -> EvidenceRetentionReport:
+    """Delete expired, unreferenced evidence blobs. Returns what it did.
+
+    ``session`` is only ever asked one question (:func:`_referenced_hashes`)
+    and is never written to — the sweep's only mutation is on the
+    filesystem, so there is nothing to commit and a caller may pass a
+    read-only session.
+
+    **A sweep that cannot prove a blob is unreferenced deletes nothing.**
+    A database error propagates rather than being swallowed into a
+    "nothing was referenced, delete everything" answer; that is the one
+    failure mode of this function that would be irreversible.
+    """
+    reference_moment = now if now is not None else datetime.now(UTC)
+    blob_cutoff = reference_moment - timedelta(days=retention_days)
+    observation_cutoff = reference_moment - timedelta(days=observation_retention_days)
+
+    scanned = 0
+    expired: list[tuple[str, Path, int]] = []
+    truncated = False
+    for evidence_hash, path in iter_stored_hashes(store_dir):
+        scanned += 1
+        try:
+            stat = path.stat()
+        except OSError:  # pragma: no cover - raced with another sweep
+            continue
+        if datetime.fromtimestamp(stat.st_mtime, UTC) >= blob_cutoff:
+            continue
+        if len(expired) >= max_blobs:
+            truncated = True
+            continue
+        expired.append((evidence_hash, path, stat.st_size))
+
+    if not expired:
+        return EvidenceRetentionReport(
+            blobs_scanned=scanned, truncated=truncated, dry_run=dry_run
+        )
+
+    referenced = _referenced_hashes(
+        session, [entry[0] for entry in expired], cutoff=observation_cutoff
+    )
+
+    deleted = 0
+    kept = 0
+    reclaimed = 0
+    delete_errors = 0
+    for evidence_hash, path, size in expired:
+        if evidence_hash in referenced:
+            kept += 1
+            continue
+        if dry_run:
+            deleted += 1
+            reclaimed += size
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            delete_errors += 1
+            logger.warning("evidence_retention could not delete %s", path, exc_info=True)
+            continue
+        deleted += 1
+        reclaimed += size
+
+    return EvidenceRetentionReport(
+        blobs_scanned=scanned,
+        blobs_expired=len(expired),
+        blobs_deleted=deleted,
+        blobs_kept_referenced=kept,
+        bytes_reclaimed=reclaimed,
+        truncated=truncated,
+        dry_run=dry_run,
+        delete_errors=delete_errors,
+    )
 
 
 def _main(argv: list[str]) -> int:

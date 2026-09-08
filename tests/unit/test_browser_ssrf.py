@@ -424,10 +424,14 @@ def test_proxied_listed_domain_document_is_continued(_amazon_listed_and_proxied)
     assert _drive_route(request).actions == ["continue_"]
 
 
-def test_direct_leg_of_a_listed_domain_keeps_the_pre_change_decision(monkeypatch):
-    # Same page, same script -- but the leg was never recorded as proxied,
-    # so the registry's DIRECT default applies and the pre-B5 decision
-    # (script allowed) stands.
+def test_direct_leg_of_a_listed_domain_is_also_document_only(monkeypatch):
+    # EPA C3 (2026-09-08, BLOCKLIST_VERSION 3): the leg was never recorded
+    # as proxied (the registry's DIRECT default applies), but the
+    # document-only rule now applies to BOTH legs -- a listed domain's
+    # script subresource is aborted on DIRECT exactly like on PROXY. Before
+    # C3 this asserted `continue_` (the B5 PROXY-only gate); see
+    # `tests/unit/test_browser_resource_policy_both_legs.py` for the
+    # policy-level coverage of this change.
     from app_shared.profiles import browser_resource_policy
     from types import SimpleNamespace
 
@@ -443,7 +447,7 @@ def test_direct_leg_of_a_listed_domain_keeps_the_pre_change_decision(monkeypatch
         resource_type="script",
     )
 
-    assert _drive_route(request).actions == ["continue_"]
+    assert _drive_route(request).actions == ["abort"]
 
 
 def test_default_settings_produce_the_pre_change_decision_on_a_proxied_leg(monkeypatch):

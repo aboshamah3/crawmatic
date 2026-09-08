@@ -893,13 +893,335 @@ def _print_report(report: BenchmarkReport) -> None:
             print(f"  {r.case_id}: {r.error}")
 
 
+# ---------------------------------------------------------------------------
+# EPA C5 (F19): the shadow-events view of the same question
+# ---------------------------------------------------------------------------
+#
+# The corpus benchmark above answers "is the ranker right?" against
+# LABELED pages. `--from-shadow-events` answers the other half, which no
+# corpus can: "how often does the ranker disagree with the chain on the
+# pages we actually scrape?" Both numbers gate the C11 owner decision on
+# `EXTRACTION_RANKING_POLICY`, and they fail in opposite directions -- a
+# ranker that is right on every labeled case and disagrees with
+# production on 30% of pages is not ready, and neither is one that never
+# disagrees but is wrong whenever it does.
+#
+# Input is a JSONL EXPORT of `extraction_shadow_events`, not a live
+# connection. Three reasons, in order: the gate is evaluated by a human
+# reading a report, the export is the artifact that gets attached to the
+# decision, and a script that opens a production database to compute a
+# release number is a script that has to be trusted with a production
+# database. Export with:
+#
+#   \copy (SELECT * FROM extraction_shadow_events
+#          WHERE observed_at >= now() - interval '7 days')
+#     TO 'shadow.jsonl' (FORMAT text)
+#
+# ...or any equivalent that emits one JSON object per line.
+
+
+#: The two numbers the plan names for the C11 flip, together:
+#:   "the shadow disagreement rate is < 1% on the C4 labeled sets AND
+#:    the ranker wins >= 99% of labeled conflicts"
+@dataclass(frozen=True)
+class ShadowGateThresholds:
+    max_disagreement_rate: float = 0.01
+    min_ranker_win_rate: float = 0.99
+
+
+@dataclass(frozen=True)
+class ShadowReport:
+    """What a window of shadow events says about the ranker."""
+
+    events: int
+    #: Denominator for the rate. NOT derivable from the events file --
+    #: only disagreements are recorded -- so the caller supplies the
+    #: count of observations over the same window. `None` means the rate
+    #: is unknown, which is reported as unknown rather than assumed
+    #: acceptable.
+    observations: int | None
+    by_kind: dict[str, int]
+    by_domain: dict[str, int]
+    #: Labeled conflicts: disagreements where a C4 labeled offer for the
+    #: same URL says which side was right.
+    labeled_conflicts: int
+    ranker_wins: int
+    first_hit_wins: int
+    #: Neither side matched the label -- counted separately because a
+    #: case where BOTH paths are wrong is evidence about the page, not
+    #: about the ranker, and folding it into either win count would
+    #: distort the ratio the gate reads.
+    both_wrong: int
+
+    def disagreement_rate(self) -> float | None:
+        if not self.observations:
+            return None
+        return self.events / self.observations
+
+    def ranker_win_rate(self) -> float | None:
+        if self.labeled_conflicts == 0:
+            return None
+        return self.ranker_wins / self.labeled_conflicts
+
+
+def load_shadow_events(path: Path) -> list[dict[str, Any]]:
+    """One JSON object per line; blank lines skipped, bad lines refused.
+
+    A malformed line raises rather than being skipped: a gate computed
+    over "whatever parsed" is a gate whose denominator nobody can
+    reproduce.
+    """
+    events: list[dict[str, Any]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            events.append(json.loads(stripped))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{number} is not a JSON object: {exc}") from exc
+    return events
+
+
+def load_labeled_prices(paths: list[Path]) -> dict[str, Decimal]:
+    """`url -> labeled price` from the C4 labeled-offer fixtures.
+
+    Only the price is read. Currency/availability disagreements are
+    reported by kind but not adjudicated here, because the C4 fixtures'
+    own README records availability as UNKNOWN on 29 of 30 amazon rows --
+    scoring against that would measure the fixture's gaps, not the
+    ranker.
+    """
+    labels: dict[str, Decimal] = {}
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            url = row.get("url")
+            price = row.get("price")
+            if not url or price is None:
+                continue
+            try:
+                labels[str(url)] = parse_money(str(price))
+            except (TypeError, ValueError, InvalidOperation):
+                continue
+    return labels
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return parse_money(str(value))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+
+
+def summarize_shadow_events(
+    events: list[dict[str, Any]],
+    *,
+    labels: dict[str, Decimal] | None = None,
+    observations: int | None = None,
+) -> ShadowReport:
+    """Reduce a window of shadow events to the two C11 gate numbers."""
+    labels = labels or {}
+    by_kind: dict[str, int] = {}
+    by_domain: dict[str, int] = {}
+    labeled_conflicts = 0
+    ranker_wins = 0
+    first_hit_wins = 0
+    both_wrong = 0
+
+    for event in events:
+        kind = str(event.get("disagreement_kind") or "unknown")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        domain = str(event.get("domain") or "unknown")
+        by_domain[domain] = by_domain.get(domain, 0) + 1
+
+        url = event.get("url")
+        truth = labels.get(str(url)) if url else None
+        if truth is None:
+            continue
+        labeled_conflicts += 1
+        first_hit = _decimal_or_none(event.get("first_hit_price"))
+        ranked = _decimal_or_none(event.get("ranked_price"))
+        if ranked is not None and ranked == truth:
+            ranker_wins += 1
+        elif first_hit is not None and first_hit == truth:
+            first_hit_wins += 1
+        else:
+            both_wrong += 1
+
+    return ShadowReport(
+        events=len(events),
+        observations=observations,
+        by_kind=by_kind,
+        by_domain=by_domain,
+        labeled_conflicts=labeled_conflicts,
+        ranker_wins=ranker_wins,
+        first_hit_wins=first_hit_wins,
+        both_wrong=both_wrong,
+    )
+
+
+def decide_shadow_gate(
+    report: ShadowReport, thresholds: ShadowGateThresholds = ShadowGateThresholds()
+) -> tuple[bool, tuple[str, ...]]:
+    """`(allowed, reasons)` for flipping `EXTRACTION_RANKING_POLICY` to v1.
+
+    **Unknown is never a pass.** An unknown disagreement rate (no
+    observation count supplied) and an unknown win rate (no labeled
+    conflict in the window) both REFUSE, because the gate's job is to
+    require evidence, and "we have no evidence of a problem" is the
+    sentence this function exists to reject.
+
+    Returns a recommendation. The flip itself is an OWNER decision at
+    C11 -- nothing in this repository changes the flag.
+    """
+    reasons: list[str] = []
+    allowed = True
+
+    rate = report.disagreement_rate()
+    if rate is None:
+        allowed = False
+        reasons.append(
+            "disagreement rate unknown: pass --observations <count over the same "
+            "window> (only disagreements are recorded, so the denominator cannot "
+            "come from the events file)"
+        )
+    elif rate > thresholds.max_disagreement_rate:
+        allowed = False
+        reasons.append(
+            f"disagreement rate {rate:.2%} exceeds "
+            f"{thresholds.max_disagreement_rate:.2%}"
+        )
+
+    win_rate = report.ranker_win_rate()
+    if win_rate is None:
+        allowed = False
+        reasons.append(
+            "ranker win rate unknown: no shadow event in this window matched a "
+            "labeled offer (pass --labels with the C4 fixtures covering these URLs)"
+        )
+    elif win_rate < thresholds.min_ranker_win_rate:
+        allowed = False
+        reasons.append(
+            f"ranker wins {win_rate:.2%} of labeled conflicts, below "
+            f"{thresholds.min_ranker_win_rate:.2%}"
+        )
+
+    if allowed:
+        reasons.append(
+            "both C11 thresholds met -- the flip to EXTRACTION_RANKING_POLICY=v1 "
+            "is an OWNER decision, not this script's"
+        )
+    return allowed, tuple(reasons)
+
+
+def _print_shadow_report(report: ShadowReport, allowed: bool, reasons: tuple[str, ...]) -> None:
+    print("=" * 78)
+    print("EXTRACTION SHADOW EVENTS — C11 gate input")
+    print("=" * 78)
+    print(f"disagreement events:     {report.events}")
+    print(f"observations in window:  {report.observations if report.observations is not None else 'n/a'}")
+    rate = report.disagreement_rate()
+    print(f"disagreement rate:       {rate:.3%}" if rate is not None else "disagreement rate:       n/a")
+    print("-" * 78)
+    for kind, count in sorted(report.by_kind.items(), key=lambda item: -item[1]):
+        print(f"  kind {kind:<12}{count:>8}")
+    for domain, count in sorted(report.by_domain.items(), key=lambda item: -item[1])[:20]:
+        print(f"  domain {domain:<30}{count:>8}")
+    print("-" * 78)
+    print(f"labeled conflicts:       {report.labeled_conflicts}")
+    print(f"  ranker correct:        {report.ranker_wins}")
+    print(f"  first-hit correct:     {report.first_hit_wins}")
+    print(f"  both wrong:            {report.both_wrong}")
+    win = report.ranker_win_rate()
+    print(f"ranker win rate:         {win:.2%}" if win is not None else "ranker win rate:         n/a")
+    print("=" * 78)
+    print(f"C11 RECOMMENDATION: {'THRESHOLDS MET' if allowed else 'NOT MET'}")
+    for reason in reasons:
+        print(f"  - {reason}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--domain", choices=["amazon", "noon", "stech"], default=None)
     parser.add_argument("--category", default=None)
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
+    # --- EPA C5 (F19) ---
+    parser.add_argument(
+        "--from-shadow-events",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "score a JSONL export of extraction_shadow_events instead of the "
+            "labeled corpus (the C11 gate input for EXTRACTION_RANKING_POLICY)"
+        ),
+    )
+    parser.add_argument(
+        "--labels",
+        type=Path,
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "C4 labeled-offer fixture(s) to adjudicate shadow disagreements "
+            "against; repeatable. Only meaningful with --from-shadow-events"
+        ),
+    )
+    parser.add_argument(
+        "--observations",
+        type=int,
+        default=None,
+        help=(
+            "how many observations were recorded over the same window as the "
+            "shadow export -- the disagreement rate's DENOMINATOR. Without it "
+            "the rate is reported as unknown and the gate refuses"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.from_shadow_events is not None:
+        shadow = summarize_shadow_events(
+            load_shadow_events(args.from_shadow_events),
+            labels=load_labeled_prices(list(args.labels or [])),
+            observations=args.observations,
+        )
+        allowed, reasons = decide_shadow_gate(shadow)
+        if not args.quiet:
+            _print_shadow_report(shadow, allowed, reasons)
+        if args.json_out is not None:
+            args.json_out.write_text(
+                json.dumps(
+                    {
+                        "events": shadow.events,
+                        "observations": shadow.observations,
+                        "disagreement_rate": shadow.disagreement_rate(),
+                        "by_kind": shadow.by_kind,
+                        "by_domain": shadow.by_domain,
+                        "labeled_conflicts": shadow.labeled_conflicts,
+                        "ranker_wins": shadow.ranker_wins,
+                        "first_hit_wins": shadow.first_hit_wins,
+                        "both_wrong": shadow.both_wrong,
+                        "ranker_win_rate": shadow.ranker_win_rate(),
+                        "c11_thresholds_met": allowed,
+                        "reasons": list(reasons),
+                    },
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+        # Exit 0 either way: like the corpus mode above, this script's exit
+        # code says the ANALYSIS ran, not that the system passed. A gate
+        # decision that shows up as a non-zero exit invites somebody to
+        # "fix" it by not running the script.
+        return 0
 
     report = run_benchmark(domain=args.domain, category=args.category)
 
