@@ -20,6 +20,19 @@ SCRAPE_RECOVER_STALLED = "maintenance.recover_stalled_batches"
 SCRAPE_FINALIZE_JOBS = "maintenance.finalize_jobs"
 SCRAPE_REDISPATCH_JOBS = "maintenance.redispatch_pending_jobs"
 SCRAPE_RECONCILE_FALSE_FAILURES = "maintenance.reconcile_false_failed_targets"
+# EPA B3 (2026-09-07), closing B2's owed wiring. Step 5 of B2's
+# commit-before-send dispatch protocol: settle every ``POSTED``
+# ``dispatch_intents`` row against the node it names
+# (``app_shared.jobs.dispatch_intents.reconcile_inflight_intents``). B2
+# shipped that function with no schedule at all — it deliberately stopped
+# short of touching the scheduler's beat loop — so a worker killed between
+# its POST and the node's answer left a ``POSTED`` row nothing ever
+# settled: not confirmable, and not re-postable either (only
+# ``RECONCILED_MISSING`` authorizes a re-POST). Driven by the DURABLE
+# ``dispatch_reconcile`` cadence, not an in-process accumulator: the
+# protocol exists to survive a process dying, so the sweep that cleans up
+# after that death has to survive it too.
+DISPATCH_RECONCILE_INTENTS = "maintenance.reconcile_dispatch_intents"
 
 # --- Price analysis (SPEC-09 FR-012, D4) ---
 # Enqueued via ``app_shared.messaging.enqueue`` from three triggers (scrape
@@ -37,6 +50,21 @@ STRATEGY_DISCOVERY_RUN = "strategy_discovery.run_discovery"
 STRATEGY_STATS_FLUSH = "maintenance.strategy_stats_flush"
 STRATEGY_LIGHT_RECHECK = "maintenance.strategy_light_recheck"
 STRATEGY_PATTERN_BACKFILL = "maintenance.strategy_pattern_backfill"
+
+# --- Discovery fleet-wide chunked scan (EPA B4, F09) ---
+# "Resumable long maintenance": bounded, cursor-driven sweep over
+# `domain_strategy_profiles` rows stuck at `DISCOVERY_REQUIRED` (any
+# path that reset a profile back to that status without itself
+# enqueueing `STRATEGY_DISCOVERY_RUN`, e.g. a restored/imported
+# dataset). Processes at most `Settings.
+# STRATEGY_DISCOVERY_MAX_DOMAINS_PER_RUN` profiles per invocation,
+# persists how far it got in `strategy_discovery_state`, and
+# re-enqueues itself to continue a still-in-progress pass -- so neither
+# a task time limit nor a worker restart mid-scan loses its place or
+# doubles up on already-forwarded profiles. A `maintenance`-queue task
+# (bounded DB scan + outbox writes, no blocking fetch), the same queue
+# as its `STRATEGY_PATTERN_BACKFILL` sibling.
+STRATEGY_DISCOVERY_SCAN = "maintenance.strategy_discovery_scan"
 
 # --- Retention, rollups & partition maintenance (SPEC-15, research R8) ---
 # Enqueued via the same ``app_shared.messaging.enqueue`` producer seam by the

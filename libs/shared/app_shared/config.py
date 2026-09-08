@@ -16,6 +16,7 @@ configuration is parsed exactly once per process.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import field_validator, model_validator
@@ -242,6 +243,40 @@ class Settings(BaseSettings):
     SCRAPE_FLUSH_MAX_ITEMS: int = 50
     SCRAPE_FLUSH_INTERVAL_SECONDS: float = 2.0
 
+    # --- Durable result spool (EPA F05, plan task B1) --------------------
+    # The spider-side SQLite/WAL queue every scrape result is written to
+    # BEFORE it enters the in-memory flush buffer, drained by the
+    # scraping-core library's `result_spool.ResultSpool` (deliberately not
+    # named in full here -- `tests/unit/test_import_boundaries.py` forbids
+    # this package from mentioning that one at all, even in a comment, so
+    # the reverse dependency edge cannot creep back in via a lazy import).
+    # Placed alongside the network
+    # ledger's own buffer (`NETLEDGER_BUFFER_PATH`, an env-only per-host
+    # fact) so both durable queues live on the same volume and one mount
+    # makes the host crash-safe rather than two.
+    SCRAPE_RESULT_SPOOL_PATH: Path = Path("/var/lib/crawmatic/spool/scrape_results.sqlite3")
+    #: How many flushes may be in flight before `process_item` starts
+    #: returning an unfired Deferred. Scrapy honours that by stopping its
+    #: pull from the scheduler, so the downloader stalls and admission
+    #: pauses -- backpressure instead of an unbounded spool when Postgres
+    #: is slower than the crawl.
+    SCRAPE_FLUSH_MAX_PENDING_BATCHES: int = 8
+    #: Delay before each successive replay of a failed batch, indexed by
+    #: the batch's attempt count (the last entry repeats). Comma-separated
+    #: in env (`"1,5,30,120,600"`), never JSON -- same convention as the
+    #: Scrapyd URL pools.
+    SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS: Annotated[tuple[float, ...], NoDecode] = (
+        1.0,
+        5.0,
+        30.0,
+        120.0,
+        600.0,
+    )
+    #: Failed attempts after which a spooled batch stops being retried and
+    #: moves to `kind='quarantined'` in the spool -- kept on disk for an
+    #: operator, never deleted (the fetch was already paid for).
+    SCRAPE_FLUSH_QUARANTINE_AFTER: int = 5
+
     # --- Auth DB role (optional — direct BYPASSRLS role for pre-auth
     # credential lookups only; see app_shared.database.get_auth_session).
     # Deliberately never falls back to DATABASE_URL (SPEC-03 [analyze C1]).
@@ -264,6 +299,24 @@ class Settings(BaseSettings):
     # instead of SCRAPE_DISPATCH_HTTP_BATCH_MAX.
     SCRAPE_BATCH_BROWSER_MAX: int = 15
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
+    # --- EPA B3 (F07, 2026-09-07): work-level fairness in the redispatch
+    # sweep. `redispatch_pending_jobs` used to walk `_scan_job_refs`'s
+    # rows in whatever order Postgres returned them -- which, for a
+    # backlogged tenant, is that tenant's jobs first and all of them. One
+    # workspace with 400 wedged jobs therefore filled every re-dispatch
+    # tick, and a second tenant's single stuck job waited behind the
+    # whole backlog. The sweep now interleaves workspaces round-robin and
+    # re-enqueues at most this many jobs per workspace per tick; the rest
+    # of that workspace's backlog is picked up by the following tick, in
+    # the same round-robin order.
+    #
+    # 4 rather than 1: a tick must still make real progress on a genuine
+    # backlog (the sweep runs on the 60s maintenance cadence), and every
+    # re-enqueue is idempotent and paced further downstream by the
+    # dispatch client's Redis guard TTL. It is a fairness knob, not a
+    # rate limit -- the rate limits live in the fleet/domain concurrency
+    # caps and the cost gate.
+    SCRAPE_DISPATCH_PER_WORKSPACE_BATCHES_PER_TICK: int = 4
     # --- EPA A3/B2 (2026-09-03): the two maintenance-sweep deadlines that
     # stop a job dangling RUNNING forever after a scrapyd container is
     # replaced mid-run. See `app_shared.jobs.reaper`.
@@ -330,6 +383,25 @@ class Settings(BaseSettings):
     # queue depth grows during a full run (under-provisioning shows up as
     # backlog, not errors).
     CELERY_WORKER_CONCURRENCY: int = 4
+
+    # --- Two consumer pools, one service (EPA B4, F09) -----------------
+    #
+    # `apps/workers/start.sh` launches exactly two `celery worker`
+    # processes in the one container: `critical@%h` (`scrape_dispatch`,
+    # `maintenance` — dispatch plus the sweeps that keep jobs/breaker/
+    # outbox state machines from getting stuck) and `bulk@%h`
+    # (`price_analysis`, `strategy_discovery`, `webhook_events` — traffic
+    # that can tolerate more queueing latency). Each process is started
+    # with an explicit `-c` flag from these two settings, which
+    # supersedes `CELERY_WORKER_CONCURRENCY` above for both pools (that
+    # setting only still matters if a process is ever started without
+    # `start.sh`'s explicit `-c`, e.g. a one-off `celery worker` shell
+    # invocation). Isolating the two pools means an overloaded
+    # `price_analysis`/`strategy_discovery` backlog can never starve the
+    # `maintenance` consumers the fleet's reapers/reconcilers depend on.
+    # See `docs/ops/CAPACITY.md` for the RAM budget this implies.
+    CELERY_CRITICAL_CONCURRENCY: int = 2
+    CELERY_BULK_CONCURRENCY: int = 2
 
     # Prefork child recycling (2026-08-03 memory-leak hardening). A child
     # is retired after this many tasks, and after its resident set passes
@@ -399,6 +471,27 @@ class Settings(BaseSettings):
     # message counts as "stuck" for alerting.
     OUTBOX_RECONCILE_INTERVAL_SECONDS: int = 300
     OUTBOX_STUCK_AFTER_SECONDS: int = 900
+    # --- EPA B3 (2026-09-07), closing B2's owed wiring: how often the
+    # scheduler claims the durable `dispatch_reconcile` cadence, which
+    # enqueues `DISPATCH_RECONCILE_INTENTS` -- step 5 of B2's
+    # commit-before-send protocol
+    # (`app_shared.jobs.dispatch_intents.reconcile_inflight_intents`).
+    # B2 shipped that function with no schedule at all, so a worker
+    # killed between its POST and the node's answer left a `POSTED` row
+    # nothing ever settled.
+    #
+    # DURABLE, not an in-process accumulator: the whole point of the
+    # protocol is to survive the process dying, so the cadence that
+    # settles its leftovers must survive a restart too -- an in-process
+    # float would reset on exactly the event it exists to clean up after.
+    # 300s matches the outbox reconcile beside it: this is a bounded
+    # scan of at most `DISPATCH_RECONCILE_LIMIT` POSTED rows plus one
+    # `listjobs` call per distinct node.
+    DISPATCH_RECONCILE_INTERVAL_SECONDS: int = 300
+    # Rows examined per reconcile pass. Bounded for the same reason
+    # `OUTBOX_DRAIN_BATCH_LIMIT` is: one pass must not hold a worker (or
+    # its 300s time limit) for an unbounded time; the next tick continues.
+    DISPATCH_RECONCILE_LIMIT: int = 200
     # How long a PUBLISHED row is kept before deletion (DEAD rows are kept
     # `DEAD_RETENTION_MULTIPLIER` times longer — they are incident
     # evidence). The table is a drain-to-empty queue, not a history table,
@@ -554,6 +647,17 @@ class Settings(BaseSettings):
     STRATEGY_DISCOVERY_MAX_SAMPLE: int = 10
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
     STRATEGY_STATS_KEY_TTL_SECONDS: int = 3600
+
+    # --- Discovery fleet-wide chunked scan (EPA B4, F09) ---------------
+    # `STRATEGY_DISCOVERY_SCAN` (`app.workers.tasks_strategy.
+    # strategy_discovery_scan`) processes at most this many
+    # `DISCOVERY_REQUIRED` profiles per invocation, persisting how far it
+    # got in `strategy_discovery_state` and re-enqueueing itself while a
+    # pass is still in progress -- "resumable long maintenance" so a task
+    # time limit or a worker restart mid-scan can never lose its place.
+    # 20 keeps one invocation's outbox-write work (bounded DB work, no
+    # blocking fetch) comfortably inside that task's own time_limit.
+    STRATEGY_DISCOVERY_MAX_DOMAINS_PER_RUN: int = 20
 
     # --- Rediscovery/discovery local rate bounds (2026-08-15 runaway
     # backstop). These are NOT tuning knobs for how eagerly the optimizer
@@ -830,13 +934,26 @@ class Settings(BaseSettings):
     # --- Scheduler two-plane limits + weighted fair queuing (EPA W4.2,
     # report §6; `app_shared.scheduling.fair_queue`). ---
     #
-    # Master switch, DEFAULT OFF. `False` keeps the SPEC-13 due-rule pass
-    # (`app.scheduler.refresh.run_refresh_pass`) exactly as it is, so a
-    # deploy that merely carries the W4.2 code changes no live scheduling
-    # behaviour. `True` swaps in the fair pass on the SAME
-    # `SCHEDULER_POLL_INTERVAL_SECONDS` cadence and the SAME
-    # `SCHEDULER_CLAIM_BATCH_LIMIT` ceiling -- no new interval knob.
-    SCHEDULER_FAIR_QUEUE_ENABLED: bool = False
+    # Master switch, DEFAULT ON since EPA B3 (F07, 2026-09-07). `False`
+    # keeps the SPEC-13 due-rule pass
+    # (`app.scheduler.refresh.run_refresh_pass`) exactly as it is; `True`
+    # swaps in the fair pass on the SAME `SCHEDULER_POLL_INTERVAL_SECONDS`
+    # cadence and the SAME `SCHEDULER_CLAIM_BATCH_LIMIT` ceiling -- no new
+    # interval knob.
+    #
+    # Shipped dark through W4.2..B4 and deferred on 2026-09-04 with the
+    # reasoning "one tenant, so weighted fair queuing has nothing to
+    # arbitrate" (`docs/DEFERRED-ITEMS.md`). B3 closes that deferral,
+    # because fairness was never the only thing this flag gated. The fair
+    # pass is also the ONLY path that carries per-rule failure isolation
+    # with a bounded-retry ledger and a dead-letter sink, the two-plane
+    # fleet/domain concurrency caps that keep one merchant's WAF from
+    # seeing the fleet's whole backlog at once, and (B3) the durable
+    # occurrence claim in `refresh_rule_occurrences`. None of those is a
+    # tenant-count question, so the flag's value stopped being one.
+    # FLEET-WIDE SCHEDULING BEHAVIOUR CHANGE, made deliberately -- see
+    # EPA B3's report.
+    SCHEDULER_FAIR_QUEUE_ENABLED: bool = True
     # FLEET PLANE: simultaneous in-flight fetches ONE DOMAIN may receive
     # from the whole fleet, counting every tenant. This is the number a
     # merchant's WAF sees; the per-workspace cap it replaces multiplied it
@@ -899,6 +1016,49 @@ class Settings(BaseSettings):
     # exercised by the W4.3 canary script), not by any live dispatch path.
     JOBS_COALESCING_FRESHNESS_SECONDS: int = 300
 
+    # --- Capacity-aware Scrapyd placement (EPA B6, F11) -----------------
+    # The most batches `choose_node` will queue behind ONE node before it
+    # calls that node saturated and looks elsewhere; when every node in
+    # the pool is at this bound the batch is DEFERRED, not POSTed (see
+    # `app_shared.jobs.nodes.choose_node`). It bounds `pending`, not
+    # `running`: the browser nodes run `max_proc = 1`
+    # (`apps/scrapers-browser/scrapyd.conf`), so anything beyond the one
+    # running spider is queue depth that a POST cannot shorten -- it only
+    # holds a cost-authorization grant and a `claimed_at` stamp open
+    # while the phase clock runs. 4 is ~4 browser runs deep, a few
+    # minutes of work at current run times, which is enough buffer to
+    # absorb a burst without letting one job monopolise a node.
+    SCRAPYD_MAX_PENDING_PER_NODE: int = 4
+
+    # --- EPA B5 (F10): FLEET-wide host admission ---------------------------
+    # Every limiter setting above this block is per-WORKSPACE. These three
+    # are the opposite and that is the point: the host sees one fleet, so
+    # ten tenants each politely inside their own ceiling still hit
+    # `amazon.sa` with ten times that. `app_shared.limiter.fleet.admit_fleet`
+    # takes one lease per physical request (a browser navigation and an
+    # HTTP request are one lease each; a retry re-acquires) against these
+    # defaults, overridable per domain by the `domain_rules` row's
+    # `fleet_concurrency` / `fleet_rate_per_minute` (NULL = use the
+    # default here).
+    #
+    # Simultaneous in-flight physical requests the WHOLE fleet may hold
+    # against one (domain, transport). Deliberately small: this is a
+    # politeness ceiling toward a third-party host, not a throughput
+    # target -- exceeding it is what gets the fleet's whole IP range
+    # blocked, and the queueing it causes is absorbed by the existing
+    # backoff/requeue/DEFERRED path, not by failing work.
+    FLEET_HOST_CONCURRENCY_DEFAULT: int = 6
+    # Physical requests per minute the WHOLE fleet may make against one
+    # (domain, transport) -- the shared token bucket's capacity.
+    FLEET_HOST_RATE_PER_MINUTE_DEFAULT: int = 90
+    # Crash-recovery window for a fleet lease. A holder that dies without
+    # releasing frees its slot this many seconds later (the semaphore
+    # Lua purges expired members on every acquire -- no reaper). It must
+    # comfortably exceed the longest single physical request, browser
+    # navigations included, or a live fetch's slot is reclaimed while it
+    # is still on the wire and the fleet quietly over-admits.
+    FLEET_LEASE_TTL_SECONDS: int = 120
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
@@ -930,6 +1090,28 @@ class Settings(BaseSettings):
                 f"{self.ENCRYPTION_PRIMARY_KEY_VERSION} not present in ENCRYPTION_KEYS"
             )
         return self
+
+    @field_validator("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS", mode="before")
+    @classmethod
+    def _parse_retry_backoff(cls, value: object) -> object:
+        """``"1,5,30"`` -> ``(1.0, 5.0, 30.0)``.
+
+        Same comma-separated convention as the Scrapyd URL pools (never
+        JSON). An empty value is rejected rather than silently meaning
+        "retry immediately, forever": the tuple is a schedule, and a
+        schedule with no entries is a misconfiguration.
+        """
+        if isinstance(value, str):
+            parsed = tuple(float(item.strip()) for item in value.split(",") if item.strip())
+        elif isinstance(value, (list, tuple)):
+            parsed = tuple(float(item) for item in value)
+        else:
+            return value
+        if not parsed:
+            raise ValueError("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS must have at least one delay")
+        if any(delay < 0 for delay in parsed):
+            raise ValueError("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS delays must be >= 0")
+        return parsed
 
     @field_validator("STRATEGY_PROFILE_SCOPE")
     @classmethod

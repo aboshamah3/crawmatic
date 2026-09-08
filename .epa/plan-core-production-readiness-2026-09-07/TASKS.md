@@ -17,15 +17,15 @@
 | A9 | A | PA-7 | Query statistics in production | 0.4 | sonnet | done-dev | 1 | reports/A9.md |
 | A10 | A | PA-8 | Engine release 1 — OWNER GATE (F20) | A1-A9 | sonnet | done-dev (step 3 owner, deferred) | 1 | reports/A10.md |
 | B1 | B | PB-1 | Durable result spool with idempotent persistence and backpressure (F05) | A5, A10 | opus | done-dev (integration deferred) | 1 | reports/B1.md |
-| B2 | B | PB-2 | Dispatch intent committed before the POST; stable remote job id; outbox (F06) | B1 | opus | done-dev (reconciler scheduling → B3/B6) | 1 | reports/B2.md |
+| B2 | B | PB-2 | Dispatch intent committed before the POST; stable remote job id; outbox (F06) | B1 | opus | done-dev (+B2-fix1: RLS backfill, grants) | 1 | reports/B2.md, reports/B2-fix1.md |
 | B3 | B | PB-3 | Atomic due-time claim, unique occurrences, per-rule isolation, fair mode on (F07) | B2, B4 | opus | done-dev | 1 | reports/B3.md |
 | B4 | B | PB-4 | Two Celery consumer pools; time limits; resumable long maintenance (F09) | B2 | sonnet | done-dev | 1 | reports/B4.md |
 | B5 | B | PB-5 | Fleet-wide host admission at the physical request boundary (F10) | B3 | opus | done-dev | 1 | reports/B5.md |
 | B6 | B | PB-6 | Capacity-aware placement persisted on the intent; bounded node queues (F11) | B2, B4 | opus | done-dev | 1 | reports/B6.md |
 | B7 | B | PB-7 | Non-blocking API middleware with deadlines everywhere (F15) | B1 | sonnet | done-dev (abuse_limit kept, see ASSUMPTIONS) | 1 | reports/B7.md |
 | B8 | B | PB-8 | Readiness probes that cannot pile up; liveness/dependency/scraping split (F16) | A10 | sonnet | done-dev | 1 | reports/B8.md |
-| B9 | B | PB-8 | Heartbeats for every process class and alerts to an owner (F22) | A5, A7 | sonnet | done-dev (rules gauge wiring follow-up) | 1 | reports/B9.md |
-| B10 | B | PB-9 | Engine release 2 — OWNER GATE | B1-B9 | sonnet | running | 1 | - |
+| B9 | B | PB-8 | Heartbeats for every process class and alerts to an owner (F22) | A5, A7 | sonnet | done-dev (+B9-fix1 wired worker+scheduler emitters; rules gauge wiring follow-up) | 1 | reports/B9.md, reports/B9-fix1.md |
+| B10 | B | PB-9 | Engine release 2 — OWNER GATE | B1-B9 | sonnet | done (owner gate: release 2 deploy deferred to owner) | 1 | reports/B10.md |
 | C1 | C | PC-1 | Per-target deadline, physical attempt budget, failure classes, method suppression (F08) | B5, B10 | opus | pending | 0 | - |
 | C2 | C | PC-2 | Amazon HTTP-leg investigation with the resolved production profile — spend ≤ $1 | C1 | sonnet | pending | 0 | - |
 | C3 | C | PC-2 | Document-only browser canary with the fixed calculator — spend ≤ $3 | A6, C1 | sonnet | pending | 0 | - |

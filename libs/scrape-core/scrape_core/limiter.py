@@ -31,7 +31,9 @@ from dataclasses import dataclass
 
 from app_shared.enums import AccessMethod
 from app_shared.limiter import bucket as _bucket
+from app_shared.limiter import fleet as _fleet
 from app_shared.limiter import locks as _locks
+from app_shared.limiter.fleet import FleetLease, FleetLimits
 from app_shared.limiter.keys import match_lock_key as _match_lock_key
 from app_shared.limiter.keys import rate_key as _rate_key
 from app_shared.limiter.keys import semaphore_key as _semaphore_key
@@ -45,11 +47,19 @@ from scrape_core.db import await_in_thread
 #: retry hint is sufficient (T012).
 _SEMAPHORE_DENIAL_WAIT_HINT_SECONDS = 1.0
 
+#: Fixed wait hint (seconds) used when the FLEET host-admission gate
+#: refuses (EPA B5/F10). Deliberately longer than the tenant semaphore's
+#: hint: a full fleet semaphore is contended by every workspace at once,
+#: so retrying as eagerly as a single-tenant denial would just add
+#: requests to a queue the host is already the bottleneck for.
+_FLEET_DENIAL_WAIT_HINT_SECONDS = 2.0
+
 __all__ = [
     "LockGrant",
     "Permission",
     "acquire_lock",
     "acquire_permission",
+    "release_fleet_lease",
     "release_lock",
     "release_slot",
 ]
@@ -71,7 +81,11 @@ class Permission(object):
     but the concurrency slot was full) -- so the spider can emit the
     correct one of ``rate_limit.hit``/``semaphore.denied``
     (`contracts/observability.md`) instead of conflating the two.
-    ``None`` on a grant (meaningless there).
+    ``None`` on a grant (meaningless there). EPA B5/F10 adds a third
+    value, ``"fleet"``: both tenant gates granted but the FLEET-wide host
+    admission lease was refused (every workspace shares that ceiling), so
+    the denial is admission pressure, not this tenant's own limit and not
+    the host blocking us -- see ``ScrapeErrorCode.FLEET_LIMITED``.
     """
 
     granted: bool
@@ -79,6 +93,14 @@ class Permission(object):
     semaphore_key: str | None = None
     semaphore_token: str | None = None
     denied_by: str | None = None
+    #: EPA B5/F10. The FLEET-wide host lease this permission also holds
+    #: (``fleet:semaphore:{domain}:{TRANSPORT}`` + its member token),
+    #: populated only on a grant and only when fleet admission ran. It is
+    #: threaded onto the request's ``meta`` exactly like the tenant
+    #: semaphore pair above so ``parse``/``errback`` release it on BOTH
+    #: the success and the error path.
+    fleet_key: str | None = None
+    fleet_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,7 @@ async def acquire_permission(
     limits: object,
     settings: object,
     sem_token: str,
+    fleet_limits: FleetLimits | None = None,
 ) -> Permission:
     """Grant/deny an outbound-fetch permission (token bucket THEN semaphore).
 
@@ -110,6 +133,16 @@ async def acquire_permission(
     over-grants) and a small fixed wait hint is returned. Any Redis
     error surfaces as ``granted=False`` (fail-closed), never a raised
     exception (reactor-seam.md).
+
+    EPA B5 (F10): when ``fleet_limits`` is supplied, a THIRD gate runs
+    after the two tenant ones -- the fleet-wide host lease for
+    ``(domain, coarse transport)``, shared by every workspace
+    (``app_shared.limiter.fleet.admit_fleet``). A fleet refusal releases
+    the tenant slot just taken and surfaces as
+    ``denied_by="fleet"``. ``fleet_limits=None`` skips the gate entirely
+    and reproduces the pre-B5 behaviour byte for byte, which is what
+    every existing caller and test that has not been taught about fleet
+    admission still gets.
     """
     ttl_seconds = 2 * 60 + settings.RATE_LIMIT_KEY_TTL_SLACK_SECONDS
     key = _rate_key(workspace_id, domain, access_method)
@@ -143,11 +176,51 @@ async def acquire_permission(
             denied_by="semaphore",
         )
 
+    # --- EPA B5 (F10): FLEET-wide host admission ------------------------
+    # Both gates above are per-WORKSPACE. This one is not, and that is the
+    # whole point: ten tenants each inside their own 90 rpm ceiling still
+    # hit the host with 900 rpm. Taken LAST so a fleet refusal is the only
+    # case that has to give a lease back, and the tenant gates -- the
+    # cheap, per-workspace fairness checks -- never run behind a queue
+    # every other workspace is also in.
+    if fleet_limits is None:
+        return Permission(
+            granted=True,
+            wait_hint_seconds=0,
+            semaphore_key=sem_key,
+            semaphore_token=sem_token,
+        )
+
+    lease = await await_in_thread(
+        _fleet.admit_fleet,
+        redis,
+        domain=domain,
+        transport=_fleet.fleet_transport_for(access_method),
+        rate_per_minute=fleet_limits.rate_per_minute,
+        concurrency=fleet_limits.concurrency,
+        lease_ttl=settings.FLEET_LEASE_TTL_SECONDS,
+    )
+    if lease is None:
+        # The tenant slot was granted a moment ago and this request is not
+        # going to happen -- hand it straight back rather than parking it
+        # for SEMAPHORE_SLOT_TTL_SECONDS behind a request that never
+        # dispatched. (The tenant token, like the semaphore's, is not
+        # refunded: the bucket self-refills and refunding could
+        # over-grant.)
+        await release_slot(redis, key=sem_key, token=sem_token)
+        return Permission(
+            granted=False,
+            wait_hint_seconds=_FLEET_DENIAL_WAIT_HINT_SECONDS,
+            denied_by="fleet",
+        )
+
     return Permission(
         granted=True,
         wait_hint_seconds=0,
         semaphore_key=sem_key,
         semaphore_token=sem_token,
+        fleet_key=lease.semaphore_key,
+        fleet_token=lease.token,
     )
 
 
@@ -158,6 +231,32 @@ async def release_slot(redis: object, *, key: str, token: str) -> None:
     ``app_shared.limiter.bucket.release_slot`` (D3) — this never raises.
     """
     await await_in_thread(_bucket.release_slot, redis, key=key, token=token)
+
+
+async def release_fleet_lease(redis: object, *, key: str, token: str) -> None:
+    """Release a FLEET host lease taken by :func:`acquire_permission`
+    (EPA B5/F10), off-reactor via ``await_in_thread``.
+
+    Takes the lease's key/token rather than a :class:`FleetLease` because
+    that is what survives a round trip through a Scrapy ``request.meta``
+    dict, which is where the pair actually lives between dispatch and
+    ``parse``/``errback``. Delegates to
+    ``app_shared.limiter.fleet.release_fleet``, so it is idempotent and
+    never raises -- and even a lost release only costs
+    ``FLEET_LEASE_TTL_SECONDS``, since the semaphore Lua purges expired
+    members on every acquire.
+    """
+    await await_in_thread(
+        _fleet.release_fleet,
+        redis,
+        FleetLease(
+            semaphore_key=key,
+            token=token,
+            domain="",
+            transport=_fleet.FleetTransport.HTTP,
+            lease_ttl=0,
+        ),
+    )
 
 
 async def acquire_lock(

@@ -27,6 +27,13 @@ _SINGLETON_PATHS = {
     # dependency state, same shape as `/health`/`/version` above, never a
     # list.
     "/ready",
+    # EPA B8 (F16): the liveness/scraping-health split. `/live` is
+    # `/health`'s twin (process-up, never a list); `/health/scraping` is
+    # one point-in-time scraping-pipeline signal, same shape as `/ready`
+    # above -- neither ends in a `{param}`, so the naive plural-suffix
+    # heuristic would otherwise misread both as collections.
+    "/live",
+    "/health/scraping",
 }
 
 

@@ -120,7 +120,14 @@ from scrape_core.errors import (
 )
 from scrape_core.extraction.regex import regex_deadline_tripped, regex_deadline_watch
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import LockGrant, Permission, acquire_lock, release_lock, release_slot
+from scrape_core.limiter import (
+    LockGrant,
+    Permission,
+    acquire_lock,
+    release_fleet_lease,
+    release_lock,
+    release_slot,
+)
 from scrape_core.result_builder import build_scrape_result
 from scrape_core.targets import (
     AdmissionContext,
@@ -615,6 +622,12 @@ class GenericPriceSpider(scrapy.Spider):
             # response/failure returns.
             meta["semaphore_key"] = permission.semaphore_key
             meta["semaphore_token"] = permission.semaphore_token
+            # EPA B5 (F10): the FLEET-wide host lease rides the same meta
+            # so `parse`/`errback` release it on BOTH the success and the
+            # error path, exactly like the tenant slot above. One physical
+            # request = one lease; a SPEC-10 retry re-acquires its own.
+            meta["fleet_key"] = permission.fleet_key
+            meta["fleet_token"] = permission.fleet_token
         if lock is not None:
             # SPEC-11 US2 (T022): threaded through so `parse`/`errback`
             # can carry the match-lock key/token onto the eventual
@@ -662,6 +675,13 @@ class GenericPriceSpider(scrapy.Spider):
         sem_token = response.meta.get("semaphore_token")
         if sem_key and sem_token:
             await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+        # EPA B5 (F10): and the FLEET host lease, on this same path -- a
+        # request built without one (pre-B5 callers, unit tests) carries
+        # no fleet meta and there is nothing to release.
+        fleet_key = response.meta.get("fleet_key")
+        fleet_token = response.meta.get("fleet_token")
+        if fleet_key and fleet_token:
+            await release_fleet_lease(get_redis_client(), key=fleet_key, token=fleet_token)
 
         target = self._targets_by_match_id[response.meta["match_id"]]
         now = datetime.now(UTC)
@@ -849,6 +869,13 @@ class GenericPriceSpider(scrapy.Spider):
         sem_token = failure.request.meta.get("semaphore_token")
         if sem_key and sem_token:
             await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+        # EPA B5 (F10): and the FLEET host lease, on this same path -- a
+        # request built without one (pre-B5 callers, unit tests) carries
+        # no fleet meta and there is nothing to release.
+        fleet_key = failure.request.meta.get("fleet_key")
+        fleet_token = failure.request.meta.get("fleet_token")
+        if fleet_key and fleet_token:
+            await release_fleet_lease(get_redis_client(), key=fleet_key, token=fleet_token)
 
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname

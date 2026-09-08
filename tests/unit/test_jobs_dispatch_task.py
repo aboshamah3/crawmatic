@@ -977,8 +977,21 @@ except Exception:
 
 # Failure BEFORE dispatch: nothing was spent, so the whole hold goes back
 # NOW rather than waiting out a 900s lease.
-if len(released) != 1:
+#
+# EPA B2 reserves every batch's grant in step 1's plan transaction (F06:
+# "the grant is reserved in the plan transaction and released in fail"),
+# so this two-batch fixture holds TWO grants by the time the first POST
+# explodes: the failing batch's, released on the `schedule()` exception
+# path, and the batch this pass never reached, released by the task's own
+# handler instead of being left to age out of its lease. Before B2 the
+# second grant did not exist yet, because authorization happened lazily
+# inside the loop -- which is exactly the window where a crash left the
+# POST unrecorded.
+if len(released) != 2:
     print("HOLD_WAS_NOT_RELEASED_AFTER_A_FAILED_POST:" + str(len(released)))
+    sys.exit(1)
+if len(set(released)) != 2:
+    print("THE_SAME_HOLD_WAS_RELEASED_TWICE:" + str(released))
     sys.exit(1)
 
 print("OK")

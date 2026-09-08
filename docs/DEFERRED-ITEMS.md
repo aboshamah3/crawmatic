@@ -315,13 +315,26 @@ a real business signal, not a test artifact — it is a pricing, cadence or COGS
 decision, and no code change will move it. Owner: owner. Trigger: before the
 Scenario 2 pricing release goes live.
 
-## 2026-09-04 — `SCHEDULER_FAIR_QUEUE_ENABLED` left `False`
+## 2026-09-04 — `SCHEDULER_FAIR_QUEUE_ENABLED` left `False` — **CLOSED 2026-09-07 (EPA B3/F07)**
 
 Single-tenant fleet in production today — weighted fair queuing
 (`app_shared.scheduling.fair_queue`) has nothing to arbitrate fairly
 between when there is only one workspace generating scheduler load.
 Revisit at 3+ tenants. (EPA plan task B4.)
 Owner: engine maintainer. Trigger: a third tenant generating scheduler load.
+
+**Closed by EPA plan task B3 (2026-09-07): the default is now `True`**
+(`libs/shared/app_shared/config.py`). The deferral's premise was that the
+flag gated *fairness only*. It does not: the fair pass is also the only
+scheduling path with per-rule failure isolation (a bounded-retry ledger
+and a dead-letter sink instead of the legacy loop's pass-ending `break`),
+the only one with the fleet/domain concurrency caps that bound what a
+single merchant's WAF sees, and — as of B3 — the only one that claims a
+due occurrence durably in `refresh_rule_occurrences` before creating a
+job. None of those is a tenant-count question. An operator can still set
+`SCHEDULER_FAIR_QUEUE_ENABLED=false` to fall back to the legacy loop,
+which B3 also gave per-rule isolation, and `tests/unit/
+test_w4_flag_defaults.py` still pins both the default and the override.
 
 ## 2026-09-03 — `UsageSnapshotArchive` (SaaS) not extended with the B3 proxy counters
 

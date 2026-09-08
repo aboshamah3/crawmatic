@@ -78,7 +78,7 @@ from scrape_core.errors import (
     classify_playwright_exception,
 )
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import LockGrant, Permission, release_slot
+from scrape_core.limiter import LockGrant, Permission, release_fleet_lease, release_slot
 from scrape_core.netledger_middleware import is_proxied
 from scrape_core.result_builder import build_scrape_result
 from scrape_core.targets import (
@@ -618,6 +618,17 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         if permission is not None:
             meta["semaphore_key"] = permission.semaphore_key
             meta["semaphore_token"] = permission.semaphore_token
+            # EPA B5 (F10): the FLEET-wide host lease. It is acquired
+            # before this request is yielded -- i.e. before scrapy-
+            # playwright opens the page and calls `page.goto` -- and
+            # released once the page has closed and the response (or
+            # failure) reached `parse`/`errback`. Every child resource
+            # the navigation pulls rides this ONE lease: the host counts
+            # a navigation as one visit, and leasing per subresource
+            # would let a single page exhaust the fleet's ceiling for the
+            # whole domain.
+            meta["fleet_key"] = permission.fleet_key
+            meta["fleet_token"] = permission.fleet_token
         if lock is not None:
             meta["match_lock_key"] = lock.key
             meta["match_lock_token"] = lock.token
@@ -754,6 +765,13 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         sem_token = response.meta.get("semaphore_token")
         if sem_key and sem_token:
             await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+        # EPA B5 (F10): and the FLEET host lease, on this same path -- a
+        # request built without one (pre-B5 callers, unit tests) carries
+        # no fleet meta and there is nothing to release.
+        fleet_key = response.meta.get("fleet_key")
+        fleet_token = response.meta.get("fleet_token")
+        if fleet_key and fleet_token:
+            await release_fleet_lease(get_redis_client(), key=fleet_key, token=fleet_token)
 
         target = self._targets_by_match_id[response.meta["match_id"]]
         now = datetime.now(UTC)
@@ -896,6 +914,13 @@ class GenericBrowserPriceSpider(scrapy.Spider):
         sem_token = failure.request.meta.get("semaphore_token")
         if sem_key and sem_token:
             await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+        # EPA B5 (F10): and the FLEET host lease, on this same path -- a
+        # request built without one (pre-B5 callers, unit tests) carries
+        # no fleet meta and there is nothing to release.
+        fleet_key = failure.request.meta.get("fleet_key")
+        fleet_token = failure.request.meta.get("fleet_token")
+        if fleet_key and fleet_token:
+            await release_fleet_lease(get_redis_client(), key=fleet_key, token=fleet_token)
 
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname

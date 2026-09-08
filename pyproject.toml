@@ -29,4 +29,5 @@ dev = [
 markers = [
     "integration: needs the docker-compose DB/pgbouncer stack; skipped by -m 'not integration'",
     "browser: needs a real Chromium (playwright install chromium); run inside the scrapers-browser image",
+    "load: local stub-based load/concurrency test (no real Redis/Postgres); run explicitly with -m load",
 ]

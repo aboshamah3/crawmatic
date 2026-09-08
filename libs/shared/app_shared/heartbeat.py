@@ -74,17 +74,20 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "HEARTBEAT_EMIT_INTERVAL_SECONDS",
     "HEARTBEAT_KEY_PREFIX",
     "HEARTBEAT_TTL_SECONDS",
     "REQUIRED_SERVICES_ENV",
     "HeartbeatEmitter",
     "InstanceFreshness",
+    "PeriodicHeartbeat",
     "ServiceFreshness",
     "aggregate_fleet_freshness",
     "aggregate_service_freshness",
@@ -119,6 +122,12 @@ REQUIRED_SERVICES_ENV = "READY_REQUIRED_HEARTBEAT_SERVICES"
 #: Optional per-service floor, e.g. ``"worker=2,scheduler=1"``. Absent
 #: services default to a floor of 1.
 REQUIRED_MIN_INSTANCES_ENV = "READY_HEARTBEAT_MIN_INSTANCES"
+
+#: EPA B9 (F22, audit §13 Operations): "every process class" beats every
+#: 30s. Comfortably inside `HEARTBEAT_TTL_SECONDS` (120s), so at least
+#: three beats land within one TTL window even if one is delayed or
+#: dropped by a GC pause or a slow Redis round trip.
+HEARTBEAT_EMIT_INTERVAL_SECONDS = 30
 
 
 def heartbeat_key(service: str, instance_id: str) -> str:
@@ -458,3 +467,78 @@ def aggregate_fleet_freshness(
         )
         for service in services
     }
+
+
+# --------------------------------------------------------------------------
+# EPA B9 (F22): automatic periodic emission, one process class at a time
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PeriodicHeartbeat:
+    """Runs one `HeartbeatEmitter` on a background daemon thread, beating
+    every `interval_seconds` (F22: "every 30s").
+
+    A thin wrapper, not a scheduler of its own — every process class that
+    needs a heartbeat constructs one of these at process start and calls
+    `start()` once:
+
+    * Scrapyd nodes: `apps/scrapers/price_monitor/scrapyd_app.py` and
+      `apps/scrapers-browser/price_monitor_browser/scrapyd_app.py`, both
+      `service="scraper"` (`heartbeat:scraper:<node>`).
+    * Celery worker pools (`critical@`/`bulk@`, B4's `-n` node names):
+      `apps/workers/app/workers/celery_app.py`, `service="worker"`,
+      `instance_id` = the pool's own Celery hostname (`sender.hostname`
+      on `worker_ready`, which carries the `-n critical@%h` /
+      `-n bulk@%h` identity `apps/workers/start.sh` sets), stopped on
+      `worker_shutdown`.
+    * The scheduler: `apps/scheduler/app/scheduler/scheduler_app.py`'s
+      `main()`, `service="scheduler"` — the one process class with no
+      port for anything to poll.
+
+    Together those three cover every long-lived process class, which is
+    what makes `READY_REQUIRED_HEARTBEAT_SERVICES=scheduler,worker` a
+    check that can actually pass (see `REQUIRED_SERVICES_ENV` above).
+
+    `stop()` is best-effort, used by tests and graceful-shutdown hooks —
+    never required for correctness: `HEARTBEAT_TTL_SECONDS` already ages
+    out a beat that stops arriving.
+    """
+
+    emitter: HeartbeatEmitter
+    interval_seconds: float = HEARTBEAT_EMIT_INTERVAL_SECONDS
+    _thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    _stop_event: threading.Event | None = field(default=None, init=False, repr=False)
+
+    def start(self) -> PeriodicHeartbeat:
+        """Take the fencing token, beat once immediately, then every
+        `interval_seconds` on a daemon thread. Idempotent — calling
+        `start()` on an already-started instance is a no-op."""
+        if self._thread is not None:
+            return self
+        self.emitter.start()
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+
+        def _loop() -> None:
+            while True:
+                self.emitter.beat()
+                if stop_event.wait(self.interval_seconds):
+                    return
+
+        thread = threading.Thread(
+            target=_loop,
+            name=f"heartbeat:{self.emitter.service}:{self.emitter.instance_id}",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+        return self
+
+    def stop(self, *, timeout: float = 1.0) -> None:
+        """Signal the loop to exit and wait up to `timeout` for it. Safe to
+        call on a never-started or already-stopped instance."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)

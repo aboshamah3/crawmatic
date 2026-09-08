@@ -88,6 +88,7 @@ from app_shared.enums import (
     VariantStrategy,
 )
 from app_shared.jobs.targets import mark_target, mark_targets_started
+from app_shared.limiter.fleet import prime_fleet_limits_cache, resolve_fleet_limits
 from app_shared.limiter.limits import resolve_limits
 from app_shared.messaging import enqueue
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
@@ -126,6 +127,7 @@ from scrape_core.limiter import (
     Permission,
     acquire_lock,
     acquire_permission,
+    release_fleet_lease,
     release_lock,
     release_slot,
 )
@@ -288,6 +290,7 @@ def _mark_target_deferred_rate_limited(
     workspace_id: uuid.UUID,
     scrape_job_id: uuid.UUID,
     match_id: uuid.UUID,
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3): mark one
     overflowed target ``DEFERRED`` + ``RATE_LIMITED`` in a single
@@ -295,6 +298,14 @@ def _mark_target_deferred_rate_limited(
     only ever be called inside :func:`scrape_core.db.run_in_thread`,
     never on the reactor thread. Reuses the single ``mark_target``
     writer (T026) -- no new persistence path.
+
+    EPA B5 (F10): ``error_code`` defaults to ``RATE_LIMITED`` (every
+    pre-existing caller's behaviour, unchanged) and is passed
+    ``FLEET_LIMITED`` when the denial that overflowed this target came
+    from the FLEET-wide host admission gate rather than the tenant's own
+    ceiling. Same status, same path, same single writer -- a different
+    verdict recorded on the attempt, so C1's classification and D5's
+    scorecard read admission pressure separately from host blocking.
     """
     with workspace_txn(workspace_id) as session:
         mark_target(
@@ -303,7 +314,7 @@ def _mark_target_deferred_rate_limited(
             scrape_job_id=scrape_job_id,
             match_id=match_id,
             status=ScrapeTargetStatus.DEFERRED,
-            error_code=ScrapeErrorCode.RATE_LIMITED,
+            error_code=error_code,
         )
 
 
@@ -1002,6 +1013,17 @@ def load_targets(
                     variant_config_error=variant_config_error,
                 )
             )
+        # EPA B5 (F10): warm the fleet host-limit cache for every domain
+        # this run will touch, in ONE query, inside the transaction that
+        # is already open and already off-reactor. That is what lets
+        # `acquire_fetch_permission` resolve a domain's fleet ceiling as
+        # a pure dict lookup per outbound request -- no DB round trip and
+        # no thread hop on the reactor thread (contracts/reactor-seam.md).
+        prime_fleet_limits_cache(
+            session,
+            {t.domain for t in targets},
+            settings=get_settings(),
+        )
         return _LoadedTargets(
             targets=targets,
             visible_providers=visible_providers,
@@ -1536,6 +1558,19 @@ async def acquire_fetch_permission(
             access_policy=target.access_policy,
             settings=settings,
         )
+        # EPA B5 (F10): the FLEET ceiling for this domain -- the
+        # `domain_rules` override if one exists, else the
+        # `FLEET_HOST_*_DEFAULT` settings. Deliberately called with NO
+        # `session_factory`: `load_targets` primed this cache for every
+        # domain of the run inside its own off-reactor transaction
+        # (`prime_fleet_limits_cache`), so this is a pure dict lookup on
+        # the reactor thread -- no blocking Redis/DB call in the scrape
+        # path (contracts/reactor-seam.md, FR-007/SC-005). A cache that
+        # is cold anyway (a hand-built spider, an expired generation)
+        # resolves to the settings defaults rather than blocking, which
+        # still enforces fleet admission, just without the per-domain
+        # override.
+        fleet_limits = resolve_fleet_limits(target.domain, settings=settings)
         sem_token = secrets.token_hex(16)
         perm = await acquire_permission(
             redis,
@@ -1545,6 +1580,7 @@ async def acquire_fetch_permission(
             limits=limits,
             settings=settings,
             sem_token=sem_token,
+            fleet_limits=fleet_limits,
         )
         if perm.granted:
             return perm
@@ -1553,7 +1589,22 @@ async def acquire_fetch_permission(
         # which gate denied -- `semaphore.denied` (concurrency slot
         # full) vs `rate_limit.hit` (token bucket denied, the
         # semaphore was never touched, Permission.denied_by).
-        if perm.denied_by == "semaphore":
+        # EPA B5 (F10) adds `fleet.denied`: both tenant gates granted and
+        # the FLEET-wide host lease refused. Logged as its own event for
+        # the same reason it gets its own `ScrapeErrorCode` -- admission
+        # pressure the whole fleet shares is not this tenant hitting its
+        # own ceiling.
+        if perm.denied_by == "fleet":
+            log_event(
+                logger,
+                "fleet.denied",
+                workspace_id=ctx.workspace_id,
+                domain=target.domain,
+                access_method=access_method,
+                fleet_concurrency=fleet_limits.concurrency,
+                fleet_rate_per_minute=fleet_limits.rate_per_minute,
+            )
+        elif perm.denied_by == "semaphore":
             log_event(
                 logger,
                 "semaphore.denied",
@@ -1581,7 +1632,22 @@ async def acquire_fetch_permission(
             state.requeue_count > settings.REQUEUE_MAX_ATTEMPTS
             or state.cumulative_wait > settings.REQUEUE_MAX_TOTAL_WAIT_SECONDS
         ):
-            await overflow_to_dispatch(ctx, target, perm, redis=redis)
+            # EPA B5 (F10): the target is deferred through the SAME
+            # `_mark_target_deferred_rate_limited` path either way -- only
+            # the recorded verdict differs, so admission pressure is
+            # never misread as this tenant's ceiling (or as the host
+            # blocking us).
+            await overflow_to_dispatch(
+                ctx,
+                target,
+                perm,
+                redis=redis,
+                error_code=(
+                    ScrapeErrorCode.FLEET_LIMITED
+                    if perm.denied_by == "fleet"
+                    else ScrapeErrorCode.RATE_LIMITED
+                ),
+            )
             return None
 
         log_event(
@@ -1629,7 +1695,11 @@ async def redispatch_job(ctx: AdmissionContext, target: SpiderTarget) -> None:
 
 
 async def defer_rate_limited_target(
-    ctx: AdmissionContext, target: SpiderTarget, *, event: str = "rate_limit.overflow"
+    ctx: AdmissionContext,
+    target: SpiderTarget,
+    *,
+    event: str = "rate_limit.overflow",
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """Hand a rate-limited target back to Celery: mark it ``DEFERRED`` +
     ``RATE_LIMITED`` and re-enqueue ``SCRAPE_DISPATCH_JOB`` so a fresh
@@ -1685,6 +1755,7 @@ async def defer_rate_limited_target(
         ctx.workspace_id,
         scrape_job_id,
         target.match_id,
+        error_code,
     )
     await await_in_thread(
         enqueue,
@@ -1760,7 +1831,12 @@ async def prepare_dispatch_with_backoff(
 
 
 async def overflow_to_dispatch(
-    ctx: AdmissionContext, target: SpiderTarget, perm: Permission, *, redis: object
+    ctx: AdmissionContext,
+    target: SpiderTarget,
+    perm: Permission,
+    *,
+    redis: object,
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3):
     requeue-cap exceeded for `target` -- release any held semaphore
@@ -1779,11 +1855,21 @@ async def overflow_to_dispatch(
     """
     if perm.semaphore_key and perm.semaphore_token:
         await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+    # EPA B5 (F10): same defensive no-op for the FLEET lease -- a denied
+    # `Permission` never carries one (a fleet refusal releases the tenant
+    # slot and returns before the lease fields are set, and a tenant
+    # denial never reaches fleet admission at all), but releasing what a
+    # granted permission would hold keeps this the one place that has to
+    # know about overflow cleanup.
+    if perm.fleet_key and perm.fleet_token:
+        await release_fleet_lease(redis, key=perm.fleet_key, token=perm.fleet_token)
 
     # SPEC-11 US4 (T031, contracts/observability.md): `rate_limit.overflow`
     # is emitted after both the DEFERRED mark and the re-dispatch enqueue
     # commit, mirroring the order the outcomes actually happen in.
-    await defer_rate_limited_target(ctx, target, event="rate_limit.overflow")
+    await defer_rate_limited_target(
+        ctx, target, event="rate_limit.overflow", error_code=error_code
+    )
 
 
 async def dispatch_admission(
@@ -1856,6 +1942,14 @@ async def dispatch_admission(
                 key=perm.semaphore_key,
                 token=perm.semaphore_token,
             )
+            # EPA B5 (F10): the FLEET lease is released on this path too
+            # -- no request is going to be built, so holding a fleet slot
+            # for FLEET_LEASE_TTL_SECONDS would throttle every OTHER
+            # workspace on this domain for a config error in one.
+            if perm.fleet_key and perm.fleet_token:
+                await release_fleet_lease(
+                    redis, key=perm.fleet_key, token=perm.fleet_token
+                )
             await release_lock(redis, key=lock_grant.key, token=lock_grant.token)
             selection = next_strategy_method(target, ScrapeErrorCode.SELECTOR_BROKEN)
             return build_scrape_result(
@@ -1894,6 +1988,11 @@ async def dispatch_admission(
     )
     if lock is None:
         await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+        # EPA B5 (F10): and the FLEET lease -- this attempt is skipped,
+        # nothing will be fetched, so the fleet slot must go back
+        # immediately rather than waiting out its TTL.
+        if perm.fleet_key and perm.fleet_token:
+            await release_fleet_lease(redis, key=perm.fleet_key, token=perm.fleet_token)
         # SPEC-11 US4 (T031, contracts/observability.md): the match
         # lock was already held -- this attempt is skipped, no fetch
         # (dedup.skip -- LOCKED_ALREADY_RUNNING).

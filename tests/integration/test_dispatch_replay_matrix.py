@@ -142,6 +142,14 @@ def _run(script: str, *, extra_env: dict[str, str] | None = None) -> None:
 # ===========================================================================
 
 _DOUBLES = '''
+# EPA B2: `dispatch_intents.scrapyd_job_id` is a `uuid` column now (the id
+# is chosen by us at plan time and POSTed as Scrapyd's `jobid`), so the
+# ids a fake node "mints" have to be storable in it. They are still
+# arbitrary values the node picked, which is the only thing these
+# scenarios care about.
+NODE_MINTED_5C_II = "9a1f6c74-51e2-4a0b-8f33-0c6d2b7e4a11"
+NODE_MINTED_ABC123 = "3d7b2e58-6c94-4f11-a2d5-8e0b19c7f632"
+NODE_MINTED_RUNNING = "c40e9a2b-7d51-4e83-9b16-5f2a8c31d074"
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -695,7 +703,10 @@ from app_shared.enums import (
     ScrapeScope,
     ScrapeTargetStatus,
 )
-from app_shared.jobs.dispatch_intents import DispatchIntentStore
+from app_shared.jobs.dispatch_intents import (
+    DispatchIntentStore,
+    deterministic_scrapyd_job_id,
+)
 from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.scrapyd.client import (
@@ -993,7 +1004,7 @@ adopt_lister = FakeLister(
         "http://scrapers-1:6800": {
             "pending": [
                 {
-                    "id": "node-minted-5c-ii",
+                    "id": NODE_MINTED_5C_II,
                     "project": "price_monitor",
                     "spider": "generic_price_spider",
                     "args": {
@@ -1014,16 +1025,16 @@ adopted_jobid = schedule(
     adopt_identity,
     client=make_client(intents=make_store(), lister=adopt_lister),
 )
-if adopted_jobid != "node-minted-5c-ii":
+if adopted_jobid != NODE_MINTED_5C_II:
     fail("SCHEDULE_DID_NOT_ADOPT_THE_FOUND_RUN:" + str(adopted_jobid))
 if transport.post_count != before:
     fail("SCHEDULE_POSTED_AFTER_ADOPTING_A_FOUND_RUN:" + str(transport.post_count))
 if adopt_row.state != DispatchIntentState.CONFIRMED:
     fail("ADOPTED_INTENT_NOT_CONFIRMED:" + str(adopt_row.state))
-if adopt_row.scrapyd_job_id != "node-minted-5c-ii":
+if str(adopt_row.scrapyd_job_id) != NODE_MINTED_5C_II:
     fail("ADOPTED_INTENT_HAS_THE_WRONG_JOBID:" + str(adopt_row.scrapyd_job_id))
 healed = fake_redis.get(adopt_identity.key)
-if healed is None or "node-minted-5c-ii" not in str(healed):
+if healed is None or NODE_MINTED_5C_II not in str(healed):
     fail("SCHEDULE_DID_NOT_HEAL_THE_GUARD_AFTER_ADOPTING:" + str(healed))
 
 # 5c-iii: every node answers and none knows the job -- `reconcile_inflight`
@@ -1047,7 +1058,7 @@ if transport.post_count != before + 1:
     fail("SCHEDULE_DID_NOT_POST_EXACTLY_ONCE_AFTER_ABSENCE:" + str(transport.post_count))
 if absent_row.state != DispatchIntentState.CONFIRMED:
     fail("ABSENCE_RECOVERY_DID_NOT_CONFIRM:" + str(absent_row.state))
-if absent_row.scrapyd_job_id != absent_jobid:
+if str(absent_row.scrapyd_job_id) != str(absent_jobid):
     fail("ABSENCE_RECOVERY_JOBID_MISMATCH:" + str(absent_row.scrapyd_job_id))
 print("OK")
 '''
@@ -1098,7 +1109,7 @@ if rows[0].id != planned.id:
     fail("RETRY_DID_NOT_REUSE_THE_PLANNED_ROW")
 if rows[0].state != DispatchIntentState.CONFIRMED:
     fail("RETRY_DID_NOT_CONFIRM:" + str(rows[0].state))
-if rows[0].scrapyd_job_id != jobid:
+if str(rows[0].scrapyd_job_id) != str(jobid):
     fail("CONFIRMED_JOBID_MISMATCH:" + str(rows[0].scrapyd_job_id))
 
 # And a redelivery after that is a no-op, as ever.
@@ -1149,7 +1160,11 @@ if scenario == "deterministic_jobid_finds_the_orphan":
                 # is exactly why the deterministic id is what makes this
                 # bucket searchable at all.
                 "running": [
-                    {"id": str(row.id), "project": "price_monitor", "spider": "s"}
+                    {
+                        "id": str(row.scrapyd_job_id),
+                        "project": "price_monitor",
+                        "spider": "s",
+                    }
                 ],
                 "finished": [],
             }
@@ -1167,7 +1182,7 @@ if scenario == "deterministic_jobid_finds_the_orphan":
         fail("ORPHAN_NOT_ADOPTED:" + str(outcome.verdict) + "/" + outcome.detail)
     if outcome.mechanism != "deterministic_jobid":
         fail("WRONG_MECHANISM:" + outcome.mechanism)
-    if outcome.scrapyd_job_id != str(row.id):
+    if outcome.scrapyd_job_id != str(row.scrapyd_job_id):
         fail("ADOPTED_THE_WRONG_JOBID:" + str(outcome.scrapyd_job_id))
     if row.state != DispatchIntentState.CONFIRMED:
         fail("INTENT_NOT_CONFIRMED:" + str(row.state))
@@ -1177,10 +1192,10 @@ if scenario == "deterministic_jobid_finds_the_orphan":
         fail("RECONCILIATION_POSTED:" + str(transport.post_count))
     # The guard is healed, so the next delivery is answered from Redis.
     committed = get_committed_dispatch(fake_redis, identity)
-    if committed is None or committed.jobid != str(row.id):
+    if committed is None or committed.jobid != str(row.scrapyd_job_id):
         fail("GUARD_NOT_HEALED_AFTER_ADOPTION")
     # ... and the ordinary dispatch path now no-ops rather than re-POSTing.
-    if schedule(identity, client=make_client(intents=make_store())) != str(row.id):
+    if schedule(identity, client=make_client(intents=make_store())) != str(row.scrapyd_job_id):
         fail("POST_RECONCILE_SCHEDULE_DID_NOT_NO_OP")
     if transport.post_count != 0:
         fail("POST_RECONCILE_SCHEDULE_RE_POSTED:" + str(transport.post_count))
@@ -1221,7 +1236,7 @@ elif scenario == "listjobs_args_correlate_a_pending_orphan":
             "http://scrapers-2:6800": {
                 "pending": [
                     {
-                        "id": "node-minted-abc123",
+                        "id": NODE_MINTED_ABC123,
                         "project": "price_monitor",
                         "spider": "generic_price_spider",
                         "version": None,
@@ -1250,9 +1265,9 @@ elif scenario == "listjobs_args_correlate_a_pending_orphan":
         fail("PENDING_ORPHAN_NOT_ADOPTED:" + str(outcome.verdict))
     if outcome.mechanism != "listjobs_args":
         fail("WRONG_MECHANISM:" + outcome.mechanism)
-    if outcome.scrapyd_job_id != "node-minted-abc123":
+    if outcome.scrapyd_job_id != NODE_MINTED_ABC123:
         fail("ADOPTED_THE_WRONG_JOBID:" + str(outcome.scrapyd_job_id))
-    if row.scrapyd_job_id != "node-minted-abc123":
+    if str(row.scrapyd_job_id) != NODE_MINTED_ABC123:
         fail("INTENT_DID_NOT_RECORD_THE_NODE_JOBID")
     if transport.post_count != 0:
         fail("RECONCILIATION_POSTED:" + str(transport.post_count))
@@ -1272,7 +1287,7 @@ elif scenario == "listjobs_args_cannot_see_a_running_orphan":
                 "pending": [],
                 "running": [
                     {
-                        "id": "node-minted-running",
+                        "id": NODE_MINTED_RUNNING,
                         "project": "price_monitor",
                         "spider": "generic_price_spider",
                         "pid": 42,
@@ -1307,7 +1322,7 @@ elif scenario == "listjobs_args_cannot_see_a_running_orphan":
         {
             "http://scrapers-1:6800": {
                 "pending": [],
-                "running": [{"id": str(row.id), "project": "price_monitor"}],
+                "running": [{"id": str(row.scrapyd_job_id), "project": "price_monitor"}],
                 "finished": [],
             }
         }
@@ -1576,7 +1591,10 @@ from app_shared.enums import (
     ScrapeProfileMode,
     ScrapeScope,
 )
-from app_shared.jobs.dispatch_intents import DispatchIntentStore
+from app_shared.jobs.dispatch_intents import (
+    DispatchIntentStore,
+    deterministic_scrapyd_job_id,
+)
 from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.scrapyd.client import ScrapydDispatchClient, ScrapydDispatchError
@@ -1707,6 +1725,13 @@ with Session(engine) as duplicate:
             match_ids=[str(match_a), str(match_b)],
             identity_key=surviving_key,
             identity_payload=identity.canonical_payload,
+            # EPA B2: `node_url`/`scrapyd_job_id` are NOT NULL. Supplied
+            # explicitly here because this INSERT deliberately bypasses
+            # `DispatchIntentStore.plan()`, which is what normally mints
+            # them -- and the point of the test is which constraint
+            # refuses it, so it must reach the identity_key one.
+            node_url="http://scrapers-1:6800",
+            scrapyd_job_id=deterministic_scrapyd_job_id(identity),
             state=DispatchIntentState.PLANNED,
             cancellation_generation_at_creation=0,
         )

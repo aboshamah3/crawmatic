@@ -364,11 +364,12 @@ def test_no_git_binary_is_not_silently_treated_as_clean(
 
 def test_manifest_carries_buffer_spool_and_blocklist_versions(tmp_path: Path) -> None:
     """The three on-disk/wire schema versions that change behaviour without
-    changing the source digest. `scrape_result_spool_version` is an explicit
-    `null` until plan task B1 introduces the spool — present-and-null, so the
-    manifest shape does not change when B1 lands."""
+    changing the source digest. `scrape_result_spool_version` was an explicit
+    `null` until plan task B1 landed the spool — present-and-null then, a real
+    number now, and the manifest shape unchanged across that transition."""
     from app_shared.netledger.buffer import BUFFER_SCHEMA_VERSION
     from app_shared.profiles.browser_resource_policy import BLOCKLIST_VERSION
+    from scrape_core.result_spool import SPOOL_SCHEMA_VERSION
 
     engine_repo = tmp_path / "engine"
     _init_repo(engine_repo)
@@ -383,8 +384,7 @@ def test_manifest_carries_buffer_spool_and_blocklist_versions(tmp_path: Path) ->
     versions = manifest["buffer_versions"]
     assert versions["netledger_buffer_schema_version"] == BUFFER_SCHEMA_VERSION
     assert versions["blocklist_version"] == BLOCKLIST_VERSION
-    assert "scrape_result_spool_version" in versions
-    assert versions["scrape_result_spool_version"] is None
+    assert versions["scrape_result_spool_version"] == SPOOL_SCHEMA_VERSION
 
 
 def test_manifest_carries_toolchain_and_config_names(tmp_path: Path) -> None:

@@ -25,10 +25,40 @@ inheriting a live connection across ``fork()``.
 
 This module defines no ORM models and runs no queries — it is
 connectivity plumbing only.
+
+F15 (EPA core-production-readiness, 2026-09-07): every engine built here
+now sets a Postgres ``statement_timeout`` (via a psycopg ``-c`` connect
+option, so it applies to every session on the connection regardless of
+pooling) and a SQLAlchemy ``pool_timeout`` (how long a caller waits for
+a pooled connection before giving up), both deadline-bearing knobs this
+module never had before -- an unbounded query or an exhausted pool used
+to be able to hang a request (and, transitively, whatever event-loop or
+thread served it) indefinitely.
+
+Both are read from ``os.environ`` (see the CONFIG NOTE below) with
+role-appropriate defaults: this module is shared by every service, and
+the plan's own numbers differ by role -- the API wants a tight
+15,000 ms ceiling since it serves interactive requests, while a worker
+running a long sweep needs 120,000 ms or more. The *default* here is
+the API's tighter number, since a request that hangs the API is the
+more visible failure; a worker process sets
+``DB_STATEMENT_TIMEOUT_MS=120000`` (and ``DB_POOL_ACQUIRE_TIMEOUT_SECONDS``
+to match) in its own environment to get the looser ceiling. A specific
+maintenance/sweep task that needs to exceed even that can use
+:func:`override_statement_timeout` to raise the limit for just its own
+transaction rather than changing the process-wide default.
+
+CONFIG NOTE: ``DB_STATEMENT_TIMEOUT_MS`` and
+``DB_POOL_ACQUIRE_TIMEOUT_SECONDS`` are read from ``os.environ`` rather
+than ``app_shared.config.Settings`` -- B7 ran in parallel with another
+worker holding ``config.py`` for the run this landed in. They belong
+there as typed settings; this is a placeholder until that consolidation
+lands (see ``reports/B7.md``).
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -37,6 +67,15 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app_shared.config import get_settings
+
+#: See the CONFIG NOTE above: placeholder env-var reads until these are
+#: consolidated into `app_shared.config.Settings`. Default matches the
+#: API's tighter ceiling (15s/15000ms); a worker process overrides both
+#: via its own environment for the plan's 120,000 ms figure.
+DB_STATEMENT_TIMEOUT_MS = int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "15000"))
+DB_POOL_ACQUIRE_TIMEOUT_SECONDS = float(
+    os.environ.get("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "15")
+)
 
 _engine: Engine | None = None
 _sessionmaker: sessionmaker[Session] | None = None
@@ -95,11 +134,15 @@ def get_engine() -> Engine:
             pool_size=settings.DB_POOL_SIZE,
             max_overflow=settings.DB_MAX_OVERFLOW,
             pool_pre_ping=True,
+            pool_timeout=DB_POOL_ACQUIRE_TIMEOUT_SECONDS,
             connect_args={
                 # PgBouncer transaction pooling: disable psycopg's
                 # server-side prepared-statement cache (see module
                 # docstring).
                 "prepare_threshold": None,
+                # F15: bound every statement on this connection so a
+                # runaway query cannot hang a caller indefinitely.
+                "options": f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
             },
         )
         # READY-007: a pooled connection must never carry one tenant's
@@ -164,6 +207,32 @@ def set_workspace_context(session: Session, workspace_id: object) -> None:
         text("SELECT set_config('app.workspace_id', :wsid, true)"),
         {"wsid": str(workspace_id)},
     )
+
+
+@contextmanager
+def override_statement_timeout(session: Session, timeout_ms: int) -> Iterator[None]:
+    """Raise (or lower) ``statement_timeout`` for the rest of this transaction only.
+
+    F15's per-role process defaults (see module docstring) are a floor
+    for interactive traffic, not a ceiling every query must fit under --
+    a maintenance or sweep task that legitimately needs more time than
+    its process default should reach for this rather than raising the
+    process-wide ``DB_STATEMENT_TIMEOUT_MS``, which would silently loosen
+    the deadline for every *other* query on the same connection/process.
+
+    Uses ``SET LOCAL`` (bound parameter, no string interpolation), the
+    same transaction-scoped mechanism as :func:`set_workspace_context` --
+    it never outlives the current transaction and needs no explicit
+    reset. Must be called on a session already inside a transaction
+    (i.e. after at least one prior statement, or right before one);
+    ``SET LOCAL`` outside a transaction block is a silent no-op in
+    Postgres.
+    """
+    session.execute(
+        text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+        {"timeout_ms": str(int(timeout_ms))},
+    )
+    yield
 
 
 def get_auth_engine() -> Engine:

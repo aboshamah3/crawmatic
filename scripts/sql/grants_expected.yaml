@@ -121,6 +121,8 @@ crawmatic_app:
   - DELETE
   - INSERT
   - SELECT
+  domain_rules:
+  - SELECT
   domain_strategy_methods:
   - DELETE
   - INSERT
@@ -216,6 +218,10 @@ crawmatic_app:
   - INSERT
   - SELECT
   - UPDATE
+  refresh_rule_occurrences:
+  - DELETE
+  - INSERT
+  - SELECT
   refresh_rules:
   - DELETE
   - INSERT
@@ -265,6 +271,10 @@ crawmatic_app:
   - INSERT
   - SELECT
   - UPDATE
+  strategy_discovery_state:
+  - DELETE
+  - INSERT
+  - SELECT
   strategy_method_switches:
   - DELETE
   - INSERT
@@ -374,6 +384,8 @@ crawmatic_auth:
   - INSERT
   - SELECT
   - UPDATE
+  domain_rules:
+  - SELECT
   domain_strategy_methods:
   - DELETE
   - INSERT
@@ -480,6 +492,11 @@ crawmatic_auth:
   - UPDATE
   proxy_providers:
   - SELECT
+  refresh_rule_occurrences:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
   refresh_rules:
   - DELETE
   - INSERT
@@ -526,6 +543,11 @@ crawmatic_auth:
   - SELECT
   - UPDATE
   strategy_discovery_runs:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_discovery_state:
   - DELETE
   - INSERT
   - SELECT
@@ -585,6 +607,8 @@ crawmatic_scraper:
   domain_access_rules: []
   domain_lifecycle_audit: []
   domain_playbooks: []
+  domain_rules:
+  - SELECT
   domain_strategy_methods: []
   domain_strategy_profiles:
   - SELECT
@@ -610,6 +634,7 @@ crawmatic_scraper:
   provider_usage_records: []
   proxy_circuit_breakers: []
   proxy_providers: []
+  refresh_rule_occurrences: []
   refresh_rules: []
   refresh_tokens: []
   request_attempts:
@@ -623,6 +648,7 @@ crawmatic_scraper:
   - SELECT
   strategy_attempt_stats: []
   strategy_discovery_runs: []
+  strategy_discovery_state: []
   strategy_method_switches: []
   users: []
   variant_alert_states: []

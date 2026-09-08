@@ -169,7 +169,18 @@ def test_rate_limit_hit_and_requeue_events_carry_documented_fields(
     calls = {"n": 0}
 
     async def _fake_acquire_permission(
-        redis: Any, *, workspace_id: Any, domain: Any, access_method: Any, limits: Any, settings: Any, sem_token: Any
+        redis: Any,
+        *,
+        workspace_id: Any,
+        domain: Any,
+        access_method: Any,
+        limits: Any,
+        settings: Any,
+        sem_token: Any,
+        # EPA B5 (F10): `acquire_fetch_permission` now also hands the
+        # resolved FLEET ceiling down. Accepted and ignored here -- this
+        # suite asserts the DENIAL EVENTS, and stubs the whole gate out.
+        fleet_limits: Any = None,
     ) -> Permission:
         calls["n"] += 1
         if calls["n"] == 1:
@@ -215,7 +226,18 @@ def test_semaphore_denied_event_carries_documented_fields(
     calls = {"n": 0}
 
     async def _fake_acquire_permission(
-        redis: Any, *, workspace_id: Any, domain: Any, access_method: Any, limits: Any, settings: Any, sem_token: Any
+        redis: Any,
+        *,
+        workspace_id: Any,
+        domain: Any,
+        access_method: Any,
+        limits: Any,
+        settings: Any,
+        sem_token: Any,
+        # EPA B5 (F10): `acquire_fetch_permission` now also hands the
+        # resolved FLEET ceiling down. Accepted and ignored here -- this
+        # suite asserts the DENIAL EVENTS, and stubs the whole gate out.
+        fleet_limits: Any = None,
     ) -> Permission:
         calls["n"] += 1
         if calls["n"] == 1:
@@ -299,7 +321,18 @@ def test_dedup_skip_event_carries_documented_fields(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def _fake_acquire_permission(
-        redis: Any, *, workspace_id: Any, domain: Any, access_method: Any, limits: Any, settings: Any, sem_token: Any
+        redis: Any,
+        *,
+        workspace_id: Any,
+        domain: Any,
+        access_method: Any,
+        limits: Any,
+        settings: Any,
+        sem_token: Any,
+        # EPA B5 (F10): `acquire_fetch_permission` now also hands the
+        # resolved FLEET ceiling down. Accepted and ignored here -- this
+        # suite asserts the DENIAL EVENTS, and stubs the whole gate out.
+        fleet_limits: Any = None,
     ) -> Permission:
         return Permission(granted=True, wait_hint_seconds=0, semaphore_key="sem-key", semaphore_token="sem-token")
 

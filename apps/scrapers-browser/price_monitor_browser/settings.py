@@ -212,6 +212,16 @@ DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS
 SCRAPE_FLUSH_INTERVAL_SECONDS = _settings.SCRAPE_FLUSH_INTERVAL_SECONDS
 
+# Durable result spool (EPA F05, plan task B1) -- the SQLite/WAL file
+# every `ScrapeResult` is written to BEFORE it enters the in-memory flush
+# buffer, so a failed flush or a killed container replays instead of
+# losing work. A per-HOST fact (which volume this container mounted), read
+# from `Settings` like everything else here, never a hardcoded literal.
+SCRAPE_RESULT_SPOOL_PATH = str(_settings.SCRAPE_RESULT_SPOOL_PATH)
+SCRAPE_FLUSH_MAX_PENDING_BATCHES = _settings.SCRAPE_FLUSH_MAX_PENDING_BATCHES
+SCRAPE_FLUSH_QUARANTINE_AFTER = _settings.SCRAPE_FLUSH_QUARANTINE_AFTER
+
+
 # Per-spider-process memory ceiling (2026-08-03 memory-leak hardening,
 # parity with price_monitor/settings.py). Scrapy's `MemoryUsage`
 # extension measures only *this* process's RSS -- Chromium runs as a

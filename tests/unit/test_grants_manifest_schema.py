@@ -1,9 +1,19 @@
 """Schema tests for `scripts/sql/grants_expected.yaml` (EPA A3/F03).
 
-Pure/off-database: parses the YAML file and the plain-text table manifest
-it must cover, and asserts the shape the packet's acceptance criteria
-name — no live Postgres involved (that is
-`tests/integration/test_grants_manifest.py`'s job).
+Pure/off-database: parses the YAML file, the plain-text table manifest
+it must cover, and the provisioning SQL that must APPLY it, and asserts
+the shape the packet's acceptance criteria name — no live Postgres
+involved (that is `tests/integration/test_grants_manifest.py`'s job).
+
+Three files carry the same privilege inventory and must agree:
+
+    scripts/rls_table_manifest.txt    the reviewed table inventory
+    scripts/sql/grants_expected.yaml  the reviewed per-role privileges
+    scripts/provision_db_roles.sql    the DDL that grants them
+
+The last section of this module (added by EPA B2-fix1, after the B10
+release rehearsal found the provisioning SQL three tables behind)
+closes the loop on the third file.
 """
 
 from __future__ import annotations
@@ -157,3 +167,105 @@ def test_app_has_no_update_on_fleet_tables_except_the_evidenced_exception() -> N
     for table in fleet_tables:
         assert "UPDATE" not in app[table], f"crawmatic_app.{table} must not have UPDATE"
     assert "UPDATE" in app["api_abuse_limit_counters"]
+
+
+# ---------------------------------------------------------------------
+# provision_db_roles.sql must APPLY exactly what grants_expected.yaml
+# REVIEWS.
+#
+# `scripts/provision_db_roles.sql` carries the same information a third
+# time, as hand-written `FOREACH tbl IN ARRAY ARRAY[...]` literals
+# grouped by privilege set -- and nothing used to check the three copies
+# against each other. The EPA B10 release rehearsal found the cost of
+# that: Stage B added three tables (`domain_rules`,
+# `refresh_rule_occurrences`, `strategy_discovery_state`) to
+# `rls_table_manifest.txt` and `grants_expected.yaml`, the arrays in the
+# provisioning SQL were never touched, and a clean migrate therefore
+# left `scripts/verify_grants.py` reporting 17 MISSING grants -- the new
+# tables were unreadable and unwritable by every application role the
+# moment the migration landed.
+#
+# These tests make the SQL file's arrays a DERIVED artifact in practice:
+# the manifest stays the single reviewed source, and any table added to
+# it without a matching entry in the provisioning SQL fails the unit
+# gate rather than a post-deploy verifier.
+# ---------------------------------------------------------------------
+
+PROVISION_SQL_PATH = REPO_ROOT / "scripts" / "provision_db_roles.sql"
+
+
+def _provisioned_grants() -> dict[str, dict[str, list[str]]]:
+    """Parse `provision_db_roles.sql`'s grant loops into role -> table ->
+    sorted privileges.
+
+    Each loop opens with a `FOREACH` over an array literal of table
+    names, then a `REVOKE ALL ... FROM <role>` (which names the role)
+    and either a `GRANT <privs> ON TABLE %I TO <role>` or no GRANT at
+    all (the deliberate empty-privilege groups).
+
+    `--` comment lines are stripped first: this file's own prose
+    describes the loop shape, and a comment must never be parsed as a
+    grant.
+    """
+    import re
+
+    sql = "\n".join(
+        line
+        for line in PROVISION_SQL_PATH.read_text().splitlines()
+        if not line.lstrip().startswith("--")
+    )
+    parsed: dict[str, dict[str, list[str]]] = {}
+    for chunk in sql.split("FOREACH tbl IN ARRAY ARRAY[")[1:]:
+        array_literal, rest = chunk.split("] LOOP", 1)
+        rest = rest.split("FOREACH tbl IN ARRAY")[0]
+        revoke = re.search(r"REVOKE ALL ON TABLE %I FROM (\w+)", rest)
+        if not revoke:  # a loop that is not a per-table grant loop
+            continue
+        role = revoke.group(1)
+        grant = re.search(r"GRANT ([A-Z, ]+) ON TABLE %I TO (\w+)", rest)
+        privileges = (
+            sorted(p.strip() for p in grant.group(1).split(",")) if grant else []
+        )
+        role_tables = parsed.setdefault(role, {})
+        for table in re.findall(r"'([^']+)'", array_literal):
+            assert table not in role_tables, (
+                f"{table} appears in two grant loops for {role} in "
+                f"provision_db_roles.sql -- the later REVOKE/GRANT pair "
+                f"silently wins"
+            )
+            role_tables[table] = privileges
+    return parsed
+
+
+@pytest.mark.parametrize("role", ["crawmatic_app", "crawmatic_auth", "crawmatic_scraper"])
+def test_provisioning_sql_covers_every_table_the_manifest_reviews(role: str) -> None:
+    expected = _load_grants()[role]
+    applied = _provisioned_grants().get(role, {})
+
+    missing = sorted(set(expected) - set(applied))
+    extra = sorted(set(applied) - set(expected))
+    assert not missing, (
+        f"scripts/provision_db_roles.sql never grants {role} anything on: "
+        f"{missing}. Add each table to the ARRAY[...] of the loop whose "
+        f"GRANT matches its privilege set in grants_expected.yaml "
+        f"(verify_grants.py reports these as MISSING after a clean migrate)."
+    )
+    assert not extra, (
+        f"scripts/provision_db_roles.sql names tables for {role} that "
+        f"grants_expected.yaml does not review: {extra}"
+    )
+
+
+@pytest.mark.parametrize("role", ["crawmatic_app", "crawmatic_auth", "crawmatic_scraper"])
+def test_provisioning_sql_applies_exactly_the_reviewed_privileges(role: str) -> None:
+    expected = _load_grants()[role]
+    applied = _provisioned_grants()[role]
+    mismatched = {
+        table: (sorted(expected[table] or []), applied[table])
+        for table in sorted(set(expected) & set(applied))
+        if sorted(expected[table] or []) != applied[table]
+    }
+    assert not mismatched, (
+        f"provision_db_roles.sql applies privileges for {role} that differ "
+        f"from grants_expected.yaml (table: (expected, applied)): {mismatched}"
+    )

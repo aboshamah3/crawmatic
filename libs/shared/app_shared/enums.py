@@ -426,6 +426,22 @@ class ScrapeErrorCode(StrEnum):
     #: ``scrape_profiles.regex_timeout_count`` / ``regex_quarantined_at``.
     #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
     REGEX_TIMEOUT = "REGEX_TIMEOUT"
+    #: EPA B5/F10 (2026-09-07). The FLEET-wide host admission gate
+    #: (``app_shared.limiter.fleet.admit_fleet``) refused this request:
+    #: the shared per-``(domain, transport)`` concurrency semaphore was
+    #: full, or the shared per-minute bucket was empty, across every
+    #: workspace at once. Deliberately not ``RATE_LIMITED`` (which
+    #: asserts *this tenant's* own ceiling denied it — a fairness
+    #: verdict) and emphatically not ``BLOCKED``/``HTTP_429`` (which
+    #: assert the HOST pushed back, a verdict about the domain that the
+    #: strategy optimizer, the access-policy tuner and the domain
+    #: scorecard all learn from). This code asserts something we did to
+    #: ourselves *before any socket opened*: we chose not to send the
+    #: request, so it is evidence about fleet capacity, never about the
+    #: domain. C1's classification and D5's scorecard both read it that
+    #: way — admission pressure counted separately from host blocking.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    FLEET_LIMITED = "FLEET_LIMITED"
 
 
 class ScrapeScope(StrEnum):
@@ -506,6 +522,15 @@ class DispatchIntentState(StrEnum):
     * ``FAILED``    — the POST failed before any confirmation. The Redis
       claim is released so a legitimate retry proceeds; the row survives
       so "tried and failed" stays distinguishable from "never tried".
+    * ``RECONCILED_MISSING`` — a ``POSTED`` intent the maintenance
+      reconciler looked for and did **not** find: every node in the
+      pool answered ``listjobs.json`` and none of them knows this job's
+      ``scrapyd_job_id``. This is the ONLY state from which a re-POST is
+      authorized, and it must re-POST with the **same** id (EPA B2/F06)
+      so a node that did in fact receive the original request dedups it
+      rather than running the batch twice. It is deliberately distinct
+      from ``PLANNED``: "we looked and it is not there" is a positive
+      finding an operator can audit, where "never sent" is not.
     * ``SUPERSEDED`` — a later planning generation replaced this intent.
       Kept, never deleted: it is the evidence of what the job was asked
       to do under the previous plan.
@@ -515,6 +540,7 @@ class DispatchIntentState(StrEnum):
     POSTED = "POSTED"
     CONFIRMED = "CONFIRMED"
     FAILED = "FAILED"
+    RECONCILED_MISSING = "RECONCILED_MISSING"
     SUPERSEDED = "SUPERSEDED"
 
 

@@ -646,6 +646,7 @@ class CostAuthorizationService:
             DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS
         ),
         breaker_scope_key: str = GLOBAL_BREAKER_SCOPE,
+        fleet_snapshot_reader: Callable[[str, str], Any] | None = None,
     ) -> None:
         self._session_scope = session_scope
         self._system_session_scope = system_session_scope
@@ -659,6 +660,14 @@ class CostAuthorizationService:
             entitlement_max_evidence_age_seconds
         )
         self._breaker_scope_key = breaker_scope_key
+        #: EPA B5/F10. Optional ``(domain, transport) -> FleetSnapshot``
+        #: callable used ONLY to enrich a concurrency denial's message
+        #: (see :meth:`_check_concurrency`). ``None`` — the default —
+        #: leaves every denial message exactly as it was; nothing in this
+        #: service ever branches on what it returns, because fleet
+        #: admission is the Redis lease at the request boundary, not a
+        #: decision taken here.
+        self._fleet_snapshot_reader = fleet_snapshot_reader
 
     # -- session plumbing ---------------------------------------------------
 
@@ -762,7 +771,7 @@ class CostAuthorizationService:
             fleet_budget = _lock_fleet_budget(session, req.provider, period, req.currency)
             tenant_budget = _lock_tenant_budget(session, workspace_id, period, req.currency)
 
-            self._check_concurrency(session, workspace_id, tenant_budget, now)
+            self._check_concurrency(session, workspace_id, tenant_budget, now, req=req)
 
             wanted = {
                 "cost_micro_units": req.estimated_cost_micro_units,
@@ -1256,6 +1265,8 @@ class CostAuthorizationService:
         workspace_id: uuid.UUID,
         budget: CostBudget,
         now: datetime,
+        *,
+        req: "AuthorizationRequest | None" = None,
     ) -> None:
         """Deny when the workspace already holds its cap in LIVE grants.
 
@@ -1264,6 +1275,25 @@ class CostAuthorizationService:
         ``RESERVED`` — the sweeper may not have reached it yet, and making
         a stuck sweeper able to wedge a workspace's whole concurrency
         budget would turn a maintenance lag into an outage.
+
+        **Tenant-scoped, and staying that way (EPA B5/F10).** The cap
+        counted here is this workspace's own; fleet-wide host admission
+        is emphatically NOT decided in this method. It is decided by
+        ``app_shared.limiter.fleet.admit_fleet``'s Redis lease at the
+        physical request boundary, because that is the only place where
+        check and act are atomic across every worker in the fleet — a
+        SQL count here would be a check-then-act race the moment two
+        workspaces authorized concurrently, which is precisely the bug
+        the lease exists to remove.
+
+        What the fleet contributes here is a *reason*, never a verdict:
+        when ``fleet_snapshot_reader`` is configured (it is ``None`` by
+        default, and then this method's messages are byte-identical to
+        before), a denial's detail also names how much fleet admission
+        pressure the domain is under, so an operator reading "workspace X
+        holds 4 live reservations (cap 4)" can tell at a glance whether
+        the fleet was also saturated on that host. The snapshot is stale
+        the instant it is read and nothing branches on it.
         """
         cap = budget.max_concurrent_reservations
         if cap is None:
@@ -1278,10 +1308,40 @@ class CostAuthorizationService:
             )
         ).scalar_one()
         if int(live) >= int(cap):
+            detail = f"workspace {workspace_id} holds {live} live reservations (cap {cap})"
+            fleet_detail = self._fleet_pressure_detail(req)
+            if fleet_detail:
+                detail = f"{detail}; {fleet_detail}"
             raise CostAuthorizationDenied(
                 DenialReason.CONCURRENCY_CAP_EXCEEDED,
-                f"workspace {workspace_id} holds {live} live reservations (cap {cap})",
+                detail,
             )
+
+    def _fleet_pressure_detail(self, req: "AuthorizationRequest | None") -> str:
+        """Render the fleet admission snapshot for a denial message, or
+        ``""`` when no reader is configured (the default).
+
+        Reasons only — see :meth:`_check_concurrency`. Never raises and
+        never branches anything: a denial *message* must not be able to
+        break the denial it is explaining, so any error resolves to no
+        extra detail at all.
+        """
+        reader = self._fleet_snapshot_reader
+        if reader is None or req is None:
+            return ""
+        try:
+            snapshot = reader(req.domain, req.transport)
+        except Exception:  # noqa: BLE001 - a reason may never break a decision
+            logger.warning(
+                "costauth: fleet snapshot unavailable for domain=%s", req.domain, exc_info=True
+            )
+            return ""
+        if snapshot is None:
+            return ""
+        return (
+            f"fleet admission on {snapshot.domain}/{snapshot.transport}: "
+            f"{snapshot.in_flight}/{snapshot.concurrency} in flight"
+        )
 
     # -- warnings -----------------------------------------------------------
 

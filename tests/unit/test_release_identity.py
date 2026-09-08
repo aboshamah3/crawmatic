@@ -48,7 +48,7 @@ import io
 import json
 import sys
 from collections.abc import Iterator
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -211,15 +211,15 @@ def _override_version_session(session: object) -> None:
     app.dependency_overrides[version._get_db_session] = _dep
 
 
-def _override_ready(session: object, redis_client: object) -> None:
-    def _session_dep() -> Iterator[object]:
-        yield session
-
-    def _redis_dep() -> object:
-        return redis_client
-
-    app.dependency_overrides[ready._get_db_session] = _session_dep
-    app.dependency_overrides[ready._get_redis_dependency] = _redis_dep
+def _override_ready(
+    monkeypatch: pytest.MonkeyPatch, session: object, redis_client: object
+) -> None:
+    """EPA B8 (F16): `/ready` no longer takes a request-scoped DB/Redis
+    dependency — each probe opens its own via the module-level
+    `get_session`/`get_redis_client` names, so tests monkeypatch those
+    directly instead of using `app.dependency_overrides`."""
+    monkeypatch.setattr(ready, "get_session", lambda: nullcontext(session))
+    monkeypatch.setattr(ready, "get_redis_client", lambda: redis_client)
 
 
 @pytest.fixture()
@@ -258,7 +258,7 @@ def test_readiness_fails_on_migration_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
-    _override_ready(alembic_downgraded_db, _FakeRedis())
+    _override_ready(monkeypatch, alembic_downgraded_db, _FakeRedis())
 
     resp = api_client.get("/ready")
 
@@ -438,7 +438,7 @@ def test_ready_is_200_when_heads_match(
     api_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
-    _override_ready(_FakeSession(head="codehead123"), _FakeRedis())
+    _override_ready(monkeypatch, _FakeSession(head="codehead123"), _FakeRedis())
 
     resp = api_client.get("/ready")
     body = resp.json()
@@ -452,7 +452,7 @@ def test_ready_migration_mismatch_names_the_failure_without_leaking(
     api_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
-    _override_ready(_FakeSession(head="older_revision_000"), _FakeRedis())
+    _override_ready(monkeypatch, _FakeSession(head="older_revision_000"), _FakeRedis())
 
     resp = api_client.get("/ready")
     body = resp.json()
@@ -470,7 +470,7 @@ def test_ready_heartbeats_not_configured_is_reported_not_failed(
     is a labelled absence, not a false readiness failure."""
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
     monkeypatch.delenv(heartbeat_mod.REQUIRED_SERVICES_ENV, raising=False)
-    _override_ready(_FakeSession(head="codehead123"), _FakeRedis())
+    _override_ready(monkeypatch, _FakeSession(head="codehead123"), _FakeRedis())
 
     resp = api_client.get("/ready")
     body = resp.json()
@@ -490,7 +490,7 @@ def test_ready_fails_when_a_declared_service_has_no_fresh_instance(
     heartbeat_mod.HeartbeatEmitter(
         redis_client, service="worker", instance_id="w-1"
     ).start().beat()
-    _override_ready(_FakeSession(head="codehead123"), redis_client)
+    _override_ready(monkeypatch, _FakeSession(head="codehead123"), redis_client)
 
     resp = api_client.get("/ready")
     body = resp.json()
@@ -510,7 +510,7 @@ def test_ready_ok_when_every_declared_service_has_a_fresh_instance(
         heartbeat_mod.HeartbeatEmitter(
             redis_client, service=service, instance_id=instance
         ).start().beat()
-    _override_ready(_FakeSession(head="codehead123"), redis_client)
+    _override_ready(monkeypatch, _FakeSession(head="codehead123"), redis_client)
 
     resp = api_client.get("/ready")
     body = resp.json()
@@ -524,7 +524,7 @@ def test_ready_still_fails_on_database_down(
 ) -> None:
     """The A5 additions must not mask the checks `/ready` already performed."""
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
-    _override_ready(_FakeSession(raises=RuntimeError("connection refused")), _FakeRedis())
+    _override_ready(monkeypatch, _FakeSession(raises=RuntimeError("connection refused")), _FakeRedis())
 
     resp = api_client.get("/ready")
     body = resp.json()
@@ -542,7 +542,7 @@ def test_migration_check_is_short_circuited_when_the_database_check_failed(
     thread-safe — so the migration check must not touch it. One root cause,
     reported once."""
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
-    _override_ready(_FakeSession(raises=RuntimeError("connection refused")), _FakeRedis())
+    _override_ready(monkeypatch, _FakeSession(raises=RuntimeError("connection refused")), _FakeRedis())
 
     body = api_client.get("/ready").json()
 
@@ -557,7 +557,7 @@ def test_heartbeat_check_is_short_circuited_when_redis_is_down(
     monkeypatch.setattr(release_mod, "code_migration_head", lambda: "codehead123")
     monkeypatch.setenv(heartbeat_mod.REQUIRED_SERVICES_ENV, "worker")
     _override_ready(
-        _FakeSession(head="codehead123"),
+        monkeypatch, _FakeSession(head="codehead123"),
         _FakeRedis(raises=ConnectionError("redis://user:pw@host:6379 refused")),
     )
 

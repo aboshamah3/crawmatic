@@ -46,8 +46,8 @@ isn't checked out locally but its SHA is already known from another job).
 Beyond the two SHAs, this wrapper adds the release-identity facts that
 live OUTSIDE the source digest but still change behaviour (F20 part 1):
 `migrations.alembic_heads` (from `alembic heads` itself), `buffer_versions`
-(netledger buffer schema, scrape-result spool — `null` until plan task B1 —
-and browser blocklist), `toolchain` (Python/Playwright/Chromium as baked
+(netledger buffer schema, scrape-result spool and browser blocklist),
+`toolchain` (Python/Playwright/Chromium as baked
 into the image), and `config_names` (the flat setting-NAME vocabulary
 `scripts/config_diff_railway.py` diffs a live service against). All are
 added before the self-hash, so `manifest_id` covers them; none of them is
@@ -117,19 +117,24 @@ def _netledger_buffer_schema_version() -> int | None:
 
 
 def _scrape_result_spool_version() -> int | None:
-    """The scrape-result spool's schema version, or `None`.
+    """`SPOOL_SCHEMA_VERSION` from `scrape_core.result_spool`, or `None`.
 
-    The spool does not exist yet: plan task B1 introduces it. The field is
-    written now (as an explicit `null`) rather than added later so a manifest
-    from before B1 and one from after have the same shape, and the transition
-    reads as "null -> 1" instead of "key appeared". The import below starts
-    resolving on its own the moment B1 lands the constant.
+    Plan task B1 landed the spool, so this now resolves to a number where
+    it used to be an explicit `null`; the field was written from the start
+    precisely so the transition reads as "null -> 1" instead of "key
+    appeared". It answers the operational question "was this host's spool
+    file written by an older schema than the image now draining it?"
+    without anyone reconstructing it from deploy history.
+
+    Still `None`-tolerant: this script also runs in build contexts where
+    the scraping-side library is not installed (it is a separate workspace
+    package), and an unknown version beats a wrong one.
     """
     try:
-        from app_shared.spool import SPOOL_SCHEMA_VERSION  # type: ignore[attr-defined]
+        from scrape_core.result_spool import SPOOL_SCHEMA_VERSION
 
         return int(SPOOL_SCHEMA_VERSION)
-    except Exception:  # noqa: BLE001 - expected until B1
+    except Exception:  # noqa: BLE001 - unknown beats a wrong number
         return None
 
 
@@ -486,8 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest["migrations"]["alembic_heads"] = resolve_alembic_heads(engine_repo)
     manifest["buffer_versions"] = {
         "netledger_buffer_schema_version": _netledger_buffer_schema_version(),
-        # `null` until plan task B1 introduces the spool — see
-        # `_scrape_result_spool_version`.
+        # See `_scrape_result_spool_version` (plan task B1).
         "scrape_result_spool_version": _scrape_result_spool_version(),
         "blocklist_version": _blocklist_version(),
     }

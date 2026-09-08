@@ -32,3 +32,5 @@
 | C11 engine release 3 | pending owner | - |
 | D1 staging environment | pending owner | - |
 | D4 staged rollout | pending owner | - |
+
+- 2026-09-08 (delegated, orchestrator): B10's rehearsal bugs are fixed at source (uncommitted migration b6e5d1c94a72 amended in place, provision_db_roles.sql grant arrays extended) rather than shipped as manual pre/post-migrate SQL in RELEASE_2. Rationale: the plan requires the migration and grants to be correct; the migration is not yet committed on this branch so amending it creates no second revision.

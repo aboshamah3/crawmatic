@@ -84,12 +84,37 @@ class PriceObservation(Base, WorkspaceScopedBase):
             ["workspaces.id"],
             name="fk_price_observations_workspace_id_workspaces",
         ),
+        # EPA F05 / plan task B1: the idempotency key the durable result
+        # spool's replay collides on. Includes the partition key because
+        # Postgres requires every partition-key column in a partitioned
+        # table's unique index; `workspace_id` leads because every read
+        # here is workspace-scoped anyway.
+        UniqueConstraint(
+            "workspace_id",
+            "attempt_uuid",
+            "scraped_at",
+            name="uq_price_observations_workspace_id_attempt_uuid_scraped_at",
+        ),
         {"postgresql_partition_by": "RANGE (scraped_at)"},
     )
 
     # PK part 2 = partition key (Postgres requires the partition key be
     # part of the primary key on a partitioned table).
     scraped_at: Mapped[datetime] = mapped_column(TZDateTime(), primary_key=True)
+
+    #: EPA F05 / plan task B1. The SAME producer-side attempt identity the
+    #: `request_attempts` row carries (`ScrapeResult.attempt_id`), which is
+    #: what makes the persistence flush replayable: with
+    #: `UNIQUE (workspace_id, attempt_uuid, scraped_at)` (see
+    #: `a4e91c7d2b58`) a replayed batch's `ON CONFLICT DO NOTHING` insert
+    #: is a no-op instead of a duplicate price point.
+    #:
+    #: NULLABLE, no default: `NULL` means "this observation has no
+    #: producer-side attempt identity" -- a pre-B1 row, or a writer that is
+    #: not the scrape pipeline. NULLs never participate in a unique index,
+    #: so such rows neither collide nor block; forcing NOT NULL would make
+    #: every other writer invent an identity it does not have.
+    attempt_uuid: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
 
     match_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
     product_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
@@ -246,6 +271,16 @@ class RequestAttempt(Base, WorkspaceScopedBase):
             ["network_operation_id"],
             ["network_operations.network_request_id"],
             name="fk_request_attempts_network_operation_id_network_operations",
+        ),
+        # EPA F05 / plan task B1: see the twin on `price_observations`.
+        # A5 minted `attempt_uuid` for correlation only; B1 is what makes
+        # it arbitrate, so a replayed flush cannot write a second attempt
+        # row for one fetch.
+        UniqueConstraint(
+            "workspace_id",
+            "attempt_uuid",
+            "created_at",
+            name="uq_request_attempts_workspace_id_attempt_uuid_created_at",
         ),
         {"postgresql_partition_by": "RANGE (created_at)"},
     )

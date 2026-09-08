@@ -282,6 +282,18 @@ def _install_fakes(
     enqueue = _RecordingEnqueue()
     fake_redis = _FakeRedis()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", txn)
+    # EPA F05 (plan task B1): the observation/attempt inserts are now
+    # `ON CONFLICT DO NOTHING` Core statements rather than ORM `add_all`,
+    # so this file's `session.added`-based assertions -- which are about
+    # WHICH rows a flush writes, not about how they reach the driver --
+    # keep their meaning by routing the instances back through `add_all`.
+    # The conflict clause itself is covered in
+    # `tests/unit/test_pipeline_flush_retry.py`.
+    monkeypatch.setattr(
+        pipelines_mod,
+        "_insert_ignoring_replays",
+        lambda session, model, instances, index_elements: session.add_all(instances),
+    )
     monkeypatch.setattr(pipelines_mod, "mark_target", mark_target)
     monkeypatch.setattr(
         pipelines_mod, "stamp_target_timestamps", _RecordingStampTimestamps()

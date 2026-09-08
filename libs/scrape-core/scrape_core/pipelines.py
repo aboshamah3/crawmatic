@@ -71,7 +71,24 @@ the reactor thread itself. ``_flush`` also swaps
 the buffer is emptied immediately regardless of whether that flush
 later succeeds or fails (see :func:`_flush`'s docstring and
 :meth:`BatchedPersistencePipeline._on_flush_failure`) — a failed flush
-loses only its own batch, never blocks or wedges subsequent flushes.
+never blocks or wedges subsequent flushes.
+
+EPA F05 (plan task B1) — a failed flush no longer *loses* its batch
+either. Every item is written to a durable on-disk spool
+(:mod:`scrape_core.result_spool`, SQLite/WAL) **before** it enters the
+in-memory buffer, and its spool row is deleted only once the persistence
+transaction has COMMITTED; a flush failure defers the rows and schedules
+a bounded ``callLater`` retry, and ``open_spider`` replays whatever a
+previous (possibly killed) container left behind. That replay is safe
+because both bulk inserts are now ``ON CONFLICT DO NOTHING`` on the
+producer-side attempt identity shared by the observation and the attempt
+(``uq_price_observations_workspace_id_attempt_uuid_scraped_at`` /
+``uq_request_attempts_workspace_id_attempt_uuid_created_at``, revision
+``a4e91c7d2b58``) — re-persisting a committed batch writes nothing.
+Admission is bounded in the same change: with
+``SCRAPE_FLUSH_MAX_PENDING_BATCHES`` flushes in flight ``process_item``
+returns an unfired ``Deferred``, so the crawl slows to what persistence
+can absorb instead of growing an unbounded spool.
 """
 
 from __future__ import annotations
@@ -80,9 +97,9 @@ import json
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Sequence
 
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, func, inspect as sa_inspect, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from twisted.internet.defer import Deferred, DeferredList
 from twisted.internet.task import LoopingCall
@@ -118,6 +135,7 @@ from app_shared.task_names import (
 from scrape_core.db import run_in_thread, workspace_txn
 from scrape_core.items import ScrapeResult
 from scrape_core.observability import log_event
+from scrape_core.result_spool import ResultSpool, SpooledBatch
 
 __all__ = ["BatchedPersistencePipeline"]
 
@@ -326,7 +344,74 @@ def _write_needs_review_classifications(
     )
 
 
-def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
+def _row_values(instance: Any) -> dict[str, Any]:
+    """Lower one ORM instance to a Core-insert dict, resolving Python defaults.
+
+    ``session.add_all`` applies a column's Python-side ``default`` at
+    flush time; a Core ``INSERT ... VALUES`` built from explicit dicts
+    does not, so an unset ``id``/``attempt_number``/``terminal_for_target``
+    would otherwise be written as ``NULL``. Columns left ``None`` that
+    carry only a *server* default are omitted entirely, so the server
+    default applies (:func:`_insert_ignoring_replays` checks that the
+    omissions agree across the batch).
+    """
+    mapper = sa_inspect(type(instance))
+    values: dict[str, Any] = {}
+    for attr in mapper.column_attrs:
+        column = attr.columns[0]
+        value = getattr(instance, attr.key)
+        if value is None:
+            default = column.default
+            if default is not None and default.is_callable:
+                value = default.arg(None)
+            elif default is not None and default.is_scalar:
+                value = default.arg
+            elif column.server_default is not None:
+                continue  # let PostgreSQL's own default fill it
+        values[attr.key] = value
+    return values
+
+
+def _insert_ignoring_replays(
+    session: Any,
+    model: Any,
+    instances: list[Any],
+    index_elements: tuple[str, ...],
+) -> None:
+    """Bulk-insert ``instances``, skipping rows a replay already wrote.
+
+    ``ON CONFLICT (index_elements) DO NOTHING`` -- the whole point of
+    plan task B1's spool: a batch whose transaction committed before the
+    process died is replayed on the next run and must be a no-op, not a
+    duplicate observation.
+    """
+    if not instances:
+        return
+    rows = [_row_values(instance) for instance in instances]
+    # One multi-VALUES statement needs one column list, so every row must
+    # carry the same keys. A key present on some rows and absent on others
+    # can only be a server-default column, and filling it with NULL is
+    # only safe where NULL is allowed -- anything else is an inconsistent
+    # batch and is refused rather than silently written.
+    columns = sa_inspect(model).column_attrs
+    keys = set().union(*(set(row) for row in rows))
+    for row in rows:
+        for missing in keys - set(row):
+            if not columns[missing].columns[0].nullable:
+                raise ValueError(
+                    f"{model.__name__}.{missing} is set on some rows of this batch and "
+                    "not others, and has no default -- refusing to write an inconsistent batch"
+                )
+            row[missing] = None
+    stmt = pg_insert(model).values(rows)
+    session.execute(stmt.on_conflict_do_nothing(index_elements=list(index_elements)))
+
+
+def _flush_batch(
+    workspace_id: Any,
+    batch: list[ScrapeResult],
+    spool_ids: Sequence[int] = (),
+) -> None:
     """Persist one batch in a single transaction (runs inside ``run_in_thread``).
 
     Bulk-inserts a ``PriceObservation`` + a ``RequestAttempt`` row per
@@ -397,12 +482,22 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
     for item in batch:
         observation_id = new_uuid7()
         moment = item.scraped_at or datetime.now(UTC)
+        # EPA F05 (plan task B1): ONE identity for the observation and the
+        # attempt this item produces, so both tables' `ON CONFLICT DO
+        # NOTHING` arbiters key off the same value and a replayed batch
+        # writes neither row twice. `BatchedPersistencePipeline` mints it
+        # (and stamps `scraped_at`) *before* the item is spooled, precisely
+        # so a replay reuses the value rather than generating a new one;
+        # the fallback here covers a direct caller that never went through
+        # the spool.
+        attempt_uuid = item.attempt_id or new_uuid7()
 
         observations.append(
             PriceObservation(
                 id=observation_id,
                 workspace_id=item.workspace_id,
                 scraped_at=moment,
+                attempt_uuid=attempt_uuid,
                 match_id=item.match_id,
                 product_id=item.product_id,
                 product_variant_id=item.product_variant_id,
@@ -430,7 +525,7 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 # left to the column's `gen_random_uuid()` server default
                 # -- a server-generated value is not readable in this
                 # process, so nothing could correlate the row afterwards.
-                attempt_uuid=item.attempt_id or new_uuid7(),
+                attempt_uuid=attempt_uuid,
                 scrape_job_id=item.scrape_job_id,
                 match_id=item.match_id,
                 strategy_method_id=item.strategy_method_id,
@@ -624,8 +719,35 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 jobs=len(fenced_job_ids),
             )
 
-        session.add_all(observations)
-        session.add_all(attempts)
+        # EPA F05 (plan task B1): idempotent, not "insert and hope".
+        #
+        # The durable result spool replays a batch whose transaction
+        # committed but whose spool rows were not deleted before the
+        # process died. That replay is only safe if a second insert of
+        # the same fetch is a no-op, so both tables are written through
+        # `ON CONFLICT DO NOTHING` on their producer-side identity
+        # (`uq_*_workspace_id_attempt_uuid_*`, revision `a4e91c7d2b58`) --
+        # the same `attempt_uuid` on the observation and on the attempt,
+        # minted by the spider (or, failing that, by `process_item` before
+        # the item was spooled) so it is stable across replays.
+        #
+        # ORM `add_all` cannot express that (no conflict clause), so the
+        # instances built above are lowered to insert dicts here. They are
+        # built as ORM objects rather than dicts from the start because
+        # everything between here and the loop -- the cancellation fence
+        # in particular -- reads and mutates them by attribute.
+        _insert_ignoring_replays(
+            session,
+            PriceObservation,
+            observations,
+            ("workspace_id", "attempt_uuid", "scraped_at"),
+        )
+        _insert_ignoring_replays(
+            session,
+            RequestAttempt,
+            attempts,
+            ("workspace_id", "attempt_uuid", "created_at"),
+        )
 
         if current_price_rows:
             # A batch may carry more than one successful observation for the
@@ -927,6 +1049,20 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
                 ),
             )
 
+    # EPA F05 (plan task B1): one line per COMMITTED batch, carrying the
+    # spool rows it makes resolvable. `spooled` is what lets an operator
+    # tie a flush in the log to the rows that are about to disappear from
+    # the on-disk spool -- and a flush with `spooled=0` is a direct call
+    # that bypassed the durable path, which is worth being able to see.
+    log_event(
+        logger,
+        "persistence.flush",
+        workspace_id=workspace_id,
+        items=len(batch),
+        observations=len(observations),
+        spooled=len(spool_ids),
+    )
+
     # SPEC-11 US2 (T023): release each item's match lock only AFTER the
     # transaction above has committed -- still inside this same
     # off-reactor flush (no second run_in_thread/reactor hop). An item
@@ -1013,15 +1149,149 @@ def _flush_batch(workspace_id: Any, batch: list[ScrapeResult]) -> None:
             )
 
 
-class BatchedPersistencePipeline:
-    """Scrapy item pipeline: buffer ``ScrapeResult`` items, flush in small batches."""
+#: How long `close_spider` waits for in-flight flushes before letting the
+#: spider close anyway (plan task B1). Not a `Settings` knob: it is a
+#: shutdown grace period, bounded by what a container orchestrator gives a
+#: process between SIGTERM and SIGKILL, not a per-deployment tuning
+#: decision. Nothing is lost when it expires -- the unflushed results stay
+#: in the spool and `open_spider` replays them on the next run.
+_CLOSE_FLUSH_GRACE_SECONDS = 30.0
 
-    def __init__(self, max_items: int, interval_seconds: float) -> None:
+
+#: Process-local count of batches that exhausted their retries and were
+#: moved to `kind='quarantined'` in the spool. Exposed under the metric
+#: name the plan gives it (`crawmatic_persistence_quarantined_batches`)
+#: through three channels, because the spider process has no Prometheus
+#: client and its numbers must still leave the box:
+#:
+#: 1. this module-level counter, for a test and for an in-process reader;
+#: 2. the Scrapy stats collector (same key), which Scrapyd surfaces per
+#:    job and the dispatcher already reads;
+#: 3. one `persistence.quarantined` structured log line per event, which
+#:    is the channel `docs/ops/OBSERVABILITY_SLO_AND_ALERTS.md` describes
+#:    for everything else the scraper counts.
+#:
+#: It is deliberately NOT a gauge derived from the database: a quarantined
+#: batch is precisely one that never reached the database.
+QUARANTINED_BATCHES_METRIC = "crawmatic_persistence_quarantined_batches"
+
+
+class _Counter:
+    """The smallest thing that can honestly be called a counter."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def inc(self, amount: int = 1) -> int:
+        self.value += amount
+        return self.value
+
+
+#: See :data:`QUARANTINED_BATCHES_METRIC`.
+crawmatic_persistence_quarantined_batches = _Counter()
+
+
+def _reactor() -> Any:
+    """The installed reactor, imported at CALL time, never at import time.
+
+    Importing ``twisted.internet.reactor`` at module import installs the
+    platform default reactor, and this module is reachable from spider
+    module imports that Scrapy performs *before* installing
+    ``AsyncioSelectorReactor`` — an import-time install aborts every crawl
+    with a reactor mismatch. Same rule (and the same reasoning) as
+    :func:`scrape_core.reactor.deferred_delay`.
+    """
+    from twisted.internet import reactor
+
+    return reactor
+
+
+class BatchedPersistencePipeline:
+    """Scrapy item pipeline: buffer ``ScrapeResult`` items, flush in small batches.
+
+    EPA F05 (plan task B1) added the three properties that make this
+    durable rather than best-effort:
+
+    **Durable first.** ``process_item`` writes the item to the on-disk
+    :class:`~scrape_core.result_spool.ResultSpool` *before* it enters the
+    in-memory buffer, and the spool row is deleted only after the
+    persistence transaction has COMMITTED. Nothing that was fetched (and
+    therefore paid for) can be lost by a failed flush or a killed
+    container any more; ``open_spider`` calls :meth:`replay_pending`
+    first, so a restarted container drains what the previous one left
+    before it takes on new work.
+
+    **Bounded retry, then quarantine.** A failed flush defers its spool
+    rows and schedules a reactor ``callLater`` replay per
+    ``SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS``. After
+    ``SCRAPE_FLUSH_QUARANTINE_AFTER`` failures the rows move to
+    ``kind='quarantined'`` in the spool -- still on disk for an operator,
+    out of the retry loop -- and
+    ``crawmatic_persistence_quarantined_batches`` increments.
+
+    **Backpressure.** With ``SCRAPE_FLUSH_MAX_PENDING_BATCHES`` flushes
+    already in flight, ``process_item`` returns an unfired ``Deferred``.
+    Scrapy honours that by stopping its pull from the scheduler, so the
+    downloader stalls and admission pauses -- the crawl slows to what
+    persistence can absorb instead of growing an unbounded spool.
+    """
+
+    def __init__(
+        self,
+        max_items: int,
+        interval_seconds: float,
+        *,
+        spool_path: Any = None,
+        max_pending_batches: int | None = None,
+        retry_backoff_seconds: Sequence[float] | None = None,
+        quarantine_after: int | None = None,
+        clock: Any = None,
+    ) -> None:
         self._max_items = max_items
         self._interval_seconds = interval_seconds
         self._buffer: list[ScrapeResult] = []
+        #: Spool row ids, positional with ``_buffer``.
+        self._spool_ids: list[int] = []
         self._pending: list[Deferred] = []
         self._looping_call: LoopingCall | None = None
+        #: Unfired Deferreds returned by ``process_item`` while the
+        #: in-flight cap is reached; fired when a flush completes.
+        self._admission_waiters: list[Deferred] = []
+        #: Set by ``from_crawler`` so quarantines land in Scrapy's stats.
+        self._stats: Any = None
+
+        settings = None
+        if (
+            spool_path is None
+            or max_pending_batches is None
+            or retry_backoff_seconds is None
+            or quarantine_after is None
+        ):
+            # Read once, and ONLY when something was left unspecified --
+            # a fully-specified construction (the tests, and any future
+            # embedder) must not require a loadable environment.
+            settings = get_settings()
+        self._max_pending_batches = (
+            settings.SCRAPE_FLUSH_MAX_PENDING_BATCHES
+            if max_pending_batches is None
+            else max_pending_batches
+        )
+        self._retry_backoff_seconds = tuple(
+            settings.SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS
+            if retry_backoff_seconds is None
+            else retry_backoff_seconds
+        )
+        self._quarantine_after = (
+            settings.SCRAPE_FLUSH_QUARANTINE_AFTER
+            if quarantine_after is None
+            else quarantine_after
+        )
+        self.spool = ResultSpool(
+            settings.SCRAPE_RESULT_SPOOL_PATH if spool_path is None else spool_path
+        )
+        self._clock = clock
 
     @classmethod
     def from_crawler(cls, crawler: Any) -> "BatchedPersistencePipeline":
@@ -1037,9 +1307,36 @@ class BatchedPersistencePipeline:
         interval_seconds = crawler.settings.getfloat(
             "SCRAPE_FLUSH_INTERVAL_SECONDS", settings.SCRAPE_FLUSH_INTERVAL_SECONDS
         )
-        return cls(max_items=max_items, interval_seconds=interval_seconds)
+        # EPA F05: the spool file is a per-HOST fact (which volume this
+        # container has mounted), so a Scrapy-level override is honoured
+        # for it exactly as for the thresholds above.
+        spool_path = crawler.settings.get(
+            "SCRAPE_RESULT_SPOOL_PATH", settings.SCRAPE_RESULT_SPOOL_PATH
+        )
+        pipeline = cls(
+            max_items=max_items,
+            interval_seconds=interval_seconds,
+            spool_path=spool_path,
+            max_pending_batches=crawler.settings.getint(
+                "SCRAPE_FLUSH_MAX_PENDING_BATCHES", settings.SCRAPE_FLUSH_MAX_PENDING_BATCHES
+            ),
+            retry_backoff_seconds=settings.SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS,
+            quarantine_after=crawler.settings.getint(
+                "SCRAPE_FLUSH_QUARANTINE_AFTER", settings.SCRAPE_FLUSH_QUARANTINE_AFTER
+            ),
+        )
+        pipeline._stats = getattr(crawler, "stats", None)
+        return pipeline
+
+    # --- lifecycle -----------------------------------------------------------
 
     def open_spider(self, spider: Any) -> None:
+        # EPA F05: leftovers FIRST. A container that was killed mid-flush
+        # (or whose database was down when it closed) still holds those
+        # results on disk; draining them before the new crawl produces its
+        # own items is what keeps "nothing fetched is ever lost" true
+        # across restarts rather than only within one run.
+        self.replay_pending()
         self._looping_call = LoopingCall(self._time_based_flush)
         # now=False: the first tick fires after interval_seconds, not
         # immediately on an (initially empty) buffer.
@@ -1048,9 +1345,34 @@ class BatchedPersistencePipeline:
     def process_item(self, item: Any, spider: Any) -> Any:
         if not isinstance(item, ScrapeResult):
             return item
+        # EPA F05: the two values the idempotency key is built from must
+        # be decided BEFORE the item becomes durable, or a replay would
+        # mint different ones and defeat `ON CONFLICT DO NOTHING`.
+        if item.attempt_id is None:
+            item.attempt_id = new_uuid7()
+        if item.scraped_at is None:
+            item.scraped_at = datetime.now(UTC)
+        # Durable first, in-memory second: a crash between the two loses
+        # nothing (the spool replays it), whereas the reverse order has a
+        # window in which the only copy is in RAM.
+        row_id = self.spool.append_batch([item])[0]
         self._buffer.append(item)
+        self._spool_ids.append(row_id)
         if len(self._buffer) >= self._max_items:
             self._flush()
+        if len(self._pending) >= self._max_pending_batches:
+            # Backpressure. Scrapy waits on this Deferred before pulling
+            # the next item, so the downloader stalls until a flush
+            # completes -- admission paused, spool bounded.
+            waiter = Deferred()
+            self._admission_waiters.append(waiter)
+            log_event(
+                logger,
+                "persistence.admission_paused",
+                pending_batches=len(self._pending),
+                max_pending_batches=self._max_pending_batches,
+            )
+            return waiter
         return item
 
     def close_spider(self, spider: Any) -> Deferred:
@@ -1058,9 +1380,23 @@ class BatchedPersistencePipeline:
             self._looping_call.stop()
         if self._buffer:
             self._flush()
-        # Wait for every in-flight (and this final) flush before the spider
-        # actually closes, so a partial last batch is never lost.
-        return DeferredList(list(self._pending), consumeErrors=True)
+        # Release anything still waiting on admission: the spider is
+        # closing, so nothing will ever be pulled through those Deferreds
+        # and leaving them unfired would hang the close.
+        self._release_admission()
+        # Wait for every in-flight (and this final) flush before the
+        # spider actually closes -- but for at most
+        # `_CLOSE_FLUSH_GRACE_SECONDS`. Waiting forever would let one
+        # unreachable database hold a container open indefinitely; what
+        # the timeout gives up is only *promptness*, never the results
+        # themselves, which stay in the spool and are replayed by
+        # `open_spider` on the next run.
+        return self._with_timeout(
+            DeferredList(list(self._pending), consumeErrors=True),
+            _CLOSE_FLUSH_GRACE_SECONDS,
+        )
+
+    # --- flush triggers ------------------------------------------------------
 
     def _time_based_flush(self) -> None:
         if self._buffer:
@@ -1073,30 +1409,186 @@ class BatchedPersistencePipeline:
         concurrency story here: the reactor is single-threaded, so this
         happens atomically with respect to further ``process_item``
         calls — no lock needed, and a size- and a time-triggered flush
-        can never race on the same items.
+        can never race on the same items. The spool ids ride along in
+        lockstep so the flush can resolve exactly the rows it committed.
         """
         batch = self._buffer
+        spool_ids = self._spool_ids
         self._buffer = []
-        workspace_id = batch[0].workspace_id
+        self._spool_ids = []
+        return self._dispatch(batch, spool_ids)
 
-        deferred = run_in_thread(_flush_batch, workspace_id, batch)
-        deferred.addErrback(self._on_flush_failure, batch=batch)
+    def replay_pending(self, limit: int | None = None) -> list[Deferred]:
+        """Dispatch everything still queued in the spool. Returns the flushes.
+
+        Grouped by ``workspace_id`` (a transaction is workspace-scoped)
+        and chunked by ``_max_items`` (a batch is a transaction, and an
+        unbounded one would take an unbounded lock). Quarantined rows are
+        not returned by the spool, so they are never replayed here.
+        """
+        entries = self.spool.pending(limit=self._replay_limit() if limit is None else limit)
+        if not entries:
+            return []
+        log_event(logger, "persistence.replay", results=len(entries))
+        return self._dispatch_entries(entries)
+
+    def _replay_limit(self) -> int:
+        return max(1, self._max_items) * max(1, self._max_pending_batches)
+
+    def _dispatch_entries(self, entries: list[SpooledBatch]) -> list[Deferred]:
+        by_workspace: dict[Any, list[SpooledBatch]] = {}
+        for entry in entries:
+            by_workspace.setdefault(entry.workspace_id, []).append(entry)
+        flushes: list[Deferred] = []
+        for grouped in by_workspace.values():
+            for start in range(0, len(grouped), self._max_items):
+                chunk = grouped[start : start + self._max_items]
+                flushes.append(
+                    self._dispatch(
+                        [entry.result for entry in chunk],
+                        [entry.row_id for entry in chunk],
+                    )
+                )
+        return flushes
+
+    def _dispatch(self, batch: list[ScrapeResult], spool_ids: list[int]) -> Deferred:
+        workspace_id = batch[0].workspace_id
+        deferred = run_in_thread(_flush_batch, workspace_id, batch, spool_ids)
+        deferred.addCallback(self._on_flush_success, spool_ids=spool_ids)
+        deferred.addErrback(self._on_flush_failure, batch=batch, spool_ids=spool_ids)
         self._pending.append(deferred)
         deferred.addBoth(self._forget_pending, deferred=deferred)
         return deferred
 
+    # --- flush completion ----------------------------------------------------
+
     def _forget_pending(self, result: Any, *, deferred: Deferred) -> Any:
         if deferred in self._pending:
             self._pending.remove(deferred)
+        # A slot freed up, whichever way the flush went. Releasing on
+        # failure too is deliberate: the plan's wording is "resolved on
+        # the next successful flush", but a Deferred that only ever fires
+        # on success would wedge the spider permanently during a database
+        # outage -- items would stop being pulled, so no flush could ever
+        # succeed, and `close_spider` would never complete either. The
+        # capacity really is free (a failed batch is back in the spool
+        # waiting on `callLater`, not in `_pending`), so this is the
+        # honest reading of the same rule.
+        self._release_admission()
         return result
 
-    def _on_flush_failure(self, failure: Failure, *, batch: list[ScrapeResult]) -> None:
-        # A persistence failure must never crash the reactor/spider run --
-        # log it and move on; the affected items are lost from this flush
-        # (no retry queue in this MVP slice) but every other flush proceeds.
+    def _release_admission(self) -> None:
+        waiters, self._admission_waiters = self._admission_waiters, []
+        for waiter in waiters:
+            if not waiter.called:
+                waiter.callback(None)
+
+    def _on_flush_success(self, result: Any, *, spool_ids: list[int]) -> Any:
+        # Only now, after the transaction COMMITTED: a kill between the
+        # commit and this line replays the batch (a no-op, thanks to the
+        # `ON CONFLICT DO NOTHING` identity keys), where the reverse order
+        # would lose it.
+        self.spool.resolve(spool_ids)
+        return result
+
+    def _on_flush_failure(
+        self,
+        failure: Failure,
+        *,
+        batch: list[ScrapeResult],
+        spool_ids: list[int],
+    ) -> None:
+        # A persistence failure must never crash the reactor/spider run.
+        # Unlike the pre-F05 behaviour, it no longer loses the batch
+        # either: the rows are still in the spool, this records the
+        # attempt against them, and a `callLater` replays them.
+        error = failure.getErrorMessage()
         logger.error(
             "BatchedPersistencePipeline: flush failed for %d item(s): %s",
             len(batch),
-            failure.getErrorMessage(),
+            error,
         )
+        attempts = self.spool.defer_many(spool_ids, error)
+        exhausted = [
+            row_id
+            for row_id in spool_ids
+            if attempts.get(row_id, 0) >= self._quarantine_after
+        ]
+        if exhausted:
+            self._quarantine(exhausted, error)
+        retryable = [row_id for row_id in spool_ids if row_id not in set(exhausted)]
+        if retryable:
+            attempt_number = max(attempts.get(row_id, 1) for row_id in retryable)
+            self._schedule_replay(retryable, attempt_number, error)
         return None
+
+    def _quarantine(self, spool_ids: list[int], error: str) -> None:
+        moved = self.spool.quarantine(spool_ids)
+        if not moved:
+            return
+        crawmatic_persistence_quarantined_batches.inc()
+        if self._stats is not None:
+            try:
+                self._stats.inc_value(QUARANTINED_BATCHES_METRIC)
+            except Exception:  # noqa: BLE001 - stats must never fail a flush
+                logger.debug("could not record %s in Scrapy stats", QUARANTINED_BATCHES_METRIC)
+        log_event(
+            logger,
+            "persistence.quarantined",
+            metric=QUARANTINED_BATCHES_METRIC,
+            count=crawmatic_persistence_quarantined_batches.value,
+            results=len(moved),
+            after_attempts=self._quarantine_after,
+            error=error,
+        )
+
+    def _schedule_replay(self, spool_ids: list[int], attempt_number: int, error: str) -> None:
+        delay = self._retry_delay(attempt_number)
+        log_event(
+            logger,
+            "persistence.retry_scheduled",
+            results=len(spool_ids),
+            attempt=attempt_number,
+            delay_seconds=delay,
+            error=error,
+        )
+        self._clock_or_reactor().callLater(delay, self._replay_rows, spool_ids)
+
+    def _replay_rows(self, spool_ids: list[int]) -> None:
+        entries = self.spool.load(spool_ids)
+        if entries:
+            self._dispatch_entries(entries)
+
+    def _retry_delay(self, attempt_number: int) -> float:
+        """Backoff for the ``attempt_number``-th failure; the last entry repeats."""
+        index = min(max(attempt_number, 1), len(self._retry_backoff_seconds)) - 1
+        return float(self._retry_backoff_seconds[index])
+
+    # --- reactor seam --------------------------------------------------------
+
+    def _clock_or_reactor(self) -> Any:
+        return self._clock if self._clock is not None else _reactor()
+
+    def _with_timeout(self, deferred: Deferred, seconds: float) -> Deferred:
+        """``deferred``, but fired with ``None`` if it takes longer than ``seconds``."""
+        if deferred.called:
+            return deferred
+        out: Deferred = Deferred()
+        timeout_call = self._clock_or_reactor().callLater(seconds, self._fire_timeout, out, seconds)
+
+        def _forward(result: Any) -> Any:
+            if timeout_call.active():
+                timeout_call.cancel()
+            if not out.called:
+                out.callback(result)
+            return result
+
+        deferred.addBoth(_forward)
+        return out
+
+    @staticmethod
+    def _fire_timeout(out: Deferred, seconds: float) -> None:
+        if out.called:
+            return
+        log_event(logger, "persistence.close_timeout", grace_seconds=seconds)
+        out.callback(None)

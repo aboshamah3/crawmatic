@@ -24,7 +24,11 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from typing import Any
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -54,14 +58,18 @@ from app_shared.jobs.batching import (
     plan_batches,
 )
 from app_shared.jobs.coalescing import cluster_for_coalescing
-from app_shared.jobs.dispatch_intents import DispatchIntentStore
+from app_shared.jobs.dispatch_intents import (
+    DispatchIntentStore,
+    reconcile_inflight_intents,
+)
 from app_shared.jobs.reaper import (
     fail_targets_past_job_deadline,
     revert_stale_started_targets,
 )
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
-from app_shared.jobs.nodes import select_node
+from app_shared.jobs.node_load import NodePlacement, read_node_loads
+from app_shared.jobs.nodes import NodeLoad
 from app_shared.jobs.targets import Counts, aggregate_counts, mark_target
 from app_shared.messaging import enqueue
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
@@ -81,6 +89,7 @@ from app_shared.scrapyd import (
 )
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
+    DISPATCH_RECONCILE_INTENTS,
     SCRAPE_DISPATCH_JOB,
     SCRAPE_FINALIZE_JOBS,
     SCRAPE_REAP_STALE_TARGETS,
@@ -230,6 +239,89 @@ def _batch_route(batch: Batch, settings) -> tuple[str, str, list[str]]:
             settings.SCRAPYD_BROWSER_URLS,
         )
     return _SCRAPYD_PROJECT, _GENERIC_PRICE_SPIDER, settings.SCRAPYD_HTTP_URLS
+
+
+def _node_placement(
+    settings, probe_client: Any = None, *, unreachable_pool_fallback: bool = False
+) -> NodePlacement:
+    """The pass-scoped placement decision-maker for one dispatch pass (B6/F11).
+
+    All the policy lives in :class:`~app_shared.jobs.node_load.NodePlacement`;
+    what this adds is the **lazy** probe client. A single-node pool never
+    reads a load at all (`NodePlacement`'s rule 2), so on today's
+    deployments the `ScrapydDispatchClient` below — and the Redis
+    connection it opens — is never constructed. `recover_stalled_batches`
+    passes its own long-lived prober in, so the sweep keeps one
+    `daemonstatus.json` cache across every job it touches.
+    """
+    holder: dict[str, Any] = {"client": probe_client}
+
+    def _read(nodes: list[str]) -> dict[str, NodeLoad]:
+        client = holder["client"]
+        if client is None:
+            client = ScrapydDispatchClient(settings=settings)
+            holder["client"] = client
+        return read_node_loads(client, nodes, getattr(client, "_redis", None))
+
+    return NodePlacement(
+        max_pending=settings.SCRAPYD_MAX_PENDING_PER_NODE,
+        load_reader=_read,
+        unreachable_pool_fallback=unreachable_pool_fallback,
+    )
+
+
+def _intent_session_factory(workspace_id: uuid.UUID) -> Callable[[], Any]:
+    """A factory of standalone, workspace-scoped sessions (EPA B2 / F06).
+
+    The dispatch-intent store's short-transaction mode opens one session
+    per transition, and that session must already be able to see the
+    workspace's rows — RLS is enforced per transaction, so a fresh one
+    has to re-assert ``app.workspace_id``. Scoping lives here, at the
+    injector, rather than inside the store: the maintenance sweep injects
+    a BYPASSRLS system session instead and must NOT have a GUC quietly
+    set behind it.
+
+    Returns a callable whose result is a **context manager** — the seam
+    shape ``drain_outbox`` already uses. It is built out of this module's
+    own ``get_session``/``set_workspace_context``, which is also what
+    lets the planner-replay harnesses substitute an in-memory session for
+    the whole five-step protocol without knowing this function exists.
+    """
+
+    @contextmanager
+    def _open() -> Iterator[Session]:
+        with get_session() as session:
+            set_workspace_context(session, workspace_id)
+            yield session
+
+    return _open
+
+
+@dataclass(frozen=True)
+class PlannedDispatch:
+    """One batch, fully decided in step 1 and not yet sent (EPA B2 / F06).
+
+    Everything the POST needs is fixed *before* the plan commits: the
+    route, the node, the identity, the ``jobid`` we chose for the remote
+    run, the C3 grant that paid for it, and the exact target rows to
+    stamp when the node says yes. Carrying it in one frozen record is
+    what makes step 3 a pure network call — it reads nothing from the
+    database, so it can run with no transaction open, which is the
+    property the whole protocol turns on.
+    """
+
+    batch: Batch
+    identity: DispatchIdentity
+    project: str
+    spider: str
+    node_url: str
+    #: ``dispatch_intents.scrapyd_job_id`` — the name the remote run has
+    #: in every attempt, including a re-POST after ``RECONCILED_MISSING``.
+    jobid: str
+    #: The C3 grant reserved for this batch in step 1's transaction, and
+    #: released in the failure path if the batch never reaches Scrapyd.
+    grant: Any
+    targets: list[ScrapeJobTarget]
 
 
 def _batch_authorization_request(
@@ -690,28 +782,31 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
             planning_generation=planning_generation,
         )
 
-        # --- persist the intents, in THIS transaction ------------------------
-        # Before a single POST: the plan is durable, or it did not happen.
-        # Doing it as its own pass (rather than inline in the dispatch
-        # loop) is what makes "the intent row and the strategy cursor
-        # commit together" true even if the first POST blows up.
+        # --- STEP 1: plan, authorize, claim -- then COMMIT --------------------
+        # The whole plan becomes durable BEFORE a single byte leaves this
+        # process (F06). Three things land in this one transaction:
+        #
+        #   * one `dispatch_intents` row per batch, PLANNED, carrying the
+        #     node it will go to and the `scrapyd_job_id` WE chose for it
+        #     (a uuid5 over the identity -- see
+        #     `deterministic_scrapyd_job_id`);
+        #   * `claimed_at` on every target those batches carry, so the
+        #     phase clock (`created_at -> dispatched_at`, `claimed_at ->
+        #     remote_accepted_at`) measures the POST round trip and not
+        #     the planning pass;
+        #   * the strategy-cursor advance and `planning_generation` that
+        #     name the plan.
+        #
+        # The store is given a `session_factory` rather than this session:
+        # from here on every intent transition commits in its OWN short
+        # transaction, which is what lets step 3 run with no transaction
+        # open at all.
         intents = DispatchIntentStore(
             session,
             workspace_id=workspace_uuid,
             scrape_job_id=job.id,
             authorized_cancellation_generation=job.cancellation_generation or 0,
         )
-        planned: list[tuple[Batch, DispatchIdentity, str, str, str]] = []
-        for batch in batches:
-            project, spider, nodes = _batch_route(batch, settings)
-            node_url = select_node(batch.domain, nodes)
-            identity = _batch_identity(job.id, batch, project, spider)
-            intents.plan(
-                identity, match_ids=batch.match_ids, batch_index=batch.batch_index
-            )
-            planned.append((batch, identity, project, spider, node_url))
-
-        client = ScrapydDispatchClient(settings=settings, intents=intents)
         # EPA C3: the cost-authorization gate. One service per task
         # invocation; it opens its own short transaction per grant, which
         # is deliberate -- the reservation must be DURABLE before the POST
@@ -719,84 +814,187 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
         # task's long transaction would tie every workspace's budget row
         # to the lifetime of one job's dispatch loop.
         costauth = CostAuthorizationService(default_workspace_id=workspace_uuid)
-        try:
-            for batch, identity, project, spider, node_url in planned:
-                # EPA W4.1: a domain certified UNSUPPORTED is a
-                # product-visible, zero-retry skip -- checked before C3's
-                # gate (see `_skip_unsupported_batch`'s docstring for why
-                # the ordering is cheaper and still composes with C3's own
-                # batch-level UNSUPPORTED denial).
-                if _skip_unsupported_batch(
-                    session,
+        planned: list[PlannedDispatch] = []
+        claim_stamp = datetime.now(timezone.utc)
+        targets_by_match: dict[Any, list[ScrapeJobTarget]] = {}
+        for target in targets:
+            targets_by_match.setdefault(target.match_id, []).append(target)
+
+        placement = _node_placement(settings)
+        for batch in batches:
+            project, spider, nodes = _batch_route(batch, settings)
+            identity = _batch_identity(job.id, batch, project, spider)
+            # EPA W4.1: a domain certified UNSUPPORTED is a
+            # product-visible, zero-retry skip -- checked before C3's
+            # gate (see `_skip_unsupported_batch`'s docstring for why
+            # the ordering is cheaper and still composes with C3's own
+            # batch-level UNSUPPORTED denial). Hoisted into the planning
+            # pass by B2: a batch nobody will ever POST should not get an
+            # intent row either.
+            if _skip_unsupported_batch(
+                session,
+                workspace_id=workspace_uuid,
+                scrape_job_id=job.id,
+                batch=batch,
+            ):
+                continue
+            # EPA B6 (F11): WHERE this batch runs, decided before it is
+            # paid for. `None` means every node in the pool is
+            # unreachable or already `SCRAPYD_MAX_PENDING_PER_NODE` deep.
+            node_url = placement.place(
+                domain=batch.domain,
+                nodes=nodes,
+                intents=intents,
+                identity=identity,
+            )
+            if node_url is None:
+                # DEFERRED, not denied and not failed: no intent row, no
+                # grant, no `claimed_at`, no POST. The targets stay
+                # PENDING/unstamped, so `redispatch_pending_jobs` offers
+                # them again once a node drains -- the same shape as a
+                # cost-authorization denial below, and for the same
+                # reason: POSTing onto a full node does not make the work
+                # run sooner, it just holds a grant and a phase clock open
+                # while it queues.
+                logger.info(
+                    "dispatch: DEFERRED batch domain=%s mode=%s -- every node in "
+                    "the pool is saturated or unreachable "
+                    "(max_pending=%d) workspace_id=%s scrape_job_id=%s",
+                    batch.domain,
+                    batch.mode,
+                    settings.SCRAPYD_MAX_PENDING_PER_NODE,
+                    workspace_uuid,
+                    job.id,
+                )
+                continue
+            # Paid dispatch site 1 (REFRESH) and site 2
+            # (BROWSER_ESCALATION) -- the same pass, distinguished by
+            # the batch's mode, because a browser batch is exactly the
+            # expensive escalation C2's DEGRADED rule denies and an
+            # HTTP batch is not.
+            purpose = (
+                AuthorizationPurpose.BROWSER_ESCALATION
+                if batch.mode == ScrapeProfileMode.BROWSER
+                else AuthorizationPurpose.REFRESH
+            )
+            grant = authorize_or_none(
+                costauth,
+                _batch_authorization_request(
+                    batch,
                     workspace_id=workspace_uuid,
                     scrape_job_id=job.id,
+                    purpose=purpose,
+                    identity=identity,
+                ),
+                site="tasks_jobs.dispatch_job",
+            )
+            if grant is None:
+                # Denied: do NOT plan, do NOT POST and do NOT stamp. The
+                # targets stay PENDING/unstamped, so `redispatch_pending_jobs`
+                # will offer them again once whatever denied them
+                # (budget, breaker, entitlement, domain state) clears.
+                # A denial must never look like a dispatch.
+                continue
+            intent = intents.plan(
+                identity,
+                match_ids=batch.match_ids,
+                batch_index=batch.batch_index,
+                node_url=node_url,
+            )
+            batch_targets = [
+                target
+                for match_id in batch.match_ids
+                for target in targets_by_match.get(match_id, ())
+            ]
+            for target in batch_targets:
+                target.claimed_at = claim_stamp
+            planned.append(
+                PlannedDispatch(
                     batch=batch,
-                ):
-                    continue
-                # Paid dispatch site 1 (REFRESH) and site 2
-                # (BROWSER_ESCALATION) -- the same loop, distinguished by
-                # the batch's mode, because a browser batch is exactly the
-                # expensive escalation C2's DEGRADED rule denies and an
-                # HTTP batch is not.
-                purpose = (
-                    AuthorizationPurpose.BROWSER_ESCALATION
-                    if batch.mode == ScrapeProfileMode.BROWSER
-                    else AuthorizationPurpose.REFRESH
+                    identity=identity,
+                    project=project,
+                    spider=spider,
+                    node_url=node_url,
+                    jobid=str(intent.scrapyd_job_id),
+                    grant=grant,
+                    targets=batch_targets,
                 )
-                grant = authorize_or_none(
-                    costauth,
-                    _batch_authorization_request(
-                        batch,
-                        workspace_id=workspace_uuid,
-                        scrape_job_id=job.id,
-                        purpose=purpose,
-                        identity=identity,
-                    ),
-                    site="tasks_jobs.dispatch_job",
-                )
-                if grant is None:
-                    # Denied: do NOT POST and do NOT stamp. The targets
-                    # stay PENDING/unstamped, so `redispatch_pending_jobs`
-                    # will offer them again once whatever denied them
-                    # (budget, breaker, entitlement, domain state) clears.
-                    # A denial must never look like a dispatch.
-                    continue
+            )
+
+        # The plan is durable here, or it did not happen. Committing also
+        # closes this session's transaction, which is a precondition of
+        # step 3 below -- the POST must not be issued with a Postgres
+        # backend pinned open behind it.
+        session.commit()
+
+        # Steps 2-4 run per batch through a store that owns its own short
+        # transactions, so `POSTED` is committed before the POST and
+        # `CONFIRMED` is committed after it.
+        dispatching_intents = DispatchIntentStore(
+            None,
+            workspace_id=workspace_uuid,
+            scrape_job_id=job.id,
+            authorized_cancellation_generation=job.cancellation_generation or 0,
+            session_factory=_intent_session_factory(workspace_uuid),
+        )
+        client = ScrapydDispatchClient(settings=settings, intents=dispatching_intents)
+        undispatched = list(planned)
+        try:
+            for item in planned:
+                # --- STEPS 2 + 3: record_post (commit) -> POST ------------
+                # `client.schedule()` marks the intent POSTED through the
+                # store above -- its own transaction, committed -- and only
+                # then issues the network call, with nothing of ours open.
+                # A worker killed anywhere in here leaves a committed
+                # POSTED row naming the node and the jobid, which is
+                # exactly what `reconcile_inflight_intents` settles.
                 try:
                     client.schedule(
-                        project,
-                        spider,
+                        item.project,
+                        item.spider,
                         workspace_id=str(workspace_uuid),
                         scrape_job_id=str(job.id),
-                        match_ids=batch.match_ids,
-                        mode=batch.mode,
+                        match_ids=item.batch.match_ids,
+                        mode=item.batch.mode,
                         # Spider argument + traceability label ONLY -- the
                         # idempotency decision is `identity`'s (EPA B1).
-                        batch_index=batch.batch_index,
-                        node_url=node_url,
-                        identity=identity,
+                        batch_index=item.batch.batch_index,
+                        node_url=item.node_url,
+                        identity=item.identity,
+                        # EPA B2: the remote run's name, chosen at plan
+                        # time and already committed on the intent. A
+                        # re-POST re-derives the same value, so Scrapyd
+                        # dedups rather than double-running the batch.
+                        jobid=item.jobid,
                         # EPA C4b: stamp this batch's C3 grant onto the
                         # spider so its own network-ledger boundary can
                         # trace every physical operation back to it.
-                        authorization_id=grant.authorization_id,
+                        authorization_id=item.grant.authorization_id,
                         # EPA Phase C F3: and WHAT that grant decided, so
                         # C1's three decision columns stop being NULL.
-                        budget_decision_version=grant.budget_decision_version,
-                        entitlement_version=grant.entitlement_version,
-                        breaker_decision=grant.breaker_decision,
+                        budget_decision_version=item.grant.budget_decision_version,
+                        entitlement_version=item.grant.entitlement_version,
+                        breaker_decision=item.grant.breaker_decision,
                     )
                 except Exception:
                     # Failure BEFORE dispatch: nothing was spent, so the
                     # whole hold goes back immediately rather than waiting
                     # out its lease. `release` is CAS-idempotent, so a
                     # retry of this task cannot double-credit the budget.
-                    costauth.release(grant.authorization_id)
+                    costauth.release(item.grant.authorization_id)
+                    undispatched.remove(item)
                     raise
+                undispatched.remove(item)
+                # --- STEP 4: confirm + stamp, in one committed transaction --
+                # `client.schedule()` has already committed CONFIRMED
+                # through its own store; this commits the target side of
+                # the same fact.
+                #
                 # F-2 (2026-08-22): stamp the batch's targets the moment they
                 # leave here, so the next dispatch delivery cannot re-plan
                 # them. A guard-deduped "already scheduled" return counts as
                 # dispatched too -- the POST that guard is standing in for did
-                # happen. One loop over the already-loaded `targets`, never an
-                # extra query.
+                # happen.
                 #
                 # EPA B2: `stamp_targets_dispatched` is the SINGLE stamping
                 # path -- it re-derives proof from the same committed
@@ -808,31 +1006,42 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 # client `schedule()` just wrote the guard through --
                 # reusing it (rather than building a second one) is what
                 # makes the guard visible here in the same call.
-                dispatched_match_ids = set(batch.match_ids)
+                accepted_at = datetime.now(timezone.utc)
                 stamp_targets_dispatched(
                     session,
                     client._redis,  # noqa: SLF001 - the same client just POSTed through
                     batch=DispatchedBatch(
                         workspace_id=workspace_uuid,
                         scrape_job_id=job.id,
-                        identity=identity,
-                        targets=[
-                            target
-                            for target in targets
-                            if target.match_id in dispatched_match_ids
-                        ],
+                        identity=item.identity,
+                        targets=item.targets,
                     ),
-                    stamp=datetime.now(timezone.utc),
+                    stamp=accepted_at,
                 )
+                for target in item.targets:
+                    # The other half of the A5 phase clock: `claimed_at`
+                    # was written in step 1, and this is when the node
+                    # said yes. Together they measure the POST round trip
+                    # and nothing else.
+                    target.remote_accepted_at = accepted_at
+                # F-1 (2026-08-22 review): a stamp is only worth what it
+                # survives. With one commit after the whole loop, batch
+                # 50's unreachable node used to roll back the stamps of
+                # batches 1-49 that really WERE POSTed -- and once the
+                # 900s Redis guard expired, the next dispatch delivery
+                # re-planned every one of them. That is the exact 2.71x
+                # mechanism this phase exists to remove. Committing per
+                # batch (B2) is the stronger form of the same rule, and
+                # it is also what keeps the next POST from running with a
+                # transaction open.
+                session.commit()
         except Exception:
-            # F-1 (2026-08-22 review): a stamp is only worth what it
-            # survives. `get_session()` never commits in its `finally`, so
-            # with one commit after the whole loop, batch 50's unreachable
-            # node used to roll back the stamps of batches 1-49 that really
-            # WERE POSTed -- and once the 900s Redis guard expired, the
-            # next dispatch delivery re-planned every one of them. That is
-            # the exact 2.71x mechanism this phase exists to remove. Commit
-            # what was earned, then let the failure propagate unchanged.
+            # Grants reserved in step 1 for batches this pass never got to
+            # are released rather than left to age out of their lease --
+            # a task that raised on batch 3 must not hold batches 4..N's
+            # budget until the reaper notices.
+            for item in undispatched:
+                costauth.release(item.grant.authorization_id)
             session.commit()
             raise
 
@@ -1027,6 +1236,34 @@ def finalize_jobs() -> None:
         session.commit()
 
 
+def _interleave_by_workspace(
+    refs: Sequence[tuple[uuid.UUID, uuid.UUID]],
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """Round-robin ``(job_id, workspace_id)`` refs across workspaces.
+
+    EPA B3/F07. Takes one job from each workspace in turn, then a second
+    from each, and so on — so the first N entries cover N distinct
+    workspaces (when that many have work) instead of N jobs belonging to
+    whichever tenant the scan happened to return first.
+
+    Order WITHIN a workspace is preserved exactly as the scan produced
+    it, so this changes only which tenant's turn it is, never which of a
+    tenant's own jobs is considered first. Total length is unchanged: a
+    sweep that reads this list to the end still sees every ref.
+    """
+    buckets: dict[uuid.UUID, list[tuple[uuid.UUID, uuid.UUID]]] = {}
+    for job_id, workspace_id in refs:
+        buckets.setdefault(workspace_id, []).append((job_id, workspace_id))
+    if not buckets:
+        return []
+    ordered: list[tuple[uuid.UUID, uuid.UUID]] = []
+    for index in range(max(len(items) for items in buckets.values())):
+        for items in buckets.values():
+            if index < len(items):
+                ordered.append(items[index])
+    return ordered
+
+
 @maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=SCRAPE_REDISPATCH_JOBS)
 def redispatch_pending_jobs() -> None:
@@ -1056,9 +1293,30 @@ def redispatch_pending_jobs() -> None:
     the TTL window — which also paces how often a still-deferred batch
     can actually re-POST. Idempotent and fire-and-forget: a broker error
     on one job is logged and the sweep moves on.
+
+    **Work-level fairness (EPA B3/F07).** The scan used to be walked in
+    whatever order Postgres returned it, which for a backlogged tenant is
+    that tenant's jobs, first and all of them. One workspace with 400
+    wedged jobs therefore filled every tick and a second tenant's single
+    stuck job waited behind the whole backlog. Two changes fix that
+    without changing what gets re-dispatched: the refs are interleaved
+    round-robin across workspaces (`_interleave_by_workspace`), and each
+    workspace re-enqueues at most
+    `SCRAPE_DISPATCH_PER_WORKSPACE_BATCHES_PER_TICK` jobs per tick. The
+    cap counts *actual re-enqueues*, not rows examined, so a workspace
+    whose jobs mostly need nothing does not spend its budget on them.
+    The remainder is picked up by the next tick, in the same order.
     """
+    per_workspace_cap = int(
+        get_settings().SCRAPE_DISPATCH_PER_WORKSPACE_BATCHES_PER_TICK
+    )
+    dispatched_per_workspace: dict[uuid.UUID, int] = {}
     with get_session() as session:
-        for job_id, workspace_id in _scan_job_refs(_NON_TERMINAL_JOB_STATUSES):
+        for job_id, workspace_id in _interleave_by_workspace(
+            _scan_job_refs(_NON_TERMINAL_JOB_STATUSES)
+        ):
+            if dispatched_per_workspace.get(workspace_id, 0) >= per_workspace_cap:
+                continue
             set_workspace_context(session, workspace_id)
 
             job = scoped_get(session, ScrapeJob, job_id, workspace_id)
@@ -1113,6 +1371,9 @@ def redispatch_pending_jobs() -> None:
                         "workspace_id": str(workspace_id),
                     },
                 )
+                dispatched_per_workspace[workspace_id] = (
+                    dispatched_per_workspace.get(workspace_id, 0) + 1
+                )
                 logger.info(
                     "redispatch_pending_jobs: re-enqueued dispatch for job %s "
                     "(started_at=%s)",
@@ -1123,6 +1384,54 @@ def redispatch_pending_jobs() -> None:
                 logger.exception(
                     "redispatch_pending_jobs: failed to re-enqueue job %s", job.id
                 )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=DISPATCH_RECONCILE_INTENTS)
+def reconcile_dispatch_intents() -> None:
+    """Settle every `POSTED` dispatch intent against the node it names.
+
+    EPA B3 (2026-09-07), closing the wiring B2 owed. B2 built step 5 of
+    the commit-before-send protocol
+    (`app_shared.jobs.dispatch_intents.reconcile_inflight_intents`) but
+    deliberately stopped short of scheduling it — that meant touching the
+    scheduler's beat loop, which B2 did not own. Until this task existed,
+    a worker killed between its POST and the node's answer left a row in
+    `POSTED` that nothing ever settled: it is not confirmable (nobody
+    asked the node) and it is not re-postable either, because only
+    `RECONCILED_MISSING` authorizes a re-POST. The whole point of
+    committing the intent before sending it is that the knowledge
+    survives the death; this is the sweep that acts on it.
+
+    Fleet-wide, on the BYPASSRLS system sessionmaker: a `POSTED` row's
+    tenant is exactly what a crashed worker did not get to tell anyone,
+    so the sweep cannot be scoped to one. `reconcile_inflight_intents`
+    commits each verdict in its own short transaction, so one unreachable
+    node cannot roll back the rows already settled — and a node that
+    cannot be reached at all leaves its rows `POSTED` for the next pass,
+    because absence of an answer is not evidence of absence.
+
+    Driven by the DURABLE `dispatch_reconcile` cadence
+    (`DISPATCH_RECONCILE_INTERVAL_SECONDS`, 300s) rather than one of the
+    in-process 60s accumulators — see `CADENCE_DISPATCH_RECONCILE`.
+    Bounded at `DISPATCH_RECONCILE_LIMIT` rows per pass so it stays well
+    inside its 300s Celery time limit; the next tick continues.
+    """
+    settings = get_settings()
+    client = ScrapydDispatchClient(settings=settings)
+    report = reconcile_inflight_intents(
+        get_system_session,
+        client,
+        limit=int(settings.DISPATCH_RECONCILE_LIMIT),
+        now=datetime.now(timezone.utc),
+    )
+    logger.info(
+        "reconcile_dispatch_intents: examined=%d confirmed=%d missing=%d unreachable=%d",
+        report.examined,
+        report.confirmed,
+        report.missing,
+        report.unreachable,
+    )
 
 
 @maintenance_task(scope=MaintenanceScope.FLEET)
@@ -1157,6 +1466,14 @@ def recover_stalled_batches() -> None:
 
     with get_session() as session:
         client = ScrapydDispatchClient(settings=settings)
+        # EPA B6 (F11): one placement decision-maker for the WHOLE sweep,
+        # not one per job. The pool is fleet-wide, so the batches this
+        # sweep has already placed must count against the next job's
+        # choice too -- a per-job instance would let ten recovering jobs
+        # each reserve the same "least loaded" node.
+        placement = _node_placement(
+            settings, probe_client=client, unreachable_pool_fallback=True
+        )
 
         for job_id, workspace_id in _scan_job_refs(_RUNNING_JOB_STATUSES):
             set_workspace_context(session, workspace_id)
@@ -1250,7 +1567,47 @@ def recover_stalled_batches() -> None:
                     ):
                         continue
                     project, spider, nodes = _batch_route(batch, settings)
-                    node_url = select_node(batch.domain, nodes)
+                    identity = _batch_identity(job.id, batch, project, spider)
+                    # EPA B6 (F11): the recovery re-POST is placed by the
+                    # same capacity-aware rule as the primary path --
+                    # sharing this sweep's one `daemonstatus.json` probe
+                    # (`placement` is built on the outer `client`, whose
+                    # cache is fleet-wide and 10 s deep). A re-plan
+                    # advances `planning_generation`, so this is a NEW
+                    # identity with no row yet and it genuinely chooses;
+                    # a redelivery of this same sweep re-reads the node
+                    # off the row it already wrote.
+                    # `unreachable_pool_fallback=True`: a pool where NO
+                    # node answers is the reaper's own precondition (F-2,
+                    # "every node this suite reaps is DEAD"), not a
+                    # capacity answer -- it re-POSTs by `select_node` and
+                    # lets the POST fail if the pool really is gone. Only
+                    # a reachable-but-FULL pool defers here.
+                    node_url = placement.place(
+                        domain=batch.domain,
+                        nodes=nodes,
+                        intents=intents,
+                        identity=identity,
+                    )
+                    if node_url is None:
+                        # Every node saturated or unreachable. A stall
+                        # recovery is the LAST thing that should force
+                        # work onto a full node: these targets have
+                        # already waited out `SCRAPE_STALL_TIMEOUT_
+                        # SECONDS` once, and a POST that only lengthens a
+                        # queue buys nothing. The next sweep re-offers
+                        # them.
+                        logger.info(
+                            "recover_stalled_batches: DEFERRED re-POST domain=%s "
+                            "mode=%s -- every node saturated or unreachable "
+                            "(max_pending=%d) workspace_id=%s scrape_job_id=%s",
+                            batch.domain,
+                            batch.mode,
+                            settings.SCRAPYD_MAX_PENDING_PER_NODE,
+                            workspace_id,
+                            job.id,
+                        )
+                        continue
                     status_payload = node_status_cache.get(node_url, _UNPROBED)
                     if status_payload is _UNPROBED:
                         status_payload = client.daemon_status(node_url)
@@ -1262,7 +1619,6 @@ def recover_stalled_batches() -> None:
                         # Node alive and working its queue: these targets are
                         # queued behind max_proc/rate limits, not stalled.
                         continue
-                    identity = _batch_identity(job.id, batch, project, spider)
                     # Paid dispatch site 6 (RETRY): a stall re-POST is a
                     # SECOND physical fetch of work already paid for once,
                     # so it must clear the gate on its own account. Its
@@ -1287,10 +1643,15 @@ def recover_stalled_batches() -> None:
                         # clears; re-POSTing unauthorized is the failure
                         # mode this whole gate exists to remove.
                         continue
-                    intents.plan(
+                    # EPA B2: the recovery re-plan records its node and
+                    # mints its own deterministic `scrapyd_job_id` exactly
+                    # as the primary path does, so a worker killed mid-POST
+                    # here is reconcilable too.
+                    recovery_intent = intents.plan(
                         identity,
                         match_ids=batch.match_ids,
                         batch_index=f"{batch.batch_index}:r{window}",
+                        node_url=node_url,
                     )
                     try:
                         dispatch_client.schedule(
@@ -1307,6 +1668,10 @@ def recover_stalled_batches() -> None:
                             batch_index=f"{batch.batch_index}:r{window}",
                             node_url=node_url,
                             identity=identity,
+                            # EPA B2: the same-id property the primary
+                            # path has -- a recovery re-POST of this
+                            # identity always carries this jobid.
+                            jobid=str(recovery_intent.scrapyd_job_id),
                             # EPA Phase C F2: the RETRY's own grant, threaded
                             # through exactly as `dispatch_job` does. Omitting
                             # it here left every recovery batch's operations

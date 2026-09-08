@@ -37,18 +37,25 @@ from __future__ import annotations
 import logging
 
 from celery import Celery
-from celery.signals import worker_init, worker_process_init
+from celery.signals import worker_init, worker_process_init, worker_ready, worker_shutdown
 
 from app_shared.config import get_settings
 from app_shared.config_validation import ProductionConfigError, assert_production_safe
 from app_shared.database import dispose_engine
+from app_shared.heartbeat import HeartbeatEmitter, PeriodicHeartbeat, default_instance_id
 from app_shared.memory_watchdog import start_memory_watchdog
+from app_shared.redis_client import get_redis_client
 from app_shared.task_names import (
+    COSTAUTH_RESERVATION_SWEEP,
     CREATE_WEBHOOK_EVENT,
+    DISPATCH_RECONCILE_INTENTS,
     MAINTENANCE_BREAKER_EVALUATE,
+    MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
+    MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
+    MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -60,12 +67,20 @@ from app_shared.task_names import (
     SCRAPE_RECONCILE_FALSE_FAILURES,
     SCRAPE_REDISPATCH_JOBS,
     STRATEGY_DISCOVERY_RUN,
+    STRATEGY_DISCOVERY_SCAN,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_PATTERN_BACKFILL,
     STRATEGY_STATS_FLUSH,
 )
 
 logger = logging.getLogger(__name__)
+
+#: The parent process's own heartbeat, started on `worker_ready` and
+#: stopped on `worker_shutdown`. Module-level (rather than passed
+#: between the two signal receivers) because Celery gives the shutdown
+#: signal a different sender than the ready signal, so there is no
+#: object to hang it off.
+_worker_heartbeat: PeriodicHeartbeat | None = None
 
 settings = get_settings()
 
@@ -215,6 +230,10 @@ app.conf.task_routes = {
     SCRAPE_FINALIZE_JOBS: {"queue": "maintenance"},
     SCRAPE_REDISPATCH_JOBS: {"queue": "maintenance"},
     SCRAPE_RECONCILE_FALSE_FAILURES: {"queue": "maintenance"},
+    # EPA B3 (closing B2's owed wiring): step 5 of the commit-before-send
+    # dispatch protocol. An ordinary `maintenance` sweep — a bounded scan
+    # of POSTED intents plus one `listjobs` call per distinct node.
+    DISPATCH_RECONCILE_INTENTS: {"queue": "maintenance"},
     PRICE_ANALYSIS_RECOMPUTE: {"queue": "price_analysis"},
     STRATEGY_DISCOVERY_RUN: {"queue": "strategy_discovery"},
     STRATEGY_LIGHT_RECHECK: {"queue": "maintenance"},
@@ -236,6 +255,101 @@ app.conf.task_routes = {
     # bounded DB work on the BYPASSRLS system session, no blocking fetch.
     OUTBOX_DRAIN: {"queue": "maintenance"},
     OUTBOX_RECONCILE: {"queue": "maintenance"},
+    # EPA B4 (F09): the fleet-wide, chunked discovery re-drive sweep — a
+    # bounded DB scan + outbox writes, no blocking fetch, the same shape
+    # as its `STRATEGY_PATTERN_BACKFILL` sibling above.
+    STRATEGY_DISCOVERY_SCAN: {"queue": "maintenance"},
+}
+
+# --- Per-task time limits (EPA B4, F09) ------------------------------------
+#
+# `CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS` (3600, see above) is sized
+# from the worst-case measured task, but nothing previously enforced that
+# any *individual* task actually stays under it — a runaway task (a bug,
+# a hung socket a lower-level timeout failed to catch) could run past the
+# visibility timeout, get redelivered to a second worker while the first
+# is still executing it, and run twice. `time_limit` is the hard ceiling
+# Celery SIGKILLs the task's process at; `soft_time_limit` (a grace
+# window before the hard kill) raises `SoftTimeLimitExceeded` inside the
+# task first, so a task with cleanup to do gets a chance to run it.
+#
+# Centralised here via `task_annotations` (rather than a `time_limit=`
+# kwarg on each `@app.task(...)` decorator scattered across five
+# `tasks_*.py` modules) so this file is the one place the whole fleet's
+# time budget is visible and reviewable — and so `tests/unit/
+# test_celery_time_limits.py` can assert "every registered task has a
+# time_limit below the visibility timeout" as an invariant a future task
+# addition cannot silently violate: a name missing from this dict has no
+# `time_limit` at all (Celery's default), which that test catches.
+#
+# Buckets follow the plan's own groupings; `soft_time_limit` is 90% of
+# `time_limit` (a design choice — only the `time_limit` values below are
+# acceptance-critical), floored at a 15s grace window:
+#
+#   dispatch (600s)              -- one Scrapyd POST + idempotency lookup.
+#   reapers/reconcilers (300s)   -- bounded per-workspace or per-key DB
+#                                    sweeps; no blocking fetch.
+#   breaker/webhooks (120s)      -- a handful of rows, no blocking fetch.
+#   rollups (1800s per chunk)    -- cross-tenant daily aggregation.
+#   discovery/analysis/backfill
+#     (900s per chunk)           -- `STRATEGY_DISCOVERY_RUN`'s own probe
+#                                    ladder (measured worst case 600s, see
+#                                    the visibility-timeout comment above)
+#                                    plus extraction/validation headroom;
+#                                    `PRICE_ANALYSIS_RECOMPUTE` and
+#                                    `STRATEGY_PATTERN_BACKFILL` bucketed
+#                                    alongside it as the next-heaviest
+#                                    shape (bounded batch, may itself
+#                                    enqueue discovery runs).
+_DISPATCH_LIMITS = {"time_limit": 600, "soft_time_limit": 540}
+_REAPER_LIMITS = {"time_limit": 300, "soft_time_limit": 270}
+_SHORT_LIMITS = {"time_limit": 120, "soft_time_limit": 100}
+_ROLLUP_LIMITS = {"time_limit": 1800, "soft_time_limit": 1620}
+_DISCOVERY_LIMITS = {"time_limit": 900, "soft_time_limit": 810}
+
+app.conf.task_annotations = {
+    # --- dispatch (600s) ---
+    SCRAPE_DISPATCH_JOB: _DISPATCH_LIMITS,
+    # The thin Scrapyd-dispatch task (`app.workers.tasks_dispatch`) is not
+    # in `task_names.py` (it predates that convention) and is never
+    # `include=`d directly — it registers on `app.tasks` transitively
+    # because `tasks_jobs.py` (which IS `include=`d) imports it. Named
+    # here by its literal string for that reason.
+    "dispatch.generic_price_spider": _DISPATCH_LIMITS,
+    # --- reapers/reconcilers (300s) ---
+    SCRAPE_RECOVER_STALLED: _REAPER_LIMITS,
+    SCRAPE_FINALIZE_JOBS: _REAPER_LIMITS,
+    SCRAPE_REDISPATCH_JOBS: _REAPER_LIMITS,
+    SCRAPE_RECONCILE_FALSE_FAILURES: _REAPER_LIMITS,
+    SCRAPE_REAP_STALE_TARGETS: _REAPER_LIMITS,
+    DISPATCH_RECONCILE_INTENTS: _REAPER_LIMITS,
+    MAINTENANCE_PARTITION_CREATE: _REAPER_LIMITS,
+    MAINTENANCE_RETENTION_DROP: _REAPER_LIMITS,
+    MAINTENANCE_FLEET_BUDGET_ROLLFORWARD: _REAPER_LIMITS,
+    STRATEGY_LIGHT_RECHECK: _REAPER_LIMITS,
+    STRATEGY_STATS_FLUSH: _REAPER_LIMITS,
+    STRATEGY_DISCOVERY_SCAN: _REAPER_LIMITS,
+    OUTBOX_DRAIN: _REAPER_LIMITS,
+    OUTBOX_RECONCILE: _REAPER_LIMITS,
+    # The remaining `maintenance`-queue tasks below have no `task_routes`
+    # entry of their own (a pre-existing gap predating this task — see
+    # B4's report) and so are not wired to any worker queue today, but
+    # every one of them IS registered on `app.tasks` (their modules are
+    # `include=`d) and therefore still needs a `time_limit`, per this
+    # file's own invariant above.
+    COSTAUTH_RESERVATION_SWEEP: _REAPER_LIMITS,
+    MAINTENANCE_RECONCILE_PROVIDER_USAGE: _REAPER_LIMITS,
+    MAINTENANCE_ENTITLEMENT_REFRESH: _REAPER_LIMITS,
+    # --- breaker / webhooks (120s) ---
+    MAINTENANCE_BREAKER_EVALUATE: _SHORT_LIMITS,
+    CREATE_WEBHOOK_EVENT: _SHORT_LIMITS,
+    # --- rollups (1800s per chunk) ---
+    MAINTENANCE_DAILY_ROLLUP: _ROLLUP_LIMITS,
+    MAINTENANCE_COST_ROLLUP: _ROLLUP_LIMITS,
+    # --- discovery / analysis / backfill (900s per chunk) ---
+    STRATEGY_DISCOVERY_RUN: _DISCOVERY_LIMITS,
+    PRICE_ANALYSIS_RECOMPUTE: _DISCOVERY_LIMITS,
+    STRATEGY_PATTERN_BACKFILL: _DISCOVERY_LIMITS,
 }
 
 
@@ -298,3 +412,60 @@ def _dispose_inherited_engine(**kwargs: object) -> None:
     sharing connections/sockets with its parent or siblings.
     """
     dispose_engine()
+
+
+@worker_ready.connect
+def _start_worker_pool_heartbeat(sender: object = None, **kwargs: object) -> None:
+    """`heartbeat:worker:<pool-node>` every 30s (EPA B9, F22).
+
+    One heartbeat per **consumer pool**, not per container: `start.sh`
+    (EPA B4, F09) runs two `celery worker` processes in the same service,
+    `-n critical@%h` and `-n bulk@%h`, and a stuck `bulk@` pool with a
+    healthy `critical@` is exactly the failure this signal exists to
+    make visible. `sender` here is the pool's own `Consumer`, whose
+    `hostname` IS that `-n` node name, so the two pools land on two
+    distinct `heartbeat:worker:*` keys with independent fences.
+
+    **Why `worker_ready` and not `worker_init`.** `worker_init` fires
+    before the prefork pool is created, so a thread started there would
+    be inherited by every forked child — N processes beating under one
+    instance id, each with a copy of a Redis connection made before the
+    fork. `worker_ready` fires in the parent *after* the pool exists, so
+    the thread is the parent's alone. It is also the point at which the
+    process is genuinely ready to consume, which is what the beat claims.
+
+    Best-effort, exactly like `_start_memory_watchdog` above and the
+    Scrapyd nodes' `_start_scraper_heartbeat`: Redis being briefly
+    unreachable at boot must never keep a worker from consuming work.
+    A monitoring outage is not a processing outage.
+    """
+    global _worker_heartbeat
+    if _worker_heartbeat is not None:  # already beating (signal re-delivered)
+        return
+    try:
+        instance_id = str(getattr(sender, "hostname", "") or "") or default_instance_id()
+        _worker_heartbeat = PeriodicHeartbeat(
+            HeartbeatEmitter(get_redis_client(), service="worker", instance_id=instance_id)
+        ).start()
+    except Exception:  # noqa: BLE001 - best-effort, see docstring
+        _worker_heartbeat = None
+        logger.warning("worker heartbeat did not start", exc_info=True)
+
+
+@worker_shutdown.connect
+def _stop_worker_pool_heartbeat(**kwargs: object) -> None:
+    """Stop the pool heartbeat thread on a graceful shutdown.
+
+    Not required for correctness — `HEARTBEAT_TTL_SECONDS` ages out a
+    beat that stops arriving, and the thread is a daemon — but stopping
+    it here means a pool that is deliberately being drained stops
+    claiming to be alive immediately rather than for one more TTL.
+    """
+    global _worker_heartbeat
+    heartbeat, _worker_heartbeat = _worker_heartbeat, None
+    if heartbeat is None:
+        return
+    try:
+        heartbeat.stop()
+    except Exception:  # noqa: BLE001 - shutdown path, never raise
+        logger.warning("worker heartbeat did not stop cleanly", exc_info=True)

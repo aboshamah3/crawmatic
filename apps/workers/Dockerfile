@@ -27,4 +27,9 @@ RUN groupadd --system app \
     && chown -R app:app /app
 USER app
 
-CMD ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info"]
+# EPA B4 (F09): two Celery consumer pools (critical@%h, bulk@%h) in this
+# one container — see apps/workers/start.sh for why and the exact
+# commands it renders. `docker-compose.yml`'s healthcheck
+# (`celery ... inspect ping`) still round-trips through the broker to
+# BOTH pools unchanged.
+CMD ["/app/start.sh"]

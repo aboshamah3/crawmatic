@@ -133,23 +133,20 @@ message" discipline as every other failure here.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Response
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app_shared import heartbeat as heartbeat_mod
 from app_shared import release as release_mod
-from app_shared.config import get_settings
-from app_shared.costauth.service import DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS
 from app_shared.database import get_session
-from app_shared.models.proxy_breaker import GLOBAL_BREAKER_SCOPE, ProxyCircuitBreaker
 from app_shared.redis_client import get_redis_client
 
 router = APIRouter(tags=["ready"])
@@ -159,28 +156,32 @@ router = APIRouter(tags=["ready"])
 #: not make an orchestrator's own probe timeout the thing that fires.
 _CHECK_TIMEOUT_SECONDS = 2.0
 
+#: EPA B8 (F16): ONE bounded, process-wide pool for every probe this router
+#: ever runs — never a per-call pool. B7's driver-level timeouts (an
+#: earlier wave) make the previous `wait=False`-and-discard pattern
+#: unnecessary: a probe that is merely slow finishes and frees its worker;
+#: a probe whose underlying driver call is genuinely stuck is bounded by
+#: that driver-level timeout, not by this pool. `max_workers=2` is a
+#: resource ceiling, not a concurrency target — see `_generation_lock`
+#: below for why concurrent `/ready` requests do not each get their own
+#: probes.
+_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
-def _get_db_session() -> Iterator[Session]:
-    """A bare DB session dependency, mirroring `app.routers.version._get_db_session`.
+#: Guards a full probe "generation" (one pass over every check). Held for
+#: the duration of computing a fresh `ReadyResponse`. A request that finds
+#: this already held does NOT wait behind it and does NOT submit its own
+#: probes — every dependency probe is I/O, and an orchestrator hammering
+#: `/ready` while a dependency is slow must not turn into N times as much
+#: load on that dependency. It gets the previous generation's result
+#: instead, marked `stale=True` (F16).
+_generation_lock = threading.Lock()
 
-    A named FastAPI dependency (rather than calling `get_session()`
-    inline) so tests can override it via `app.dependency_overrides`, the
-    same pattern every other router in this app uses for its DB
-    dependency.
-    """
-    with get_session() as session:
-        yield session
-
-
-def _get_redis_dependency() -> Any:
-    """The process-wide Redis client, as a FastAPI dependency.
-
-    Deliberately a dependency (not a bare module call inline in the
-    route, the way `ops_metrics._get_redis` is) so it can be overridden
-    with a fake in tests the exact same way `_get_db_session` is —
-    consistent treatment for both dependencies this endpoint checks.
-    """
-    return get_redis_client()
+#: The last completed generation's result + status code, read by any
+#: request that loses the race for `_generation_lock`. `None` until the
+#: first generation ever completes.
+_cache_lock = threading.Lock()
+_last_response: "ReadyResponse | None" = None
+_last_status_code: int = 503
 
 
 class DependencyCheck(BaseModel):
@@ -196,10 +197,17 @@ class DependencyCheck(BaseModel):
 class ReadyResponse(BaseModel):
     ready: bool
     checks: dict[str, DependencyCheck]
+    #: EPA B8 (F16): true when this body is the previous generation's
+    #: cached result, returned because a generation was already in flight
+    #: when this request arrived rather than recomputed on this request's
+    #: behalf. A stale body can still be trusted for its own probe ages —
+    #: it is simply not THIS request's own round trip.
+    stale: bool = False
 
 
-def _run_with_timeout(fn: Callable[[], None], *, timeout: float) -> DependencyCheck:
-    """Run `fn` (a no-arg probe) with a hard wall-clock budget.
+def _await_probe(future: "Future[DependencyCheck]", *, timeout: float) -> DependencyCheck:
+    """Wait for a probe already submitted to `_PROBE_EXECUTOR`, bounded by
+    `timeout`.
 
     Never raises: a timeout, a connection error, or any other exception
     all become a failed `DependencyCheck` carrying the exception CLASS
@@ -212,63 +220,42 @@ def _run_with_timeout(fn: Callable[[], None], *, timeout: float) -> DependencyCh
     OperationalError or TimeoutError?"); the message belongs in the
     server log, which is already where the traceback goes. Same
     discipline as `/version`'s `db_error`.
+
+    Unlike the pre-B8 per-check pool, a timeout here does NOT shut down or
+    discard anything: `_PROBE_EXECUTOR` is shared and long-lived, and B7's
+    driver-level statement/socket timeouts (an earlier wave) already bound
+    how long the submitted call itself can run — this timeout is a second,
+    independent guard on how long THIS request waits for it, not the only
+    thing standing between a hung driver call and a wedged worker.
     """
-    pool = ThreadPoolExecutor(max_workers=1)
     try:
-        future = pool.submit(fn)
-        try:
-            future.result(timeout=timeout)
-            return DependencyCheck(ok=True)
-        except FutureTimeoutError:
-            return DependencyCheck(
-                ok=False, error=f"TimeoutError: exceeded {timeout}s budget"
-            )
-        except Exception as exc:  # noqa: BLE001 - reported as class name only
-            return DependencyCheck(ok=False, error=exc.__class__.__name__)
-    finally:
-        # `wait=False`: on a genuine timeout the submitted call is still
-        # running on its worker thread. Waiting here would silently turn
-        # the timeout budget back into an unbounded block, defeating the
-        # whole point. The worker thread finishes (or stays blocked) on
-        # its own; it holds no resource this process doesn't already
-        # leak on any other timed-out DB/Redis call.
-        pool.shutdown(wait=False)
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        return DependencyCheck(ok=False, error=f"TimeoutError: exceeded {timeout}s budget")
+    except Exception as exc:  # noqa: BLE001 - reported as class name only
+        return DependencyCheck(ok=False, error=exc.__class__.__name__)
 
 
-def _run_check_with_timeout(
-    fn: Callable[[], DependencyCheck], *, timeout: float
-) -> DependencyCheck:
-    """`_run_with_timeout` for a probe that builds its own `DependencyCheck`.
-
-    Same budget, same thread-pool discipline, same "class name only" failure
-    reporting; the difference is that these A5 probes have a verdict of their
-    own to report (a mismatch is not an exception) rather than signalling
-    success by simply not raising.
-    """
-    pool = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = pool.submit(fn)
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeoutError:
-            return DependencyCheck(
-                ok=False, error=f"TimeoutError: exceeded {timeout}s budget"
-            )
-        except Exception as exc:  # noqa: BLE001 - reported as class name only
-            return DependencyCheck(ok=False, error=exc.__class__.__name__)
-    finally:
-        pool.shutdown(wait=False)
-
-
-def _check_database(session: Session) -> None:
+def _probe_database() -> DependencyCheck:
     """Schema-independent connectivity probe — same query `check_connection()`
-    (`app_shared.database`) uses, run inline here so it can share this
-    request's already-open session rather than opening a second one."""
-    session.execute(text("SELECT 1"))
+    (`app_shared.database`) uses. EPA B8: opens its OWN session via
+    `get_session()` rather than sharing this request's session, so a
+    request handler is never the only thing keeping a probe's session
+    alive across generations."""
+    try:
+        with get_session() as session:
+            session.execute(text("SELECT 1"))
+        return DependencyCheck(ok=True)
+    except Exception as exc:  # noqa: BLE001 - reported as class name only
+        return DependencyCheck(ok=False, error=exc.__class__.__name__)
 
 
-def _check_redis(client: Any) -> None:
-    client.ping()
+def _probe_redis() -> DependencyCheck:
+    try:
+        get_redis_client().ping()
+        return DependencyCheck(ok=True)
+    except Exception as exc:  # noqa: BLE001 - reported as class name only
+        return DependencyCheck(ok=False, error=exc.__class__.__name__)
 
 
 def _live_migration_head(session: Session) -> str | None:
@@ -352,105 +339,59 @@ def _check_heartbeats(client: Any) -> DependencyCheck:
     return DependencyCheck(ok=True, detail=detail)
 
 
-def _breaker_enabled() -> bool:
-    """`PROXY_BREAKER_ENABLED`, without requiring a COMPLETE `Settings`.
+def _probe_migrations() -> DependencyCheck:
+    """`_check_migrations`, opening its OWN session (EPA B8/F16).
 
-    Task H2's lesson, applied one module over: a probe that constructs the
-    whole settings object inherits every unrelated required field, and a
-    process that is missing one then reports a `ValidationError` as a
-    failed dependency — a config problem masquerading as an outage. The
-    field's own default is `True`, and defaulting to "enabled" is the
-    fail-safe side of the question: it makes this check DO the freshness
-    read rather than silently declare the deadlock somebody else's
-    problem.
+    Never shares a session object with `_probe_database` — each probe in
+    this router now opens exactly one `get_session()` of its own, so a
+    session held by a stuck probe can never be touched by another one
+    (the hazard the pre-B8 short-circuiting comments here used to guard
+    against by sharing a single request-scoped session instead).
     """
     try:
-        return bool(get_settings().PROXY_BREAKER_ENABLED)
-    except Exception:  # noqa: BLE001 - a probe must not depend on full config
-        return True
-
-
-def _check_breaker_evidence(session: Session) -> DependencyCheck:
-    """Is the proxy breaker's evidence fresh enough for the cost gate?
-
-    EPA B1. The cost gate fails CLOSED on breaker evidence older than
-    `DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS`: a stale
-    `proxy_circuit_breakers.evaluated_at` denies every paid scrape in the
-    fleet. That is a total functional outage of the product's main job,
-    and before this check it was completely invisible from the outside —
-    every dependency up, every probe green, and not one paid request able
-    to run. An instance in that state is NOT ready, so this check
-    participates in the 200/503 verdict like every other one.
-
-    It reads the same row the gate reads, so it cannot disagree with it.
-    Nothing request-derived reaches the body: `detail` is built from an
-    integer this process computed and the row's own enum value.
-    """
-    if not _breaker_enabled():
-        # No breaker means no gate to deadlock; a disabled subsystem is a
-        # labelled absence, not a pass and not a failure (this module's
-        # docstring, same treatment as undeclared heartbeat services).
-        return DependencyCheck(ok=True, detail="disabled")
-
-    row = session.execute(
-        select(ProxyCircuitBreaker.evaluated_at, ProxyCircuitBreaker.state).where(
-            ProxyCircuitBreaker.scope_key == GLOBAL_BREAKER_SCOPE
-        )
-    ).first()
-    if row is None:
+        with get_session() as session:
+            return _check_migrations(session)
+    except Exception as exc:  # noqa: BLE001 - class name only, never the message
         return DependencyCheck(
-            ok=False,
-            error="no-row",
-            detail="cost gate denies all paid work",
+            ok=False, error=exc.__class__.__name__, detail="live migration head unreadable"
         )
 
-    evaluated_at, state = row[0], row[1]
-    # TIMESTAMPTZ everywhere, so a naive value can only come from outside
-    # the ORM; assume UTC rather than crash the probe.
-    if evaluated_at.tzinfo is None:
-        evaluated_at = evaluated_at.replace(tzinfo=UTC)
-    age_seconds = int((datetime.now(UTC) - evaluated_at).total_seconds())
-    stale = age_seconds > DEFAULT_BREAKER_MAX_EVIDENCE_AGE_SECONDS
-    return DependencyCheck(
-        ok=not stale,
-        error="stale" if stale else None,
-        detail=f"age_seconds={age_seconds} state={getattr(state, 'value', state)}",
+
+def _probe_heartbeats() -> DependencyCheck:
+    try:
+        return _check_heartbeats(get_redis_client())
+    except Exception as exc:  # noqa: BLE001 - reported as class name only
+        return DependencyCheck(ok=False, error=exc.__class__.__name__)
+
+
+def _compute_ready_response() -> tuple[ReadyResponse, int]:
+    """Run one full probe generation and return the fresh, non-stale result.
+
+    EPA B8 (F16): breaker evidence and freshness moved OUT of `/ready` and
+    into `GET /health/scraping` (`apps.api.app.routers.health`) — a
+    scraping-pipeline signal never gates readiness. `/ready` stays
+    DB/Redis/migration/heartbeats only; `READY_REQUIRED_HEARTBEAT_SERVICES`
+    stays here because a missing scheduler heartbeat is a dependency
+    failure, not a scraping-quality signal.
+
+    Every probe opens its OWN `get_session()`/`get_redis_client()` and is
+    submitted to the shared, bounded `_PROBE_EXECUTOR` — never more than
+    `max_workers=2` probe threads exist for this whole router, no matter
+    how many `/ready` requests are in flight (see `_generation_lock`,
+    which ensures only one generation ever runs at a time).
+    """
+    checks: dict[str, DependencyCheck] = {}
+
+    checks["database"] = _await_probe(
+        _PROBE_EXECUTOR.submit(_probe_database), timeout=_CHECK_TIMEOUT_SECONDS
+    )
+    checks["redis"] = _await_probe(
+        _PROBE_EXECUTOR.submit(_probe_redis), timeout=_CHECK_TIMEOUT_SECONDS
     )
 
-
-@router.get("/ready", response_model=ReadyResponse)
-def ready(
-    response: Response,
-    session: Session = Depends(_get_db_session),
-    redis_client: Any = Depends(_get_redis_dependency),
-) -> ReadyResponse:
-    # Every check is independently timeboxed by the same budget: the two new
-    # A5 checks each perform I/O (one system-table read, one Redis SCAN), so
-    # a hung dependency must not be able to delay the verdict through them
-    # any more than it can through the connectivity probes above.
-    checks = {
-        "database": _run_with_timeout(
-            lambda: _check_database(session), timeout=_CHECK_TIMEOUT_SECONDS
-        ),
-        "redis": _run_with_timeout(
-            lambda: _check_redis(redis_client), timeout=_CHECK_TIMEOUT_SECONDS
-        ),
-    }
-
-    # The two A5 checks reuse this request's session/client, and each check
-    # runs on its own worker thread — but strictly one at a time, because
-    # `_run_with_timeout` blocks on `future.result()` before the next check
-    # is submitted. The single exception is a TIMED-OUT check: `wait=False`
-    # deliberately leaves that worker running (see `_run_with_timeout`), so
-    # its `session` is still in use by another thread. A SQLAlchemy `Session`
-    # is not thread-safe, so `migrations` is short-circuited rather than
-    # allowed to touch a session a stuck thread still holds. Nothing is lost:
-    # a failed `database` check has already decided the verdict, and
-    # "database unreachable" is the more accurate thing to report than a
-    # derived migration error caused by it.
     if checks["database"].ok:
-        checks["migrations"] = _run_check_with_timeout(
-            lambda: _check_migrations(session), timeout=_CHECK_TIMEOUT_SECONDS
+        checks["migrations"] = _await_probe(
+            _PROBE_EXECUTOR.submit(_probe_migrations), timeout=_CHECK_TIMEOUT_SECONDS
         )
     else:
         checks["migrations"] = DependencyCheck(
@@ -459,26 +400,9 @@ def ready(
             detail="not checked — the database check failed first",
         )
 
-    # Same session hazard, same short-circuit, same reason as `migrations`
-    # above: a timed-out `database` check leaves its worker thread still
-    # holding this session, and a `Session` is not thread-safe.
-    if checks["database"].ok:
-        checks["breaker_evidence"] = _run_check_with_timeout(
-            lambda: _check_breaker_evidence(session), timeout=_CHECK_TIMEOUT_SECONDS
-        )
-    else:
-        checks["breaker_evidence"] = DependencyCheck(
-            ok=False,
-            error="DatabaseUnavailable",
-            detail="not checked — the database check failed first",
-        )
-
-    # Redis has no equivalent hazard (`redis.Redis` is thread-safe and pools
-    # its own connections), but the same short-circuit is applied for the
-    # same readability reason: one root cause, reported once.
     if checks["redis"].ok:
-        checks["heartbeats"] = _run_check_with_timeout(
-            lambda: _check_heartbeats(redis_client), timeout=_CHECK_TIMEOUT_SECONDS
+        checks["heartbeats"] = _await_probe(
+            _PROBE_EXECUTOR.submit(_probe_heartbeats), timeout=_CHECK_TIMEOUT_SECONDS
         )
     else:
         checks["heartbeats"] = DependencyCheck(
@@ -486,9 +410,60 @@ def ready(
             error="RedisUnavailable",
             detail="not checked — the redis check failed first",
         )
+
     ready_state = all(check.ok for check in checks.values())
-    response.status_code = 200 if ready_state else 503
-    return ReadyResponse(ready=ready_state, checks=checks)
+    return ReadyResponse(ready=ready_state, checks=checks), (200 if ready_state else 503)
+
+
+def _get_cached() -> "tuple[ReadyResponse, int] | None":
+    with _cache_lock:
+        if _last_response is None:
+            return None
+        return _last_response, _last_status_code
+
+
+def _set_cached(resp: ReadyResponse, status_code: int) -> None:
+    global _last_response, _last_status_code
+    with _cache_lock:
+        _last_response = resp
+        _last_status_code = status_code
+
+
+@router.get("/ready", response_model=ReadyResponse)
+def ready(response: Response) -> ReadyResponse:
+    """EPA B8 (F16): at most one probe generation runs at a time.
+
+    A request that acquires `_generation_lock` computes a fresh result and
+    caches it. A request that finds the lock already held returns the
+    cached result (if any) with `stale=True` instead of piling its own
+    probes on top of the in-flight generation — see `_generation_lock`'s
+    docstring. The one case with no cached result to fall back on (the
+    very first request(s) this process ever serves) blocks for the
+    in-flight generation instead of fabricating a verdict.
+    """
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        cached = _get_cached()
+        if cached is not None:
+            cached_resp, cached_status = cached
+            response.status_code = cached_status
+            return ReadyResponse(
+                ready=cached_resp.ready, checks=cached_resp.checks, stale=True
+            )
+        # No prior generation exists yet — wait for the in-flight one
+        # rather than guess. This only happens for the first request(s) a
+        # cold process serves before any generation has ever completed.
+        _generation_lock.acquire(blocking=True)
+        acquired = True
+
+    try:
+        resp, status_code = _compute_ready_response()
+        _set_cached(resp, status_code)
+    finally:
+        _generation_lock.release()
+
+    response.status_code = status_code
+    return resp
 
 
 __all__ = ["router"]

@@ -271,6 +271,20 @@ GRANT USAGE, CREATE ON SCHEMA public TO crawmatic_migrate;
 --    catch, and tests/integration/test_grants_manifest.py runs both
 --    against the same compose database.
 --
+--    THE ARRAYS BELOW ARE DERIVED, NOT INDEPENDENT (EPA B2-fix1).
+--    Each `FOREACH tbl IN ARRAY ARRAY[...]` loop is exactly one
+--    privilege-set group of `scripts/sql/grants_expected.yaml`, and
+--    `tests/unit/test_grants_manifest_schema.py` fails the unit gate if
+--    the two ever diverge — a table added to the manifest and to the
+--    YAML but not to the array below. That test exists because the EPA
+--    B10 release rehearsal caught exactly that drift: Stage B's three
+--    new tables (`domain_rules`, `refresh_rule_occurrences`,
+--    `strategy_discovery_state`) reached both reviewed files and not
+--    this one, so a clean migrate left `verify_grants.py` reporting 17
+--    MISSING grants and the tables unusable by every runtime role. When
+--    you add a table to the manifest, add it to the loop whose GRANT
+--    matches its privilege set here in the same change.
+--
 --    Still no DDL, no TRUNCATE-privilege, no REFERENCES, for the same
 --    three reasons as before:
 --
@@ -320,7 +334,7 @@ BEGIN
             EXECUTE format('GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_app', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'domain_lifecycle_audit', 'domain_playbooks', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'proxy_circuit_breakers', 'rollup_watermarks', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'domain_lifecycle_audit', 'domain_playbooks', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'proxy_circuit_breakers', 'refresh_rule_occurrences', 'rollup_watermarks', 'strategy_discovery_state', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -354,7 +368,7 @@ BEGIN
             -- crawmatic_app gets no privileges on this table (see grants_expected.yaml)
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'network_operations'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'domain_rules', 'network_operations'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -390,7 +404,7 @@ BEGIN
     END LOOP;
 
     -- ---- crawmatic_auth ----
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'api_abuse_limit_counters', 'competitor_product_matches', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'domain_strategy_profiles', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'network_operations', 'outbox_messages', 'price_alert_events', 'price_observations', 'product_group_items', 'product_groups', 'product_variants', 'provider_usage_records', 'proxy_circuit_breakers', 'refresh_rules', 'refresh_tokens', 'request_attempts', 'rollup_watermarks', 'scrape_job_targets', 'scrape_jobs', 'scrape_profile_revisions', 'scrape_profiles', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_method_switches', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'api_abuse_limit_counters', 'competitor_product_matches', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'domain_strategy_profiles', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'network_operations', 'outbox_messages', 'price_alert_events', 'price_observations', 'product_group_items', 'product_groups', 'product_variants', 'provider_usage_records', 'proxy_circuit_breakers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'request_attempts', 'rollup_watermarks', 'scrape_job_targets', 'scrape_jobs', 'scrape_profile_revisions', 'scrape_profiles', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -407,7 +421,7 @@ BEGIN
             EXECUTE format('GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_auth', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'api_keys', 'proxy_providers', 'users', 'webhook_endpoints'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'api_keys', 'domain_rules', 'proxy_providers', 'users', 'webhook_endpoints'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -443,7 +457,7 @@ BEGIN
     END LOOP;
 
     -- ---- crawmatic_scraper ----
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rules', 'refresh_tokens', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_settlements', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -477,7 +491,7 @@ BEGIN
             EXECUTE format('GRANT INSERT ON TABLE %I TO crawmatic_scraper', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['competitor_product_matches', 'domain_strategy_profiles', 'scrape_profiles'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['competitor_product_matches', 'domain_rules', 'domain_strategy_profiles', 'scrape_profiles'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
             CONTINUE;
