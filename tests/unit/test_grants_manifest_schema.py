@@ -156,6 +156,7 @@ def test_app_has_no_update_on_fleet_tables_except_the_evidenced_exception() -> N
         "domain_playbooks",
         "extraction_shadow_events",
         "fleet_cost_budgets",
+        "fleet_daily_scorecard",
         "fleet_network_cost_rollups",
         "maintenance_cadences",
         "proxy_circuit_breakers",

@@ -1353,6 +1353,22 @@ class Settings(BaseSettings):
 
     # --- END EPA C9 (F14) APPEND BLOCK -----------------------------------
 
+    # --- BEGIN EPA D5 (deep dive §12 item 9) APPEND BLOCK -- daily scorecard
+    #
+    # Appended (not interleaved with any block above) for the same reason
+    # every other EPA append block here is: this file is edited by
+    # several concurrent tasks and an append cannot conflict with theirs.
+    #
+    #: Cadence for `MAINTENANCE_DAILY_SCORECARD`
+    #: (`app_shared.maintenance.scorecard.run_daily_scorecard`). Daily,
+    #: like every other retention/rollup-shaped job — the scorecard row
+    #: it writes is itself a closed CALENDAR DAY, so running it more than
+    #: once a day would not produce a more current row, only a repeated
+    #: one (the write is an idempotent UPSERT on `date`).
+    SCORECARD_INTERVAL_SECONDS: int = 86400
+
+    # --- END EPA D5 APPEND BLOCK -------------------------------------------
+
     @field_validator("STRATEGY_PROFILE_SCOPE")
     @classmethod
     def _validate_strategy_profile_scope(cls, value: str) -> str:

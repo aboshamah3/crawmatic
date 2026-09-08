@@ -141,6 +141,10 @@ crawmatic_app:
   - DELETE
   - INSERT
   - SELECT
+  fleet_daily_scorecard:
+  - DELETE
+  - INSERT
+  - SELECT
   fleet_network_cost_rollups:
   - DELETE
   - INSERT
@@ -416,6 +420,11 @@ crawmatic_auth:
   - INSERT
   - SELECT
   - UPDATE
+  fleet_daily_scorecard:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
   fleet_network_cost_rollups:
   - DELETE
   - INSERT
@@ -640,6 +649,7 @@ crawmatic_scraper:
   extraction_shadow_events:
   - INSERT
   fleet_cost_budgets: []
+  fleet_daily_scorecard: []
   fleet_network_cost_rollups: []
   maintenance_cadences: []
   match_audit_classifications: []

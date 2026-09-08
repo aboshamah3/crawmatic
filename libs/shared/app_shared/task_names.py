@@ -243,3 +243,23 @@ MAINTENANCE_DOMAIN_TIMEOUT_TUNE = "maintenance.domain_timeout_tune"
 # ``SCRAPE_REDISPATCH_JOBS`` only jobs holding ``PENDING``/``DEFERRED``
 # work. See ``app_shared.jobs.reaper``.
 SCRAPE_REAP_STALE_TARGETS = "maintenance.reap_stale_targets"
+
+# --- Daily cost and freshness scorecard (EPA D5, deep dive §12 item 9) ---
+# Writes one ``fleet_daily_scorecard`` row per UTC day (yesterday's,
+# closed window) carrying the fleet's own cost/freshness figures --
+# provider bytes, valid-fresh-match rate and its attempt amplification,
+# browser/proxy mix, queue and persistence p95s, budget reserved/settled,
+# backup egress (fed by C10's ``POST /admin/ops/backup-report``
+# receiver), and cost per valid-fresh match. See
+# ``app_shared.maintenance.scorecard`` for the full field-by-field
+# provenance, including which three columns are always ``NULL`` today
+# (no durable Railway usage-API store exists yet) and why a missing
+# input is written as ``NULL``, never a fabricated ``0``.
+#
+# ``maintenance`` queue, daily (``SCORECARD_INTERVAL_SECONDS``), on the
+# scheduler's durable cadence -- the same shape as
+# ``MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN``/``MAINTENANCE_DAILY_ROLLUP``.
+# Read back by ``GET /admin/scorecard?days=30``
+# (``apps/api/app/routers/admin_ops.py``), same service-token guard as
+# the rest of that router.
+MAINTENANCE_DAILY_SCORECARD = "maintenance.daily_scorecard"

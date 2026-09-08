@@ -37,9 +37,9 @@
 | C9 | C | PC-8 | Retention per data class; ledger child summarization; partitioning (F14) | C8 | opus | done-dev (owner ratification: FK trade + RETENTION_ENABLED_CLASSES) | 1 | reports/C9.md |
 | C10 | C | PC-9 | Backups from inside Railway, measured, encrypted, off-host (F21) | B10 | opus | done-dev (owner gate step 3 deferred; backup-report route has no receiver) | 1 | reports/C10.md |
 | C11 | C | PC-10 | Engine release 3 — OWNER GATE | C1-C10 | sonnet | done (owner gate: release 3 deploy deferred) | 1 | reports/C11.md |
-| D1 | D | PD-1 | Controlled-origin fleet test at 100 × 5,000 in a temporary Railway staging environment | D5 | opus | pending | 0 | - |
-| D2 | D | PD-2 | Fault-injection matrix in staging | C11 | sonnet | pending | 0 | - |
-| D3 | D | PD-2 | Bounded real-domain canary with provider and container reconciliation — spend ≤ $3 | C11 | sonnet | pending | 0 | - |
-| D4 | D | PD-4 | Staged rollout 1 → 5 → 20 → 100 stores with stop rules — OWNER GATE per step | D1, D2, D3 | sonnet | pending | 0 | - |
-| D5 | D | PD-3 | Daily cost and freshness scorecard | C11 | sonnet | pending | 0 | - |
-| D6 | D | PD-4 | Re-score against the gate table and close the plan | D1-D5 | sonnet | pending | 0 | - |
+| D1 | D | PD-1 | Controlled-origin fleet test at 100 × 5,000 in a temporary Railway staging environment | D5 | opus | done-dev (steps 2–4 owner-deferred; 500k benchmark PASS 2.3 s) | 1 | reports/D1.md |
+| D2 | D | PD-2 | Fault-injection matrix in staging | C11 | sonnet | done-dev (staging runs owner-deferred) | 1 | reports/D2.md |
+| D3 | D | PD-2 | Bounded real-domain canary with provider and container reconciliation — spend ≤ $3 | C11 | sonnet | done-dev (canary spend ≤$3 owner-deferred) | 1 | reports/D2.md |
+| D4 | D | PD-4 | Staged rollout 1 → 5 → 20 → 100 stores with stop rules — OWNER GATE per step | D1, D2, D3 | sonnet | done-dev (rollout execution owner-deferred) | 1 | reports/D4.md |
+| D5 | D | PD-3 | Daily cost and freshness scorecard | C11 | sonnet | done-dev (Railway CPU/RAM/egress columns NULL until watchdog store) | 1 | reports/D5.md |
+| D6 | D | PD-4 | Re-score against the gate table and close the plan | D1-D5 | sonnet | done-dev (re-score: 0 PASS, 5 PARTIAL, 7 NOT YET MEASURED of 12) | 1 | reports/D4.md |

@@ -148,6 +148,7 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_RECONCILE_PROVIDER_USAGE,
     CADENCE_EVIDENCE_RETENTION,
     CADENCE_LEDGER_SUMMARIZE_CHILDREN,
+    CADENCE_DAILY_SCORECARD,
     CADENCE_RETENTION_DROP,
 )
 from app_shared.models.refresh_rule_occurrences import refresh_rule_occurrences
@@ -182,6 +183,7 @@ from app_shared.task_names import (
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_EVIDENCE_RETENTION,
     MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
+    MAINTENANCE_DAILY_SCORECARD,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -460,6 +462,23 @@ def _enqueue_ledger_summarize_children() -> None:
         )
 
 
+def _enqueue_daily_scorecard() -> None:
+    """Fire-and-forget `MAINTENANCE_DAILY_SCORECARD` on the `maintenance`
+    queue (EPA D5, deep dive §12 item 9) -- write yesterday UTC's
+    fleet-wide cost/freshness scorecard row.
+
+    Errors logged and swallowed, same as every sibling here: a missed
+    tick means the row for that day is written on the NEXT tick instead
+    (the write is an idempotent UPSERT on `date`, so a late run is not a
+    lost day), and there is no downstream deletion or spend riding on
+    this task the way there is on retention/rollup.
+    """
+    try:
+        enqueue(MAINTENANCE_DAILY_SCORECARD, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_DAILY_SCORECARD)
+
+
 def _enqueue_outbox_drain() -> None:
     """Fire-and-forget `OUTBOX_DRAIN` on the `maintenance` queue (audit
     risk H1). This is the pass that turns durably-recorded
@@ -721,6 +740,17 @@ _DURABLE_CADENCES = (
         CADENCE_LEDGER_SUMMARIZE_CHILDREN,
         "LEDGER_SUMMARIZE_INTERVAL_SECONDS",
         _enqueue_ledger_summarize_children,
+    ),
+    # EPA D5 2026-09-08 (deep dive §12 item 9). Its OWN knob
+    # (`SCORECARD_INTERVAL_SECONDS`, daily) rather than sharing another
+    # daily job's: the scorecard row is a closed CALENDAR DAY summary,
+    # not a sweep with a backlog, so an operator tuning how often to
+    # recompute it is making an independent decision from every other
+    # daily cadence here.
+    (
+        CADENCE_DAILY_SCORECARD,
+        "SCORECARD_INTERVAL_SECONDS",
+        _enqueue_daily_scorecard,
     ),
 )
 

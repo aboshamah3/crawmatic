@@ -10,11 +10,12 @@ Handovers: 1
 | 0 | Phase 0 — Preconditions | - | 7a26c54 | - | done (d824f31) | 4/4 | PASS |
 | A | Stage A — Contain risk, trustworthy baseline | 0 | d824f31 | - | done (8960632) | 10/10 | PASS (#2 after 1 fix) |
 | B | Stage B — Durable work, reliable schedules | A | 8960632 | - | done (3730ab9) | 10/10 | PASS (#2 after 1 fix cycle) |
-| C | Stage C — Efficient and correct results/cost | B | 3730ab9 | - | done (committing) | 11/11 | PASS (#1) |
-| D | Stage D — Certify and expand | C | - | - | pending | 0/6 | - |
+| C | Stage C — Efficient and correct results/cost | B | 3730ab9 | - | done (9e932fa) | 11/11 | PASS (#1) |
+| D | Stage D — Certify and expand | C | 9e932fa | - | done (committing) | 6/6 | PASS (#1) |
 
 ## Wave in flight
-none — phase C committed; D-w1 next. Alembic head a5e0c74b13d9.
+none — all phases committed; Stage 9 (final verification → reporter) next. Alembic head a5e0c74b13d9.
 
 ## Next action
-Phase C gate review in flight. PASS → secret-scan, add reviewed files, commit `EPA phase C`, Stage D.
+Phase D gate review in flight. PASS → secret-scan, add reviewed files, commit `EPA phase D`; final verification agent; reporter; terminal status COMPLETE-WITH-DEFERRED-GATES (owner gates listed).
+

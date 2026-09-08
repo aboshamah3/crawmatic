@@ -18,7 +18,15 @@ members = ["apps/*", "libs/*"]
 # makes EVERY `uv run` in the repo fail. Excluding it keeps it out of the
 # resolution entirely, which also means adding this service does not touch
 # `uv.lock` (C10, F21).
-exclude = ["apps/dr-backup"]
+# `apps/fixture-origin` (EPA D1, F22) is excluded for the same mechanical
+# reason and one design reason. Mechanical: it has no pyproject.toml, and
+# `apps/*` would otherwise claim it as a member and break every `uv run`.
+# Design: it is the *target* of the fleet test, not a component of the
+# engine — it must not be able to import `app_shared` or share a
+# dependency set with the services being measured, so its two pins live
+# in `apps/fixture-origin/Dockerfile` and adding it touches neither
+# `uv.lock` nor any engine image.
+exclude = ["apps/dr-backup", "apps/fixture-origin"]
 
 [dependency-groups]
 dev = [

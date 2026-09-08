@@ -282,6 +282,12 @@ from app_shared.models.network_operation_summaries import (
 )
 from app_shared.models.rollup_completion import RollupCompletion
 
+# EPA D5 (deep dive §12 item 9): one row per UTC day summarising fleet-wide
+# cost and freshness. Global, no RLS, no `workspace_id` — the
+# `rollup_completion`/`rollup_watermarks` shape (deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`).
+from app_shared.models.fleet_daily_scorecard import FleetDailyScorecard
+
 # EPA C5 (2026-08-26): raw provider usage evidence — the OTHER side of
 # reconciliation against C1's ledger. Re-exported so `Base.metadata` sees
 # the table for Alembic autogenerate/offline-render (`target_metadata`).
@@ -421,4 +427,5 @@ __all__ = [
     "ControlPlaneRule",
     "StrategyDiscoveryState",
     "DISCOVERY_SCAN_STATE_KEY",
+    "FleetDailyScorecard",
 ]

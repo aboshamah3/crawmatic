@@ -143,6 +143,13 @@ CADENCE_EVIDENCE_RETENTION = "evidence_retention"
 #: must not be confused with the partition drop's. Interval:
 #: ``LEDGER_SUMMARIZE_INTERVAL_SECONDS`` (daily, its own knob).
 CADENCE_LEDGER_SUMMARIZE_CHILDREN = "ledger_summarize_children"
+#: EPA D5 (2026-09-08, deep dive §12 item 9): the daily cost/freshness
+#: scorecard (``app_shared.maintenance.scorecard.run_daily_scorecard``
+#: via ``MAINTENANCE_DAILY_SCORECARD``). Its own key for the same reason
+#: every other daily maintenance job gets one: an operator pausing the
+#: scorecard write must not also pause rollups or retention. Interval:
+#: ``SCORECARD_INTERVAL_SECONDS`` (daily, its own knob).
+CADENCE_DAILY_SCORECARD = "daily_scorecard"
 
 #: Every cadence the scheduler drives durably (the daily ones, plus the
 #: 6-hourly entitlement refresh and the 5-minute breaker evaluation). The
@@ -160,6 +167,7 @@ DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_DISPATCH_RECONCILE,
     CADENCE_EVIDENCE_RETENTION,
     CADENCE_LEDGER_SUMMARIZE_CHILDREN,
+    CADENCE_DAILY_SCORECARD,
 )
 
 
@@ -204,6 +212,7 @@ __all__ = [
     "CADENCE_RETENTION_DROP",
     "CADENCE_EVIDENCE_RETENTION",
     "CADENCE_LEDGER_SUMMARIZE_CHILDREN",
+    "CADENCE_DAILY_SCORECARD",
     "DURABLE_CADENCE_KEYS",
     "EPOCH_DUE",
     "MaintenanceCadence",

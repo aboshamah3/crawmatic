@@ -109,6 +109,7 @@ def test_five_hundred_thousand_observations_roll_up_in_keyset_batches() -> None:
     from app_shared.config import get_settings
     from app_shared.database import get_session, get_system_sessionmaker
     from app_shared.enums import ProductStatus, VariantStatus, WorkspaceStatus
+    from app_shared.ids import new_uuid7
     from app_shared.maintenance.rollups import run_daily_rollup
     from app_shared.models import Workspace
     from app_shared.models.catalog import Product, ProductVariant
@@ -136,7 +137,19 @@ def test_five_hundred_thousand_observations_roll_up_in_keyset_batches() -> None:
         product_id = product.id
         variant_ids = []
         for index in range(VARIANTS):
+            # EPA D1 (first actual run of this benchmark): the id is
+            # assigned EXPLICITLY rather than left to
+            # `Base.id`'s `default=new_uuid7`. A Core/ORM column default
+            # is evaluated at INSERT time, so reading `variant.id`
+            # straight after `session.add()` yields `None` — and the
+            # `variant_ids` list then carried 5,000 `None`s into
+            # `_seed_states`, which failed with
+            # `invalid input syntax for type uuid: "None"` before a
+            # single observation was seeded. Assigning up front keeps
+            # the single-flush shape (no per-variant round trip) while
+            # making the ids real.
             variant = ProductVariant(
+                id=new_uuid7(),
                 workspace_id=workspace_id,
                 product_id=product_id,
                 title=f"v{index}",
@@ -225,15 +238,22 @@ def _seed_observations(workspace_id, product_id, variant_ids, noon) -> None:
             session.execute(
                 text(
                     """
+                    -- No `created_at`/`updated_at`: `PriceObservation` is
+                    -- the one workspace-scoped model in the schema that
+                    -- deliberately does NOT carry `TimestampMixin` (it is
+                    -- immutable and partitioned by `scraped_at`, which IS
+                    -- its time column). Naming them here made this
+                    -- statement fail with `column "created_at" of relation
+                    -- "price_observations" does not exist` on the
+                    -- benchmark's first actual run (EPA D1).
                     INSERT INTO price_observations (
                         id, workspace_id, scraped_at, match_id, product_id,
-                        product_variant_id, price, currency, success, comparable,
-                        created_at, updated_at)
+                        product_variant_id, price, currency, success, comparable)
                     SELECT gen_random_uuid(), :ws,
                            :noon + make_interval(secs => (n % 86000)),
                            md5(v::text || (n % :matches)::text)::uuid,
                            :product, v,
-                           10.0000 + (n % 50), 'USD', TRUE, TRUE, now(), now()
+                           10.0000 + (n % 50), 'USD', TRUE, TRUE
                     FROM unnest(CAST(:variants AS uuid[])) AS v,
                          generate_series(0, :per_variant - 1) AS n
                     """
@@ -248,6 +268,19 @@ def _seed_observations(workspace_id, product_id, variant_ids, noon) -> None:
                 },
             )
             session.commit()
+        # ANALYZE before measuring anything (EPA D1, first actual run).
+        # Without it the rollup's first batch is planned against
+        # statistics that still say this partition is EMPTY -- autoanalyze
+        # has not caught up with a bulk load -- and the planner picks a
+        # nested loop that turns a 0.2 s statement into one that had not
+        # finished after 18 MINUTES on a 100,000-observation dataset.
+        # That is a real property of a freshly restored/seeded staging
+        # database (see docs/ops/FLEET_TEST_2026-09.md), but it is the
+        # PLANNER's bad day, not the rollup's cost, and a benchmark that
+        # measures it measures nothing reproducible.
+        session.execute(text("ANALYZE price_observations"))
+        session.execute(text("ANALYZE variant_price_states"))
+        session.commit()
 
 
 def _cleanup(workspace_id, day: date) -> None:

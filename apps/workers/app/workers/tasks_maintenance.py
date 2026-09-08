@@ -58,6 +58,7 @@ from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.maintenance.ledger_summaries import run_ledger_child_summarization
 from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
+from app_shared.maintenance.scorecard import run_daily_scorecard
 from app_shared.maintenance.rollups import (
     recompute_window,
     run_daily_rollup,
@@ -83,6 +84,7 @@ from app_shared.task_names import (
     MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_EVIDENCE_RETENTION,
     MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
+    MAINTENANCE_DAILY_SCORECARD,
     MAINTENANCE_DOMAIN_TIMEOUT_TUNE,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
@@ -494,6 +496,57 @@ def ledger_summarize_children() -> None:
         len(report.parents_summarized),
         report.children_deleted,
         report.parents_deferred_unsettled,
+    )
+
+
+def _scorecard_redis_client():
+    """Best-effort Redis client for the scorecard's backup-egress input.
+
+    Mirrors `apps/api/app/routers/ops_metrics.py`'s `_get_redis`: Redis
+    unavailability must degrade `backup_egress_gb` to `NULL`, never fail
+    the whole scorecard write.
+    """
+    try:
+        from app_shared.redis_client import get_redis_client
+
+        return get_redis_client()
+    except Exception:  # noqa: BLE001 - see docstring
+        return None
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_DAILY_SCORECARD)
+def daily_scorecard() -> None:
+    """`MAINTENANCE_DAILY_SCORECARD` (`maintenance` queue, EPA D5, deep
+    dive §12 item 9).
+
+    Writes yesterday UTC's `fleet_daily_scorecard` row -- see
+    `app_shared.maintenance.scorecard` for the full field-by-field
+    provenance and the NULL-never-0 discipline every metric here
+    follows. Idempotent (an UPSERT on `date`), so a re-run for a day
+    already written simply overwrites it with a freshly-computed answer.
+
+    FLEET-scoped on the BYPASSRLS system session: every metric is a
+    cross-tenant aggregate with no `workspace_id` to scope by at all --
+    the same reasoning `ledger_summarize_children`/`run_daily_rollup`'s
+    driver scan use.
+    """
+    with _system_session("daily_scorecard") as session:
+        report = run_daily_scorecard(
+            session,
+            now=datetime.now(timezone.utc),
+            redis_client=_scorecard_redis_client(),
+        )
+        session.commit()
+
+    logger.info(
+        "maintenance_daily_scorecard date=%s missing_metric_fraction=%s "
+        "valid_fresh_matches=%s browser_share=%s proxied_share=%s",
+        report.date.isoformat(),
+        report.row.missing_metric_fraction,
+        report.row.valid_fresh_matches,
+        report.row.browser_share,
+        report.row.proxied_share,
     )
 
 

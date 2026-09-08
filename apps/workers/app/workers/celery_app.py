@@ -59,6 +59,7 @@ from app_shared.task_names import (
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
     MAINTENANCE_EVIDENCE_RETENTION,
     MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
+    MAINTENANCE_DAILY_SCORECARD,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -269,6 +270,11 @@ app.conf.task_routes = {
     # ARRIVED, so pausing it is a different decision from pausing a
     # partition drop.
     MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN: {"queue": "maintenance"},
+    # EPA D5 (deep dive §12 item 9): the daily cost/freshness scorecard.
+    # Same queue and same BYPASSRLS system session as its maintenance
+    # siblings; its own task so pausing it never pauses rollups or
+    # retention.
+    MAINTENANCE_DAILY_SCORECARD: {"queue": "maintenance"},
     CREATE_WEBHOOK_EVENT: {"queue": "webhook_events"},
     # Audit H1: both outbox passes are ordinary `maintenance` sweeps —
     # bounded DB work on the BYPASSRLS system session, no blocking fetch.
@@ -351,6 +357,10 @@ app.conf.task_annotations = {
     # because a summarised parent is no longer eligible. Nothing here
     # needs the 1,800 s a full-day rollup does.
     MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN: _REAPER_LIMITS,
+    # EPA D5: a handful of bounded aggregate SELECTs plus one UPSERT for
+    # a single closed calendar day -- reaper-shaped, nowhere near the
+    # 1,800s a full-day rollup needs.
+    MAINTENANCE_DAILY_SCORECARD: _REAPER_LIMITS,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD: _REAPER_LIMITS,
     # EPA C1 (F08): one 7-day aggregate + at most one UPSERT per
     # domain -- a reaper-shaped sweep, so the 300s reaper budget.

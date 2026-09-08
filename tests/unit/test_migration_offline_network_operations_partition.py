@@ -57,11 +57,26 @@ def _upgrade_sql() -> str:
 
 
 def test_single_head() -> None:
+    """Exactly one head, and this revision is still part of the chain
+    leading to it.
+
+    `SWAP_REVISION` no longer needs to BE the head: later EPA tasks
+    chain further revisions on top of it (e.g. EPA D5's
+    `f6b28c714a93_fleet_daily_scorecard`). Pinning the head string here
+    would make this test fail every time a later, unrelated migration
+    lands — the property this test actually owns is "one head, and the
+    swap is still in its ancestry", not "the swap is the newest thing".
+    """
     result = _run_alembic("heads")
     assert result.returncode == 0, result.stderr
     heads = [line for line in result.stdout.splitlines() if line.strip()]
     assert len(heads) == 1, f"expected exactly one head, got: {heads}"
-    assert SWAP_REVISION in heads[0]
+
+    history = _run_alembic("history")
+    assert history.returncode == 0, history.stderr
+    assert SWAP_REVISION in history.stdout, (
+        f"{SWAP_REVISION} should still appear in the migration history"
+    )
 
 
 def test_revisions_chain_in_the_declared_order() -> None:
