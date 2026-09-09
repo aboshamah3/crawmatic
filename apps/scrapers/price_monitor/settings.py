@@ -129,15 +129,20 @@ DOWNLOADER_MIDDLEWARES = {
     # HttpCompressionMiddleware (590), which is the only position where
     # `bytes_decompressed` is measurable at all. The compressed count
     # comes from `scrape_core.middlewares.wire_bytes.WireBytesMiddleware`
-    # (585, just below), with the pre-EPA-A7 `bytes_received`-signal total
+    # (595, just above), with the pre-EPA-A7 `bytes_received`-signal total
     # kept only as a fallback for the rare case a response never reaches
-    # 585 (e.g. a mid-download exception).
+    # 595 (e.g. a mid-download exception).
     "scrape_core.netledger_middleware.NetLedgerMiddleware": 130,
-    # EPA A7 (deep dive §8.2): one priority below `HttpCompressionMiddleware`
-    # (590) so it sees the response BEFORE decompression rewrites
-    # `response.body` in place -- see the middleware's own module
-    # docstring for why 585 specifically.
-    "scrape_core.middlewares.wire_bytes.WireBytesMiddleware": 585,
+    # EPA A7 (deep dive §8.2), priority CORRECTED by review R12
+    # (2026-09-09). Responses walk this map in DESCENDING priority, so the
+    # original 585 -- "one below 590" -- ran this middleware AFTER
+    # `HttpCompressionMiddleware`, i.e. on the already-decoded body: the
+    # reviewer's probe recorded 177 bytes on the wire as 18,053. 595 is
+    # ABOVE compression (590) and still BELOW `RedirectMiddleware` (600),
+    # so the measurement happens before decompression without changing
+    # which responses reach the measurement at all -- see the middleware's
+    # own module docstring for why 595 specifically.
+    "scrape_core.middlewares.wire_bytes.WireBytesMiddleware": 595,
     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
 }
 

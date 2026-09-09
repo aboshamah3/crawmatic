@@ -24,12 +24,12 @@ Registered at priority **130** in both projects' ``DOWNLOADER_MIDDLEWARES``:
   body is still compressed.
 * The COMPRESSED count, for PROXY and DIRECT, comes from
   ``response.meta["wire_bytes"]`` (EPA A7,
-  :mod:`scrape_core.middlewares.wire_bytes`, priority 585 — one below
+  :mod:`scrape_core.middlewares.wire_bytes`, priority 595 — one above
   ``HttpCompressionMiddleware`` so it still sees the response before
   decompression) — ``len(body) + len(headers) + len(status line)`` as it
   actually crossed the wire, at THAT priority, before this middleware
   (130) ever runs. When that meta key is absent (a response never
-  reached 585, e.g. an exception mid-download) this falls back to the
+  reached 595, e.g. an exception mid-download) this falls back to the
   pre-A7 measurement: Scrapy's ``bytes_received`` signal, the raw
   transport bytes with no framing added — still never fabricated, just
   less precise. BROWSER keeps its own separate measurement (below).
@@ -511,14 +511,14 @@ class NetLedgerMiddleware:
             bytes_compressed = main_document_bytes
             bytes_decompressed = None
         else:
-            # PROXY/DIRECT: EPA A7's `WireBytesMiddleware` (585) stamps
+            # PROXY/DIRECT: EPA A7's `WireBytesMiddleware` (595) stamps
             # the actual on-the-wire count (body + headers + status line,
             # still compressed at that priority) onto `wire_bytes` before
             # this middleware (130) ever runs. Preferred over the older
             # `bytes_received`-signal total, which only ever saw raw TCP
             # chunks with no framing accounted for. The signal total is
             # kept as the fallback for the one case `wire_bytes` cannot
-            # cover: a response that never reached priority 585 at all
+            # cover: a response that never reached priority 595 at all
             # (an exception mid-download, or the middleware disabled).
             wire_bytes = meta.get("wire_bytes")
             if wire_bytes is not None:

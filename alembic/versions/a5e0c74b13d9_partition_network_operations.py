@@ -108,6 +108,9 @@ from app_shared.models.network_operations import (
     NETWORK_OPERATION_IMMUTABILITY_SQL,
 )
 from app_shared.models.rls import PARTITION_RLS_INHERITANCE_SQL
+from app_shared.models.workspace_usage_view import (
+    RECREATE_WORKSPACE_USAGE_VIEW_SQL,
+)
 
 
 # revision identifiers, used by Alembic.
@@ -362,6 +365,20 @@ def upgrade() -> None:
     """Upgrade schema."""
     op.execute(BUILD_AND_COPY_SQL)
     op.execute(SWAP_SQL)
+    # Review R13 (2026-09-09). `SWAP_SQL` renames the relation
+    # `workspace_usage_v` was created over, and Postgres resolves a view's
+    # dependencies to relation OIDs rather than names -- so at this point
+    # the tenant usage view is still reading
+    # `network_operations_pre_partition`: a table that receives no further
+    # rows, and that can now never be dropped, because the view depends on
+    # it. Both failures are silent. Recreating the view (its definition
+    # names the table, so the new one rebinds to whatever currently holds
+    # the name) is what makes the swap complete, and the grant must be
+    # re-applied because a recreated view is a NEW object that carries
+    # none of the old one's privileges. `CREATE OR REPLACE` would not do:
+    # it cannot change a view's underlying relation binding.
+    for statement in RECREATE_WORKSPACE_USAGE_VIEW_SQL:
+        op.execute(statement)
     op.execute(NETWORK_OPERATION_IMMUTABILITY_SQL)
     op.execute(PARTITION_RLS_INHERITANCE_SQL)
 
@@ -369,4 +386,11 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Downgrade schema."""
     op.execute(DOWNGRADE_SQL)
+    # The mirror of the recreation above. `DOWNGRADE_SQL` drops the
+    # partitioned table and renames the legacy one back, which leaves the
+    # view bound to a relation that no longer exists -- and, before that,
+    # would have made the drop itself fail on the dependency. Same three
+    # statements, same order, on the way back.
+    for statement in RECREATE_WORKSPACE_USAGE_VIEW_SQL:
+        op.execute(statement)
     op.execute(NETWORK_OPERATION_IMMUTABILITY_SQL)

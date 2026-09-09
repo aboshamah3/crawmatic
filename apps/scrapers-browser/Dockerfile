@@ -76,9 +76,24 @@ RUN mkdir -p eggs logs dbs items \
 RUN mkdir -p eggs/price_monitor_browser \
     && uvx --from scrapyd-client==2.0.3 scrapyd-deploy --build-egg eggs/price_monitor_browser/1_0.egg
 
+# Review R10 (2026-09-09): the durable result spool
+# (`Settings.SCRAPE_RESULT_SPOOL_PATH`, default
+# `/var/lib/crawmatic/spool/scrape_results.sqlite3`) is opened
+# UNCONDITIONALLY by `BatchedPersistencePipeline.__init__`, i.e. while
+# Scrapy is building the pipeline, before a spider has fetched anything.
+# Nothing here created that directory and nothing mounted a volume at it,
+# so every new spider on this image died at construction with a bare
+# `[Errno 13]` on a path that appeared in neither this file nor
+# docker-compose.yml. It is created (and owned by the runtime user)
+# alongside the netledger buffer's directory, so the two durable queues
+# live on one volume and one mount makes the host crash-safe -- the
+# reason `config.py` placed them side by side in the first place.
+RUN mkdir -p /var/lib/crawmatic/spool /var/lib/crawmatic/netledger
+
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \
     && chown -R app:app /app \
+    && chown -R app:app /var/lib/crawmatic \
     && chown -R app:app /ms-playwright
 USER app
 

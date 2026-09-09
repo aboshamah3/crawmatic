@@ -209,6 +209,19 @@ services:
       context: .
       dockerfile: apps/scrapers/Dockerfile
     env_file: .env
+    # Review R10 (2026-09-09): the durable result spool. Every scrape
+    # result is written to `SCRAPE_RESULT_SPOOL_PATH` (default
+    # `/var/lib/crawmatic/spool/scrape_results.sqlite3`) BEFORE it enters
+    # the flush buffer, and the row is deleted only once Postgres has
+    # committed it — so the file's whole purpose is to survive the
+    # container. Held on the same volume as the netledger buffer
+    # (`NETLEDGER_BUFFER_PATH`, its sibling under `/var/lib/crawmatic`),
+    # because one mount for both durable queues is what makes the node
+    # crash-safe rather than two that can be half-configured. The image
+    # creates the directory app-owned (see the Dockerfile); this keeps
+    # what is written into it.
+    volumes:
+      - scrapers_spool:/var/lib/crawmatic
     environment:
       SCRAPYD_USERNAME: ${SCRAPYD_USERNAME}
       SCRAPYD_PASSWORD: ${SCRAPYD_PASSWORD}
@@ -233,6 +246,19 @@ services:
       context: .
       dockerfile: apps/scrapers-browser/Dockerfile
     env_file: .env
+    # Review R10 (2026-09-09): the durable result spool. Every scrape
+    # result is written to `SCRAPE_RESULT_SPOOL_PATH` (default
+    # `/var/lib/crawmatic/spool/scrape_results.sqlite3`) BEFORE it enters
+    # the flush buffer, and the row is deleted only once Postgres has
+    # committed it — so the file's whole purpose is to survive the
+    # container. Held on the same volume as the netledger buffer
+    # (`NETLEDGER_BUFFER_PATH`, its sibling under `/var/lib/crawmatic`),
+    # because one mount for both durable queues is what makes the node
+    # crash-safe rather than two that can be half-configured. The image
+    # creates the directory app-owned (see the Dockerfile); this keeps
+    # what is written into it.
+    volumes:
+      - scrapers_browser_spool:/var/lib/crawmatic
     environment:
       SCRAPYD_USERNAME: ${SCRAPYD_USERNAME}
       SCRAPYD_PASSWORD: ${SCRAPYD_PASSWORD}
@@ -252,3 +278,8 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  # R10: one durable-queue volume per scraper node. Separate volumes (not
+  # one shared) because the spool is a per-HOST fact — two Scrapyd nodes
+  # draining each other's half-written batches is not a recovery story.
+  scrapers_spool:
+  scrapers_browser_spool:

@@ -65,6 +65,7 @@ import uuid
 from dataclasses import dataclass, fields
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Iterable, Sequence, get_args, get_origin, get_type_hints
 
 from app_shared.netledger.buffer import BufferedEvent, DurableEventBuffer
@@ -76,10 +77,33 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "KIND_QUARANTINED",
     "KIND_SCRAPE_RESULT",
+    "SPOOL_PATH_SETTING",
     "SPOOL_SCHEMA_VERSION",
     "ResultSpool",
+    "SpoolNotWritableError",
     "SpooledBatch",
 ]
+
+#: The setting (and, because ``Settings`` reads its fields from the
+#: environment, the env var) that moves the spool file. Named in the
+#: fail-fast message below rather than spelled out at the call site: an
+#: operator handed a path with no lever has been told what broke and not
+#: what to do about it.
+SPOOL_PATH_SETTING = "SCRAPE_RESULT_SPOOL_PATH"
+
+
+class SpoolNotWritableError(RuntimeError):
+    """The spool directory does not exist and cannot be created, or is read-only.
+
+    Raised by :meth:`ResultSpool.__init__`, which is reached during
+    ``BatchedPersistencePipeline`` CONSTRUCTION -- before a spider has
+    fetched anything. That timing is why this is a distinct, loud error
+    rather than a bare ``PermissionError`` from ``sqlite3``: review R10
+    found both scraper images dropping to ``USER app`` without ever
+    creating ``/var/lib/crawmatic/spool``, so every new spider on those
+    images died at construction with ``[Errno 13]`` on a path that
+    appeared in no Dockerfile and no compose file.
+    """
 
 #: A scrape result durably queued for persistence, not yet committed.
 KIND_SCRAPE_RESULT = "SCRAPE_RESULT"
@@ -129,6 +153,40 @@ class SpooledBatch:
     attempts: int
 
 
+def _ensure_spool_directory(path: str | os.PathLike[str]) -> None:
+    """Create the spool's parent directory and PROVE it is writable.
+
+    Two failures, one message. The directory may be impossible to create
+    (``/var/lib/crawmatic`` is root-owned; the spider is ``app``), or it
+    may already exist and be read-only (a volume mounted root-owned) --
+    ``mkdir(exist_ok=True)`` is happy with the second and ``sqlite3``
+    is not. So this creates, then writes and removes a probe file: the
+    only check that answers the question the caller is about to ask.
+
+    ``:memory:`` is passed straight through -- it names no directory, and
+    :class:`~app_shared.netledger.buffer.DurableEventBuffer` already
+    special-cases it.
+    """
+    resolved = str(path)
+    if resolved == ":memory:":
+        return
+    directory = Path(resolved).parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".crawmatic-spool-probe-{os.getpid()}"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as exc:
+        raise SpoolNotWritableError(
+            f"the scrape result spool directory {directory} is not writable "
+            f"({type(exc).__name__}: {exc}). Every scrape result is written here "
+            "before it reaches Postgres, so the spider cannot start without it. "
+            f"Either provision the directory in the scrapers/scrapers-browser image "
+            f"and mount a volume there, or point {SPOOL_PATH_SETTING} at a directory "
+            "this process can write."
+        ) from exc
+
+
 class ResultSpool:
     """Durable queue of ``ScrapeResult`` items awaiting persistence.
 
@@ -143,6 +201,9 @@ class ResultSpool:
         *,
         synchronous: str = "NORMAL",
     ) -> None:
+        # Fail fast, and fail legibly: this runs during pipeline
+        # construction, before any fetch (review R10).
+        _ensure_spool_directory(path)
         self._buffer = DurableEventBuffer(path, synchronous=synchronous)
 
     @property

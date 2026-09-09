@@ -82,6 +82,12 @@ from typing import Sequence, Union
 
 from alembic import op
 
+from app_shared.models.workspace_usage_view import (
+    CREATE_WORKSPACE_USAGE_VIEW_SQL,
+    DROP_WORKSPACE_USAGE_VIEW_SQL,
+    GRANT_WORKSPACE_USAGE_VIEW_SQL,
+)
+
 # revision identifiers, used by Alembic.
 revision: str = '193ac27f0dc2'
 down_revision: Union[str, Sequence[str], None] = 'a2f0217c9d43'
@@ -89,53 +95,28 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-_WORKSPACE_CTX = "NULLIF(current_setting('app.workspace_id', true), '')::uuid"
-
-_CREATE_VIEW_SQL = f"""
-CREATE VIEW workspace_usage_v AS
-SELECT
-    noa.workspace_id,
-    no_.network_request_id,
-    no_.domain,
-    no_.http_method,
-    no_.provider,
-    no_.transport,
-    no_.created_at,
-    no_.closed_at,
-    no_.bytes_compressed,
-    no_.bytes_decompressed,
-    no_.response_status,
-    no_.duration_ms,
-    noa.fraction_ppb,
-    noa.allocated_cost_micro_units,
-    noa.currency
-FROM network_operations no_
-JOIN network_operation_allocations noa
-    ON noa.operation_id = no_.network_request_id
-WHERE noa.workspace_id = {_WORKSPACE_CTX};
-"""
-
-_DROP_VIEW_SQL = "DROP VIEW IF EXISTS workspace_usage_v;"
-
+# Review R13 (2026-09-09): the definition and the grant moved to
+# `app_shared.models.workspace_usage_view` so the LATER
+# `network_operations` partition swap (`a5e0c74b13d9`) can recreate this
+# exact view after its rename. A view is bound to a relation OID, so the
+# swap left this one reading the renamed-away legacy table; the fix is a
+# recreation, and a recreation that re-types the definition is the same
+# bug with a longer fuse. The SQL below is byte-identical to what this
+# revision has always emitted -- offline `--sql` renders of an already-
+# applied migration must not change.
 
 def upgrade() -> None:
     """Upgrade schema: create the tenant-safe workspace_usage_v view."""
-    op.execute(_CREATE_VIEW_SQL)
+    op.execute(CREATE_WORKSPACE_USAGE_VIEW_SQL)
     # crawmatic_app only -- see module docstring for why crawmatic_auth
     # and crawmatic_scraper are deliberately not granted this view.
     # Idempotent-safe to re-run in a fresh database that has not yet run
     # provision_db_roles.sql (the role may not exist yet in a from-
     # scratch CI database); guarded the same way section 7 of that file
     # guards its own catalog-driven repairs.
-    op.execute(
-        "DO $$ BEGIN "
-        "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crawmatic_app') THEN "
-        "GRANT SELECT ON workspace_usage_v TO crawmatic_app; "
-        "END IF; "
-        "END $$;"
-    )
+    op.execute(GRANT_WORKSPACE_USAGE_VIEW_SQL)
 
 
 def downgrade() -> None:
     """Downgrade schema: drop the workspace_usage_v view."""
-    op.execute(_DROP_VIEW_SQL)
+    op.execute(DROP_WORKSPACE_USAGE_VIEW_SQL)

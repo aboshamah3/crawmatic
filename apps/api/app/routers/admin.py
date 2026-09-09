@@ -118,12 +118,38 @@ BOOTSTRAP_SCOPES: list[str] = [
 ]
 
 #: What a store connector actually does (audit P0.3): read catalog and price
-#: comparisons, manage competitors and matches. Price comparison routes are
+#: comparisons, manage competitors and matches, and run the plugin's own
+#: live price check. Price comparison routes are
 #: deliberately gated by `alerts:read`, so omitting it makes the plugin's
 #: engine-price refresh fail 403 after an otherwise successful pairing.
-#: Everything else in BOOTSTRAP_SCOPES —
-#: jobs/refresh_rules/webhooks/scrape_profiles/domain_rules writes — is
-#: SaaS-worker business and never belongs on a key that lives in WordPress.
+#:
+#: `jobs:read` + `jobs:write` (review R03, 2026-09-09) are the live check.
+#: The plugin's "refresh prices now" action posts
+#: `POST /v1/variants/{id}/rescrape` (`jobs:write`) and then polls
+#: `GET /v1/jobs/{job_id}` (`jobs:read`); with neither scope on the key,
+#: a correctly paired plugin got 403 on a SHIPPED feature, every time.
+#: `tests/integration/test_api_contract.py` recorded that gap deliberately
+#: and asked for a decision rather than a scope-list edit, so here is the
+#: decision and its reasoning: the risk that kept `jobs:write` off this
+#: key is that it spends scrape budget from a credential living on a
+#: merchant's own WordPress host — but both routes resolve every row
+#: through `scoped_get(..., principal.workspace_id)`, so the spend is
+#: bounded to the one workspace the key was minted for and a
+#: cross-workspace id answers 404, not 403. See
+#: `tests/unit/test_connector_key_live_checks.py`, which proves both
+#: halves; the negative half is what makes the grant defensible.
+#:
+#: `jobs:cancel` stays OUT: it terminalizes rows nobody can get back and
+#: no plugin feature needs it. So does everything else in
+#: BOOTSTRAP_SCOPES — refresh_rules/webhooks/scrape_profiles/domain_rules
+#: writes — which is SaaS-worker business and never belongs on a key that
+#: lives in WordPress.
+#:
+#: Widening this list does NOT widen keys already minted: the scope set is
+#: copied onto the `api_keys` row at mint time (see
+#: `create_connector_key`), so an existing connector key keeps the set it
+#: was issued with until the SaaS re-mints it. That is the safe direction,
+#: and the operational cost of this change.
 CONNECTOR_SCOPES: list[str] = [
     "products:read",
     "variants:read",
@@ -132,6 +158,8 @@ CONNECTOR_SCOPES: list[str] = [
     "matches:read",
     "matches:write",
     "alerts:read",
+    "jobs:read",
+    "jobs:write",
 ]
 
 
