@@ -289,6 +289,17 @@ def test_late_result_after_cancel_is_rejected_not_persisted(monkeypatch: Any) ->
         def execute(self, stmt: Any) -> Any:
             return None
 
+    # EPA F05 (plan task B1): the observation/attempt inserts are now
+    # `ON CONFLICT DO NOTHING` Core statements rather than ORM `add_all`,
+    # so the instances are routed back through `add_all` here -- this
+    # test is about WHICH rows a fenced flush writes, not about how they
+    # reach the driver.
+    monkeypatch.setattr(
+        pipelines_mod,
+        "_insert_ignoring_replays",
+        lambda session, model, instances, index_elements: session.add_all(instances),
+    )
+
     class _FakeTxn:
         def __init__(self, session: _FakeSession) -> None:
             self._session = session
@@ -386,6 +397,17 @@ def test_uncancelled_job_results_still_persist(monkeypatch: Any) -> None:
 
         def execute(self, stmt: Any) -> Any:
             return None
+
+    # EPA F05 (plan task B1): the observation/attempt inserts are now
+    # `ON CONFLICT DO NOTHING` Core statements rather than ORM `add_all`,
+    # so the instances are routed back through `add_all` here -- this
+    # test is about WHICH rows a fenced flush writes, not about how they
+    # reach the driver.
+    monkeypatch.setattr(
+        pipelines_mod,
+        "_insert_ignoring_replays",
+        lambda session, model, instances, index_elements: session.add_all(instances),
+    )
 
     class _FakeTxn:
         def __init__(self, session: _FakeSession) -> None:

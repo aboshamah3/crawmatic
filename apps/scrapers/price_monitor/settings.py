@@ -127,10 +127,17 @@ DOWNLOADER_MIDDLEWARES = {
     # leaves an operation row behind; on the response path -- which Scrapy
     # walks in DESCENDING priority -- it is strictly *after* the built-in
     # HttpCompressionMiddleware (590), which is the only position where
-    # `bytes_decompressed` is measurable at all. The compressed count is
-    # position-independent: it comes from Scrapy's `bytes_received`
-    # signal, the raw transport bytes.
+    # `bytes_decompressed` is measurable at all. The compressed count
+    # comes from `scrape_core.middlewares.wire_bytes.WireBytesMiddleware`
+    # (585, just below), with the pre-EPA-A7 `bytes_received`-signal total
+    # kept only as a fallback for the rare case a response never reaches
+    # 585 (e.g. a mid-download exception).
     "scrape_core.netledger_middleware.NetLedgerMiddleware": 130,
+    # EPA A7 (deep dive §8.2): one priority below `HttpCompressionMiddleware`
+    # (590) so it sees the response BEFORE decompression rewrites
+    # `response.body` in place -- see the middleware's own module
+    # docstring for why 585 specifically.
+    "scrape_core.middlewares.wire_bytes.WireBytesMiddleware": 585,
     "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 750,
 }
 
@@ -186,6 +193,16 @@ DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
 # `Settings`/config (env/DB-tunable), never hardcoded literals here.
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS
 SCRAPE_FLUSH_INTERVAL_SECONDS = _settings.SCRAPE_FLUSH_INTERVAL_SECONDS
+
+# Durable result spool (EPA F05, plan task B1) -- the SQLite/WAL file
+# every `ScrapeResult` is written to BEFORE it enters the in-memory flush
+# buffer, so a failed flush or a killed container replays instead of
+# losing work. A per-HOST fact (which volume this container mounted), read
+# from `Settings` like everything else here, never a hardcoded literal.
+SCRAPE_RESULT_SPOOL_PATH = str(_settings.SCRAPE_RESULT_SPOOL_PATH)
+SCRAPE_FLUSH_MAX_PENDING_BATCHES = _settings.SCRAPE_FLUSH_MAX_PENDING_BATCHES
+SCRAPE_FLUSH_QUARANTINE_AFTER = _settings.SCRAPE_FLUSH_QUARANTINE_AFTER
+
 
 # Per-spider-process memory ceiling (2026-08-03 memory-leak hardening).
 # Scrapy's built-in `MemoryUsage` extension polls this process's RSS and,

@@ -61,6 +61,7 @@ from scripts.backfill_daily_rollups import (  # noqa: E402
     parse_args,
     run_backfill,
 )
+from unit._rollup_batch_fake import evaluate_batch, is_batch_statement  # noqa: E402
 
 # --- date_range --------------------------------------------------------
 
@@ -108,6 +109,9 @@ class _FakeResult:
     def first(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        return self._rows[0] if self._rows else None
+
     def __iter__(self):
         return iter(self._rows)
 
@@ -149,45 +153,38 @@ class _PersistentFakeSession:
             # params -- record it and stop, never falls through to the
             # upsert catch-all below.
             return _FakeResult([])
-        if "DISTINCT" in sql and "price_observations" in sql:
-            params = stmt.compile().params
-            rows = self._in_day(params["day_start"], params["day_end"])
-            seen = []
-            for obs in rows:
-                key = (obs.workspace_id, obs.product_variant_id, obs.product_id)
-                if key not in seen:
-                    seen.append(key)
-            return _FakeResult(
-                [
-                    SimpleNamespace(workspace_id=ws, product_variant_id=variant, product_id=product)
-                    for ws, variant, product in seen
-                ]
-            )
-        if "variant_price_states" in sql:
-            params = stmt.compile().params
-            state = self.states.get((params["workspace_id"], params["product_variant_id"]))
-            return _FakeResult([state] if state is not None else [])
-        if "price_observations" in sql:
-            params = stmt.compile().params
-            return _FakeResult(
-                [
-                    obs
-                    for obs in self._in_day(params["day_start"], params["day_end"])
-                    if obs.workspace_id == params["workspace_id"]
-                    and obs.product_variant_id == params["product_variant_id"]
-                ]
-            )
-        # The upsert statement: key on (workspace_id, product_variant_id,
-        # date) exactly like the real ON CONFLICT arbiter -- a second
-        # write for the same key overwrites the stored value in place,
-        # never appends a second entry.
-        params = dict(stmt.compile().params)
-        key = (params["workspace_id"], params["product_variant_id"], params["date"])
-        self.store[key] = params
-        return _FakeResult([])
+        if "to_regclass" in sql:
+            # The EPA C7 `rollup_completion` capability probe. This fake
+            # models no checkpoint table: the backfill script's contract
+            # is about the read-only guard and the upserts, and a
+            # non-resumable run exercises exactly the same statements.
+            return _FakeResult([False])
+        # The EPA C7 set-based batch statement, evaluated over the
+        # in-memory rows using the statement's OWN bind parameters.
+        if is_batch_statement(sql):
+            params = dict(stmt.compile().params)
 
-    def _in_day(self, day_start: datetime, day_end: datetime) -> list:
-        return [obs for obs in self.observations if day_start <= obs.scraped_at < day_end]
+            def _upsert(values: dict) -> None:
+                # Key on (workspace_id, product_variant_id, date) exactly
+                # like the real ON CONFLICT arbiter -- a second write for
+                # the same key overwrites the stored value in place,
+                # never appends a second entry.
+                key = (
+                    values["workspace_id"],
+                    values["product_variant_id"],
+                    values["date"],
+                )
+                self.store[key] = values
+
+            outcome = evaluate_batch(
+                params,
+                dry_run="INSERT" not in sql,
+                observations=self.observations,
+                states=self.states,
+                upsert=_upsert,
+            )
+            return _FakeResult([outcome])
+        raise AssertionError(f"unexpected statement: {sql[:120]}")
 
     def commit(self) -> None:
         self.committed = True

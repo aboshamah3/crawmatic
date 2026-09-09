@@ -139,6 +139,9 @@ class TestPartitionNaming:
                 "price_observations_2026_08",
                 "price_alert_events_2026_08",
                 "webhook_events_2026_08",
+                # EPA C9 (F14) partitioned the network ledger, so it is a
+                # fifth registered parent the snapshot now reports on.
+                "network_operations_2026_08",
             },
         )
         snapshot = collect_snapshot(_BoomSession(), now=NOW)
@@ -148,6 +151,7 @@ class TestPartitionNaming:
             "request_attempts",
             "price_alert_events",
             "webhook_events",
+            "network_operations",
         }
         for p in snapshot.partitions:
             assert p.current_month_present is True, p.table

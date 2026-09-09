@@ -10,15 +10,42 @@ package = false
 
 [tool.uv.workspace]
 members = ["apps/*", "libs/*"]
+# `apps/dr-backup` is a shell + stdlib-Python job that runs inside its OWN
+# container image (alpine + postgres-client 18 + gnupg + python3; see
+# apps/dr-backup/Dockerfile). It has no Python dependencies, nothing to build,
+# and nothing to install into this workspace's environment — but `apps/*`
+# would still claim it as a member, and a member without a pyproject.toml
+# makes EVERY `uv run` in the repo fail. Excluding it keeps it out of the
+# resolution entirely, which also means adding this service does not touch
+# `uv.lock` (C10, F21).
+# `apps/fixture-origin` (EPA D1, F22) is excluded for the same mechanical
+# reason and one design reason. Mechanical: it has no pyproject.toml, and
+# `apps/*` would otherwise claim it as a member and break every `uv run`.
+# Design: it is the *target* of the fleet test, not a component of the
+# engine — it must not be able to import `app_shared` or share a
+# dependency set with the services being measured, so its two pins live
+# in `apps/fixture-origin/Dockerfile` and adding it touches neither
+# `uv.lock` nor any engine image.
+exclude = ["apps/dr-backup", "apps/fixture-origin"]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9",
     "httpx>=0.28,<1",
     "alembic>=1.13,<2",
+    # Pinned build tool (EPA A4/F04): both scrapyd Dockerfiles invoke this
+    # via `uvx --from scrapyd-client==2.0.3` directly (uvx's ephemeral env
+    # does not read this group), so this entry exists to keep uv.lock's
+    # dependency graph and hashes for the pin auditable/reproducible from
+    # the workspace side too, and to let a dev venv run scrapyd-deploy
+    # locally without a separate uvx install.
+    "scrapyd-client==2.0.3",
 ]
 
 [tool.pytest.ini_options]
 markers = [
     "integration: needs the docker-compose DB/pgbouncer stack; skipped by -m 'not integration'",
+    "browser: needs a real Chromium (playwright install chromium); run inside the scrapers-browser image",
+    "load: local stub-based load/concurrency test (no real Redis/Postgres); run explicitly with -m load",
+    "benchmark: seeds a large synthetic dataset and measures wall-clock/statement cost against a real Postgres; run explicitly with -m benchmark (never in the unit gate)",
 ]

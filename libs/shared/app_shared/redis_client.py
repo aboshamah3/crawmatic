@@ -11,9 +11,25 @@ and by ``apps/api`` routers/dependencies that construct one to pass in.
 All security-sensitive callers are responsible for their own fail-safe
 handling on connection errors (per contracts/security-cache.md) — this
 module only owns connectivity, not policy.
+
+F15 (EPA core-production-readiness, 2026-09-07): this client previously
+carried no ``socket_timeout``/``socket_connect_timeout`` at all, so a
+wedged Redis connection could block a caller (and, on the sync client
+used from inside async request handlers, the whole event loop)
+indefinitely. It now reads ``socket_timeout``, ``socket_connect_timeout``
+and a ``health_check_interval`` from ``REDIS_SOCKET_TIMEOUT_SECONDS``
+(default ``2.0``) / ``REDIS_CONNECT_TIMEOUT_SECONDS`` (default ``1.0``).
+
+CONFIG NOTE: those two are read from ``os.environ`` rather than
+``app_shared.config.Settings`` -- B7 ran in parallel with another worker
+holding ``config.py`` for the run this landed in. They belong there as
+typed settings; this is a placeholder until that consolidation lands
+(see ``reports/B7.md``).
 """
 
 from __future__ import annotations
+
+import os
 
 import redis
 
@@ -21,6 +37,16 @@ from app_shared.config import get_settings
 from app_shared.redis_policy import enforce_redis_memory_policy
 
 _redis_client: redis.Redis | None = None
+
+#: See the CONFIG NOTE above: placeholder env-var reads until these are
+#: consolidated into `app_shared.config.Settings`.
+REDIS_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("REDIS_SOCKET_TIMEOUT_SECONDS", "2.0"))
+REDIS_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0"))
+#: Fixed, not (yet) a separate setting -- the criteria names it alongside
+#: the two above without a distinct env var; a value comfortably inside
+#: the socket timeout keeps a dead connection from going unnoticed
+#: between requests.
+_REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 
 def get_redis_client() -> redis.Redis:
@@ -39,7 +65,13 @@ def get_redis_client() -> redis.Redis:
     global _redis_client
     if _redis_client is None:
         settings = get_settings()
-        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        client = redis.Redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+            health_check_interval=_REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+        )
         enforce_redis_memory_policy(
             client, require=settings.PROXY_REDIS_REQUIRE_NOEVICTION
         )

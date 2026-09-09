@@ -52,26 +52,61 @@ owes. Reconciling fleet egress is C5's problem.
 from __future__ import annotations
 
 import math
+import os
 
+from pydantic import ValidationError
+
+from app_shared.config import Settings, get_settings
 from app_shared.costauth.service import MICRO_UNITS_PER_USD
 
 __all__ = [
     "BROWSER_CPU_PER_WALL_SECOND",
     "BROWSER_BILLING_RATE_PER_CPU_SECOND",
+    "BYTES_PER_GIB",
     "ESTIMATED_BROWSER_CPU_SECONDS_PER_REQUEST",
     "ESTIMATED_BYTES_PER_REQUEST",
     "MICRO_USD_PER_BROWSER_CPU_SECOND",
     "PROXY_BILLING_RATE_PER_GIB",
     "USD_PER_BROWSER_CPU_SECOND",
     "USD_PER_GIB_PROXY",
+    "billing_unit_bytes",
     "estimate_reservation_micro_units",
     "price_operation_micro_units",
 ]
 
-#: Bytes in one gibibyte. The provider quotes ``$/GB`` but meters in
-#: binary units, so the divisor is ``2**30`` and is spelled out rather
-#: than left as a magic number in a money expression.
+#: Bytes in one gibibyte — the DEFAULT billing unit, and what every number
+#: in this module's docstring and `tests/unit/test_cost_estimator.py` is
+#: measured against. The unit actually used by :func:`price_operation_micro_units`
+#: is :func:`billing_unit_bytes` (EPA A8, deep dive §8.3,
+#: ``app_shared.config.Settings.PROXY_BILLING_UNIT_BYTES``), which defaults
+#: to this same value so today's numbers do not move — this constant
+#: itself is kept as the well-known "one GiB" name other modules quote.
 BYTES_PER_GIB = 2**30
+
+
+def billing_unit_bytes() -> int:
+    """The bytes-per-``$``:data:`USD_PER_GIB_PROXY` unit, as a NAMED
+    setting rather than an implicit constant (deep dive §8.3: the
+    September pricing note itself conflated ``$/GB`` and ``$/GiB``).
+    Reads :data:`app_shared.config.Settings.PROXY_BILLING_UNIT_BYTES`
+    fresh on every call so a test/operator override via the environment
+    takes effect without this module caching a stale value.
+
+    Falls back to reading the SAME environment variable directly (or the
+    field's own default) if the process's full ``Settings`` cannot be
+    built — a byte-pricing unit is not worth coupling to every OTHER
+    required setting (``DATABASE_URL``, ``JWT_SECRET``, ...) existing
+    first; production always has the full environment, so this path is
+    only ever taken by a narrow unit test exercising pricing in
+    isolation, never by a real deployment.
+    """
+    try:
+        return int(get_settings().PROXY_BILLING_UNIT_BYTES)
+    except ValidationError:
+        raw = os.environ.get("PROXY_BILLING_UNIT_BYTES")
+        if raw is not None:
+            return int(raw)
+        return int(Settings.model_fields["PROXY_BILLING_UNIT_BYTES"].default)
 
 #: USD per GiB of proxied bytes — the recorded DataImpulse pool rate
 #: (2026-09-03). The ONLY rate that prices proxy traffic.
@@ -149,15 +184,18 @@ def _normalized_transport(transport: object) -> str:
 
 
 def _price_bytes_micro_units(bytes_on_wire: int) -> int:
-    """Proxied bytes at :data:`USD_PER_GIB_PROXY`, rounded UP.
+    """Proxied bytes at :data:`USD_PER_GIB_PROXY` per :func:`billing_unit_bytes`,
+    rounded UP.
 
     Integer arithmetic end to end (a ceiling division), not
-    ``ceil(bytes * 1e6 / 2**30)``: at petabyte scale the float form loses
+    ``ceil(bytes * 1e6 / unit)``: at petabyte scale the float form loses
     the low bits of the numerator, and money does not get to be
-    approximately right.
+    approximately right. Rounding up (never down) is unchanged by the
+    unit becoming a setting — a smaller configured unit must still never
+    under-book a byte that was actually billed.
     """
     numerator = int(bytes_on_wire) * int(USD_PER_GIB_PROXY * MICRO_UNITS_PER_USD)
-    return -(-numerator // BYTES_PER_GIB)
+    return -(-numerator // billing_unit_bytes())
 
 
 def price_operation_micro_units(

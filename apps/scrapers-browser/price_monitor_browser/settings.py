@@ -30,6 +30,19 @@ concurrency/timeout/flush knobs read from `app_shared.config.get_settings()`
   (bypassing `RedirectMiddleware`/`SsrfGuardMiddleware` entirely for that
   hop) -- see `scrape_core.browser.ssrf` module docstring.
 
+**Connection-time egress guard (READY F01, plan task A1)**: the three
+layers above are all *check-then-connect* — and for the browser, the
+route hook only ever sees the FIRST request of a redirect chain (Chromium
+follows `Location` inside its own network stack). `PLAYWRIGHT_LAUNCH_OPTIONS`
+below therefore launches Chromium behind
+`scrape_core.browser.egress_guard.EgressGuard` on loopback, with
+`--proxy-bypass-list=<-loopback>` so not even a loopback IP literal
+escapes it. Every connection the browser opens — each redirect hop,
+sub-resource, worker, popup and WebSocket — is validated and then dialed
+**on the address the guard itself resolved**, which is what closes DNS
+rebinding. The layers above stay wired as defense in depth. See that
+module's docstring.
+
 **Resource-blocking policy (EPA B6)**: the same `PLAYWRIGHT_ABORT_REQUEST`
 hook now also carries the sub-resource cost/category block policy
 (`app_shared.profiles.browser_resource_policy` -- default blocklist:
@@ -43,6 +56,12 @@ that request, never in place of it (that module's docstring).
 from app_shared.config import get_settings
 
 import scrape_core  # noqa: F401  # proves libs/scrape-core is importable here
+from scrape_core.browser.egress_guard import ensure_process_guard
+
+# Config-driven (env/DB-tunable, Principle IV) -- never a hardcoded literal
+# in this module. Read once, at the top, because the egress-guard wiring
+# below needs it before the tuning block further down does.
+_settings = get_settings()
 
 BOT_NAME = "price_monitor_browser"
 
@@ -105,6 +124,37 @@ PLAYWRIGHT_BROWSER_TYPE = "chromium"
 # addition to `SsrfGuardMiddleware`/`DNS_RESOLVER` below).
 PLAYWRIGHT_ABORT_REQUEST = "scrape_core.browser.ssrf.abort_unsafe_request"
 
+# Connection-time egress guard (READY F01) -- see the module docstring for
+# why the route hook above cannot be the enforcement point on its own.
+#
+# Started HERE, at settings import, rather than at spider open: the launch
+# argument has to name the port, and scrapy-playwright launches the browser
+# from the download handler with whatever `PLAYWRIGHT_LAUNCH_OPTIONS` said
+# at import time. `ensure_process_guard()` is idempotent (one listener per
+# process however often this module is imported) and runs the listener on
+# its own event loop in a daemon thread, so the AsyncioSelectorReactor is
+# untouched.
+#
+# `--proxy-bypass-list=<-loopback>`: the `<-loopback>` token REMOVES
+# Chromium's built-in "never proxy localhost/127.0.0.1/[::1]" rule. Without
+# it the one destination class the guard most needs to refuse is the one
+# class Chromium would dial directly.
+#
+# A failure to start is deliberately fatal (`ensure_process_guard` does not
+# swallow): a browser node that silently fell back to route-hook-only
+# coverage is the exact state F01 exists to end.
+if _settings.BROWSER_EGRESS_GUARD_ENABLED:
+    _egress_guard = ensure_process_guard()
+    PLAYWRIGHT_LAUNCH_OPTIONS = {
+        "args": [
+            f"--proxy-server=http://127.0.0.1:{_egress_guard.port}",
+            "--proxy-bypass-list=<-loopback>",
+        ]
+    }
+else:
+    _egress_guard = None
+    PLAYWRIGHT_LAUNCH_OPTIONS = {}
+
 ITEM_PIPELINES = {
     "scrape_core.pipelines.BatchedPersistencePipeline": 300,
 }
@@ -140,10 +190,9 @@ DOWNLOADER_MIDDLEWARES = {
 # auditable rather than a silent degrade.
 NETLEDGER_ENABLED = True
 
-# Config-driven (env/DB-tunable, Principle IV) -- never a hardcoded
-# literal here. Low bounded browser concurrency (analyze A1): each
-# context/page is an expensive real Chromium instance.
-_settings = get_settings()
+# Low bounded browser concurrency (analyze A1): each context/page is an
+# expensive real Chromium instance. Values from `_settings` (read at the
+# top of this module), never hardcoded literals here.
 CONCURRENT_REQUESTS = _settings.BROWSER_CONCURRENT_REQUESTS
 PLAYWRIGHT_MAX_CONTEXTS = _settings.BROWSER_MAX_CONTEXTS
 PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = _settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS
@@ -162,6 +211,16 @@ DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
 # hardcoded literals here.
 SCRAPE_FLUSH_MAX_ITEMS = _settings.SCRAPE_FLUSH_MAX_ITEMS
 SCRAPE_FLUSH_INTERVAL_SECONDS = _settings.SCRAPE_FLUSH_INTERVAL_SECONDS
+
+# Durable result spool (EPA F05, plan task B1) -- the SQLite/WAL file
+# every `ScrapeResult` is written to BEFORE it enters the in-memory flush
+# buffer, so a failed flush or a killed container replays instead of
+# losing work. A per-HOST fact (which volume this container mounted), read
+# from `Settings` like everything else here, never a hardcoded literal.
+SCRAPE_RESULT_SPOOL_PATH = str(_settings.SCRAPE_RESULT_SPOOL_PATH)
+SCRAPE_FLUSH_MAX_PENDING_BATCHES = _settings.SCRAPE_FLUSH_MAX_PENDING_BATCHES
+SCRAPE_FLUSH_QUARANTINE_AFTER = _settings.SCRAPE_FLUSH_QUARANTINE_AFTER
+
 
 # Per-spider-process memory ceiling (2026-08-03 memory-leak hardening,
 # parity with price_monitor/settings.py). Scrapy's `MemoryUsage`

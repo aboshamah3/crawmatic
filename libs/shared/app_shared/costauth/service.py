@@ -180,6 +180,7 @@ scrapy, no fastapi (``tests/unit/test_import_boundaries.py``).
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -235,11 +236,18 @@ __all__ = [
     "CrossWorkspaceCoalescingUnsupported",
     "DenialReason",
     "MICRO_UNITS_PER_USD",
+    "ESTIMATED_BROWSER_WALL_SECONDS_PER_REQUEST",
+    "FirstRungReservation",
     "SettledCost",
     "authorize_or_none",
+    "costauth_denials_by_reason",
+    "escalation_reservation",
     "estimate_bytes",
+    "first_rung_reservation",
     "period_key_for",
     "release_reservations_for_scrape_job",
+    "reservation_rung",
+    "reset_costauth_denials",
     "sweep_expired_reservations",
 ]
 
@@ -363,6 +371,13 @@ class CostAuthorizationDenied(CostAuthorizationError):
     def __init__(self, reason: DenialReason | str, detail: str = "") -> None:
         self.reason = DenialReason(reason)
         self.detail = detail
+        # EPA C6 (F18): the ONE choke point for the denials-by-reason
+        # counter. Every refusal in this module -- including the fleet
+        # reasons B5 added -- is exactly one construction of this
+        # exception, and there is no path that denies without raising
+        # it, so counting here is complete by construction rather than
+        # by remembering to increment at each of the dozen raise sites.
+        _record_denial(self.reason)
         super().__init__(f"{self.reason.value}: {detail}" if detail else self.reason.value)
 
 
@@ -582,6 +597,14 @@ def _required_domain_gate(purpose: AuthorizationPurpose, transport: str) -> _Dom
       leave ``UNKNOWN``.
     * **everything else** is broad crawl, so an uncertified domain cannot
       be refreshed, retried, fallen back to, or manually rechecked.
+
+    ``PROXY_ESCALATION`` (F18) deliberately takes no special case: a
+    direct-to-proxy climb is paid traffic on a normal transport, so it
+    clears the same broad-crawl gate an ordinary ``REFRESH`` on ``PROXY``
+    does. C2 reserves "expensive escalation" for the browser rung, which
+    is the only one that costs browser-seconds, and widening it to cover
+    every paid climb would deny a DEGRADED domain the cheap paid retry
+    that is often what recovers it.
     """
     if purpose is AuthorizationPurpose.BROWSER_ESCALATION or str(transport).upper() == "BROWSER":
         return _DomainGate.EXPENSIVE_ESCALATION
@@ -646,6 +669,7 @@ class CostAuthorizationService:
             DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS
         ),
         breaker_scope_key: str = GLOBAL_BREAKER_SCOPE,
+        fleet_snapshot_reader: Callable[[str, str], Any] | None = None,
     ) -> None:
         self._session_scope = session_scope
         self._system_session_scope = system_session_scope
@@ -659,6 +683,14 @@ class CostAuthorizationService:
             entitlement_max_evidence_age_seconds
         )
         self._breaker_scope_key = breaker_scope_key
+        #: EPA B5/F10. Optional ``(domain, transport) -> FleetSnapshot``
+        #: callable used ONLY to enrich a concurrency denial's message
+        #: (see :meth:`_check_concurrency`). ``None`` — the default —
+        #: leaves every denial message exactly as it was; nothing in this
+        #: service ever branches on what it returns, because fleet
+        #: admission is the Redis lease at the request boundary, not a
+        #: decision taken here.
+        self._fleet_snapshot_reader = fleet_snapshot_reader
 
     # -- session plumbing ---------------------------------------------------
 
@@ -762,7 +794,7 @@ class CostAuthorizationService:
             fleet_budget = _lock_fleet_budget(session, req.provider, period, req.currency)
             tenant_budget = _lock_tenant_budget(session, workspace_id, period, req.currency)
 
-            self._check_concurrency(session, workspace_id, tenant_budget, now)
+            self._check_concurrency(session, workspace_id, tenant_budget, now, req=req)
 
             wanted = {
                 "cost_micro_units": req.estimated_cost_micro_units,
@@ -1256,6 +1288,8 @@ class CostAuthorizationService:
         workspace_id: uuid.UUID,
         budget: CostBudget,
         now: datetime,
+        *,
+        req: "AuthorizationRequest | None" = None,
     ) -> None:
         """Deny when the workspace already holds its cap in LIVE grants.
 
@@ -1264,6 +1298,25 @@ class CostAuthorizationService:
         ``RESERVED`` — the sweeper may not have reached it yet, and making
         a stuck sweeper able to wedge a workspace's whole concurrency
         budget would turn a maintenance lag into an outage.
+
+        **Tenant-scoped, and staying that way (EPA B5/F10).** The cap
+        counted here is this workspace's own; fleet-wide host admission
+        is emphatically NOT decided in this method. It is decided by
+        ``app_shared.limiter.fleet.admit_fleet``'s Redis lease at the
+        physical request boundary, because that is the only place where
+        check and act are atomic across every worker in the fleet — a
+        SQL count here would be a check-then-act race the moment two
+        workspaces authorized concurrently, which is precisely the bug
+        the lease exists to remove.
+
+        What the fleet contributes here is a *reason*, never a verdict:
+        when ``fleet_snapshot_reader`` is configured (it is ``None`` by
+        default, and then this method's messages are byte-identical to
+        before), a denial's detail also names how much fleet admission
+        pressure the domain is under, so an operator reading "workspace X
+        holds 4 live reservations (cap 4)" can tell at a glance whether
+        the fleet was also saturated on that host. The snapshot is stale
+        the instant it is read and nothing branches on it.
         """
         cap = budget.max_concurrent_reservations
         if cap is None:
@@ -1278,10 +1331,40 @@ class CostAuthorizationService:
             )
         ).scalar_one()
         if int(live) >= int(cap):
+            detail = f"workspace {workspace_id} holds {live} live reservations (cap {cap})"
+            fleet_detail = self._fleet_pressure_detail(req)
+            if fleet_detail:
+                detail = f"{detail}; {fleet_detail}"
             raise CostAuthorizationDenied(
                 DenialReason.CONCURRENCY_CAP_EXCEEDED,
-                f"workspace {workspace_id} holds {live} live reservations (cap {cap})",
+                detail,
             )
+
+    def _fleet_pressure_detail(self, req: "AuthorizationRequest | None") -> str:
+        """Render the fleet admission snapshot for a denial message, or
+        ``""`` when no reader is configured (the default).
+
+        Reasons only — see :meth:`_check_concurrency`. Never raises and
+        never branches anything: a denial *message* must not be able to
+        break the denial it is explaining, so any error resolves to no
+        extra detail at all.
+        """
+        reader = self._fleet_snapshot_reader
+        if reader is None or req is None:
+            return ""
+        try:
+            snapshot = reader(req.domain, req.transport)
+        except Exception:  # noqa: BLE001 - a reason may never break a decision
+            logger.warning(
+                "costauth: fleet snapshot unavailable for domain=%s", req.domain, exc_info=True
+            )
+            return ""
+        if snapshot is None:
+            return ""
+        return (
+            f"fleet admission on {snapshot.domain}/{snapshot.transport}: "
+            f"{snapshot.in_flight}/{snapshot.concurrency} in flight"
+        )
 
     # -- warnings -----------------------------------------------------------
 
@@ -1885,3 +1968,227 @@ def _as_aware(moment: datetime) -> datetime:
     crashes instead of denying.
     """
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# EPA C6 / F18 — reservation by the KNOWN first rung, escalation reserved
+# separately, and the denials-by-reason counter opsmetrics exports.
+# ---------------------------------------------------------------------------
+
+#: Wall-clock browser seconds assumed per request when a batch is
+#: authorized on the ``BROWSER`` rung. The same figure the dispatch site
+#: has always used; named here so the first-rung helper and the dispatch
+#: site cannot drift apart. It is a *budget dimension* (wall seconds a
+#: browser occupies a node), NOT the CPU-second figure
+#: ``app_shared.costauth.pricing`` prices money with.
+ESTIMATED_BROWSER_WALL_SECONDS_PER_REQUEST = 30
+
+
+@dataclass(frozen=True)
+class FirstRungReservation:
+    """What to reserve for ONE rung of a strategy ladder (F18).
+
+    Every field maps onto the identically-named
+    :class:`AuthorizationRequest` field, so a dispatch site builds its
+    request by spreading this record — it never re-derives a number.
+
+    The whole point is :attr:`estimated_bytes` ``== 0`` on ``DIRECT``.
+    Before F18 every HTTP batch was authorized as ``PROXY`` "fail-closed"
+    because the planner could not know which rung the spider would land
+    on. It can now: the playbook's ``cheap_path`` names the rung the
+    spider will actually try FIRST, and a rung that costs nothing must
+    reserve nothing. Over-reserving is not free — it is a byte and money
+    ceiling consumed by traffic that never touches a provider, which
+    denies real paid work later in the period for no reason.
+
+    A ``DIRECT`` rung is still **authorized**. Reserving zero money is
+    not the same as skipping the gate: the circuit breaker, the
+    workspace entitlement and the concurrency cap all apply to free
+    traffic too, and a fleet that keeps hammering a domain whose breaker
+    is OPEN is a problem whether or not the fetches are billed.
+    """
+
+    transport: str
+    provider: str
+    estimated_bytes: int
+    estimated_cost_micro_units: int
+    estimated_requests: int
+    estimated_browser_seconds: int = 0
+
+
+#: ``transport -> fleet budget scope_key``. Not a dict comprehension over
+#: the transports: the mapping is a contract, and an unmapped transport
+#: must raise rather than silently pick a scope.
+_PROVIDER_FOR_TRANSPORT = {
+    "DIRECT": FLEET_PROVIDER_DIRECT,
+    "PROXY": FLEET_PROVIDER_PROXY,
+    "BROWSER": FLEET_PROVIDER_BROWSER,
+}
+
+
+#: ``AccessMethod`` value -> reservation rung. The strategy ladder names
+#: transports at the FETCH-MECHANICS grain (``DIRECT_HTTP_RETRY`` is a
+#: different *method* from ``DIRECT_HTTP``, and an unproxied headless
+#: browser is a different *method* from a proxied one); the budget names
+#: them at the MONEY grain — free fleet egress, paid proxy bytes, paid
+#: browser wall-seconds. This table is the one place the two vocabularies
+#: meet, so a new ``AccessMethod`` member has exactly one place to declare
+#: what it costs.
+#:
+#: ``PLAYWRIGHT_DIRECT`` maps to ``BROWSER``, not ``DIRECT``: it makes no
+#: proxy request, but it still occupies a browser node for wall-seconds,
+#: and browser-seconds are the dimension the ``BROWSER`` scope bounds.
+#: Calling it free because its bytes are free is exactly the over-optimism
+#: F18 is the mirror image of.
+_RUNG_FOR_ACCESS_METHOD = {
+    "DIRECT_HTTP": "DIRECT",
+    "DIRECT_HTTP_RETRY": "DIRECT",
+    "PROXY_HTTP": "PROXY",
+    "PLAYWRIGHT_DIRECT": "BROWSER",
+    "PLAYWRIGHT_PROXY": "BROWSER",
+}
+
+
+def _normalized_rung(transport: object) -> str:
+    name = str(getattr(transport, "value", transport) or "").strip().upper()
+    name = _RUNG_FOR_ACCESS_METHOD.get(name, name)
+    if name not in _PROVIDER_FOR_TRANSPORT:
+        raise ValueError(
+            f"unknown transport {transport!r} — a reservation must name one of "
+            f"{sorted(_PROVIDER_FOR_TRANSPORT)} or an AccessMethod in "
+            f"{sorted(_RUNG_FOR_ACCESS_METHOD)}"
+        )
+    return name
+
+
+def reservation_rung(transport: object) -> str:
+    """The budget rung (``DIRECT``/``PROXY``/``BROWSER``) `transport` bills as.
+
+    Accepts either a rung name or an :class:`~app_shared.enums.AccessMethod`
+    (member or value) — see :data:`_RUNG_FOR_ACCESS_METHOD` for why the two
+    vocabularies differ. Raises ``ValueError`` on anything else rather than
+    guessing: a reservation that picked the wrong scope would bound the
+    wrong budget, which is indistinguishable from no bound at all.
+    """
+    return _normalized_rung(transport)
+
+
+def first_rung_reservation(
+    *, initial_transport: object, unique_requests: int
+) -> FirstRungReservation:
+    """Reserve for the rung the batch will actually try FIRST (F18).
+
+    ``initial_transport`` is the playbook's ``cheap_path`` — ``DIRECT``,
+    ``PROXY`` or ``BROWSER``. ``unique_requests`` is the **coalesced**
+    count of unique PHYSICAL requests the batch will make, not its match
+    count: three matches pointing at one competitor URL are one fetch,
+    and reserving three requests for them books a request-budget ceiling
+    against work that will never happen (the mirror image, on the
+    reservation side, of the C6/F17 over-count on the aggregation side).
+
+    ``DIRECT`` reserves zero bytes, zero money and zero browser seconds,
+    but a real request count — the request dimension counts *fetches*,
+    and a direct fetch is still a fetch that a runaway loop can make a
+    million of.
+
+    ``estimate_reservation_micro_units`` is imported lazily: pricing is
+    the module that owns every rate and it imports ``MICRO_UNITS_PER_USD``
+    from here, so a module-level import would be a cycle.
+    """
+    from app_shared.costauth.pricing import estimate_reservation_micro_units
+
+    rung = _normalized_rung(initial_transport)
+    requests = max(1, int(unique_requests))
+    if rung == "DIRECT":
+        return FirstRungReservation(
+            transport="DIRECT",
+            provider=FLEET_PROVIDER_DIRECT,
+            estimated_bytes=0,
+            estimated_cost_micro_units=0,
+            estimated_requests=requests,
+            estimated_browser_seconds=0,
+        )
+    return FirstRungReservation(
+        transport=rung,
+        provider=_PROVIDER_FOR_TRANSPORT[rung],
+        estimated_bytes=estimate_bytes(requests),
+        estimated_cost_micro_units=estimate_reservation_micro_units(
+            transport=rung, requests=requests
+        ),
+        estimated_requests=requests,
+        estimated_browser_seconds=(
+            requests * ESTIMATED_BROWSER_WALL_SECONDS_PER_REQUEST
+            if rung == "BROWSER"
+            else 0
+        ),
+    )
+
+
+def escalation_reservation(
+    *, to_transport: object, unique_requests: int
+) -> tuple[AuthorizationPurpose, FirstRungReservation]:
+    """The SEPARATE reservation a ladder takes when it climbs a rung (F18).
+
+    Returns the purpose to authorize under and the amounts to reserve.
+    The amounts are the FULL cost of the escalated rung, not a delta
+    against the first rung's grant: the first rung's grant is a live
+    reservation for the transport it named (zero, for ``DIRECT``), it is
+    settled or released on its own terms, and a "top-up" that mutated it
+    would make one grant describe two different physical transports.
+
+    Escalating to ``DIRECT`` is not an escalation and raises — a ladder
+    only ever climbs toward money.
+    """
+    rung = _normalized_rung(to_transport)
+    if rung == "DIRECT":
+        raise ValueError(
+            "DIRECT is the cheap rung — escalation climbs toward a paid "
+            "transport, never back down to fleet egress"
+        )
+    purpose = (
+        AuthorizationPurpose.BROWSER_ESCALATION
+        if rung == "BROWSER"
+        else AuthorizationPurpose.PROXY_ESCALATION
+    )
+    return purpose, first_rung_reservation(
+        initial_transport=rung, unique_requests=unique_requests
+    )
+
+
+#: Process-local denial tally, ``DenialReason.value -> count``. Every
+#: reason is pre-seeded at zero so a scrape can distinguish "this reason
+#: has never fired" from "this build does not know this reason" —
+#: absence of a series is the thing a dashboard cannot alert on.
+#:
+#: Monotonic within a process and never persisted: it is a Prometheus
+#: COUNTER, and a counter's job is to be differentiated by the scraper,
+#: which handles a process restart as a reset. Guarded by a lock because
+#: the API serves denials from a thread pool.
+_DENIALS_LOCK = threading.Lock()
+_DENIALS_BY_REASON: dict[str, int] = {reason.value: 0 for reason in DenialReason}
+
+
+def _record_denial(reason: DenialReason) -> None:
+    """Tally one refusal. Never raises — a broken metric must not deny."""
+    try:
+        with _DENIALS_LOCK:
+            _DENIALS_BY_REASON[reason.value] = _DENIALS_BY_REASON.get(reason.value, 0) + 1
+    except Exception:  # noqa: BLE001 — a counter is never worth an exception
+        logger.debug("cost_authorization.denial_counter_failed", exc_info=True)
+
+
+def costauth_denials_by_reason() -> dict[str, int]:
+    """Snapshot of the denial tally, for opsmetrics.
+
+    A COPY: the caller renders it while other threads keep denying, and a
+    live view would make one scrape's samples disagree with each other.
+    """
+    with _DENIALS_LOCK:
+        return dict(_DENIALS_BY_REASON)
+
+
+def reset_costauth_denials() -> None:
+    """Zero the tally. For tests only — production counters never reset."""
+    with _DENIALS_LOCK:
+        for key in list(_DENIALS_BY_REASON):
+            _DENIALS_BY_REASON[key] = 0

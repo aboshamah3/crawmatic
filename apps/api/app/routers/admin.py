@@ -48,6 +48,8 @@ from app_shared.database import get_auth_session
 from app_shared.enums import ApiKeyStatus, WorkspaceStatus
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
 from app_shared.models.identity import ApiKey, Workspace
+from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.profiles.repository import clear_regex_quarantine
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.security.api_keys import generate_api_key
 from app_shared.security.scopes import validate_scopes
@@ -58,6 +60,7 @@ from app.schemas.admin import (
     AdminApiKeyListItem,
     AdminApiKeyListResponse,
     ApiKeyRevokeResponse,
+    ProfileRegexUnquarantineResponse,
     ConnectorKeyCreateRequest,
     ConnectorKeyCreateResponse,
     UsageListResponse,
@@ -617,3 +620,55 @@ def export_usage(
     )
 
     return UsageListResponse(items=items, next_cursor=next_cursor)
+
+
+@router.post(
+    "/profiles/{scrape_profile_id}/regex-unquarantine",
+    response_model=ProfileRegexUnquarantineResponse,
+)
+def unquarantine_profile_regex(
+    scrape_profile_id: uuid.UUID,
+    session: Session = Depends(get_admin_session),
+) -> ProfileRegexUnquarantineResponse:
+    """`POST /v1/admin/profiles/{id}/regex-unquarantine` — release a regex quarantine (A2/F02).
+
+    Clears both `regex_quarantined_at` and `regex_timeout_count`, so the
+    extraction chain resumes running this profile's
+    `price_regex`/`old_price_regex`/`currency_regex`/`stock_regex` and the
+    profile starts again from a clean count rather than one timeout away
+    from re-quarantine.
+
+    Cross-workspace on purpose (this router is service-token-only and runs
+    on the BYPASSRLS seam): a **global** profile — `workspace_id IS NULL` —
+    is never auto-quarantined by any single tenant's scrape, so an operator
+    here is the only party that can release one.
+
+    Idempotent: releasing a profile that was not quarantined is a 200 with
+    `was_quarantined=false`. An unknown id is a 404 — silently reporting
+    success for a profile that does not exist would let a typo read as a
+    completed remediation.
+    """
+    profile = session.execute(
+        select(ScrapeProfile).where(ScrapeProfile.id == scrape_profile_id)  # noqa: workspace-scope
+    ).scalar_one_or_none()
+    if profile is None:
+        raise _not_found("Scrape profile not found.")
+
+    was_quarantined = profile.regex_quarantined_at is not None
+    quarantined_at = profile.regex_quarantined_at
+    timeout_count = profile.regex_timeout_count
+
+    clear_regex_quarantine(session, scrape_profile_id)
+    session.flush()
+    logger.info(
+        "admin_regex_unquarantine scrape_profile_id=%s was_quarantined=%s timeout_count=%s",
+        scrape_profile_id,
+        was_quarantined,
+        timeout_count,
+    )
+    return ProfileRegexUnquarantineResponse(
+        scrape_profile_id=scrape_profile_id,
+        was_quarantined=was_quarantined,
+        quarantined_at=quarantined_at,
+        regex_timeout_count=timeout_count,
+    )

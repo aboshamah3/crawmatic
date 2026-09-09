@@ -1,0 +1,701 @@
+# scripts/sql/grants_expected.yaml -- component-scoped DB grants manifest
+# (EPA plan-core-production-readiness-2026-09-07, A3/F03).
+#
+# The explicit-privilege half of the pair `scripts/provision_db_roles.sql`
+# (the DDL that applies these exact grants) and `scripts/verify_grants.py`
+# (which diffs a live database's `information_schema.role_table_grants`
+# against this file and exits 2 on drift). `tests/unit/
+# test_grants_manifest_schema.py` asserts every table in
+# `scripts/rls_table_manifest.txt` appears exactly once per role below,
+# always as an explicit privilege list -- never an implicit `ALL`, and
+# never a missing/omitted table (an omission is exactly as unreviewed as
+# an implicit `ALL` grant would be).
+#
+# THREE ROLES
+# -----------
+#   crawmatic_app      The ordinary tenant connection (API/worker/
+#                       scheduler). NOBYPASSRLS -- every read/write is
+#                       filtered by the per-transaction `app.workspace_id`
+#                       GUC.
+#   crawmatic_auth      BYPASSRLS. The narrow system seam: pre-auth
+#                       credential lookup, the SaaS admin control plane,
+#                       and cross-tenant maintenance/scheduler scans.
+#   crawmatic_scraper   NEW (this task). NOBYPASSRLS. The scrapyd
+#                       services' narrow ingestion role -- write access to
+#                       exactly the fleet-ingestion columns a spider run
+#                       produces, read access to the profile/match data it
+#                       needs to know what and how to scrape, nothing on
+#                       budgets/entitlements/users. Not yet wired into any
+#                       deployed service's DATABASE_URL -- that DSN
+#                       cutover is owner work tracked as A10
+#                       (`docs/ops/SECRETS_BY_COMPONENT.md`).
+#
+# `network_operations` IS DELIBERATELY NOT FULLY CLOSED FOR crawmatic_app
+# OR crawmatic_auth. This file's per-table comments (generated from a
+# code audit; see the generator's inline notes preserved below) record
+# two evidenced exceptions to the plan's literal "tenant roles read
+# workspace_usage_v, never the table" / "crawmatic_auth: no SELECT
+# network_operations" language:
+#
+#   * `apps/api/app/services/admin_usage.py` joins `NetworkOperation`
+#     directly on the ordinary crawmatic_app session for the admin usage
+#     report -- SELECT is kept for crawmatic_app.
+#   * `app_shared.netledger.recorder`'s open/close/replay path runs on
+#     `get_system_session` (crawmatic_auth) and issues real
+#     `SELECT ... FROM network_operations` statements -- SELECT is kept
+#     for crawmatic_auth (in addition to the INSERT/UPDATE it already
+#     needs to open and close a ledger row).
+#
+# Fully closing either would break a live code path that is out of this
+# packet's file scope to migrate onto the new `workspace_usage_v` view.
+# See the A3 task report's Escalation section for the tracked follow-up.
+#
+# Every other table/role narrowing below (fleet tables lose UPDATE for
+# crawmatic_app; identity tables are SELECT-only for crawmatic_auth
+# except the evidenced `refresh_tokens` write-path exception; `products`
+# loses UPDATE for crawmatic_auth; crawmatic_scraper's five named grants)
+# was checked against an actual code audit of every writer this task
+# could find for the affected tables -- not asserted from the plan text
+# alone.
+crawmatic_app:
+  _smoke_foundation:
+  - DELETE
+  - INSERT
+  - SELECT
+  access_policies:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  alembic_version:
+  - SELECT
+  api_abuse_limit_counters:
+  - INSERT
+  - SELECT
+  - UPDATE
+  api_keys:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  competitor_product_matches:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  competitors:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  control_plane_rules:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  cost_budgets:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  cost_reservations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  dispatch_intents:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_access_rules:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_lifecycle_audit:
+  - DELETE
+  - INSERT
+  - SELECT
+  domain_playbooks:
+  - DELETE
+  - INSERT
+  - SELECT
+  domain_rules:
+  - SELECT
+  domain_strategy_methods:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_strategy_profiles:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  extraction_shadow_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  fleet_cost_budgets:
+  - DELETE
+  - INSERT
+  - SELECT
+  fleet_daily_scorecard:
+  - DELETE
+  - INSERT
+  - SELECT
+  fleet_network_cost_rollups:
+  - DELETE
+  - INSERT
+  - SELECT
+  maintenance_cadences:
+  - DELETE
+  - INSERT
+  - SELECT
+  match_audit_classifications:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  match_competitor_identifiers:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  match_current_prices:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_cost_rollups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_operation_allocations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_operation_resource_summaries: []
+  network_operation_settlements: []
+  network_operations:
+  - SELECT
+  network_operations_pre_partition: []
+  outbox_messages:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  price_alert_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  price_observations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  product_group_items:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  product_groups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  product_variants:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  products:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  provider_usage_records: []
+  proxy_circuit_breakers:
+  - DELETE
+  - INSERT
+  - SELECT
+  proxy_providers:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  refresh_rule_occurrences:
+  - DELETE
+  - INSERT
+  - SELECT
+  refresh_rules:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  refresh_tokens:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  request_attempts:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  rollup_completion:
+  - DELETE
+  - INSERT
+  - SELECT
+  rollup_watermarks:
+  - DELETE
+  - INSERT
+  - SELECT
+  scrape_job_targets:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_jobs:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_profile_revisions:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_profiles:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_attempt_stats:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_discovery_runs:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_discovery_state:
+  - DELETE
+  - INSERT
+  - SELECT
+  strategy_method_switches:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  users:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  variant_alert_states:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  variant_price_daily_rollups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  variant_price_states:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  webhook_endpoints:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  webhook_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  workspace_entitlements:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  workspaces:
+  - DELETE
+  - INSERT
+  - SELECT
+crawmatic_auth:
+  _smoke_foundation:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  access_policies:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  alembic_version:
+  - SELECT
+  api_abuse_limit_counters:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  api_keys:
+  - SELECT
+  competitor_product_matches:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  competitors:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  control_plane_rules:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  cost_budgets:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  cost_reservations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  dispatch_intents:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_access_rules:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_lifecycle_audit:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_playbooks:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_rules:
+  - SELECT
+  domain_strategy_methods:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  domain_strategy_profiles:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  extraction_shadow_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  fleet_cost_budgets:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  fleet_daily_scorecard:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  fleet_network_cost_rollups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  maintenance_cadences:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  match_audit_classifications:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  match_competitor_identifiers:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  match_current_prices:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_cost_rollups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_operation_allocations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_operation_resource_summaries:
+  - DELETE
+  - INSERT
+  - SELECT
+  network_operation_settlements:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_operations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  network_operations_pre_partition: []
+  outbox_messages:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  price_alert_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  price_observations:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  product_group_items:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  product_groups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  product_variants:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  products:
+  - DELETE
+  - INSERT
+  - SELECT
+  provider_usage_records:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  proxy_circuit_breakers:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  proxy_providers:
+  - SELECT
+  refresh_rule_occurrences:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  refresh_rules:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  refresh_tokens:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  request_attempts:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  rollup_completion:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  rollup_watermarks:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_job_targets:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_jobs:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_profile_revisions:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  scrape_profiles:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_attempt_stats:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_discovery_runs:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_discovery_state:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  strategy_method_switches:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  users:
+  - SELECT
+  variant_alert_states:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  variant_price_daily_rollups:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  variant_price_states:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  webhook_endpoints:
+  - SELECT
+  webhook_events:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  workspace_entitlements:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+  workspaces:
+  - DELETE
+  - INSERT
+  - SELECT
+  - UPDATE
+crawmatic_scraper:
+  _smoke_foundation: []
+  access_policies: []
+  alembic_version: []
+  api_abuse_limit_counters: []
+  api_keys: []
+  competitor_product_matches:
+  - SELECT
+  competitors: []
+  control_plane_rules: []
+  cost_budgets: []
+  cost_reservations: []
+  dispatch_intents: []
+  domain_access_rules: []
+  domain_lifecycle_audit: []
+  domain_playbooks: []
+  domain_rules:
+  - SELECT
+  domain_strategy_methods: []
+  domain_strategy_profiles:
+  - SELECT
+  extraction_shadow_events:
+  - INSERT
+  fleet_cost_budgets: []
+  fleet_daily_scorecard: []
+  fleet_network_cost_rollups: []
+  maintenance_cadences: []
+  match_audit_classifications: []
+  match_competitor_identifiers: []
+  match_current_prices: []
+  network_cost_rollups: []
+  network_operation_allocations: []
+  network_operation_resource_summaries: []
+  network_operation_settlements: []
+  network_operations:
+  - INSERT
+  network_operations_pre_partition: []
+  outbox_messages: []
+  price_alert_events: []
+  price_observations:
+  - INSERT
+  product_group_items: []
+  product_groups: []
+  product_variants: []
+  products: []
+  provider_usage_records: []
+  proxy_circuit_breakers: []
+  proxy_providers: []
+  refresh_rule_occurrences: []
+  refresh_rules: []
+  refresh_tokens: []
+  request_attempts:
+  - INSERT
+  rollup_completion: []
+  rollup_watermarks: []
+  scrape_job_targets:
+  - UPDATE
+  scrape_jobs: []
+  scrape_profile_revisions: []
+  scrape_profiles:
+  - SELECT
+  strategy_attempt_stats: []
+  strategy_discovery_runs: []
+  strategy_discovery_state: []
+  strategy_method_switches: []
+  users: []
+  variant_alert_states: []
+  variant_price_daily_rollups: []
+  variant_price_states: []
+  webhook_endpoints: []
+  webhook_events: []
+  workspace_entitlements: []
+  workspaces: []
+

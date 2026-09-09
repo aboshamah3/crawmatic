@@ -193,6 +193,75 @@ class RunReport:
     partitions_created: list[str] = field(default_factory=list)
 
 
+# --- the partition-maintenance seam (EPA C9, F14) --------------------------
+#
+# `CREATE TABLE ... PARTITION OF` and reclaiming a child both require
+# OWNERSHIP of the parent — there is no grantable "attach a partition"
+# privilege in PostgreSQL. `scripts/provision_db_roles.sql` §8 correctly
+# moves ownership of every table to `crawmatic_migrate`, a role no
+# service logs in as; the maintenance job runs as `crawmatic_auth`. The
+# EPA C8 rehearsal found the consequence: on a correctly provisioned
+# database this module could do neither, silently, forever.
+#
+# §9 of that script is the fix — two SECURITY DEFINER functions owned by
+# the table owner, EXECUTE granted only to `crawmatic_auth`, each
+# validating its argument against `pg_catalog` so neither is a general
+# DDL hole. This module prefers them WHEN THEY EXIST and falls back to
+# direct DDL when they do not, which is what keeps a database
+# provisioned before §9 (and every unit test's fake session) behaving
+# exactly as it did.
+#
+# The probe is deliberately total: any failure at all — the function
+# absent, the catalog unreadable, a fake session that raises on an
+# unrecognised statement — reads as "no seam", because the fallback is
+# always at least as capable as the seam and the alternative is a
+# maintenance job that crashes on a probe.
+
+#: `to_regprocedure` returns NULL rather than raising for an unknown
+#: signature — the function-level twin of the `to_regclass` gate above.
+_SEAM_PROBE_SQL = (
+    "SELECT to_regprocedure('crawmatic_create_partition(text, text, text, text)') "
+    "IS NOT NULL AND to_regprocedure('crawmatic_drop_partition(text)') IS NOT NULL"
+)
+
+
+def _seam_probe_stmt():
+    """Build the (unexecuted) seam-availability probe (mirrors
+    :func:`_to_regclass_stmt` so its SQL is unit-assertable)."""
+    return text(_SEAM_PROBE_SQL)
+
+
+def partition_seam_available(session: Session) -> bool:
+    """Return ``True`` iff `provision_db_roles.sql` §9's helper functions
+    are present AND callable by this session.
+
+    Total by design — see this section's comment. A ``False`` answer
+    always means "issue the DDL directly", which is what every
+    pre-§9 database and every unit-test fake needs.
+    """
+    try:
+        return bool(session.execute(_seam_probe_stmt()).scalar())
+    except Exception:
+        return False
+
+
+def _seam_create_stmt(child_name: str, parent_name: str, start: datetime, end: datetime):
+    """Build the (unexecuted) seam call replacing :func:`_create_partition_stmt`."""
+    return text(
+        "SELECT crawmatic_create_partition(:parent, :child, :range_start, :range_end)"
+    ).bindparams(
+        parent=parent_name,
+        child=child_name,
+        range_start=start.date().isoformat(),
+        range_end=end.date().isoformat(),
+    )
+
+
+def _seam_drop_stmt(name: str):
+    """Build the (unexecuted) seam call replacing :func:`_drop_partition_stmt`."""
+    return text("SELECT crawmatic_drop_partition(:child)").bindparams(child=name)
+
+
 def _create_partition_stmt(child_name: str, parent_name: str, start: datetime, end: datetime):
     """Build the (unexecuted) idempotent partition-creation DDL statement.
 
@@ -259,6 +328,10 @@ def create_missing_partitions(
     needs no privilege the old one did not already have.
     """
     report = RunReport()
+    # Probed ONCE per run, not once per partition: it is a catalog read
+    # whose answer cannot change mid-run, and a job that creates two
+    # partitions should not ask the same question twice.
+    use_seam = partition_seam_available(session)
     for entry in PARTITIONED_TABLES:
         if not table_exists(session, entry.name):
             report.tables_skipped_absent.append(entry.name)
@@ -269,10 +342,24 @@ def create_missing_partitions(
             child_name = partition_name(entry.name, suffix)
             if table_exists(session, child_name):
                 continue
-            session.execute(_create_partition_stmt(child_name, entry.name, start, end))
+            stmt = (
+                _seam_create_stmt(child_name, entry.name, start, end)
+                if use_seam
+                else _create_partition_stmt(child_name, entry.name, start, end)
+            )
+            session.execute(stmt)
             report.partitions_created.append(child_name)
 
-    if report.partitions_created:
+    if report.partitions_created and not use_seam:
+        # Only when the DDL went out directly. The seam
+        # (`provision_db_roles.sql` §9) applies the parent's RLS posture
+        # to each child inside the same SECURITY DEFINER call that
+        # creates it — it has to, because `ALTER TABLE ... ENABLE ROW
+        # LEVEL SECURITY` and `CREATE POLICY` also require ownership, so
+        # this schema-wide statement would fail here for exactly the
+        # reason the seam exists. Both paths are idempotent and produce
+        # the same posture; the difference is only which role can issue
+        # it.
         session.execute(text(PARTITION_RLS_INHERITANCE_SQL))
 
     return report
@@ -303,4 +390,7 @@ def drop_partition(session: Session, name: str) -> None:
     no-op rather than an error (FR-020). No workspace-owned rows are
     touched — this is DDL on the system session, not a data query.
     """
-    session.execute(_drop_partition_stmt(name))
+    if partition_seam_available(session):
+        session.execute(_seam_drop_stmt(name))
+    else:
+        session.execute(_drop_partition_stmt(name))

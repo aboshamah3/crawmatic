@@ -218,6 +218,19 @@ class AuthorizationPurpose(StrEnum):
     MANUAL_RECHECK = "MANUAL_RECHECK"
     BROWSER_ESCALATION = "BROWSER_ESCALATION"
     RETRY = "RETRY"
+    #: EPA C6 (F18, 2026-09-08). A batch whose playbook's cheap path is
+    #: ``DIRECT`` reserves ``estimated_bytes=0`` on ``DIRECT`` transport
+    #: -- it is still authorized, because the breaker, the entitlement
+    #: and the concurrency cap apply to free traffic too, but it books no
+    #: proxy money it may never spend. When that first rung fails and the
+    #: ladder climbs to the paid proxy, the money for the paid rung is
+    #: reserved SEPARATELY, at escalation time, under this purpose. It is
+    #: the proxy-shaped sibling of :attr:`BROWSER_ESCALATION`, which does
+    #: the same for the browser rung.
+    #:
+    #: Stored in a plain ``VARCHAR`` column (see :func:`enum_column`), so
+    #: adding a member needs no migration and no type change.
+    PROXY_ESCALATION = "PROXY_ESCALATION"
 
 
 class EntitlementState(StrEnum):

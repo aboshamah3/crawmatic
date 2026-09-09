@@ -135,6 +135,14 @@ class _FakeSession:
             qualified = params["qualified_name"]
             name = qualified.split(".", 1)[1]
             return _FakeResult(name if name in self.existing_relations else None)
+        if "to_regprocedure" in sql:
+            # EPA C9 (F14): the `provision_db_roles.sql` §9 seam probe.
+            # Answered FALSE so these tests keep asserting the DIRECT DDL
+            # they were written for — the fallback path is the one every
+            # database provisioned before §9 still takes, so it is the
+            # one that must stay covered here. The seam path has its own
+            # coverage in `test_partition_seam.py`.
+            return _FakeResult(False)
         self.executed_ddl.append(sql)
         return _FakeResult(None)
 

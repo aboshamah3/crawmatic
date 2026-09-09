@@ -36,8 +36,18 @@ well under the 63-byte Postgres identifier cap.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, Uuid, text
+from sqlalchemy import (
+    DateTime,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -133,6 +143,23 @@ class ScrapeProfile(Base, TimestampMixin):
     price_transform_rules: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
     validation_rules: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
     confidence_rules: Mapped[dict | None] = mapped_column(JSONB(), nullable=True)
+
+    # --- regex execution quarantine (A2/F02) ---------------------------------
+    # Set by the persistence pipeline when this profile's regex rules blow
+    # their execution deadline (`ScrapeErrorCode.REGEX_TIMEOUT`). At
+    # `EXTRACTION_REGEX_QUARANTINE_AFTER` timeouts `regex_quarantined_at` is
+    # stamped and the extraction chain stops running this profile's regex
+    # strategy until an operator clears it
+    # (`POST /admin/profiles/{id}/regex-unquarantine`). Deliberately per
+    # PROFILE, not per domain: the offending artifact is a stored pattern on
+    # this row, and quarantining the domain would punish every other profile
+    # that scrapes it.
+    regex_timeout_count: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default=text("0")
+    )
+    regex_quarantined_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     wait_for_selector: Mapped[str | None] = mapped_column(Text(), nullable=True)
     request_timeout_ms: Mapped[int] = mapped_column(Integer(), nullable=False, default=30000)

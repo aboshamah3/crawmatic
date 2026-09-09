@@ -66,6 +66,13 @@ class UsageRow(BaseModel):
     proxied_http_attempted: int = 0
     proxied_browser_attempted: int = 0
     proxy_bytes: int = 0
+    #: Task C6/F17 (2026-09-08). This workspace's OWN share of the
+    #: physical operations the cycle used, read from
+    #: `network_operation_allocations` — never the whole physical cost of
+    #: an operation three co-tenants shared. Additive with a `0` default
+    #: for the same reason the three B3 fields above are: a row shape
+    #: without it still validates.
+    allocated_cost_micro_units: int = 0
 
 
 class UsageListResponse(BaseModel):
@@ -178,3 +185,17 @@ class TargetReconciliationResponse(BaseModel):
     job_status_before: str
     job_status_projected: str | None
     applied_count: int
+
+
+class ProfileRegexUnquarantineResponse(BaseModel):
+    """Result of releasing a scrape profile's regex quarantine (A2/F02).
+
+    `was_quarantined` reports the state the call *found*, so an operator can
+    tell a real release from a no-op re-run without a second request; both
+    are 200 (the endpoint is idempotent).
+    """
+
+    scrape_profile_id: uuid.UUID
+    was_quarantined: bool
+    quarantined_at: datetime | None
+    regex_timeout_count: int

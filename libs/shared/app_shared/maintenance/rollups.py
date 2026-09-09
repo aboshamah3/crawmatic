@@ -5,15 +5,20 @@ day — clarification), upserts one ``variant_price_daily_rollups`` row per
 ``(workspace_id, product_variant_id)`` that had >=1 ``price_observations``
 row on ``D``:
 
-* **Competitor min/avg/max + comparable count** are computed in Python
-  from that day's raw observations (:func:`aggregate_competitor_prices`,
-  a pure function — no live DB needed to unit-test it), filtered to
-  ``success AND comparable AND price IS NOT NULL AND currency ==
-  <client currency>`` (FR-011) — a currency mismatch (or a failed/
-  unpriced/non-comparable observation) is excluded from BOTH the
-  aggregate AND the count. ``comparable`` is the *persisted* SPEC-09
-  decision (already false on a currency mismatch) — read, not
-  recomputed (research R6).
+* **Competitor min/avg/max + comparable count** are computed over the
+  **latest eligible observation per ``(workspace, variant, match, day)``**
+  (EPA C7, plan F12) — a competitor observed ten times that day counts
+  once, so the average is an average over competitors rather than over
+  scrape events. Eligible means ``success AND comparable AND price IS
+  NOT NULL AND currency == <client currency>`` (FR-011) — a currency
+  mismatch (or a failed/unpriced/non-comparable observation) is excluded
+  from BOTH the aggregate AND the count. ``comparable`` is the
+  *persisted* SPEC-09 decision (already false on a currency mismatch) —
+  read, not recomputed (research R6). The aggregation runs **in
+  Postgres** (:mod:`app_shared.maintenance.rollup_sql`);
+  :func:`aggregate_competitor_prices` is the pure Python statement of
+  the same rule, kept as the executable specification the tests
+  hand-compute against.
 * **``client_price``/``currency``/``latest_alert_type``/``product_id``**
   are read (not recomputed) from the SPEC-09 current-comparison surface
   ``variant_price_states``, scoped by ``workspace_id`` + ``product_variant_id``
@@ -24,8 +29,16 @@ row on ``D``:
 The driver scan (step 1: "which (workspace, variant) pairs had activity
 on D") is inherently cross-tenant — one day spans every workspace — so
 it runs unscoped on the BYPASSRLS system session (`# noqa:
-workspace-scope`, research R9). Every subsequent read/write for a given
-pair carries an explicit ``workspace_id=`` (FR-014).
+workspace-scope`, research R9). Since EPA C7 the driver, the
+aggregation and the upsert are **one set-based statement per keyset
+batch** of at most ``ROLLUP_BATCH_LIMIT`` pairs
+(:mod:`app_shared.maintenance.rollup_sql`) rather than ``1 + 3N``
+statements for N pairs; every join inside it is on ``workspace_id`` +
+``product_variant_id``, so a row from one workspace can never be joined
+to another's state (FR-014). Each batch commits and records a durable
+``rollup_completion`` checkpoint, so an invocation killed at the Celery
+``time_limit`` resumes from where it stopped instead of restarting the
+day.
 
 Scraping-free (Constitution I/V) — SQLAlchemy + stdlib only.
 """
@@ -40,11 +53,18 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, NamedTuple
 
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import func
 
+from app_shared.maintenance.rollup_sql import (
+    MIN_UUID,
+    ROLLUP_BATCH_LIMIT,
+    EVENT_COMPLETION_STORE_ABSENT,
+    clear_completion,
+    completion_store_available,
+    read_completion,
+    rollup_batch_stmt,
+    upsert_completion,
+)
 from app_shared.maintenance.rollup_watermark import (
     EVENT_WATERMARK_STORE_ABSENT,
     WATERMARK_DAILY_ROLLUP,
@@ -53,7 +73,6 @@ from app_shared.maintenance.rollup_watermark import (
     seed_watermark,
     watermark_store_available,
 )
-from app_shared.models.rollups import VariantPriceDailyRollup
 
 # `variant_price_daily_rollups.average_competitor_price` is `NUMERIC(18,4)`
 # (`Money`, FR-012) — an arithmetic mean of N observed prices is not
@@ -92,12 +111,24 @@ class ObservationRow(NamedTuple):
     """One raw ``price_observations`` row's fields relevant to competitor
     aggregation — the minimal shape :func:`aggregate_competitor_prices`
     needs, independent of how the rows were fetched (a live query result
-    or a fake row in a unit test)."""
+    or a fake row in a unit test).
+
+    ``match_id``/``scraped_at`` (EPA C7) are what make the latest-eligible-
+    per-match collapse expressible: rows sharing a ``match_id`` are the
+    same competitor listing observed repeatedly, and ``scraped_at`` picks
+    which of those readings survives. Both default to ``None`` so a
+    caller that genuinely has one row per competitor (or is testing the
+    aggregate arithmetic alone) need not invent them — see
+    :func:`aggregate_competitor_prices` for exactly what ``None`` means
+    there.
+    """
 
     price: Decimal | None
     currency: str | None
     success: bool
     comparable: bool
+    match_id: uuid.UUID | None = None
+    scraped_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -116,22 +147,68 @@ def aggregate_competitor_prices(
 ) -> CompetitorAggregate:
     """Pure aggregation over one (workspace, variant, day)'s raw observations.
 
-    Filters to ``success AND comparable AND price IS NOT NULL AND
-    currency == client_currency`` (FR-011) — a currency mismatch (already
-    flagged ``comparable=False`` by SPEC-09) or any failed/unpriced/
-    non-comparable row is excluded from BOTH the min/avg/max aggregate
-    AND the count, never merely from the aggregate. Zero matching rows
-    -> NULL ``cheapest``/``average``/``highest`` and ``comparable_count=0``
-    (FR-013) — a valid result, never an error. All arithmetic is exact
-    ``Decimal`` (never float); the average is quantized to the column's
-    ``NUMERIC(18,4)`` scale with ``ROUND_HALF_UP`` (ties away from zero)
-    since an arithmetic mean is not generally exact at 4 decimal places.
+    **Latest eligible observation per match, then aggregate** (EPA C7,
+    plan F12). Two steps, in this order:
+
+    1. *Eligibility.* Keep only ``success AND comparable AND price IS NOT
+       NULL AND currency == client_currency`` (FR-011) — a currency
+       mismatch (already flagged ``comparable=False`` by SPEC-09) or any
+       failed/unpriced/non-comparable row is excluded from BOTH the
+       min/avg/max aggregate AND the count, never merely from the
+       aggregate.
+    2. *Collapse.* Of the surviving rows, keep exactly ONE per
+       ``match_id`` — the one with the greatest ``scraped_at``. A
+       competitor whose page was scraped ten times that day therefore
+       contributes one price, not ten, so ``comparable_count`` counts
+       *competitors* and the average is not weighted by how often each
+       competitor happened to be refreshed. Filtering before collapsing
+       is deliberate: a competitor whose last read of the day failed
+       contributes its most recent *usable* reading instead of vanishing
+       from the day.
+
+    Rows with ``match_id is None`` are not collapsed with anything —
+    each is its own group. That is the honest reading of "no match
+    identity": two rows that cannot be shown to be the same competitor
+    must not be assumed to be one. Ties on ``scraped_at`` within a match
+    keep the first row seen (Postgres's ``DISTINCT ON`` is likewise
+    arbitrary among ties; the values being tied is what makes that safe).
+
+    Zero surviving rows -> NULL ``cheapest``/``average``/``highest`` and
+    ``comparable_count=0`` (FR-013) — a valid result, never an error. All
+    arithmetic is exact ``Decimal`` (never float); the average is
+    quantized to the column's ``NUMERIC(18,4)`` scale with
+    ``ROUND_HALF_UP`` (ties away from zero) since an arithmetic mean is
+    not generally exact at 4 decimal places — matching the ``ROUND(AVG(
+    price), 4)`` the set-based statement issues.
+
+    This is the executable specification of what
+    :mod:`app_shared.maintenance.rollup_sql` does server-side; the live
+    path does NOT call it (that was the N+1). Tests hand-compute against
+    it.
     """
-    prices = [
-        row.price
+    eligible = [
+        row
         for row in rows
         if row.success and row.comparable and row.price is not None and row.currency == client_currency
     ]
+
+    # Collapse to the latest eligible row per match. `None` match ids are
+    # never merged -- each keeps its own slot via a unique sentinel key.
+    latest: dict[object, ObservationRow] = {}
+    for index, row in enumerate(eligible):
+        key: object = row.match_id if row.match_id is not None else ("__unmatched__", index)
+        incumbent = latest.get(key)
+        if incumbent is None:
+            latest[key] = row
+            continue
+        # An absent `scraped_at` cannot claim to be later than a present
+        # one; between two absent ones the first seen wins (a tie).
+        if row.scraped_at is not None and (
+            incumbent.scraped_at is None or row.scraped_at > incumbent.scraped_at
+        ):
+            latest[key] = row
+
+    prices = [row.price for row in latest.values() if row.price is not None]
     if not prices:
         return CompetitorAggregate(cheapest=None, average=None, highest=None, comparable_count=0)
 
@@ -181,193 +258,201 @@ def utc_day_bounds(target_date: date_type) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
-def _driver_pairs_stmt(target_date: date_type):
-    """Build the (unexecuted) cross-tenant driver-scan statement.
-
-    Distinct ``(workspace_id, product_variant_id, product_id)`` with >=1
-    ``price_observations`` row on ``target_date`` (contracts/daily-rollup.md
-    step 1) — inherently cross-tenant (one day spans every workspace), so
-    this is the one unscoped scan in this module (`# noqa:
-    workspace-scope`, research R9). Split out so its rendered SQL can be
-    asserted in a pure unit test without a live DB (mirrors
-    `app_shared.maintenance.partitions._to_regclass_stmt`).
-
-    The day predicate is a half-open range on the raw partition key
-    (:func:`utc_day_bounds`) so the scan prunes to the target day's
-    partition instead of seq-scanning every month.
-    """
-    day_start, day_end = utc_day_bounds(target_date)
-    return text(
-        """
-        SELECT DISTINCT workspace_id, product_variant_id, product_id
-        FROM price_observations
-        WHERE scraped_at >= :day_start AND scraped_at < :day_end
-        """
-    ).bindparams(day_start=day_start, day_end=day_end)
-
-
-def _day_observations_stmt(
-    target_date: date_type, workspace_id: uuid.UUID, product_variant_id: uuid.UUID
-):
-    """Build the (unexecuted) statement fetching one (ws, variant, day)'s
-    raw observation rows (price/currency/success/comparable) — the
-    unfiltered input to :func:`aggregate_competitor_prices`. Explicitly
-    scoped by ``workspace_id`` (FR-014) in addition to the day + variant.
-
-    This statement executes once per (workspace, variant) pair returned
-    by :func:`_driver_pairs_stmt`, so its per-call cost is multiplied by
-    the driver's row count — the half-open range on the raw partition
-    key (:func:`utc_day_bounds`) is what keeps it an index scan of one
-    partition rather than a full-table seq scan per pair.
-    """
-    day_start, day_end = utc_day_bounds(target_date)
-    return text(
-        """
-        SELECT price, currency, success, comparable
-        FROM price_observations
-        WHERE scraped_at >= :day_start AND scraped_at < :day_end
-          AND workspace_id = :workspace_id
-          AND product_variant_id = :product_variant_id
-        """
-    ).bindparams(
-        day_start=day_start,
-        day_end=day_end,
-        workspace_id=workspace_id,
-        product_variant_id=product_variant_id,
-    )
-
-
-def _client_state_stmt(workspace_id: uuid.UUID, product_variant_id: uuid.UUID):
-    """Build the (unexecuted) statement reading the SPEC-09 current-state
-    surface (`client_price`/`currency`/`latest_alert_type`) for one
-    variant — read, not recomputed (research R6). Explicitly scoped by
-    ``workspace_id`` (FR-014).
-    """
-    return text(
-        """
-        SELECT client_price, currency, latest_alert_type
-        FROM variant_price_states
-        WHERE workspace_id = :workspace_id AND product_variant_id = :product_variant_id
-        """
-    ).bindparams(workspace_id=workspace_id, product_variant_id=product_variant_id)
-
-
 @dataclass
 class RunReport:
     """Structured summary of one ``run_daily_rollup`` run (FR-023,
     data-model.md §5) — logged by the Celery task wrapper, never
-    persisted."""
+    persisted.
+
+    ``complete`` is the field that decides whether the caller must
+    re-enqueue: ``False`` means the invocation stopped on its batch or
+    time budget with pairs still unprocessed, and the durable
+    ``rollup_completion`` checkpoint holds where to resume. It is also
+    the value written to that table's ``complete`` column, which C8's
+    retention gate reads before allowing a day's source partition to be
+    dropped.
+    """
 
     rollups_upserted: int = 0
     variants_skipped_no_state: list[str] = field(default_factory=list)
+    #: Statements issued: one per keyset batch (was ``1 + 3N``).
+    batches: int = 0
+    #: (workspace, variant) pairs the batches covered.
+    driver_rows: int = 0
+    complete: bool = True
+    #: The keyset cursor after the last committed batch, as strings.
+    last_key: tuple[str, str] | None = None
+    #: ``False`` when ``rollup_completion`` is not migrated yet — the run
+    #: is still correct, just not resumable.
+    checkpoint_available: bool = False
+    #: The cursor this run started from, when it resumed a partial day.
+    resumed_from: tuple[str, str] | None = None
 
 
 def run_daily_rollup(
-    session: Session, *, target_date: date_type | None = None, dry_run: bool = False
+    session: Session,
+    *,
+    target_date: date_type | None = None,
+    dry_run: bool = False,
+    batch_limit: int = ROLLUP_BATCH_LIMIT,
+    max_batches: int | None = None,
+    deadline: datetime | None = None,
+    restart: bool = False,
+    commit: bool = True,
+    now: datetime | None = None,
 ) -> RunReport:
     """Upsert one ``variant_price_daily_rollups`` row per (workspace,
     variant) that had >=1 observation on ``target_date`` (contracts/
     daily-rollup.md). ``target_date`` defaults to yesterday UTC
     (:func:`default_target_date`).
 
+    **Set-based, batched, resumable** (EPA C7, plan F12). The day is
+    walked in keyset batches of ``batch_limit`` ``(workspace_id,
+    product_variant_id)`` pairs; each batch is ONE statement
+    (:func:`app_shared.maintenance.rollup_sql.rollup_batch_stmt`) that
+    selects the batch, collapses the day's observations to the latest
+    eligible one per ``(workspace, variant, match)``, aggregates, joins
+    ``variant_price_states`` and upserts — replacing the ``1 + 3N``
+    statements per day this function used to issue. After each batch the
+    durable ``rollup_completion`` checkpoint is written **in the same
+    transaction** and the transaction is committed, so:
+
+    * a run killed at the Celery ``time_limit`` keeps every batch it
+      finished and the next invocation resumes from the cursor rather
+      than re-walking the day;
+    * a crash mid-batch loses that batch's rows AND its cursor advance
+      together, so the batch is simply redone — and because the upsert
+      is absolute (``ON CONFLICT ... DO UPDATE`` with computed values,
+      never ``count + delta``) redoing it converges on the same rows.
+      Nothing is ever double-counted.
+
+    A day whose checkpoint already says ``complete`` is a no-op: the
+    function returns immediately with ``rollups_upserted=0``. Pass
+    ``restart=True`` (what :func:`recompute_window` does) to clear that
+    and re-derive the day in full.
+
+    ``max_batches``/``deadline`` bound one invocation. ``deadline`` is a
+    tz-aware UTC instant checked *between* batches — the caller sets it
+    below the Celery ``time_limit`` so the process stops itself cleanly
+    instead of being SIGKILLed mid-transaction. Either bound stopping the
+    run leaves ``report.complete is False``, which is the caller's signal
+    to re-enqueue.
+
     A variant with observations that day but **no** SPEC-09
     ``variant_price_states`` row yet (never computed) has no
-    ``client_price`` to snapshot (NOT NULL column) — recorded in
+    ``client_price`` to snapshot (NOT NULL column) — reported in
     ``variants_skipped_no_state`` and skipped rather than erroring or
     writing a placeholder; this is distinct from the *zero-comparable*
-    case (FR-013), which still gets a row.
+    case (FR-013), which still gets a row (the statement's ``LEFT JOIN``
+    to the aggregate, ``COALESCE(..., 0)``).
 
-    ``dry_run=True`` (SPEC-15 Task 1.4, `scripts/backfill_daily_rollups.py`):
-    runs every read and the full aggregation exactly as normal — the same
-    driver scan, client-state read, day-observations read, and
-    :func:`aggregate_competitor_prices` call — and still counts the
-    result in ``report.rollups_upserted``, but the ``INSERT ... ON
-    CONFLICT`` statement is never built or executed. This makes the
-    caller's session genuinely, Postgres-enforceable read-only for the
-    whole call (no write statement is EVER sent), which a real upsert +
-    app-level ``session.rollback()`` cannot guarantee on its own — a
-    transaction-level ``SET TRANSACTION READ ONLY`` only holds if no
-    write statement is subsequently attempted in that same transaction;
-    ``session.execute(stmt)``ing the real upsert first and rolling back
-    after is NOT compatible with that guard (Postgres raises `cannot
-    execute INSERT in a read-only transaction` the instant the write is
-    attempted). ``dry_run=False`` (the default) is byte-for-byte the
-    original behaviour — every existing caller (the `MAINTENANCE_DAILY_
-    ROLLUP` Celery task, live/unit tests) is unaffected.
+    ``dry_run=True`` (SPEC-15 Task 1.4, `scripts/backfill_daily_rollups.py`)
+    renders the same statement with the data-modifying CTE removed: it
+    runs the identical driver scan, collapse, aggregation and state join
+    and still reports what WOULD be written, but no write statement is
+    ever built or sent — not the upsert, not the checkpoint — so the
+    caller's session is genuinely, Postgres-enforceably read-only for the
+    whole call (a `SET TRANSACTION READ ONLY` guard holds only if no
+    write is attempted; executing the real upsert and rolling back after
+    is not compatible with it). A dry run also never consults the
+    checkpoint: it always walks the whole day, because "what would a full
+    run write" is the question it is asked.
     """
     if target_date is None:
-        target_date = default_target_date(datetime.now(timezone.utc))
+        target_date = default_target_date(now or datetime.now(timezone.utc))
+    if batch_limit <= 0:
+        raise ValueError(f"batch_limit must be positive, got {batch_limit}")
 
-    report = RunReport()
+    day_start, day_end = utc_day_bounds(target_date)
+    report = RunReport(complete=False)
 
-    # Cross-tenant scan (research R9) -- the one unscoped read in this
-    # module; every subsequent read/write below carries an explicit
-    # workspace_id= (FR-014).
-    pairs = session.execute(_driver_pairs_stmt(target_date)).all()  # noqa: workspace-scope
-
-    for row in pairs:
-        workspace_id = row.workspace_id
-        product_variant_id = row.product_variant_id
-        product_id = row.product_id
-
-        state_row = session.execute(
-            _client_state_stmt(workspace_id, product_variant_id)
-        ).first()
-        if state_row is None:
-            report.variants_skipped_no_state.append(str(product_variant_id))
-            continue
-
-        observation_rows = [
-            ObservationRow(
-                price=obs.price,
-                currency=obs.currency,
-                success=obs.success,
-                comparable=obs.comparable,
-            )
-            for obs in session.execute(
-                _day_observations_stmt(target_date, workspace_id, product_variant_id)
-            )
-        ]
-        aggregate = aggregate_competitor_prices(
-            observation_rows, client_currency=state_row.currency
+    # A dry run must send no write at all, so it neither reads nor writes
+    # the checkpoint and always starts from the beginning of the day.
+    checkpoint = (not dry_run) and completion_store_available(session)
+    report.checkpoint_available = checkpoint
+    if not checkpoint and not dry_run:
+        logger.warning(
+            "%s table=%s target_date=%s remedy=%s",
+            EVENT_COMPLETION_STORE_ABSENT,
+            "rollup_completion",
+            target_date.isoformat(),
+            "apply the pending rollup_completion migration; until then every "
+            "invocation restarts the day from the beginning and a run killed "
+            "at the Celery time_limit makes no durable forward progress",
         )
 
-        values = {
-            "workspace_id": workspace_id,
-            "product_id": product_id,
-            "product_variant_id": product_variant_id,
-            "date": target_date,
-            "currency": state_row.currency,
-            "client_price": state_row.client_price,
-            "cheapest_competitor_price": aggregate.cheapest,
-            "average_competitor_price": aggregate.average,
-            "highest_competitor_price": aggregate.highest,
-            "comparable_competitor_count": aggregate.comparable_count,
-            "latest_alert_type": state_row.latest_alert_type,
-        }
-        if not dry_run:
-            stmt = pg_insert(VariantPriceDailyRollup).values(**values)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["workspace_id", "product_variant_id", "date"],
-                set_={
-                    "product_id": stmt.excluded.product_id,
-                    "currency": stmt.excluded.currency,
-                    "client_price": stmt.excluded.client_price,
-                    "cheapest_competitor_price": stmt.excluded.cheapest_competitor_price,
-                    "average_competitor_price": stmt.excluded.average_competitor_price,
-                    "highest_competitor_price": stmt.excluded.highest_competitor_price,
-                    "comparable_competitor_count": stmt.excluded.comparable_competitor_count,
-                    "latest_alert_type": stmt.excluded.latest_alert_type,
-                    "updated_at": func.now(),
-                },
-            )
-            session.execute(stmt)
-        # dry_run=True: `values` was fully computed (proves what WOULD be
-        # written) but no statement is ever sent -- the count below is
-        # the only side effect.
-        report.rollups_upserted += 1
+    last_workspace_id = MIN_UUID
+    last_variant_id = MIN_UUID
+    stamp = now or datetime.now(timezone.utc)
 
-    return report
+    if checkpoint:
+        if restart:
+            clear_completion(session, target_date, now=stamp)
+        else:
+            existing = read_completion(session, target_date)
+            if existing is not None:
+                if existing.complete:
+                    report.complete = True
+                    return report
+                if existing.last_key_workspace_id is not None:
+                    last_workspace_id = existing.last_key_workspace_id
+                    last_variant_id = existing.last_key_variant_id or MIN_UUID
+                    report.resumed_from = (str(last_workspace_id), str(last_variant_id))
+
+    while True:
+        # Cross-tenant statement (research R9) -- the one unscoped read in
+        # this module; every join inside it pairs workspace_id with
+        # product_variant_id, so no row is ever matched across workspaces
+        # (FR-014).
+        row = session.execute(  # noqa: workspace-scope
+            rollup_batch_stmt(
+                target_date,
+                day_start,
+                day_end,
+                last_workspace_id=last_workspace_id,
+                last_product_variant_id=last_variant_id,
+                batch_limit=batch_limit,
+                dry_run=dry_run,
+            )
+        ).first()
+
+        driver_rows = int(row.driver_rows or 0) if row is not None else 0
+        report.batches += 1
+        report.driver_rows += driver_rows
+        report.rollups_upserted += int(row.rollups_upserted or 0) if row is not None else 0
+        if row is not None and row.variants_skipped_no_state:
+            report.variants_skipped_no_state.extend(row.variants_skipped_no_state)
+        if row is not None and row.last_workspace_id is not None:
+            last_workspace_id = row.last_workspace_id
+            last_variant_id = row.last_product_variant_id
+            report.last_key = (str(last_workspace_id), str(last_variant_id))
+
+        # A short batch means the keyset window ran off the end of the
+        # day: there is nothing after the cursor, so the day is done.
+        day_done = driver_rows < batch_limit
+
+        if checkpoint:
+            upsert_completion(
+                session,
+                target_date,
+                last_workspace_id=None if last_workspace_id == MIN_UUID else last_workspace_id,
+                last_variant_id=None if last_variant_id == MIN_UUID else last_variant_id,
+                complete=day_done,
+                now=stamp,
+            )
+        if commit and not dry_run:
+            session.commit()
+
+        if day_done:
+            report.complete = True
+            return report
+        if max_batches is not None and report.batches >= max_batches:
+            return report
+        # Real clock, never the caller's `now` stamp: `now` exists to make
+        # the WRITES deterministic in a test, and reusing it here would
+        # freeze the budget and loop forever.
+        if deadline is not None and datetime.now(timezone.utc) >= deadline:
+            return report
 
 
 # --- Durable watermark: bounded catch-up + recompute (EPA W5.5-L2 Item A) ---
@@ -418,6 +503,11 @@ class CatchupReport:
     ``days_remaining`` is how many owed days this run did NOT reach
     because ``max_days`` capped the batch -- the operator's "am I still
     behind?" number, and the thing that must trend to 0.
+
+    ``complete`` is ``False`` when the run stopped with work still owed
+    -- either a day did not finish inside this invocation's batch/time
+    budget (``incomplete_day``) or ``max_days`` capped the batch. The
+    Celery task re-enqueues itself while it is ``False`` (EPA C7).
     """
 
     days_processed: list[str] = field(default_factory=list)
@@ -428,6 +518,11 @@ class CatchupReport:
     days_remaining: int = 0
     watermark_before: str | None = None
     watermark_after: str | None = None
+    complete: bool = True
+    #: The UTC day this run stopped part-way through, if any. Its
+    #: watermark is deliberately NOT advanced.
+    incomplete_day: str | None = None
+    batches: int = 0
 
 
 def run_rollup_catchup(
@@ -438,6 +533,8 @@ def run_rollup_catchup(
     seed_lag_days: int | None = None,
     watermark_key: str = WATERMARK_DAILY_ROLLUP,
     commit: bool = True,
+    batch_limit: int = ROLLUP_BATCH_LIMIT,
+    deadline: datetime | None = None,
 ) -> CatchupReport:
     """Roll up every UTC day owed since the durable watermark, in a bounded batch.
 
@@ -461,6 +558,21 @@ def run_rollup_catchup(
     because a re-run is idempotent by construction (``ON CONFLICT ... DO
     UPDATE`` with absolute values, never ``count + delta``), even a
     torn-looking retry converges on the same rows.
+
+    Since EPA C7 :func:`run_daily_rollup` itself commits per keyset
+    batch, so the final batch of a day commits just before step 2 rather
+    than with it. The property is unchanged and is now enforced twice: a
+    crash in that gap leaves the day's rows durable but its watermark
+    un-advanced, so the day is re-planned -- and its ``rollup_completion``
+    row already says ``complete``, so the re-plan is a no-op that just
+    advances the cursor. A day that did NOT finish inside this
+    invocation's budget does **not** get its watermark advanced at all;
+    the loop stops there, reports ``complete=False`` and names the day in
+    ``incomplete_day``, and the caller re-enqueues.
+
+    ``deadline`` (a tz-aware UTC instant) and ``batch_limit`` are passed
+    straight through to :func:`run_daily_rollup`; the deadline is checked
+    between batches AND between days.
 
     **Degraded mode.** When ``rollup_watermarks`` does not exist yet (the
     migration is pending -- see the module docstring of
@@ -492,12 +604,22 @@ def run_rollup_catchup(
             "rollup missed during downtime is never re-attempted and its source "
             "partition can be dropped by retention before it is ever aggregated",
         )
-        day_report = run_daily_rollup(session, target_date=latest_complete_day)
+        day_report = run_daily_rollup(
+            session,
+            target_date=latest_complete_day,
+            batch_limit=batch_limit,
+            deadline=deadline,
+            commit=commit,
+        )
         if commit:
             session.commit()
         report.days_processed.append(latest_complete_day.isoformat())
         report.rollups_upserted += day_report.rollups_upserted
         report.variants_skipped_no_state.extend(day_report.variants_skipped_no_state)
+        report.batches += day_report.batches
+        if not day_report.complete:
+            report.complete = False
+            report.incomplete_day = latest_complete_day.isoformat()
         return report
 
     report.watermark_available = True
@@ -524,17 +646,48 @@ def run_rollup_catchup(
     total_owed = (latest_complete_day - watermark.last_complete_date).days
     report.days_remaining = max(0, total_owed - len(owed))
 
+    if report.days_remaining:
+        report.complete = False
+
     for day in owed:
-        day_report = run_daily_rollup(session, target_date=day)
+        day_report = run_daily_rollup(
+            session,
+            target_date=day,
+            batch_limit=batch_limit,
+            deadline=deadline,
+            commit=commit,
+        )
+        report.days_processed.append(day.isoformat())
+        report.rollups_upserted += day_report.rollups_upserted
+        report.variants_skipped_no_state.extend(day_report.variants_skipped_no_state)
+        report.batches += day_report.batches
+
+        if not day_report.complete:
+            # The day is only PARTLY rolled up. Advancing the watermark
+            # here would declare it finished and let retention drop its
+            # source partition -- the exact data loss the cursor exists
+            # to prevent. Stop, report, and let the caller re-enqueue:
+            # the durable `rollup_completion` cursor resumes this day
+            # where it stopped.
+            report.complete = False
+            report.incomplete_day = day.isoformat()
+            return report
+
         # Same transaction as the day's own upserts -- see the ordering
         # contract in `app_shared.maintenance.rollup_watermark`.
         advance_watermark(session, day, key=watermark_key, now=now)
         if commit:
             session.commit()
-        report.days_processed.append(day.isoformat())
-        report.rollups_upserted += day_report.rollups_upserted
-        report.variants_skipped_no_state.extend(day_report.variants_skipped_no_state)
         report.watermark_after = day.isoformat()
+
+        if deadline is not None and datetime.now(timezone.utc) >= deadline:
+            # Out of budget between days: whatever is still owed stays
+            # owed, and the caller re-enqueues.
+            remaining = (latest_complete_day - day).days
+            if remaining > 0:
+                report.days_remaining = remaining
+                report.complete = False
+            return report
 
     return report
 
@@ -575,10 +728,19 @@ def recompute_window(
     the advance is ``GREATEST``-guarded anyway, so even a mistaken call
     could not rewind the cadence's progress.
 
-    One transaction per day (committed as it completes, unless
+    One transaction per keyset batch (committed as it completes, unless
     ``commit=False``) so a long range makes durable partial progress and
-    an interruption costs at most the day in flight -- which, being
+    an interruption costs at most the batch in flight -- which, being
     idempotent, is simply redone.
+
+    Every day is recomputed with ``restart=True``: a deliberate repair
+    must re-derive a day even when its ``rollup_completion`` row already
+    says ``complete``, which is exactly the case a repair is called for.
+    That resets the day's checkpoint first, so an interrupted recompute
+    resumes mid-day on the next call rather than starting over -- and
+    leaves the day marked incomplete until it finishes, which is the
+    honest state for C8's retention gate to see while a repair is in
+    flight.
 
     ``dry_run=True`` forwards to :func:`run_daily_rollup`'s own genuinely
     read-only path (no write statement is ever sent), matching
@@ -596,7 +758,13 @@ def recompute_window(
     report = RecomputeReport(dry_run=dry_run)
     day = start_date
     while day <= end_date:
-        day_report = run_daily_rollup(session, target_date=day, dry_run=dry_run)
+        day_report = run_daily_rollup(
+            session,
+            target_date=day,
+            dry_run=dry_run,
+            restart=True,
+            commit=commit,
+        )
         if commit and not dry_run:
             session.commit()
         report.days_recomputed.append(day.isoformat())

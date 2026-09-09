@@ -252,13 +252,19 @@ def test_split_attempt_bytes_multiple_documents_sum():
     assert subresource_bytes == 0
 
 
-# --- EPA B5: document-only proxied browser legs for LISTED domains ------------
+# --- EPA B5/C3: document-only browser legs for LISTED domains -----------------
 #
-# The canary-gated rule added on 2026-09-03. Its whole safety property is
-# that it is OFF unless an operator lists a domain in
-# `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` (default `()`), AND the leg is
-# actually proxied. Every test below either pins that gate or pins the
-# unchanged default behaviour on the other side of it.
+# The canary-gated rule added on 2026-09-03 (B5, PROXY-only) and extended to
+# both transports on 2026-09-08 (C3, BLOCKLIST_VERSION 3). Its whole safety
+# property is that it is OFF unless an operator lists a domain in
+# `BROWSER_DOCUMENT_ONLY_DOMAINS` or its alias
+# `BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS` (both default `()`). Every test
+# below either pins that gate or pins the unchanged default behaviour on the
+# other side of it. `tests/unit/test_browser_resource_policy_both_legs.py`
+# (EPA C3) covers the both-legs extension itself; this file's own DIRECT
+# cases were updated in place to match (BLOCKLIST_VERSION 3 changes what a
+# listed domain's DIRECT leg does, not just what a new leg-agnostic domain
+# does).
 
 
 @pytest.fixture
@@ -287,10 +293,11 @@ def settings_with_nothing_listed(monkeypatch):
     )
 
 
-def test_blocklist_version_is_2():
-    # Bumped by B5 so a `policy_version` stamp on a canary run's log lines
-    # is never silently reinterpreted as a v1 (pre-document-only) decision.
-    assert browser_resource_policy.BLOCKLIST_VERSION == 2
+def test_blocklist_version_is_3():
+    # Bumped by B5 (v2) then C3 (v3, both-legs document-only, 2026-09-08)
+    # so a `policy_version` stamp on a canary run's log lines is never
+    # silently reinterpreted as an earlier rule-set's decision.
+    assert browser_resource_policy.BLOCKLIST_VERSION == 3
 
 
 def test_proxied_blocked_resource_types_never_contains_document():
@@ -321,10 +328,11 @@ def test_script_blocked_on_proxy_for_listed_domain(settings_with_amazon_listed):
     )
 
 
-def test_script_not_blocked_on_direct_for_listed_domain(settings_with_amazon_listed):
-    # DIRECT bytes are the fleet's own egress and cost nothing per byte --
-    # the document-only rule is a PROXY-cost rule, never a general one.
-    assert not should_block(
+def test_script_blocked_on_direct_for_listed_domain_too(settings_with_amazon_listed):
+    # EPA C3 (2026-09-08, BLOCKLIST_VERSION 3): the document-only rule now
+    # applies to BOTH transports, not just PROXY -- a listed domain's
+    # DIRECT leg is document-only exactly like its PROXY leg.
+    assert should_block(
         "https://www.amazon.sa/main.js",
         "script",
         None,
@@ -442,7 +450,9 @@ def test_evaluate_request_forwards_domain_and_transport(settings_with_amazon_lis
         "https://www.amazon.sa/dp/B0ABC", "document", None,
         domain="www.amazon.sa", transport="PROXY",
     )
-    assert not evaluate_request(
+    # EPA C3 (BLOCKLIST_VERSION 3): a listed domain is document-only on
+    # DIRECT too, not just PROXY.
+    assert evaluate_request(
         "https://www.amazon.sa/main.js", "script", None,
         domain="www.amazon.sa", transport="DIRECT",
     )

@@ -17,10 +17,16 @@ Task B4 turned ``JOBS_COALESCING_ENABLED`` on by default: duplicate URL
 fetches across matches are free to remove now that the canary period
 (W4.3) is over, and there is exactly one tenant in production today, so
 there is no cross-workspace fan-in risk to gate behind a flag anymore.
-``SCHEDULER_FAIR_QUEUE_ENABLED`` stays OFF -- it is a single-tenant
-fleet today, so weighted fair queuing across workspaces has nothing to
-arbitrate; it is deferred to 3+ tenants (see
-``docs/DEFERRED-ITEMS.md``).
+EPA plan task B3 (F07, 2026-09-07) then turned ``SCHEDULER_FAIR_QUEUE_
+ENABLED`` on by default too, closing the 2026-09-04 deferral. Its premise
+was that the flag gated *fairness* only, which a single-tenant fleet has
+no use for. It does not: the fair pass is also the only scheduling path
+with per-rule failure isolation (bounded-retry ledger + dead-letter sink,
+instead of the legacy loop's pass-ending ``break``), with the
+fleet/domain concurrency caps, and -- since B3 -- with the durable
+``refresh_rule_occurrences`` claim. None of those depends on the tenant
+count. The override test below still pins that an operator can turn it
+back off.
 
 ``_env_file=None`` is passed to every ``Settings(...)`` call, and only
 the required variables are set, so these assertions see neither a
@@ -49,9 +55,9 @@ REQUIRED_ENV = {
 }
 
 #: The two W4 flags this module pins, each with its own module and its
-#: shipped default -- no longer both `False` since Task B4.
+#: shipped default -- both `True` since Task B3 (2026-09-07).
 W4_FLAG_DEFAULTS = (
-    ("SCHEDULER_FAIR_QUEUE_ENABLED", "app_shared.scheduling.fair_queue", False),
+    ("SCHEDULER_FAIR_QUEUE_ENABLED", "app_shared.scheduling.fair_queue", True),
     ("JOBS_COALESCING_ENABLED", "app_shared.jobs.coalescing", True),
 )
 
@@ -66,11 +72,16 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     return Settings(_env_file=None)
 
 
-def test_scheduler_fair_queue_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """W4.4's fair-queue scheduler still ships dark: OFF means the
-    existing scheduling path is untouched. Single-tenant fleet has
-    nothing to arbitrate fairly between yet."""
-    assert _settings(monkeypatch).SCHEDULER_FAIR_QUEUE_ENABLED is False
+def test_scheduler_fair_queue_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Task B3 (F07): the fair pass is now the shipped scheduling path.
+
+    It carries per-rule failure isolation, the bounded-retry/dead-letter
+    ledger, the two-plane fleet/domain caps and the durable
+    ``refresh_rule_occurrences`` claim -- properties a single-tenant fleet
+    needs just as much as a multi-tenant one, which is what closed the
+    2026-09-04 "revisit at 3+ tenants" deferral.
+    """
+    assert _settings(monkeypatch).SCHEDULER_FAIR_QUEUE_ENABLED is True
 
 
 def test_jobs_coalescing_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:

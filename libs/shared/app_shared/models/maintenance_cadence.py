@@ -111,6 +111,45 @@ CADENCE_BREAKER_EVALUATE = "breaker_evaluate"
 #: already three orders of magnitude of margin, and the work on all but
 #: the first tick of a month is a single SELECT.
 CADENCE_FLEET_BUDGET_ROLLFORWARD = "fleet_budget_rollforward"
+#: EPA B3 (2026-09-07), closing B2's owed wiring: settles every
+#: ``POSTED`` ``dispatch_intents`` row against the node it names
+#: (``app_shared.jobs.dispatch_intents.reconcile_inflight_intents``, step
+#: 5 of the commit-before-send protocol). DURABLE rather than one of the
+#: in-process 60s cadences precisely because of what it cleans up after:
+#: a worker (or a whole service) that died between its POST and the
+#: node's answer. An in-process accumulator resets on exactly the event
+#: this cadence exists to recover from, so the deadline lives in
+#: Postgres like the rest of them. Interval:
+#: ``DISPATCH_RECONCILE_INTERVAL_SECONDS`` (300s, its own knob — the
+#: reconcile is what bounds how long a `POSTED` row can sit unsettled,
+#: which is a decision of its own and not a borrowed daily one).
+CADENCE_DISPATCH_RECONCILE = "dispatch_reconcile"
+#: EPA C5 (2026-09-08, F19): the raw-evidence blob sweep
+#: (``app_shared.observations.evidence_store.sweep_evidence_retention``
+#: via ``MAINTENANCE_EVIDENCE_RETENTION``). Its own key rather than a step
+#: inside ``CADENCE_RETENTION_DROP``'s row for the same reason it is its
+#: own task: one of the two ages rows that a partition drop would remove
+#: anyway, the other irreversibly deletes the evidence a price was
+#: justified by. A shared claim would mean pausing one to pause the
+#: other. Interval: ``EVIDENCE_RETENTION_INTERVAL_SECONDS`` (daily, its
+#: own knob).
+CADENCE_EVIDENCE_RETENTION = "evidence_retention"
+#: EPA C9 (2026-09-08, F14): the LEDGER child summarizer
+#: (``app_shared.maintenance.ledger_summaries.
+#: run_ledger_child_summarization`` via
+#: ``MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN``). Its own key for the same
+#: reason it is its own task: it is gated on a provider settlement having
+#: arrived, so its "nothing to do" is a normal and frequent outcome that
+#: must not be confused with the partition drop's. Interval:
+#: ``LEDGER_SUMMARIZE_INTERVAL_SECONDS`` (daily, its own knob).
+CADENCE_LEDGER_SUMMARIZE_CHILDREN = "ledger_summarize_children"
+#: EPA D5 (2026-09-08, deep dive §12 item 9): the daily cost/freshness
+#: scorecard (``app_shared.maintenance.scorecard.run_daily_scorecard``
+#: via ``MAINTENANCE_DAILY_SCORECARD``). Its own key for the same reason
+#: every other daily maintenance job gets one: an operator pausing the
+#: scorecard write must not also pause rollups or retention. Interval:
+#: ``SCORECARD_INTERVAL_SECONDS`` (daily, its own knob).
+CADENCE_DAILY_SCORECARD = "daily_scorecard"
 
 #: Every cadence the scheduler drives durably (the daily ones, plus the
 #: 6-hourly entitlement refresh and the 5-minute breaker evaluation). The
@@ -125,6 +164,10 @@ DURABLE_CADENCE_KEYS: tuple[str, ...] = (
     CADENCE_ENTITLEMENT_REFRESH,
     CADENCE_BREAKER_EVALUATE,
     CADENCE_FLEET_BUDGET_ROLLFORWARD,
+    CADENCE_DISPATCH_RECONCILE,
+    CADENCE_EVIDENCE_RETENTION,
+    CADENCE_LEDGER_SUMMARIZE_CHILDREN,
+    CADENCE_DAILY_SCORECARD,
 )
 
 
@@ -160,12 +203,16 @@ class MaintenanceCadence(Base, TimestampMixin):
 __all__ = [
     "CADENCE_BREAKER_EVALUATE",
     "CADENCE_COST_ROLLUP",
+    "CADENCE_DISPATCH_RECONCILE",
     "CADENCE_DAILY_ROLLUP",
     "CADENCE_ENTITLEMENT_REFRESH",
     "CADENCE_FLEET_BUDGET_ROLLFORWARD",
     "CADENCE_PARTITION_CREATE",
     "CADENCE_RECONCILE_PROVIDER_USAGE",
     "CADENCE_RETENTION_DROP",
+    "CADENCE_EVIDENCE_RETENTION",
+    "CADENCE_LEDGER_SUMMARIZE_CHILDREN",
+    "CADENCE_DAILY_SCORECARD",
     "DURABLE_CADENCE_KEYS",
     "EPOCH_DUE",
     "MaintenanceCadence",

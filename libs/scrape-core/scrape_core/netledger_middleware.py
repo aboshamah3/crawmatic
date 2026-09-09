@@ -22,11 +22,17 @@ Registered at priority **130** in both projects' ``DOWNLOADER_MIDDLEWARES``:
   has already decoded the body. That is what makes
   ``bytes_decompressed`` measurable at all: at any priority above 590 the
   body is still compressed.
-* The COMPRESSED count does not depend on middleware position at all. It
-  comes from Scrapy's ``bytes_received`` signal, which reports the raw
-  bytes as they arrive off the transport — the truest available reading
-  of "what the wire carried", and the same fact B6 records for the
-  browser path.
+* The COMPRESSED count, for PROXY and DIRECT, comes from
+  ``response.meta["wire_bytes"]`` (EPA A7,
+  :mod:`scrape_core.middlewares.wire_bytes`, priority 585 — one below
+  ``HttpCompressionMiddleware`` so it still sees the response before
+  decompression) — ``len(body) + len(headers) + len(status line)`` as it
+  actually crossed the wire, at THAT priority, before this middleware
+  (130) ever runs. When that meta key is absent (a response never
+  reached 585, e.g. an exception mid-download) this falls back to the
+  pre-A7 measurement: Scrapy's ``bytes_received`` signal, the raw
+  transport bytes with no framing added — still never fabricated, just
+  less precise. BROWSER keeps its own separate measurement (below).
 
 Redirect chains are ONE operation, on purpose and with a caveat
 ---------------------------------------------------------------
@@ -505,8 +511,21 @@ class NetLedgerMiddleware:
             bytes_compressed = main_document_bytes
             bytes_decompressed = None
         else:
-            raw = meta.get(_META_RAW_BYTES)
-            bytes_compressed = int(raw) if raw else None
+            # PROXY/DIRECT: EPA A7's `WireBytesMiddleware` (585) stamps
+            # the actual on-the-wire count (body + headers + status line,
+            # still compressed at that priority) onto `wire_bytes` before
+            # this middleware (130) ever runs. Preferred over the older
+            # `bytes_received`-signal total, which only ever saw raw TCP
+            # chunks with no framing accounted for. The signal total is
+            # kept as the fallback for the one case `wire_bytes` cannot
+            # cover: a response that never reached priority 585 at all
+            # (an exception mid-download, or the middleware disabled).
+            wire_bytes = meta.get("wire_bytes")
+            if wire_bytes is not None:
+                bytes_compressed = int(wire_bytes)
+            else:
+                raw = meta.get(_META_RAW_BYTES)
+                bytes_compressed = int(raw) if raw else None
             bytes_decompressed = len(response.body) if response is not None else None
 
         transport = _transport_for(meta)
@@ -572,6 +591,31 @@ class NetLedgerMiddleware:
             billing_unit=billing_unit,
             billing_rate_micro_units=billing_rate,
         )
+
+    @staticmethod
+    def _child_duration_ms(observed: dict[str, Any]) -> int | None:
+        """A browser sub-resource's own duration, from Playwright/CDP timing.
+
+        ``observed["timing"]`` is whatever CDP resource-timing dict B6b's
+        accumulator attached for this response, when it captured one —
+        e.g. ``{"requestStart": 0, "responseEnd": 240}`` (both wall-clock
+        milliseconds since navigation start, so their difference is this
+        one asset's duration). Never fabricated: no ``timing`` key, or
+        either endpoint missing/non-numeric, yields ``None`` rather than
+        a guessed number — the same NEVER-FABRICATE posture as every
+        other byte/cost figure this module writes.
+        """
+        timing = observed.get("timing")
+        if not timing:
+            return None
+        start = timing.get("requestStart")
+        end = timing.get("responseEnd")
+        if start is None or end is None:
+            return None
+        try:
+            return int(end) - int(start)
+        except (TypeError, ValueError):
+            return None
 
     def _drain_subresources(
         self, request: Any, parent_id: uuid.UUID, spider: Any
@@ -652,6 +696,7 @@ class NetLedgerMiddleware:
                     OperationOutcome(
                         bytes_compressed=byte_count,
                         response_status=observed.get("status"),
+                        duration_ms=self._child_duration_ms(observed),
                         extraction_result=observed.get("resource_type"),
                         estimated_cost_micro_units=cost,
                         currency="USD" if cost is not None else None,

@@ -67,12 +67,29 @@ def session() -> _EventLoggingSession:
     return _EventLoggingSession()
 
 
+def _outbox_shim(fake):
+    """Adapt EPA B2's outbox producer to this file's `_FakeEnqueue`.
+
+    `create_*_job` no longer calls `enqueue` — it writes an
+    `outbox_messages` row in the caller's transaction and the outbox
+    dispatcher publishes it (EPA B2 / F06). The assertions below are
+    about *what would be published*, which is exactly the row's
+    `task_name`/`queue`/`payload`, so the fake keeps its old shape and
+    this adapter maps the writer's signature onto it.
+    """
+
+    def _write(session, *, workspace_id, task_name, queue, kwargs=None, **rest):
+        fake(task_name, queue=queue, kwargs=kwargs)
+
+    return _write
+
+
 @pytest.fixture()
 def fake_enqueue(
     monkeypatch: pytest.MonkeyPatch, session: _EventLoggingSession
 ) -> _FakeEnqueue:
     fake = _FakeEnqueue(session)
-    monkeypatch.setattr(service_module, "enqueue", fake)
+    monkeypatch.setattr(service_module, "write_outbox_message", _outbox_shim(fake))
     return fake
 
 
@@ -232,3 +249,62 @@ def test_competitor_scope_resolves_only_matching_competitor(
     job = session._rows.get(ScrapeJob, [])[0]
     assert job.competitor_id == target_competitor_id
     assert job.scope == ScrapeScope.COMPETITOR
+
+
+# --- EPA B2 / F06: the dispatch request is a ROW, not a broker call ---------
+
+
+def test_job_creation_never_touches_the_broker(
+    session: _EventLoggingSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rolled-back job creation cannot produce a Celery message.
+
+    Proven structurally, which is the strongest form available without a
+    real transaction: `app_shared.jobs.service` no longer holds a
+    reference to `enqueue` at all, and the only thing it calls is the
+    transactional-outbox producer, with **this session**. A message that
+    is a row in the caller's transaction disappears with a rollback by
+    construction — there is no ordering to get wrong and no broker call
+    to un-send. The end-to-end rollback is exercised against real
+    Postgres in `tests/integration/test_dispatch_reconcile_fake_scrapyd.py`.
+    """
+    from app_shared.outbox.writer import write_outbox_message as real_writer
+
+    assert not hasattr(service_module, "enqueue"), (
+        "jobs.service must not keep a broker seam: an enqueue-before-commit "
+        "is exactly the lost/orphaned dispatch F06 removes"
+    )
+    assert service_module.write_outbox_message is real_writer
+
+    seen: list[dict[str, Any]] = []
+
+    def _capture(sess, **kwargs):
+        seen.append({"session": sess, **kwargs})
+
+    monkeypatch.setattr(service_module, "write_outbox_message", _capture)
+
+    workspace_id = uuid.uuid4()
+    competitor_id = uuid.uuid4()
+    session.seed(_make_match(workspace_id=workspace_id, competitor_id=competitor_id))
+
+    job_id, _status = create_scope_job(
+        session,
+        workspace_id=workspace_id,
+        scope=ScrapeScope.COMPETITOR,
+        target_id=competitor_id,
+        requested_by=None,
+    )
+
+    assert len(seen) == 1
+    written = seen[0]
+    # The row rides the caller's transaction — that is the whole mechanism.
+    assert written["session"] is session
+    assert written["task_name"] == SCRAPE_DISPATCH_JOB
+    assert written["queue"] == "scrape_dispatch"
+    assert written["kwargs"]["scrape_job_id"] == str(job_id)
+    assert written["kwargs"]["workspace_id"] == str(workspace_id)
+    # One PENDING row per created job: a replayed creation collapses onto
+    # it instead of producing a second dispatch delivery.
+    assert written["dedup_key"] == f"{service_module.JOB_CREATED_DEDUP_PREFIX}:{job_id}"
+    # And nothing was committed by the service itself.
+    assert "commit" not in session.events

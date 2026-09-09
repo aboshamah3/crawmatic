@@ -152,12 +152,22 @@ class InflightReconciliation:
     def may_repost(self) -> bool:
         """Whether the caller is cleared to run the ordinary dispatch path.
 
-        True only when the intent is back at ``PLANNED`` — i.e. this call
+        True when the intent is back at ``PLANNED`` — i.e. this call
         established absence, or the intent was never in flight to begin
-        with. ``CONFIRMED`` and ``AMBIGUOUS`` are both hard stops: the
-        first because the run exists, the second because we do not know.
+        with — or at ``RECONCILED_MISSING``, the equivalent verdict the
+        EPA B2 maintenance sweep
+        (:func:`app_shared.jobs.dispatch_intents.reconcile_inflight_intents`)
+        writes when every node denied the job. Both mean "looked, not
+        there"; the re-POST that follows carries the SAME
+        ``scrapyd_job_id``, so a node that did receive the original
+        request dedups it. ``CONFIRMED`` and ``AMBIGUOUS`` are both hard
+        stops: the first because the run exists, the second because we do
+        not know.
         """
-        return self.state == DispatchIntentState.PLANNED
+        return self.state in (
+            DispatchIntentState.PLANNED,
+            DispatchIntentState.RECONCILED_MISSING,
+        )
 
 
 class ScrapydJobLister(Protocol):
@@ -309,8 +319,11 @@ def _correlate(
     """
     entries = _iter_entries(payload)
     if deterministic:
-        # The remote id IS the intent id, so every bucket is searchable.
-        wanted = str(intent.id)
+        # The remote id IS the id WE chose at plan time (EPA B2:
+        # `dispatch_intents.scrapyd_job_id`, a uuid5 over the identity),
+        # so every bucket is searchable. `intent.id` is the pre-B2
+        # fallback for a row planned before that column was populated.
+        wanted = str(intent.scrapyd_job_id or intent.id)
         for _bucket, entry in entries:
             if str(entry.get("id")) == wanted:
                 return wanted, True

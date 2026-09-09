@@ -125,8 +125,31 @@ class DispatchIntent(Base, WorkspaceScopedBase, TimestampMixin):
     #: re-deriving it from the columns above.
     identity_payload: Mapped[str] = mapped_column(Text(), nullable=False)
 
+    # --- the chosen remote run (EPA B2 / F06) --------------------------------
+    #: The Scrapyd node this intent is (or was) POSTed to, chosen at plan
+    #: time by ``select_node`` and recorded BEFORE the POST. Recovery
+    #: needs it: ``node_class`` names the pool, but only the URL says
+    #: which member actually received the request, and asking the whole
+    #: pool is strictly more work and strictly less certain. Empty string
+    #: on rows planned before B2 (the migration's backfill) — never NULL,
+    #: so "no node recorded" is one value, not two.
+    node_url: Mapped[str] = mapped_column(
+        Text(), nullable=False, default="", server_default=text("''")
+    )
+    #: **Chosen by us, not by the node.** ``uuid5`` over the dispatch
+    #: identity (:func:`app_shared.jobs.dispatch_intents.deterministic_scrapyd_job_id`),
+    #: assigned in ``plan()`` and POSTed as Scrapyd's ``jobid`` form
+    #: field, which Scrapyd 1.6 honours verbatim. That is what makes a
+    #: re-POST after ``RECONCILED_MISSING`` safe: the same identity
+    #: re-derives the same id, so a node that did receive the original
+    #: request dedups instead of double-running the batch. NOT NULL —
+    #: an intent without a name for its remote run is exactly the
+    #: ambiguity B2 exists to remove.
+    scrapyd_job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), nullable=False, index=True
+    )
+
     # --- outcome -------------------------------------------------------------
-    scrapyd_job_id: Mapped[str | None] = mapped_column(Text(), nullable=True, index=True)
     state: Mapped[DispatchIntentState] = enum_column(
         DispatchIntentState, nullable=False, default=DispatchIntentState.PLANNED
     )

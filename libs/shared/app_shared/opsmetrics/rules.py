@@ -201,8 +201,87 @@ class Thresholds:
     optimizer_churn_high_fraction: float = 0.5
     optimizer_churn_min_profiles: int = 5
 
+    # --- EPA B9 (F22, audit §13 Operations) --------------------------------
+    # See the "EPA B9 new alert rules" section below for why each of these
+    # is read from the snapshot via `getattr(..., None)` rather than a
+    # declared `OpsSnapshot` field.
+    #: Below this fraction of ACTIVE matches freshened in 24h, the scraping
+    #: pipeline is degraded — the same number `apps.api.app.routers.health`
+    #: (EPA B8) reports `/health/scraping` degraded at, so both surfaces
+    #: agree.
+    freshness_fraction_24h_min: float = 0.95
+    #: More than this many pending persistence batches is a backlog the
+    #: writer is not draining.
+    persistence_pending_batches_high: int = 16
+    #: Tighter, earlier-warning companion to `breaker_evaluator_stale_seconds`
+    #: (3000s/CRITICAL region): 900s = three missed
+    #: `PROXY_BREAKER_EVAL_INTERVAL_SECONDS` (300) leases, a WARNING that the
+    #: evaluator is falling behind before it reaches the existing HIGH
+    #: `breaker.evaluator_stale` alert's territory.
+    breaker_evaluation_lag_warning_seconds: float = 900.0
+    #: Host and every mounted volume: below this free fraction, the next
+    #: write (a partition INSERT, a backup, a log line) may fail outright.
+    disk_free_fraction_critical: float = 0.15
+    #: Same figure as `app_shared.opsmetrics.emit.LEDGER_LINKED_ATTEMPT_FRACTION_MIN`
+    #: (not imported directly: `emit` imports FROM this module, so the
+    #: reverse import would be circular) — kept in sync by hand, and by the
+    #: unit test that pins both to 0.95.
+    ledger_linked_attempt_fraction_24h_min: float = 0.95
+    #: `POSTED` dispatch intents unresolved for longer than this are the
+    #: "for 10 min" duration in the rule's name — a `POSTED` intent seen
+    #: once is not yet an incident; one still `POSTED` 10 minutes later is.
+    dispatch_ambiguous_intents_sustained_seconds: float = 600.0
+
 
 DEFAULT_THRESHOLDS = Thresholds()
+
+
+# --------------------------------------------------------------------------
+# EPA A5 (deep dive §5) — thresholds for the baseline OUTCOME gauges
+#
+# The `Thresholds` dataclass above is consumed by the `RULES` table, and
+# every field in it has a rule that reads it. These five have no rule yet:
+# the gauges they judge (`crawmatic_attempts_per_valid_fresh_24h`,
+# `crawmatic_persistence_failures_1h`,
+# `crawmatic_dispatch_ambiguous_intents`,
+# `crawmatic_cost_model_drift_ratio` — see
+# `app_shared.opsmetrics.emit.BaselineMetrics`) are collected outside
+# `OpsSnapshot`, and `Rule.evaluate` takes an `OpsSnapshot`. Adding
+# unevaluated fields to `Thresholds` would make `DEFAULT_THRESHOLDS`
+# claim coverage that does not exist, so they are module constants until
+# B9 wires the collection into the snapshot and can promote them.
+#
+# They are stated NOW, here, for the same reason the A7 ledger-coverage
+# thresholds are stated in `emit`: "what counts as bad" is a judgement
+# made while the measurement is fresh in mind, and re-deriving it months
+# later from a dashboard is how thresholds end up meaning nothing.
+# --------------------------------------------------------------------------
+
+#: More than this many fetch attempts per freshly-priced match means the
+#: escalation ladder is burning money without producing outcomes. Set
+#: against the measured 2026-09-03 baseline, where a healthy domain sits
+#: near 1-2 and a broken one runs the whole ladder for every match.
+ATTEMPTS_PER_VALID_FRESH_MAX: float = 6.0
+
+#: A fetch that succeeded on the wire and persisted nothing is a defect,
+#: not noise — money was spent and no durable row came out of it. A
+#: handful within one hour is a broken write path.
+PERSISTENCE_FAILURES_1H_MAX: int = 5
+
+#: `POSTED` is the ONE genuinely ambiguous dispatch state (the run may or
+#: may not exist on the node). Any intent still sitting there past the
+#: collector's 5-minute window is unresolved work: either it will never
+#: run, or it may run twice. Zero is the only defensible ceiling.
+DISPATCH_AMBIGUOUS_INTENTS_MAX: int = 0
+
+#: Our ledger's proxied byte count may legitimately differ from the
+#: provider's billed figure (compression, CONNECT/TLS overhead, redirect
+#: chains) — but a factor of two in either direction is a cost model that
+#: no longer describes what we are being charged for. NOTE: the gauge is
+#: NULL (never 0) when no provider figure has been imported, so a missing
+#: reconciliation must be alerted on as *absence*, never read as 0 drift.
+COST_MODEL_DRIFT_RATIO_MIN: float = 0.5
+COST_MODEL_DRIFT_RATIO_MAX: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -1519,6 +1598,243 @@ def _r_rls(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
 
 
 # --------------------------------------------------------------------------
+# EPA B9 (F22, audit §13 Operations) — new alert rules
+#
+# Every gauge below is read via `getattr(snapshot, "<name>", None)` rather
+# than a declared `OpsSnapshot` field. Wiring the actual DB/Redis
+# collection into `OpsSnapshot`/`collect_snapshot`
+# (`app_shared.opsmetrics.snapshot`) is out of this task's file scope (EPA
+# plan-core-production-readiness-2026-09-07, packet PB-8/B9 — its Modify
+# list is `heartbeat.py`, this file, `admin_ops.py`, and the scrapyd app;
+# `snapshot.py`/`emit.py` are not in it). Each rule is INERT (returns no
+# alerts) against any snapshot that does not carry the attribute — the
+# same "stated, not yet wired" holding pattern this module already uses
+# above for `ATTEMPTS_PER_VALID_FRESH_MAX`/`PERSISTENCE_FAILURES_1H_MAX`/
+# `DISPATCH_AMBIGUOUS_INTENTS_MAX`/`COST_MODEL_DRIFT_RATIO_MIN/MAX` — and
+# is fully implemented and unit-tested against a synthetic double
+# (`tests/unit/test_ops_rules_new.py`) in the meantime, so wiring the
+# attribute later is the only remaining step, not a rewrite.
+#
+# `queue_oldest_pending_seconds > 3600` (also in the plan's list) is NOT
+# duplicated here: `_r_queue`'s existing `queue.pending_target_age` rule
+# already fires at exactly this condition
+# (`Thresholds.target_pending_age_seconds == 3_600.0`, evaluated against
+# the already-wired `snapshot.queue.oldest_pending_target_age_seconds`) —
+# see `test_ops_rules_new.py` for the ±1 coverage the plan asks for.
+# --------------------------------------------------------------------------
+
+_J_B9 = (
+    "EPA B9 (audit §13 Operations): every process class needs a signal an "
+    "operator can act on before it becomes an incident. See the module "
+    "comment above this rule for why it is INERT until a later task "
+    "attaches the named attribute to a real `OpsSnapshot`."
+)
+
+
+def _r_freshness_fraction_24h(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    fraction = getattr(snapshot, "freshness_fraction_24h", None)
+    if fraction is None or fraction >= t.freshness_fraction_24h_min:
+        return []
+    return [
+        _alert(
+            "freshness.fraction_24h",
+            Severity.HIGH,
+            Category.RELIABILITY,
+            f"Only {fraction:.0%} of ACTIVE matches had a fresh price in the "
+            "last 24h.",
+            _J_B9,
+            observed={
+                "freshness_fraction_24h": round(fraction, 4),
+                "threshold": t.freshness_fraction_24h_min,
+            },
+        )
+    ]
+
+
+def _r_persistence_backlog(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    out: list[Alert] = []
+    pending = getattr(snapshot, "persistence_pending_batches", None)
+    if pending is not None and pending > t.persistence_pending_batches_high:
+        out.append(
+            _alert(
+                "persistence.pending_batches",
+                Severity.HIGH,
+                Category.RELIABILITY,
+                f"{pending} persistence batches pending — the writer is not "
+                "draining the backlog.",
+                _J_B9,
+                observed={
+                    "pending_batches": pending,
+                    "threshold": t.persistence_pending_batches_high,
+                },
+            )
+        )
+    quarantined = getattr(snapshot, "persistence_quarantined_batches", None)
+    if quarantined is not None and quarantined > 0:
+        out.append(
+            _alert(
+                "persistence.quarantined_batches",
+                Severity.CRITICAL,
+                Category.RELIABILITY,
+                f"{quarantined} persistence batches quarantined — data that "
+                "arrived is not being written.",
+                _J_B9,
+                observed={"quarantined_batches": quarantined},
+            )
+        )
+    return out
+
+
+def _r_breaker_evaluation_lag(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    """Earlier-warning companion to `_r_breaker`'s `breaker.evaluator_stale`
+    (3000s/HIGH): fires WARNING at 900s, well before the existing rule's
+    territory, using the SAME already-wired `snapshot.breaker` field — no
+    new attribute needed."""
+    age = snapshot.breaker.seconds_since_evaluation
+    if age is None or age <= t.breaker_evaluation_lag_warning_seconds:
+        return []
+    return [
+        _alert(
+            "breaker.evaluation_lag",
+            Severity.WARNING,
+            Category.COST,
+            f"Proxy breaker last evaluated {age / 60:.0f} minutes ago — "
+            "falling behind its lease cadence.",
+            _J_BREAKER,
+            observed={
+                "seconds_since_evaluation": round(age),
+                "threshold_seconds": t.breaker_evaluation_lag_warning_seconds,
+            },
+            runbook="#stop-proxy-spend-now",
+        )
+    ]
+
+
+def _r_costauth_budget_denials(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    denials_by_reason = getattr(snapshot, "costauth_denials_1h_by_reason", None)
+    if not denials_by_reason:
+        return []
+    budget_denials = denials_by_reason.get("BUDGET", 0) or 0
+    if budget_denials <= 0:
+        return []
+    return [
+        _alert(
+            "costauth.budget_denials_1h",
+            Severity.HIGH,
+            Category.COST,
+            f"{budget_denials} request(s) denied for reason=BUDGET in the "
+            "last hour — a workspace or the fleet ceiling is exhausted.",
+            _J_B9,
+            observed={"denials_1h": budget_denials, "reason": "BUDGET"},
+        )
+    ]
+
+
+def _r_disk_free(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    by_mount = getattr(snapshot, "disk_free_fraction_by_mount", None)
+    if not by_mount:
+        return []
+    out: list[Alert] = []
+    for mount, fraction in sorted(by_mount.items()):
+        if fraction is not None and fraction < t.disk_free_fraction_critical:
+            out.append(
+                _alert(
+                    "infra.disk_free",
+                    Severity.CRITICAL,
+                    Category.INFRA,
+                    f"{mount}: only {fraction:.0%} free — the next write "
+                    "(a partition INSERT, a backup, a log line) may fail.",
+                    _J_B9,
+                    subject=mount,
+                    observed={
+                        "free_fraction": round(fraction, 4),
+                        "threshold": t.disk_free_fraction_critical,
+                    },
+                )
+            )
+    return out
+
+
+def _r_restore_verify(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    failed = getattr(snapshot, "restore_verify_failed", None)
+    if not failed:
+        return []
+    return [
+        _alert(
+            "backup.restore_verify_failed",
+            Severity.CRITICAL,
+            Category.DATA,
+            "The most recent backup restore verification failed — a backup "
+            "that has never been proven restorable is not a backup.",
+            _J_B9,
+        )
+    ]
+
+
+def _r_ledger_linked_attempt_fraction(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    fraction = getattr(snapshot, "ledger_linked_attempt_fraction_24h", None)
+    if fraction is None or fraction >= t.ledger_linked_attempt_fraction_24h_min:
+        return []
+    return [
+        _alert(
+            "cost.ledger_linked_attempt_fraction_24h",
+            Severity.WARNING,
+            Category.COST,
+            f"Only {fraction:.0%} of the last 24h's request attempts linked "
+            "to a network-ledger operation — cost accounting coverage is "
+            "dropping.",
+            _J_B9,
+            observed={
+                "linked_attempt_fraction_24h": round(fraction, 4),
+                "threshold": t.ledger_linked_attempt_fraction_24h_min,
+            },
+        )
+    ]
+
+
+def _r_dispatch_ambiguous_sustained(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    count = getattr(snapshot, "dispatch_ambiguous_intents", None)
+    oldest_seconds = getattr(snapshot, "dispatch_ambiguous_intents_oldest_seconds", None)
+    if not count or oldest_seconds is None:
+        return []
+    if oldest_seconds <= t.dispatch_ambiguous_intents_sustained_seconds:
+        return []
+    return [
+        _alert(
+            "dispatch.ambiguous_intents_sustained",
+            Severity.HIGH,
+            Category.RELIABILITY,
+            f"{count} dispatch intent(s) still POSTED and unresolved after "
+            f"{oldest_seconds / 60:.0f} minutes — the run may or may not "
+            "exist on the node.",
+            _J_B9,
+            observed={
+                "ambiguous_intents": count,
+                "oldest_seconds": round(oldest_seconds),
+                "threshold_seconds": t.dispatch_ambiguous_intents_sustained_seconds,
+            },
+        )
+    ]
+
+
+def _r_heartbeat_missing(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
+    missing = getattr(snapshot, "heartbeat_missing_services", None)
+    if not missing:
+        return []
+    return [
+        _alert(
+            "heartbeat.missing",
+            Severity.HIGH,
+            Category.RELIABILITY,
+            f"No fresh heartbeat instance for service {service!r}.",
+            _J_B9,
+            subject=service,
+        )
+        for service in sorted(missing)
+    ]
+
+
+# --------------------------------------------------------------------------
 # Registry + entry point
 # --------------------------------------------------------------------------
 
@@ -1612,6 +1928,71 @@ RULES: tuple[Rule, ...] = (
         "RLS effectiveness of the connected role",
         "Audit C3.",
         _r_rls,
+    ),
+    # --- EPA B9 (F22) — inert until a later task wires the named
+    # attribute onto a real OpsSnapshot; see the section comment above.
+    Rule(
+        "freshness.fraction_24h",
+        Category.RELIABILITY,
+        "24h price-freshness fraction",
+        _J_B9,
+        _r_freshness_fraction_24h,
+    ),
+    Rule(
+        "persistence.*",
+        Category.RELIABILITY,
+        "Persistence pending/quarantined batch backlog",
+        _J_B9,
+        _r_persistence_backlog,
+    ),
+    Rule(
+        "breaker.evaluation_lag",
+        Category.COST,
+        "Proxy breaker evaluation lag (early warning)",
+        _J_BREAKER,
+        _r_breaker_evaluation_lag,
+    ),
+    Rule(
+        "costauth.budget_denials_1h",
+        Category.COST,
+        "Cost-authorization denials for reason=BUDGET",
+        _J_B9,
+        _r_costauth_budget_denials,
+    ),
+    Rule(
+        "infra.disk_free",
+        Category.INFRA,
+        "Host and volume free-disk fraction",
+        _J_B9,
+        _r_disk_free,
+    ),
+    Rule(
+        "backup.restore_verify_failed",
+        Category.DATA,
+        "Backup restore verification",
+        _J_B9,
+        _r_restore_verify,
+    ),
+    Rule(
+        "cost.ledger_linked_attempt_fraction_24h",
+        Category.COST,
+        "Network-ledger linked-attempt coverage",
+        _J_B9,
+        _r_ledger_linked_attempt_fraction,
+    ),
+    Rule(
+        "dispatch.ambiguous_intents_sustained",
+        Category.RELIABILITY,
+        "Dispatch intents stuck POSTED past the resolution window",
+        _J_B9,
+        _r_dispatch_ambiguous_sustained,
+    ),
+    Rule(
+        "heartbeat.missing",
+        Category.RELIABILITY,
+        "Missing fresh heartbeat instance per declared service",
+        _J_B9,
+        _r_heartbeat_missing,
     ),
 )
 

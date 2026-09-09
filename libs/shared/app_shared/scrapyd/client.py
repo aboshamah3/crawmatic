@@ -248,6 +248,7 @@ class ScrapydDispatchClient:
         batch_index: int | str,
         node_url: str | None = None,
         identity: DispatchIdentity | None = None,
+        jobid: str | uuid.UUID | None = None,
         authorization_id: str | uuid.UUID | None = None,
         budget_decision_version: str | None = None,
         entitlement_version: str | None = None,
@@ -274,6 +275,17 @@ class ScrapydDispatchClient:
         ``node_url`` (SPEC-08 FR-012, FR-014) targets a specific
         deterministically-selected Scrapyd node; when ``None`` this falls
         back to ``SCRAPYD_HTTP_URLS[0]``.
+
+        ``jobid`` (EPA B2 / F06) is the remote run's name, **chosen by the
+        caller at plan time** — the intent's ``scrapyd_job_id``, a
+        ``uuid5`` over the identity. Scrapyd 1.6 honours a client-supplied
+        ``jobid`` verbatim, which is what makes a re-POST after
+        ``RECONCILED_MISSING`` safe: the duplicate carries the same name,
+        so a node that did receive the original request dedups it instead
+        of running the batch twice. Passing it explicitly overrides the
+        older ``SCRAPYD_DETERMINISTIC_JOBID``-gated fallback (which sent
+        the intent row's own id); ``None`` keeps that fallback unchanged
+        for callers that have not been migrated.
 
         ``authorization_id`` (EPA C3/C4) is the caller's C3 grant for this
         dispatch. Unlike ``batch_index`` it IS forwarded to the spider —
@@ -341,6 +353,14 @@ class ScrapydDispatchClient:
             # PLANNED. Fall through to claim + POST exactly as a crash
             # BEFORE the POST would (item 6).
 
+        # The remote run's name. When the caller did not name it, ask the
+        # durable authority for the one it minted at plan time (EPA B2) —
+        # never fall back to something *else*, because an id we POST that
+        # disagrees with the id the row records is an intent recovery can
+        # no longer find.
+        if jobid is None:
+            jobid = self._planned_jobid(identity)
+
         # --- 1. claim --------------------------------------------------------
         # SET NX before the network call: whoever wins the claim owns the POST.
         if not self._redis.set(
@@ -377,7 +397,7 @@ class ScrapydDispatchClient:
                 )
 
         # --- 2. POST ---------------------------------------------------------
-        intent_id = self._record_post(identity)
+        intent_id = self._record_post(identity, node_url)
         try:
             jobid = self._post_schedule(
                 project,
@@ -389,6 +409,7 @@ class ScrapydDispatchClient:
                 node_url=node_url,
                 identity=identity,
                 intent_id=intent_id,
+                jobid=jobid,
                 authorization_id=authorization_id,
                 budget_decision_version=budget_decision_version,
                 entitlement_version=entitlement_version,
@@ -499,9 +520,42 @@ class ScrapydDispatchClient:
             identity, settings=self._settings, lister=self._lister, redis=self._redis
         )
 
-    def _record_post(self, identity: DispatchIdentity | None) -> str | None:
+    def _planned_jobid(self, identity: DispatchIdentity | None) -> str | None:
+        """The ``scrapyd_job_id`` the authority chose for ``identity``, if any.
+
+        Duck-typed (``getattr``) for the same reason
+        :meth:`_reconcile_posted` is: an authority that predates EPA B2 —
+        a hand-rolled test double, the legacy ``intents=None`` posture —
+        simply has no opinion, and the older
+        ``SCRAPYD_DETERMINISTIC_JOBID``-gated fallback in
+        :meth:`_post_schedule` still applies for it.
+        """
         if identity is None or self._intents is None:
             return None
+        planned = getattr(self._intents, "planned_scrapyd_job_id", None)
+        if not callable(planned):
+            return None
+        return planned(identity)
+
+    def _record_post(
+        self, identity: DispatchIdentity | None, node_url: str | None = None
+    ) -> str | None:
+        """Step 2: mark the intent ``POSTED`` — committed, before the POST.
+
+        ``node_url`` is forwarded so the durable row records **which**
+        node the request is about to go to (EPA B2): ``node_class`` names
+        the pool, but recovery has to ask a specific member. Forwarded
+        with ``getattr`` capability detection so an authority that
+        predates the keyword (a hand-rolled test double) still works.
+        """
+        if identity is None or self._intents is None:
+            return None
+        if node_url:
+            try:
+                return self._intents.record_post(identity, node_url=node_url)
+            except TypeError:
+                # Pre-B2 authority without the keyword — degrade, never fail.
+                pass
         return self._intents.record_post(identity)
 
     def _confirm(self, identity: DispatchIdentity | None, jobid: str) -> None:
@@ -606,6 +660,83 @@ class ScrapydDispatchClient:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def list_jobs(self, node_url: str, project: str | None = None) -> set[str]:
+        """Every job id ``node_url`` knows — pending, running and finished.
+
+        The read half of EPA B2's step 5. ``reconcile_inflight_intents``
+        asks this about the node a ``POSTED`` intent recorded, and the
+        answer decides the row's fate: the id is present -> ``CONFIRMED``;
+        the id is absent -> ``RECONCILED_MISSING`` (the only state from
+        which a re-POST is authorized, and it re-POSTs the same id).
+
+        **An empty set means "the node answered and knows nothing", and
+        that distinction is the whole contract.** A node that cannot be
+        reached, answers an HTTP error, or returns something that is not
+        a JSON object raises :class:`ScrapydDispatchError` — it must never
+        collapse into "no such job", because that would authorize a
+        re-POST on the strength of a network failure. Contrast
+        :meth:`daemon_status`, which deliberately returns ``None`` rather
+        than raising: there, "node dead" IS the answer the caller wants.
+
+        Bounded knowledge, deliberately not hidden: both deployed nodes
+        run ``MemoryJobStorage`` with ``finished_to_keep = 100``, so a run
+        that finished long ago — or before a container restart — is simply
+        gone from the listing. Absence here is "no evidence of a run", and
+        the same-id re-POST is what makes acting on it safe.
+
+        Args:
+            node_url: the node to ask; the one the intent recorded.
+            project: the Scrapyd project (the ``node_class`` prefix).
+                ``listjobs.json`` needs it to scope the listing; ``None``
+                asks for everything the node has.
+
+        Raises:
+            ScrapydDispatchError: the node did not answer usefully.
+        """
+        base = node_url.rstrip("/") if node_url else ""
+        if not base:
+            raise ScrapydDispatchError(
+                "cannot list jobs: the dispatch intent recorded no node_url"
+            )
+        getter = self._session.get if self._session is not None else requests.get
+        params = {"project": project} if project else {}
+        try:
+            response = getter(
+                f"{base}/listjobs.json",
+                params=params,
+                auth=(self._settings.SCRAPYD_USERNAME, self._settings.SCRAPYD_PASSWORD),
+                timeout=self._timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised as a dispatch error
+            raise ScrapydDispatchError(
+                f"listjobs.json on {base} was unreachable: {type(exc).__name__}: {exc}"
+            ) from exc
+        if response.status_code == 401:
+            raise ScrapydAuthError(
+                f"Scrapyd rejected the listjobs.json credentials on {base} (HTTP 401)"
+            )
+        if response.status_code >= 400:
+            raise ScrapydDispatchError(
+                f"listjobs.json on {base} returned HTTP {response.status_code}"
+            )
+        try:
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001 - re-raised as a dispatch error
+            raise ScrapydDispatchError(
+                f"listjobs.json on {base} returned unparseable JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ScrapydDispatchError(
+                f"listjobs.json on {base} returned {type(payload).__name__}, not an object"
+            )
+
+        known: set[str] = set()
+        for bucket in ("pending", "running", "finished"):
+            for entry in payload.get(bucket) or ():
+                if isinstance(entry, dict) and entry.get("id") is not None:
+                    known.add(str(entry["id"]))
+        return known
+
     def _post_schedule(
         self,
         project: str,
@@ -618,6 +749,7 @@ class ScrapydDispatchClient:
         node_url: str | None = None,
         identity: DispatchIdentity | None = None,
         intent_id: str | None = None,
+        jobid: str | uuid.UUID | None = None,
         authorization_id: str | uuid.UUID | None = None,
         budget_decision_version: str | None = None,
         entitlement_version: str | None = None,
@@ -643,11 +775,17 @@ class ScrapydDispatchClient:
             "match_ids": match_ids,
             "mode": mode,
         }
-        # Deterministic jobid, behind capability detection — see
-        # `_DETERMINISTIC_JOBID_SETTING` above for the open question B3
-        # Step 0 answers on a live node. Off by default; a node that
-        # ignores the field just answers with its own jobid.
-        if intent_id is not None and getattr(
+        # The remote run's name. EPA B2 makes this an explicit argument:
+        # the caller chose it at plan time (the intent's `scrapyd_job_id`,
+        # a uuid5 over the identity) and committed it BEFORE the POST, so
+        # a re-POST authorized by `RECONCILED_MISSING` carries the same
+        # value and Scrapyd dedups it. When the caller did not supply one
+        # we fall back to the older `SCRAPYD_DETERMINISTIC_JOBID`-gated
+        # behaviour of sending the intent row's id; a node that ignores
+        # the field just answers with its own jobid either way.
+        if jobid is not None:
+            data["jobid"] = str(jobid)
+        elif intent_id is not None and getattr(
             self._settings, _DETERMINISTIC_JOBID_SETTING, False
         ):
             data["jobid"] = str(intent_id)

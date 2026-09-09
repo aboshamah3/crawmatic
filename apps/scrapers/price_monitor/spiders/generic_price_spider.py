@@ -118,8 +118,16 @@ from scrape_core.errors import (
     classify_exception,
     classify_http_status,
 )
+from scrape_core.extraction.regex import regex_deadline_tripped, regex_deadline_watch
 from scrape_core.items import ScrapeResult
-from scrape_core.limiter import LockGrant, Permission, acquire_lock, release_lock, release_slot
+from scrape_core.limiter import (
+    LockGrant,
+    Permission,
+    acquire_lock,
+    release_fleet_lease,
+    release_lock,
+    release_slot,
+)
 from scrape_core.result_builder import build_scrape_result
 from scrape_core.targets import (
     AdmissionContext,
@@ -140,6 +148,7 @@ from scrape_core.targets import (
     overflow_to_dispatch,
     prepare_dispatch_with_backoff,
     redispatch_job,
+    resolve_request_timeout_seconds,
     sticky_proxy_username,
     next_strategy_method,
 )
@@ -603,17 +612,36 @@ class GenericPriceSpider(scrapy.Spider):
             # before any homepage extractor runs.
             meta["dont_redirect"] = True
             meta["handle_httpstatus_all"] = True
-        if target.access_policy is not None and target.access_policy.timeout_ms:
-            # Issue 4: the resolved policy timeout was never translated
-            # into the request -- Scrapy's 180 s DOWNLOAD_TIMEOUT applied
-            # instead (546 s noon hangs). `download_timeout` is seconds.
-            meta["download_timeout"] = target.access_policy.timeout_ms / 1000.0
+        # Issue 4: the resolved policy timeout was never translated into
+        # the request -- Scrapy's 180 s DOWNLOAD_TIMEOUT applied instead
+        # (546 s noon hangs). `download_timeout` is seconds.
+        #
+        # EPA C4 closes C1's second carry-forward here: the per-domain
+        # LEARNED timeout (`domain_rules.request_timeout_seconds`, written
+        # by `maintenance.domain_timeout_tune` since C1) had no reader, so
+        # every fetch still paid the global ceiling.
+        # `resolve_request_timeout_seconds` is the single precedence rule
+        # -- learned value, else the policy's `timeout_ms`, else `None`
+        # meaning "leave it to Scrapy's DOWNLOAD_TIMEOUT", which is
+        # already `SCRAPE_DOWNLOAD_TIMEOUT_SECONDS`. It is pure, so it is
+        # safe on the reactor thread here, and a target with neither
+        # source still carries NO `download_timeout` key, exactly as
+        # before.
+        request_timeout_seconds = resolve_request_timeout_seconds(target)
+        if request_timeout_seconds is not None:
+            meta["download_timeout"] = request_timeout_seconds
         if permission is not None:
             # SPEC-11 US1 (T014): threaded through so `parse`/`errback`
             # can release this fetch's concurrency slot as soon as the
             # response/failure returns.
             meta["semaphore_key"] = permission.semaphore_key
             meta["semaphore_token"] = permission.semaphore_token
+            # EPA B5 (F10): the FLEET-wide host lease rides the same meta
+            # so `parse`/`errback` release it on BOTH the success and the
+            # error path, exactly like the tenant slot above. One physical
+            # request = one lease; a SPEC-10 retry re-acquires its own.
+            meta["fleet_key"] = permission.fleet_key
+            meta["fleet_token"] = permission.fleet_token
         if lock is not None:
             # SPEC-11 US2 (T022): threaded through so `parse`/`errback`
             # can carry the match-lock key/token onto the eventual
@@ -661,6 +689,13 @@ class GenericPriceSpider(scrapy.Spider):
         sem_token = response.meta.get("semaphore_token")
         if sem_key and sem_token:
             await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+        # EPA B5 (F10): and the FLEET host lease, on this same path -- a
+        # request built without one (pre-B5 callers, unit tests) carries
+        # no fleet meta and there is nothing to release.
+        fleet_key = response.meta.get("fleet_key")
+        fleet_token = response.meta.get("fleet_token")
+        if fleet_key and fleet_token:
+            await release_fleet_lease(get_redis_client(), key=fleet_key, token=fleet_token)
 
         target = self._targets_by_match_id[response.meta["match_id"]]
         now = datetime.now(UTC)
@@ -668,6 +703,24 @@ class GenericPriceSpider(scrapy.Spider):
         # read from `response.meta` (stamped by `_request_for` at dispatch
         # time) -- never the pre-SPEC-10 hardcoded `DIRECT_HTTP`.
         attempt_kwargs = _attempt_kwargs_from_meta(response.meta)
+        # EPA C5 (F19): the raw bytes this result was extracted from,
+        # carried to `_flush_batch`, which writes them into the
+        # content-addressed evidence store and keeps the hash on the
+        # observation row (`offer_raw_evidence_hash`). Attached HERE, on
+        # `attempt_kwargs`, because every result this method emits --
+        # HTTP-status failure, adapter miss, validation rejection and
+        # success alike -- already spreads it, and an evidence hash that
+        # only appeared on successes would be missing exactly where a
+        # human most wants to replay the page.
+        #
+        # `response.body` is bytes already held by this response object,
+        # so this is a reference, not a copy: siblings riding the same
+        # fetch share it, and `store_evidence` is content-addressed, so N
+        # sibling rows produce ONE blob. Bounded by Scrapy's own
+        # `DOWNLOAD_MAXSIZE`; deliberately NOT spooled (see
+        # `scrape_core.result_spool._NON_SPOOLED_FIELDS`). Nothing is
+        # written unless `EVIDENCE_STORE_DIR` is configured.
+        attempt_kwargs["raw_evidence"] = response.body or None
 
         adapter_key = response.meta.get("adapter_key", AdapterKey.DEFAULT_HTTP)
         status_error_code = classify_http_status(response.status)
@@ -696,23 +749,39 @@ class GenericPriceSpider(scrapy.Spider):
         final_url = response.url
         if 300 <= response.status < 400 and response.headers.get("Location"):
             final_url = response.urljoin(response.headers["Location"].decode("utf-8"))
-        adapter_result = get_adapter(adapter_key).adapt(
-            AdapterResponse(
-                body=response.body,
-                final_url=final_url,
-                requested_url=response.meta.get("adapter_requested_url", response.request.url),
-                status=response.status,
-            ),
-            AdapterContext.from_target(target),
-            preferred_method=(
-                target.strategy_start.extraction_method
-                if target.strategy_start is not None
-                else None
-            ),
-        )
+        # A2/F02: the extraction chain runs inside a deadline watch. A
+        # profile regex that blows `EXTRACTION_REGEX_TIMEOUT_SECONDS` (or the
+        # 4x per-page budget) is swallowed four layers down —
+        # `extract_regex` returns None so the page keeps its other four
+        # readings — and surfaces here, where the failure is classified. It
+        # is recorded as REGEX_TIMEOUT rather than PRICE_NOT_FOUND because
+        # the two say different things: PRICE_NOT_FOUND asserts the page was
+        # read and carried no price, REGEX_TIMEOUT asserts our own profile
+        # configuration was too expensive to finish. Only the latter must
+        # drive the profile quarantine (see the persistence pipeline).
+        with regex_deadline_watch():
+            adapter_result = get_adapter(adapter_key).adapt(
+                AdapterResponse(
+                    body=response.body,
+                    final_url=final_url,
+                    requested_url=response.meta.get(
+                        "adapter_requested_url", response.request.url
+                    ),
+                    status=response.status,
+                ),
+                AdapterContext.from_target(target),
+                preferred_method=(
+                    target.strategy_start.extraction_method
+                    if target.strategy_start is not None
+                    else None
+                ),
+            )
+            regex_deadline = regex_deadline_tripped()
         candidate = adapter_result.candidate
         if adapter_result.outcome is not AdapterOutcome.FOUND or candidate is None:
             error_code = _adapter_error_code(adapter_result.outcome)
+            if regex_deadline is not None and error_code is ScrapeErrorCode.PRICE_NOT_FOUND:
+                error_code = ScrapeErrorCode.REGEX_TIMEOUT
             canonical_url = (
                 adapter_result.canonical_url
                 if adapter_result.outcome is AdapterOutcome.REPAIRED
@@ -726,7 +795,10 @@ class GenericPriceSpider(scrapy.Spider):
                 success=False,
                 error_code=error_code,
                 error_message=(
-                    adapter_result.message
+                    f"profile regex exceeded its "
+                    f"{regex_deadline['timeout']}s execution deadline"
+                    if error_code is ScrapeErrorCode.REGEX_TIMEOUT and regex_deadline
+                    else adapter_result.message
                     or "adapter found no exact, identity-valid price"
                 ),
                 final_url=adapter_result.final_url,
@@ -829,6 +901,13 @@ class GenericPriceSpider(scrapy.Spider):
         sem_token = failure.request.meta.get("semaphore_token")
         if sem_key and sem_token:
             await release_slot(get_redis_client(), key=sem_key, token=sem_token)
+        # EPA B5 (F10): and the FLEET host lease, on this same path -- a
+        # request built without one (pre-B5 callers, unit tests) carries
+        # no fleet meta and there is nothing to release.
+        fleet_key = failure.request.meta.get("fleet_key")
+        fleet_token = failure.request.meta.get("fleet_token")
+        if fleet_key and fleet_token:
+            await release_fleet_lease(get_redis_client(), key=fleet_key, token=fleet_token)
 
         now = datetime.now(UTC)
         hostname = urlsplit(failure.request.url).hostname

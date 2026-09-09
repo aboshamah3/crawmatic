@@ -19,11 +19,35 @@
 #      alone would pass a restore that preserved every row's existence and
 #      corrupted every row's contents.
 #
+#   6. THE MIGRATION HEAD of the restored database equals the head recorded
+#      in the manifest INSIDE the dump's own snapshot (dr_lib.sh). A restore
+#      that lands at a different revision is a restore of something else.
+#   7. THE SIDECARS a Postgres dump does not contain restore too (C10/F21):
+#      the netledger durable buffer, the B1 result spool, the C5 evidence
+#      directory listing and the config snapshot. Money already spent and
+#      pages already fetched live in those two SQLite queues; a "successful"
+#      restore that silently drops them is not a recovery point. Each one is
+#      asserted PRESENT-AND-SOUND or SKIPPED-WITH-A-STATED-REASON — never a
+#      silent pass.
+#   8. THE RLS BACKFILL AUDIT (B2-fix1 follow-up, 2026-09-08): production's
+#      fail-closed row-level security silently filters DML issued by
+#      `crawmatic_migrate`, so a migration that backfills with a bare
+#      UPDATE/INSERT reports "0 rows" and moves on. That is harmless in
+#      production, where those migrations ran BEFORE the policies existed —
+#      but a DR restore that replays the whole chain onto an empty database
+#      would silently skip every one of them. This step pins the KNOWN-latent
+#      set and fails if it grows, so a new migration of that shape cannot be
+#      added without someone deciding what a fresh restore does about it.
+#      §Restoring for real in RUNBOOK.md carries the operator procedure.
+#
 # Failure => non-zero exit AND a `DR-ALERT` line on stderr. On this host that
 # IS the alert: there is no pager, no on-call rotation and no alert router.
 # Wiring these exits to a real notification channel is an OWNER GATE, named in
 # RUNBOOK.md §Alerting. Cron mails the output to root if a local MTA exists,
 # which is a mailbox, not an alert.
+#
+# Every step is TIMED and the timings are in the report: an RTO number nobody
+# measured is a wish.
 #
 # The scratch container holds a full plaintext copy of production data, so it
 # is destroyed unconditionally on exit — success, failure, or interrupt.
@@ -68,7 +92,22 @@ done
 
 fail() { FAILURES=$((FAILURES + 1)); dr_alert "$*"; RESULTS+=("FAIL|$*"); }
 pass() { dr_log INFO "PASS $*"; RESULTS+=("PASS|$*"); }
+# A skip is a RECORDED FACT with a reason, never a quiet success: an operator
+# reading this report must be able to see what was NOT proven.
+skip() { dr_log WARN "SKIP $*"; RESULTS+=("SKIP|$*"); }
 RESULTS=()
+STEPS=()      # "label|seconds" — every step is timed (RTO evidence)
+
+timed() {  # $1 = label, $2.. = command
+  local label="$1"; shift
+  local t0 t1 rc=0
+  t0=$(date -u +%s)
+  "$@" || rc=$?
+  t1=$(date -u +%s)
+  STEPS+=("$label|$(( t1 - t0 ))")
+  dr_log INFO "── step: $label — $(( t1 - t0 ))s"
+  return "$rc"
+}
 
 free_port() {
   local p
@@ -98,7 +137,7 @@ main() {
   local run_t0; run_t0=$(date -u +%s)
 
   # 1. integrity of the stored ciphertext
-  if ( cd "$SET_DIR" && sha256sum -c --status SHA256SUMS ); then
+  if timed "sha256sums verify" bash -c "cd '$SET_DIR' && sha256sum -c --status SHA256SUMS"; then
     pass "SHA256SUMS of $set_name verify"
   else
     fail "SHA256SUMS of $set_name DO NOT verify — stored backup is damaged"
@@ -111,17 +150,19 @@ main() {
   port=$(free_port)
   pw=$(openssl rand -hex 24)
   CONTAINER="dr-verify-$$"
-  docker run -d --name "$CONTAINER" \
-    -e POSTGRES_PASSWORD="$pw" \
-    -p "127.0.0.1:$port:5432" "$DR_PG_IMAGE" >/dev/null
-  dr_log INFO "scratch $DR_PG_IMAGE started as $CONTAINER on 127.0.0.1:$port (loopback only)"
-
-  local ready=0 i
-  for i in $(seq 1 60); do
-    if docker exec "$CONTAINER" pg_isready -q -U postgres >/dev/null 2>&1; then ready=1; break; fi
-    sleep 1
-  done
-  (( ready )) || dr_die "scratch container never became ready"
+  start_scratch() {
+    docker run -d --name "$CONTAINER" \
+      -e POSTGRES_PASSWORD="$pw" \
+      -p "127.0.0.1:$port:5432" "$DR_PG_IMAGE" >/dev/null
+    dr_log INFO "scratch $DR_PG_IMAGE started as $CONTAINER on 127.0.0.1:$port (loopback only)"
+    local ready=0 i
+    for i in $(seq 1 60); do
+      if docker exec "$CONTAINER" pg_isready -q -U postgres >/dev/null 2>&1; then ready=1; break; fi
+      sleep 1
+    done
+    (( ready )) || dr_die "scratch container never became ready"
+  }
+  timed "scratch container up" start_scratch
 
   dr_clear_pgenv
   export PGHOST=127.0.0.1 PGPORT="$port" PGUSER=postgres PGPASSWORD="$pw" PGDATABASE=postgres
@@ -129,8 +170,13 @@ main() {
   local total_restore=0
   local target
   for target in $(jq -r '.targets | keys[]' "$SET_DIR/manifest.json"); do
-    verify_target "$target" || true
+    timed "restore + assert [$target]" verify_target "$target" || true
   done
+
+  # The three things a `pg_restore` alone does not recover.
+  timed "sidecars (netledger buffer, result spool, evidence listing)" verify_sidecars || true
+  timed "config snapshot"        verify_config_snapshot || true
+  timed "RLS backfill audit"     verify_rls_backfill_audit || true
 
   local run_t1; run_t1=$(date -u +%s)
   local elapsed=$(( run_t1 - run_t0 ))
@@ -232,7 +278,182 @@ verify_target() {  # $1 = target name
   done < <(jq -r --arg n "$name" '.targets[$n].checksums[] | "\(.table)|\(.md5)"' "$SET_DIR/manifest.json")
   (( ckfail == 0 )) && pass "[$name] $nck full-table content checksum(s) match"
 
+  # ── migration head equality ──────────────────────────────────────────────
+  # The manifest's head was read inside the dump's own snapshot, so this is an
+  # exact comparison, not a version-drift heuristic. Two probes, because
+  # PostgreSQL resolves relations at parse time and not every target is
+  # Alembic-migrated (the SaaS database is Prisma-migrated and legitimately
+  # has no alembic_version).
+  local want_head got_head
+  want_head=$(jq -r --arg n "$name" '.targets[$n].alembic_head // ""' "$SET_DIR/manifest.json")
+  if [[ -z "$want_head" ]]; then
+    skip "[$name] migration head not recorded in this manifest (set predates C10) — cannot assert equality"
+  elif [[ "$want_head" == "none" ]]; then
+    pass "[$name] manifest records no alembic_version relation, and none is required for this target"
+  else
+    local has_rel
+    has_rel=$(dr_psql -d "$db" -c "SELECT coalesce(to_regclass('public.alembic_version')::text, '');" | head -n1)
+    if [[ -z "$has_rel" ]]; then
+      fail "[$name] manifest records alembic head '$want_head' but the restored database has no alembic_version table"
+    else
+      got_head=$(dr_psql -d "$db" -c "SELECT coalesce(string_agg(version_num, ',' ORDER BY version_num), 'none') FROM alembic_version;" | head -n1)
+      if [[ "$got_head" == "$want_head" ]]; then
+        pass "[$name] migration head matches the dump-time snapshot exactly ($got_head)"
+      else
+        fail "[$name] migration head MISMATCH — manifest '$want_head', restored '$got_head'"
+      fi
+    fi
+  fi
+
   dr_log INFO "[$name] restored $(wc -l < "$WORK/$name.actual_tables") tables in ${secs}s"
+}
+
+# ── Sidecars ───────────────────────────────────────────────────────────────
+# A Postgres dump is not the whole recovery point (see the header, assertion
+# 7). The producing side records each sidecar in the manifest as present or
+# absent WITH A REASON; this restores the present ones and asserts they are
+# sound, and reports the absent ones as SKIPs carrying that reason — an
+# operator must be able to see what was not proven.
+verify_sidecars() {
+  local manifest="$SET_DIR/manifest.json"
+  local n; n=$(jq -r '.sidecars // [] | length' "$manifest")
+  if [[ "$n" == "0" ]]; then
+    skip "sidecars: this set records none (produced before C10, or by the legacy host-side dump path)"
+    return 0
+  fi
+
+  local bundle; bundle=$(jq -r '.sidecar_file // "sidecars.tar.gz.gpg"' "$manifest")
+  local dir="$WORK/sidecars"; mkdir -p "$dir"
+  local any_present; any_present=$(jq -r '[.sidecars[] | select(.present)] | length' "$manifest")
+  if (( any_present > 0 )); then
+    if [[ ! -f "$SET_DIR/$bundle" ]]; then
+      fail "sidecars: manifest lists $any_present present sidecar(s) but $bundle is not in the set"
+      return 1
+    fi
+    if dr_gpg_decrypt_stdout "$SET_DIR/$bundle" 2> "$WORK/sidecars.gpg.err" | tar -C "$dir" -xzf -; then
+      pass "sidecars: $bundle decrypts and unpacks"
+    else
+      fail "sidecars: $bundle failed to decrypt/unpack: $(tail -c 300 "$WORK/sidecars.gpg.err" | tr '\n' ' ')"
+      return 1
+    fi
+  fi
+
+  # One jq call per field rather than a single `@tsv` row: TAB is an IFS
+  # WHITESPACE character, so bash collapses runs of it and an empty field —
+  # `.reason` on a captured sidecar is always empty — silently shifts every
+  # later column left. The first run of this drill reported "sha256 is missing
+  # from the bundle" for exactly that reason.
+  local kind present reason f want_sha got_sha
+  while IFS= read -r kind; do
+    [[ -n "$kind" ]] || continue
+    present=$(jq -r --arg k "$kind" '.sidecars[] | select(.kind==$k) | .present | tostring' "$manifest")
+    reason=$( jq -r --arg k "$kind" '.sidecars[] | select(.kind==$k) | .reason  // ""' "$manifest")
+    f=$(      jq -r --arg k "$kind" '.sidecars[] | select(.kind==$k) | .file    // ""' "$manifest")
+    want_sha=$(jq -r --arg k "$kind" '.sidecars[] | select(.kind==$k) | .sha256 // ""' "$manifest")
+    if [[ "$present" != "true" ]]; then
+      skip "sidecar $kind NOT captured — ${reason:-no reason recorded} (OWNER GATE: mount the queue volume on dr-backup, RUNBOOK §Sidecars)"
+      continue
+    fi
+    if [[ ! -s "$dir/$f" ]]; then
+      fail "sidecar $kind: manifest says present but $f is missing from the bundle"
+      continue
+    fi
+    got_sha=$(sha256sum "$dir/$f" | cut -d' ' -f1)
+    if [[ -n "$want_sha" && "$got_sha" != "$want_sha" ]]; then
+      fail "sidecar $kind: sha256 ${got_sha:0:12}… != manifest ${want_sha:0:12}…"
+      continue
+    fi
+    case "$kind" in
+      netledger_buffer|result_spool)
+        # A restored queue that is corrupt is worse than an absent one: it
+        # would be replayed. `integrity_check` is sqlite's own answer.
+        local check counts
+        check=$(dr_sqlite_integrity "$dir/$f")
+        if [[ "$check" == "ok" ]]; then
+          counts=$(dr_sqlite_counts "$dir/$f")
+          pass "sidecar $kind restores and passes PRAGMA integrity_check ($counts)"
+        else
+          fail "sidecar $kind FAILS PRAGMA integrity_check: $check"
+        fi ;;
+      evidence_listing)
+        local want_files got_files want_bytes got_bytes
+        want_files=$(jq -r --arg k "$kind" '.sidecars[] | select(.kind==$k) | .files // 0' "$manifest")
+        want_bytes=$(jq -r --arg k "$kind" '.sidecars[] | select(.kind==$k) | .blob_bytes // 0' "$manifest")
+        got_files=$(grep -c . "$dir/$f" || true)
+        got_bytes=$(awk '{s += $2} END {printf "%d", s + 0}' "$dir/$f")
+        if [[ "$want_files" == "$got_files" && "$want_bytes" == "$got_bytes" ]]; then
+          pass "sidecar $kind restores: $got_files evidence blob(s), $(dr_human "$got_bytes") referenced, matching the manifest"
+        else
+          fail "sidecar $kind: listing has $got_files file(s) / $got_bytes byte(s), manifest says $want_files / $want_bytes"
+        fi ;;
+      *)
+        pass "sidecar $kind restores ($f, sha256 matches)" ;;
+    esac
+  done < <(jq -r '.sidecars[].kind' "$manifest")
+}
+
+# ── Config snapshot ────────────────────────────────────────────────────────
+# Restored FROM THE MANIFEST to a file next to the report, so a recovery has
+# the producing service's configuration in front of it instead of
+# reconstructing it from memory. Also asserts the snapshot kept its promise:
+# NAMES for everything, VALUES only for the declared allowlist.
+verify_config_snapshot() {
+  local manifest="$SET_DIR/manifest.json"
+  local n; n=$(jq -r '.config_snapshot.variable_count // 0' "$manifest")
+  if [[ "$n" == "0" ]]; then
+    skip "config snapshot: this set records none (produced before C10, or by the legacy host-side dump path)"
+    return 0
+  fi
+  local out="$DR_REPORTS_DIR/config-$(basename "$SET_DIR").json"
+  jq '.config_snapshot' "$manifest" > "$out"; chmod 600 "$out"
+
+  local leaked
+  leaked=$(jq -r '
+      (.config_snapshot.value_allowlist // []) as $allow
+      | (.config_snapshot.values // {}) | keys[]
+      | select(. as $k | ($allow | index($k)) | not)' "$manifest" | tr '\n' ' ')
+  if [[ -n "${leaked// /}" ]]; then
+    fail "config snapshot records VALUES for non-allowlisted variable(s): $leaked"
+  else
+    pass "config snapshot restored to $out ($n variable name(s); values only for the declared allowlist)"
+  fi
+}
+
+# ── RLS backfill audit ─────────────────────────────────────────────────────
+# See the header, assertion 8. Each migration is parsed with Python's `ast`
+# so that only REAL SQL string arguments count: b6e5d1c94a72's docstring
+# explains at length why a bare `UPDATE dispatch_intents` would be wrong, and
+# a grep-based audit would happily report that prose as the bug it warns
+# about.
+DR_RLS_BACKFILL_KNOWN="${DR_RLS_BACKFILL_KNOWN:-5b9a86717a66_normalise_api_key_status.py|UPDATE|api_keys
+6e4a9c8f2d10_versioned_strategy_methods.py|DELETE|strategy_attempt_stats
+6e4a9c8f2d10_versioned_strategy_methods.py|INSERT|domain_strategy_methods
+6e4a9c8f2d10_versioned_strategy_methods.py|INSERT|scrape_profile_revisions
+6e4a9c8f2d10_versioned_strategy_methods.py|UPDATE|domain_strategy_profiles
+6e4a9c8f2d10_versioned_strategy_methods.py|UPDATE|strategy_attempt_stats}"
+
+verify_rls_backfill_audit() {
+  local repo="${DR_REPO_ROOT:-$(cd "$HERE/../.." && pwd)}"
+  local versions="$repo/alembic/versions"
+  if [[ ! -d "$versions" ]]; then
+    skip "RLS backfill audit: $versions not present (running outside a checkout)"
+    return 0
+  fi
+  local found
+  found=$(dr_rls_backfill_scan "$versions" 2>"$WORK/rls_audit.err") || true
+  if [[ -s "$WORK/rls_audit.err" ]]; then
+    fail "RLS backfill audit could not run: $(tail -c 300 "$WORK/rls_audit.err" | tr '\n' ' ')"
+    return 1
+  fi
+  local n_known n_found new_ones
+  n_known=$(printf '%s\n' "$DR_RLS_BACKFILL_KNOWN" | grep -c . || true)
+  n_found=$(printf '%s\n' "$found" | grep -c . || true)
+  new_ones=$(comm -13 <(printf '%s\n' "$DR_RLS_BACKFILL_KNOWN" | sort) <(printf '%s\n' "$found" | sort) | grep . || true)
+  if [[ -n "$new_ones" ]]; then
+    fail "RLS backfill audit: NEW migration(s) backfill an RLS-protected table with bare DML — a fresh-restore replay of the chain would silently no-op them: $(printf '%s' "$new_ones" | tr '\n' ' ')"
+    return 1
+  fi
+  pass "RLS backfill audit: $n_found latent backfill(s), all in the known set of $n_known (RUNBOOK §Restoring for real, step 4, carries the operator procedure)"
 }
 
 write_report() {  # $1 = set name, $2 = wall seconds, $3 = restore seconds
@@ -241,7 +462,7 @@ write_report() {  # $1 = set name, $2 = wall seconds, $3 = restore seconds
   {
     echo "# Restore verification — $set_name"
     echo
-    echo "- Verdict: **$verdict** ($FAILURES failed assertion(s))"
+    echo "- Verdict: **$verdict** ($FAILURES failed assertion(s), $(printf '%s\n' "${RESULTS[@]}" | grep -c '^SKIP|' || true) skipped)"
     echo "- Run (UTC): $(dr_ts)"
     echo "- Wall clock: ${elapsed}s   |   pg_restore time only: ${restore_secs}s"
     echo "- Backup set: \`$SET_DIR\`"
@@ -256,14 +477,26 @@ write_report() {  # $1 = set name, $2 = wall seconds, $3 = restore seconds
       printf '| %s | %s |\n' "${r%%|*}" "$(printf '%s' "${r#*|}" | sed 's/|/\\|/g')"
     done
     echo
+    echo "## Step timings (RTO evidence — a number nobody measured is a wish)"
+    echo
+    printf '| Step | Seconds |\n|---|---:|\n'
+    local st
+    for st in "${STEPS[@]}"; do
+      printf '| %s | %s |\n' "${st%%|*}" "${st##*|}"
+    done
+    echo
     echo "## Manifest summary (names and counts only — no credential material)"
     echo
     echo '```json'
     jq '{backup_set, created_utc, encryption,
-         targets: (.targets | map_values({file, bytes, sha256, server_version,
+         private_network: (.private_network // null),
+         targets: (.targets | map_values({file, bytes, bytes_exported, bytes_on_wire,
+                                          sha256, server_version, alembic_head,
                                           table_count: (.tables | length),
                                           total_rows: ([.tables[].rows] | add),
-                                          checksum_tables: [.checksums[].table]}))}' \
+                                          checksum_tables: [.checksums[].table]})),
+         sidecars: (.sidecars // []),
+         config_variable_count: (.config_snapshot.variable_count // 0)}' \
        "$SET_DIR/manifest.json"
     echo '```'
     echo

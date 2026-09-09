@@ -55,6 +55,16 @@ class _FakeSettings:
     PRICE_ANALYSIS_DEDUP_TTL_SECONDS = 21600
     STRATEGY_STATS_KEY_TTL_SECONDS = 3600
     STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD = 0.85
+    # EPA F05 (plan task B1) -- the durable-spool knobs
+    # `BatchedPersistencePipeline.__init__` reads when a caller leaves
+    # them unspecified. `:memory:` keeps this file's pipelines off disk:
+    # the spool's own behaviour is `tests/unit/test_result_spool.py`'s
+    # subject, and the retry/backpressure behaviour is
+    # `tests/unit/test_pipeline_flush_retry.py`'s.
+    SCRAPE_RESULT_SPOOL_PATH = ":memory:"
+    SCRAPE_FLUSH_MAX_PENDING_BATCHES = 8
+    SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS = (1.0, 5.0, 30.0, 120.0, 600.0)
+    SCRAPE_FLUSH_QUARANTINE_AFTER = 5
 
 
 class _FakeRedis:
@@ -95,6 +105,18 @@ def _stub_target_terminalization(monkeypatch: Any) -> None:
     monkeypatch.setattr(pipelines_mod, "write_outbox_message", lambda *a, **k: None)
     monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: _FakeRedis())
+    # EPA F05 (plan task B1): the observation/attempt inserts are now
+    # `ON CONFLICT DO NOTHING` Core statements rather than ORM `add_all`,
+    # so this file's `session.added`-based assertions -- which are about
+    # WHICH rows a flush writes, not about how they reach the driver --
+    # keep their meaning by routing the instances back through `add_all`.
+    # The conflict clause itself is covered in
+    # `tests/unit/test_pipeline_flush_retry.py`.
+    monkeypatch.setattr(
+        pipelines_mod,
+        "_insert_ignoring_replays",
+        lambda session, model, instances, index_elements: session.add_all(instances),
+    )
 
 
 def _make_result(

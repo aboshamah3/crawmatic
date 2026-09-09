@@ -46,6 +46,7 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -82,6 +83,7 @@ from app_shared.maintenance.scoping import (
     maintenance_task,
     workspace_context,
 )
+from app_shared.messaging import enqueue
 from app_shared.models.network_operations import NetworkTransport
 from app_shared.netledger.recorder import (
     LedgerOpenError,
@@ -92,6 +94,10 @@ from app_shared.netledger.recorder import (
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.observations import RequestAttempt
 from app_shared.models.strategy import DomainStrategyProfile, StrategyDiscoveryRun
+from app_shared.models.strategy_discovery_state import (
+    DISCOVERY_SCAN_STATE_KEY,
+    StrategyDiscoveryState,
+)
 from app_shared.profiles.confidence import resolve_confidence_rules
 from app_shared.redis_client import get_redis_client
 from app_shared.repository import scoped_get, scoped_select
@@ -120,6 +126,7 @@ from app_shared.strategy.stats_buffer import dirty_key, read_pending
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     STRATEGY_DISCOVERY_RUN,
+    STRATEGY_DISCOVERY_SCAN,
     STRATEGY_LIGHT_RECHECK,
     STRATEGY_PATTERN_BACKFILL,
     STRATEGY_STATS_FLUSH,
@@ -1977,3 +1984,223 @@ def pattern_backfill() -> None:
         # See `flush_stats`: per-profile isolation is not permission to
         # report success on a batch that dropped work.
         raise first_error
+
+
+# --- STRATEGY_DISCOVERY_SCAN (EPA B4, F09, "resumable long maintenance") --
+
+
+def _read_discovery_scan_cursor(session: Session) -> uuid.UUID | None:
+    """Return the persisted `strategy_discovery_state` cursor, or `None`
+    if a pass has never run or the previous pass completed (both look
+    identical: "start from the beginning")."""
+    state = session.get(StrategyDiscoveryState, DISCOVERY_SCAN_STATE_KEY)
+    return state.cursor_profile_id if state is not None else None
+
+
+def _discovery_scan_cursor_upsert_stmt(
+    *, cursor_profile_id: uuid.UUID | None, now: datetime
+):
+    """Build the (unexecuted) durable-cursor upsert.
+
+    Split out so its shape can be asserted in a pure unit test without a
+    live DB (the `rollup_watermark._advance_stmt` precedent).
+    `cursor_profile_id=None` both seeds the first-ever row and resets a
+    just-completed pass back to "start from the beginning" -- the same
+    value, the same meaning, in both cases. `ON CONFLICT DO UPDATE`
+    (single global row, `DISCOVERY_SCAN_STATE_KEY`) mirrors the
+    `rollup_watermarks`/`maintenance_cadences` upsert precedent; unlike
+    those tables' raw-SQL `GREATEST`-guarded advance, this cursor is not
+    required to be monotonic under concurrent writers -- exactly one
+    `STRATEGY_DISCOVERY_SCAN` is ever in flight at a time (Celery does
+    not run two instances of the same periodic sweep concurrently here,
+    and a resumed pass always re-enqueues itself serially), so a plain
+    overwrite is sufficient.
+    """
+    return (
+        pg_insert(StrategyDiscoveryState)
+        .values(
+            key=DISCOVERY_SCAN_STATE_KEY,
+            cursor_profile_id=cursor_profile_id,
+            last_advanced_at=now,
+            advance_count=1,
+            created_at=now,
+            updated_at=now,
+        )
+        .on_conflict_do_update(
+            index_elements=[StrategyDiscoveryState.key],
+            set_={
+                "cursor_profile_id": cursor_profile_id,
+                "last_advanced_at": now,
+                "advance_count": StrategyDiscoveryState.advance_count + 1,
+                "updated_at": now,
+            },
+        )
+    )
+
+
+def _advance_discovery_scan_cursor(
+    session: Session, *, cursor_profile_id: uuid.UUID | None
+) -> None:
+    """Durably upsert how far the current pass has gotten (executes
+    :func:`_discovery_scan_cursor_upsert_stmt` on the caller's session)."""
+    now = datetime.now(timezone.utc)
+    session.execute(_discovery_scan_cursor_upsert_stmt(cursor_profile_id=cursor_profile_id, now=now))
+
+
+def _discovery_scan_query(*, cursor: uuid.UUID | None, limit: int):
+    """Build the (unexecuted) fleet-wide `DISCOVERY_REQUIRED` scan.
+
+    `(id, workspace_id, competitor_id, domain, url_pattern)` for up to
+    `limit` profiles strictly after `cursor` (`None` = from the start of
+    the table), ordered by id. Split out so its shape (status filter,
+    cursor predicate, ordering, limit) can be asserted in a pure unit
+    test without a live DB.
+    """
+    stmt = select(
+        DomainStrategyProfile.id,
+        DomainStrategyProfile.workspace_id,
+        DomainStrategyProfile.competitor_id,
+        DomainStrategyProfile.domain,
+        DomainStrategyProfile.url_pattern,
+    ).where(  # noqa: workspace-scope
+        DomainStrategyProfile.status == StrategyStatus.DISCOVERY_REQUIRED
+    )
+    if cursor is not None:
+        stmt = stmt.where(DomainStrategyProfile.id > cursor)
+    return stmt.order_by(DomainStrategyProfile.id).limit(limit)
+
+
+def _scan_discovery_due_profile_refs(
+    *, cursor: uuid.UUID | None, limit: int
+) -> list[tuple[uuid.UUID, uuid.UUID, uuid.UUID, str, str]]:
+    """Execute :func:`_discovery_scan_query` on the sanctioned BYPASSRLS
+    system session -- the same `_scan_stale_pattern_profile_refs`
+    precedent above: a fleet-wide maintenance sweep is structurally
+    cross-tenant, and under FORCE ROW LEVEL SECURITY an unscoped scan on
+    the ordinary role fails closed to ZERO rows rather than raising,
+    which would silently disable this scan forever instead of erroring
+    loudly.
+    """
+    with get_system_session() as session:
+        return list(session.execute(_discovery_scan_query(cursor=cursor, limit=limit)).all())
+
+
+def _plan_next_scan_chunk(
+    batch_ids: list[uuid.UUID], *, chunk_size: int
+) -> tuple[bool, uuid.UUID | None]:
+    """Pure pagination arithmetic, no I/O: given the ids just fetched
+    (already `chunk_size`-limited, ordered by id), decide whether this
+    pass is complete and what the next cursor should be.
+
+    A short/empty chunk (fewer rows than `chunk_size`) means the scan
+    reached the end of the table for this pass -- `pass_complete=True`,
+    and the cursor resets to `None` so the NEXT pass starts over from the
+    beginning (catching any profile that flipped back to
+    `DISCOVERY_REQUIRED` behind an already-advanced cursor). A full
+    chunk means more rows may remain past it -- `pass_complete=False`,
+    cursor advances to the last id in this chunk.
+    """
+    pass_complete = len(batch_ids) < chunk_size
+    new_cursor = None if pass_complete else batch_ids[-1]
+    return pass_complete, new_cursor
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=STRATEGY_DISCOVERY_SCAN)
+def strategy_discovery_scan() -> None:
+    """`STRATEGY_DISCOVERY_SCAN` (`maintenance` queue, EPA B4, F09).
+
+    The fleet-wide, chunked counterpart to the per-key discovery triggers
+    in `resolution.py`/`rediscovery.py`: those enqueue `STRATEGY_DISCOVERY_
+    RUN` the instant a NEW `DISCOVERY_REQUIRED` profile is created, but
+    nothing previously re-drove a profile that ended up `DISCOVERY_
+    REQUIRED` through some other path (a restored/imported dataset, an
+    enqueue that raced a process crash before the outbox pattern covered
+    this seam) and therefore never got its triggering enqueue at all --
+    such a profile would sit stuck forever with no self-healing path back
+    to `ACTIVE`/`LEARNING`.
+
+    Bounded to `Settings.STRATEGY_DISCOVERY_MAX_DOMAINS_PER_RUN` profiles
+    per invocation (each fan-out is a paid `PROXY_HTTP` probe on its
+    worst-case leg; `STRATEGY_DISCOVERY_RUN`'s own per-key daily ceiling
+    still applies per profile). "Resumable": `strategy_discovery_state`
+    persists the last profile id forwarded, so this invocation resumes
+    strictly after it -- a task time limit or a worker restart mid-scan
+    can neither lose a profile nor double-enqueue one already forwarded.
+    A full chunk means more profiles may remain past the cursor, so this
+    re-enqueues itself immediately to continue the same pass; a
+    short/empty chunk means the pass reached the end, so the cursor
+    resets to the start for the next pass. (There is no steady-state
+    schedule wired up in this change -- out of this packet's file scope
+    -- so today this task runs when something enqueues it: an operator
+    action, a future scheduler cadence, or a resumed pass re-enqueueing
+    itself as below.)
+
+    Each enqueue goes through the transactional outbox
+    (`write_outbox_message`, one workspace / one transaction --
+    `pattern_backfill`'s READY-007 fix applies here identically) rather
+    than a pre-commit `enqueue()`, and is deduplicated per profile
+    (`discovery:scan:{profile_id}`, distinct from `pattern_backfill`'s own
+    `discovery:backfill:{profile_id}` dedup key) so a re-run of an
+    already-forwarded chunk before the dispatcher drains it cannot double
+    up. The cursor advance itself is a separate, system-session write
+    (the scan spans workspaces; the durable cursor names no tenant) and
+    is safe to commit independently of any one workspace's outbox writes
+    succeeding or failing -- a workspace whose outbox insert failed is
+    simply picked up again on the NEXT full pass, exactly like a profile
+    `pattern_backfill`'s own per-profile isolation re-scans next time.
+    """
+    settings = get_settings()
+    chunk_size = int(settings.STRATEGY_DISCOVERY_MAX_DOMAINS_PER_RUN)
+
+    with get_system_session() as session:
+        cursor = _read_discovery_scan_cursor(session)
+
+    batch = _scan_discovery_due_profile_refs(cursor=cursor, limit=chunk_size)
+
+    enqueued = 0
+    if batch:
+        with get_session() as session:
+            for profile_id, workspace_id, competitor_id, domain, url_pattern in batch:
+                with workspace_context(session, workspace_id):
+                    write_outbox_message(
+                        session,
+                        workspace_id=workspace_id,
+                        task_name=STRATEGY_DISCOVERY_RUN,
+                        queue=_DISCOVERY_QUEUE,
+                        kwargs={
+                            "workspace_id": str(workspace_id),
+                            "competitor_id": str(competitor_id),
+                            "domain": domain,
+                            "url_pattern": url_pattern,
+                            "sample_urls": [],
+                            "triggered_by": "AUTO",
+                        },
+                        dedup_key=f"discovery:scan:{profile_id}",
+                    )
+                enqueued += 1
+
+    pass_complete, new_cursor = _plan_next_scan_chunk(
+        [row[0] for row in batch], chunk_size=chunk_size
+    )
+
+    with get_system_session() as session:
+        _advance_discovery_scan_cursor(session, cursor_profile_id=new_cursor)
+        session.commit()
+
+    logger.info(
+        "strategy_discovery_scan enqueued=%d pass_complete=%s next_cursor=%s",
+        enqueued,
+        pass_complete,
+        new_cursor,
+    )
+
+    if not pass_complete and batch:
+        # A full chunk means more `DISCOVERY_REQUIRED` profiles may
+        # remain past this cursor -- resume immediately rather than
+        # waiting for whatever next triggers this task. Safe even if
+        # this particular enqueue is lost: the durable cursor above has
+        # already committed, so the next invocation -- from wherever it
+        # is triggered -- resumes from the same point instead of
+        # restarting the pass or skipping ahead.
+        enqueue(STRATEGY_DISCOVERY_SCAN, queue="maintenance")

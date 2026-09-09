@@ -12,9 +12,13 @@ All DB-independent — no real Postgres connection is ever opened:
   ``apps/workers/app/workers/celery_app.py`` is wired to call it —
   [analyze G1].
 * (c) pooler-safe config — the engine build path passes
-  ``connect_args={"prepare_threshold": None}`` so server-side prepared
-  statements are disabled under PgBouncer transaction pooling —
-  [analyze G2].
+  ``connect_args={"prepare_threshold": None, "options": "-c statement_timeout=..."}``
+  so server-side prepared statements are disabled under PgBouncer
+  transaction pooling — [analyze G2] — and, since F15 (EPA
+  core-production-readiness, 2026-09-07), every statement on the
+  connection is bounded by ``DB_STATEMENT_TIMEOUT_MS``, with
+  ``pool_timeout=DB_POOL_ACQUIRE_TIMEOUT_SECONDS`` bounding how long a
+  caller waits for a pooled connection.
 """
 
 from __future__ import annotations
@@ -238,4 +242,8 @@ def test_get_engine_passes_prepare_threshold_none_connect_arg(
         monkeypatch.setattr(database, "_engine", None, raising=False)
         monkeypatch.setattr(database, "_sessionmaker", None, raising=False)
 
-    assert captured.get("connect_args") == {"prepare_threshold": None}
+    assert captured.get("connect_args") == {
+        "prepare_threshold": None,
+        "options": f"-c statement_timeout={database.DB_STATEMENT_TIMEOUT_MS}",
+    }
+    assert captured.get("pool_timeout") == database.DB_POOL_ACQUIRE_TIMEOUT_SECONDS

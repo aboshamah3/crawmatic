@@ -89,6 +89,10 @@ __all__ = [
     "classify_http_status",
     "classify_exception",
     "classify_playwright_exception",
+    # EPA C1/F08 (2026-09-07)
+    "classify_extraction_outcome",
+    "classify_timeout_phase",
+    "page_carries_product_identity",
 ]
 
 # --- §34 codes this slice emits, re-exported as module-level constants for
@@ -344,3 +348,126 @@ def classify_playwright_exception(exc: BaseException) -> ScrapeErrorCode:
     if transport_code is not None:
         return transport_code
     return ScrapeErrorCode.PLAYWRIGHT_FAILED
+
+
+# ---------------------------------------------------------------------------
+# EPA C1 / F08 (2026-09-07): failure classes the old vocabulary conflated
+# ---------------------------------------------------------------------------
+#
+# Two conflations cost real money, and both are fixed by *reading what we
+# already measured* rather than by fetching anything more:
+#
+# 1. `TIMEOUT` blamed nobody. A connect timeout is the proxy vendor's
+#    problem, a TTFB timeout is the host's, and a read timeout is page
+#    weight -- three different fixes behind one code, so the per-domain
+#    timeout tuner and the access-policy tuner both had to guess. A5
+#    already splits `request_attempts` into `connect_ms`/`ttfb_ms`/
+#    `read_ms`, so the phase that never completed is knowable.
+#
+# 2. `PRICE_NOT_FOUND` was claimed for any 200 with no price -- including
+#    interstitials, consent walls, soft-404s and un-rendered JS shells.
+#    That is a much stronger claim than the evidence supports, and it is
+#    the claim the strategy optimizer, rediscovery and the domain
+#    scorecard all learn from. Deep dive §6.1: "200 and fast is not
+#    success."
+
+
+def classify_timeout_phase(
+    *,
+    connect_ms: int | None = None,
+    ttfb_ms: int | None = None,
+    read_ms: int | None = None,
+) -> ScrapeErrorCode:
+    """Refine a timeout into the phase that never completed.
+
+    The three arguments are exactly A5's ``request_attempts`` timing
+    split, and ``None`` keeps its meaning there: *this boundary was never
+    reached*, never "zero milliseconds". So the first ``None`` in
+    lifecycle order names the phase that timed out.
+
+    Falls back to the undifferentiated ``TIMEOUT`` when every phase
+    completed (the timeout came from somewhere else -- an overall
+    deadline, extraction) or when a transport reports no split at all.
+    Deliberately opt-in and separate from :func:`classify_exception`:
+    that function's ``TIMEOUT`` answer is unchanged, so no historical row
+    and no existing caller is silently re-classified.
+    """
+    if connect_ms is None:
+        return ScrapeErrorCode.CONNECT_TIMEOUT
+    if ttfb_ms is None:
+        return ScrapeErrorCode.TTFB_TIMEOUT
+    if read_ms is None:
+        return ScrapeErrorCode.READ_TIMEOUT
+    return ScrapeErrorCode.TIMEOUT
+
+
+def page_carries_product_identity(
+    *,
+    title: str | None = None,
+    product_name: str | None = None,
+    sku: str | None = None,
+    structured_product_data: bool = False,
+) -> bool:
+    """Whether a 200 response looks like a product page at all.
+
+    Deliberately generous: ANY one signal is enough. The question this
+    answers is not "is this the right product" (that is identity
+    validation, and it has its own codes) but the much weaker "did we get
+    a product page or a wall". Being generous here means
+    ``EXTRACTION_FAILED`` is only ever claimed when the page carried
+    nothing product-shaped whatsoever -- the case where calling it
+    ``PRICE_NOT_FOUND`` would teach the optimizer something false.
+
+    Whitespace-only strings do not count: an empty ``<title></title>`` is
+    the absence of a title, not a title.
+    """
+    if structured_product_data:
+        return True
+    return any(
+        isinstance(value, str) and value.strip()
+        for value in (title, product_name, sku)
+    )
+
+
+def classify_extraction_outcome(
+    *,
+    status_code: int,
+    price_found: bool,
+    has_product_identity: bool,
+    identity_matches_target: bool | None = None,
+) -> ScrapeErrorCode | None:
+    """Classify what a fetched page actually produced.
+
+    Returns ``None`` for a success (a price was extracted). Otherwise, in
+    order:
+
+    * a non-2xx/3xx status defers to :func:`classify_http_status` -- the
+      status is the stronger evidence and always wins;
+    * **no product identity at all** -> ``EXTRACTION_FAILED``. We cannot
+      tell what we fetched, so this is evidence about our ACCESS PATH (an
+      interstitial, a consent wall, a soft-404, a JS shell we never
+      rendered) and about nothing else. It is also what makes
+      ``AttemptBudget.suppress`` refuse the same method again for this
+      target: re-running it would fetch the same wall at full price;
+    * identity present but proven to be a DIFFERENT product ->
+      ``IDENTITY_MISMATCH`` (unchanged, pre-existing code);
+    * identity present, and either matched or unchecked ->
+      ``PRICE_NOT_FOUND``, which now means what it always claimed to
+      mean: we read this product's genuine page and it carried no price.
+      That is a listing verdict, and the only one of these four the
+      strategy optimizer and the domain scorecard should ever learn from.
+
+    ``identity_matches_target=None`` means "not checked", not "mismatch"
+    -- an unchecked page with a title stays ``PRICE_NOT_FOUND`` rather
+    than being upgraded to an accusation we cannot support.
+    """
+    status_error = classify_http_status(status_code)
+    if status_error is not None:
+        return status_error
+    if price_found:
+        return None
+    if not has_product_identity:
+        return ScrapeErrorCode.EXTRACTION_FAILED
+    if identity_matches_target is False:
+        return ScrapeErrorCode.IDENTITY_MISMATCH
+    return ScrapeErrorCode.PRICE_NOT_FOUND

@@ -62,7 +62,12 @@ from app_shared.models.scrape_profiles import ScrapeProfile, ScrapeProfileRevisi
 # `from app_shared.models import PriceObservation, RequestAttempt,
 # MatchCurrentPrice`. Workspace-owned (unlike ScrapeProfile): registered
 # in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
-from app_shared.models.observations import MatchCurrentPrice, PriceObservation, RequestAttempt
+from app_shared.models.observations import (
+    ExtractionShadowEvent,
+    MatchCurrentPrice,
+    PriceObservation,
+    RequestAttempt,
+)
 
 # The SPEC-08 jobs/orchestration models — re-exported so `Base.metadata`
 # sees both tables for Alembic autogenerate/offline-render
@@ -114,6 +119,16 @@ from app_shared.models.strategy import (
 # registered in `app_shared.repository.WORKSPACE_OWNED_MODELS`.
 from app_shared.models.refresh_rules import RefreshRule
 
+# EPA B3 (F07): the scheduler's due-time identity ledger. A Core Table,
+# not a `Base` subclass (the composite `(rule_id, scheduled_for)` IS the
+# identity — see that module's docstring), re-exported here for the same
+# two reasons as everything else in this file: `Base.metadata` must see
+# it for Alembic autogenerate/offline-render, and callers want
+# `from app_shared.models import refresh_rule_occurrences`. Fleet-wide,
+# no `workspace_id`, no RLS — filed SYSTEM in
+# `scripts/rls_table_manifest.txt`.
+from app_shared.models.refresh_rule_occurrences import refresh_rule_occurrences
+
 # The SPEC-15 US2 VariantPriceDailyRollup model — re-exported so
 # `Base.metadata` sees the table for Alembic autogenerate/offline-render
 # (target_metadata), and so callers can `from app_shared.models import
@@ -137,6 +152,13 @@ from app_shared.models.webhooks import WebhookEndpoint, WebhookEvent
 # uses, and so a reader of this registry sees the audit table exists —
 # it was previously importable only from the leaf module.
 from app_shared.models.domain_playbooks import DomainLifecycleAudit, DomainPlaybook
+
+# EPA B5/F10 (2026-09-07): the FLEET-wide per-domain limits table backing
+# `app_shared.limiter.fleet.admit_fleet`'s host admission. Also fully
+# global, no workspace column, no RLS — deliberately NOT the tenant
+# `DomainAccessRule` above (see the model's module docstring for why the
+# two must stay separate tables).
+from app_shared.models.domain_rules import DomainRule
 
 # 2026-08-15 audit risk H3: durable (non-Redis) proxy-spend circuit
 # breaker state. Also fully global, no workspace column, no RLS — a
@@ -246,6 +268,26 @@ from app_shared.models.cost_authorization import (
 from app_shared.models.rollup_watermarks import RollupWatermark
 from app_shared.models.strategy_switches import StrategyMethodSwitch
 
+# EPA C7 (2026-09-08, F12): the per-day rollup completion checkpoint that
+# makes a daily rollup resumable and gates C8's retention drop.
+# Re-exported so `Base.metadata` sees the table for Alembic
+# autogenerate/offline-render (`target_metadata`). Global, no
+# workspace_id, no RLS — the `rollup_watermarks` shape (deliberately NOT
+# added to `app_shared.repository.WORKSPACE_OWNED_MODELS`). Not used by
+# the runtime path, which reads/writes it via raw `sqlalchemy.text`
+# behind a `to_regclass` capability probe (see
+# `app_shared.maintenance.rollup_sql`).
+from app_shared.models.network_operation_summaries import (
+    NetworkOperationResourceSummary,
+)
+from app_shared.models.rollup_completion import RollupCompletion
+
+# EPA D5 (deep dive §12 item 9): one row per UTC day summarising fleet-wide
+# cost and freshness. Global, no RLS, no `workspace_id` — the
+# `rollup_completion`/`rollup_watermarks` shape (deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`).
+from app_shared.models.fleet_daily_scorecard import FleetDailyScorecard
+
 # EPA C5 (2026-08-26): raw provider usage evidence — the OTHER side of
 # reconciliation against C1's ledger. Re-exported so `Base.metadata` sees
 # the table for Alembic autogenerate/offline-render (`target_metadata`).
@@ -294,6 +336,17 @@ from app_shared.models.api_abuse_limit_counters import ApiAbuseLimitCounter
 # actually reads it (the control-plane routes), not with the schema.
 from app_shared.models.control_plane import ControlPlaneRule
 
+# EPA B4 (2026-09-07, F09): the durable cursor behind the fleet-wide
+# chunked `STRATEGY_DISCOVERY_SCAN` sweep. Re-exported so `Base.metadata`
+# sees the table for Alembic autogenerate/offline-render
+# (`target_metadata`). Global (no `workspace_id`, no RLS) — the same
+# `maintenance_cadences`/`rollup_watermarks` shape (deliberately NOT
+# added to `app_shared.repository.WORKSPACE_OWNED_MODELS`).
+from app_shared.models.strategy_discovery_state import (
+    DISCOVERY_SCAN_STATE_KEY,
+    StrategyDiscoveryState,
+)
+
 __all__ = [
     "Base",
     "metadata",
@@ -318,6 +371,7 @@ __all__ = [
     "PriceObservation",
     "RequestAttempt",
     "MatchCurrentPrice",
+    "ExtractionShadowEvent",
     "ScrapeJob",
     "ScrapeJobTarget",
     "VariantPriceState",
@@ -334,11 +388,13 @@ __all__ = [
     "StrategyAttemptStats",
     "StrategyDiscoveryRun",
     "RefreshRule",
+    "refresh_rule_occurrences",
     "VariantPriceDailyRollup",
     "WebhookEndpoint",
     "WebhookEvent",
     "DomainLifecycleAudit",
     "DomainPlaybook",
+    "DomainRule",
     "ProxyBreakerState",
     "ProxyBreakerTrip",
     "ProxyCircuitBreaker",
@@ -360,6 +416,8 @@ __all__ = [
     "ReservationState",
     "WorkspaceEntitlement",
     "RollupWatermark",
+    "NetworkOperationResourceSummary",
+    "RollupCompletion",
     "StrategyMethodSwitch",
     "ProviderUsageRecord",
     "ProviderUsageGranularity",
@@ -367,4 +425,7 @@ __all__ = [
     "NetworkCostRollup",
     "ApiAbuseLimitCounter",
     "ControlPlaneRule",
+    "StrategyDiscoveryState",
+    "DISCOVERY_SCAN_STATE_KEY",
+    "FleetDailyScorecard",
 ]

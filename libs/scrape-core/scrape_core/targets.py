@@ -50,8 +50,8 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import Any, Callable
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlsplit
 
 from sqlalchemy import select
@@ -87,10 +87,16 @@ from app_shared.enums import (
     ScrapeTargetStatus,
     VariantStrategy,
 )
-from app_shared.jobs.targets import mark_target
+from app_shared.jobs.targets import (
+    PICKUP_ELIGIBLE_TARGET_STATUSES,
+    mark_target,
+    mark_targets_started,
+)
+from app_shared.limiter.fleet import prime_fleet_limits_cache, resolve_fleet_limits
 from app_shared.limiter.limits import resolve_limits
 from app_shared.messaging import enqueue
 from app_shared.models.access import AccessPolicy, DomainAccessRule, ProxyProvider
+from app_shared.models.domain_playbooks import DomainPlaybook
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.identity import Workspace
 from app_shared.models.jobs import ScrapeJobTarget
@@ -115,9 +121,17 @@ from app_shared.strategy.resolution import (
     resolve_or_create_strategy_profile,
     resolve_strategy_start,
 )
-from app_shared.strategy.methods import resolve_method_candidate
+from app_shared.strategy.methods import (
+    DEFAULT_STRATEGY_VERSION,
+    LadderDecision,
+    PlaybookStrategy,
+    resolve_next_physical_attempt,
+)
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
 from app_shared.url_pattern import URL_PATTERN_ALGORITHM_VERSION, derive_url_pattern
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from scrape_core.attempt_budget import AttemptBudget
 
 from scrape_core.browser.variant import VariantConfigError, resolve_variant_values
 from scrape_core.db import as_awaitable, await_in_thread, run_in_thread, workspace_txn
@@ -126,6 +140,7 @@ from scrape_core.limiter import (
     Permission,
     acquire_lock,
     acquire_permission,
+    release_fleet_lease,
     release_lock,
     release_slot,
 )
@@ -156,7 +171,9 @@ __all__ = [
     "overflow_to_dispatch",
     "dispatch_admission",
     "sticky_proxy_username",
+    "next_strategy_attempt",
     "next_strategy_method",
+    "resolve_request_timeout_seconds",
 ]
 
 #: `{provider_id: (status, type, country)}` -- the shape `assign_proxy` expects.
@@ -245,6 +262,20 @@ class SpiderTarget:
     # 1:1, only the fetch count changes). Defaults empty so every
     # existing constructor call site keeps working unchanged.
     sibling_targets: list["SpiderTarget"] = field(default_factory=list)
+    # EPA C4 (F08): this domain's versioned escalation strategy, read once
+    # off-reactor by `load_targets` from `domain_playbooks` and carried
+    # here so the ESCALATION ladder (`next_strategy_attempt`, called from
+    # the spiders' `parse` on the reactor thread) can apply it without a
+    # DB round trip. `PlaybookStrategy` is a frozen value object, so
+    # reading it on the reactor is pure. `None` for a domain with no
+    # playbook row and for every hand-built target -- the ladder then
+    # runs with no strategy hints, exactly as before C4.
+    playbook_strategy: PlaybookStrategy | None = None
+    #: `domain_playbooks.strategy_version` this target's CURRENT rung was
+    #: selected under, for attribution of the attempt this target
+    #: produces. Mirrors `playbook_strategy.strategy_version` when a
+    #: playbook is present; `DEFAULT_STRATEGY_VERSION` otherwise.
+    strategy_version: int = DEFAULT_STRATEGY_VERSION
 
 
 @dataclass
@@ -268,26 +299,195 @@ class _RequeueState:
 def next_strategy_method(
     target: SpiderTarget,
     outcome: ScrapeErrorCode,
+    *,
+    budget: "AttemptBudget | None" = None,
 ):
     """Return the next configured method after ``outcome``, or ``None``.
 
-    Pure and safe on the reactor thread: every candidate was loaded in one
-    bounded query by :func:`load_targets`.
+    Pure and safe on the reactor thread when ``budget`` is ``None``: every
+    candidate was loaded in one bounded query by :func:`load_targets`.
+
+    ``budget`` (EPA C1/F08) is this target's
+    :class:`scrape_core.attempt_budget.AttemptBudget`. Passing it makes
+    the ladder charge and gate every physical attempt — see
+    :func:`next_strategy_attempt` for the variant that also reports the
+    terminal refusal code, which is what a caller needs in order to
+    finalize the target honestly. **Passing a budget makes this call do
+    Redis I/O**, so it must then be made off the reactor thread.
+    """
+    return next_strategy_attempt(target, outcome, budget=budget).selection
+
+
+def next_strategy_attempt(
+    target: SpiderTarget,
+    outcome: ScrapeErrorCode,
+    *,
+    budget: "AttemptBudget | None" = None,
+) -> LadderDecision:
+    """:func:`next_strategy_method` plus WHY, when the ladder refuses.
+
+    A ``refusal`` of ``ATTEMPT_BUDGET_EXHAUSTED`` or
+    ``TARGET_DEADLINE_EXCEEDED`` is terminal for the target and is the
+    code the caller must persist; ``selection=None`` with no refusal is
+    the pre-existing "the chain ended" outcome and keeps its old meaning.
     """
     if target.strategy_method_id is None:
-        return None
-    return resolve_method_candidate(
+        return LadderDecision(strategy_version=target.strategy_version)
+    return resolve_next_physical_attempt(
         target.strategy_methods,
         current_method_id=target.strategy_method_id,
         outcome=outcome,
         current_attempt_ordinal=target.strategy_attempt_ordinal,
+        budget=budget,
+        # EPA C4: the domain's versioned strategy, loaded off-reactor by
+        # `load_targets` and carried on the target. This is the ladder
+        # that actually escalates, so it is where
+        # `fallback_cap_per_refresh` does its work -- capping how many
+        # times ONE target may reach the expensive (browser) rung in one
+        # refresh -- and where every escalated attempt gets stamped with
+        # the strategy version that produced it.
+        playbook=target.playbook_strategy,
     )
+
+
+def _load_playbook_strategies(
+    session: Any, domains: set[str]
+) -> dict[str, PlaybookStrategy]:
+    """`{domain: PlaybookStrategy}` for `domains`, in ONE bounded query.
+
+    EPA C4. `domain_playbooks` is fleet-wide, operator-curated reference
+    data with no `workspace_id` (see `app_shared.models.domain_playbooks`),
+    so a plain `select` is the sanctioned path — the same one
+    `app_shared.strategy.resolution` already uses for this table.
+
+    A domain with no row is simply absent, and the ladder then runs with
+    no strategy hints — exactly the pre-C4 behaviour.
+    """
+    wanted = {domain for domain in domains if domain}
+    if not wanted:
+        return {}
+    strategies: dict[str, PlaybookStrategy] = {}
+    for row in (
+        session.execute(select(DomainPlaybook).where(DomainPlaybook.domain.in_(wanted)))
+        .scalars()
+        .all()
+    ):
+        strategy = PlaybookStrategy.from_row(row)
+        if strategy is not None:
+            strategies[row.domain] = strategy
+    return strategies
+
+
+def _target_attempt_budget(
+    redis: Any,
+    *,
+    scrape_job_id: uuid.UUID | None,
+    job_target: Any,
+    match_id: uuid.UUID,
+    domain: str,
+    playbook: PlaybookStrategy | None,
+) -> "AttemptBudget | None":
+    """This target's physical-attempt gate, or `None` when unwired.
+
+    EPA C4, closing C1's carry-forward (`reports/C1.md`: "does not
+    construct an `AttemptBudget` at the spider/dispatch call sites …
+    the gate is inert in production until a caller passes one").
+
+    `None` — no Redis, no job, or a hand-built load — means the ladder
+    behaves exactly as it did before C1: the gate is *absent*, never
+    accidentally permissive.
+
+    The deadline is anchored on the TARGET's own clock (`started_at`,
+    else `created_at`, else now), never on the job's: a per-target bound
+    anchored on a 12-hour job window would be unreachable, and a re-load
+    must re-derive the same instant rather than grant a fresh one.
+
+    The import is local so this module's import closure is unchanged for
+    every caller that never builds a budget (the TYPE_CHECKING block at
+    the top of this file carries the annotation).
+    """
+    if redis is None or scrape_job_id is None:
+        return None
+    from scrape_core.attempt_budget import AttemptBudget
+
+    settings = _settings()
+    anchor = (
+        getattr(job_target, "started_at", None)
+        or getattr(job_target, "created_at", None)
+        or datetime.now(UTC)
+    )
+    fraction = (
+        playbook.recovery_probe_fraction
+        if playbook is not None and playbook.recovery_probe_fraction is not None
+        else settings.SCRAPE_RECOVERY_PROBE_FRACTION
+    )
+    return AttemptBudget(
+        redis,
+        job_id=scrape_job_id,
+        match_id=match_id,
+        max_physical=settings.SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS,
+        deadline_at=anchor
+        + timedelta(seconds=settings.SCRAPE_TARGET_DEADLINE_SECONDS),
+        domain=domain,
+        recovery_probe_fraction=fraction,
+    )
+
+
+def resolve_request_timeout_seconds(target: SpiderTarget) -> float | None:
+    """The per-request wall-clock timeout for one target, in seconds.
+
+    EPA C4, closing C1's second carry-forward: the tuner
+    (`app_shared.maintenance.domain_timeouts`) has been WRITING
+    `domain_rules.request_timeout_seconds` since C1 and nothing read it,
+    so every fetch still paid the global 60 s ceiling — which is the whole
+    cost the column exists to remove ("46.9 s average proxied-HTTP
+    attempt" is a measurement of that ceiling, not of any domain).
+
+    Precedence, most specific first:
+
+    1. ``domain_rule.request_timeout_seconds`` — the learned per-domain
+       value, ``clamp(1.5 x p95(successful attempt duration, 7 d), 10, 60)``.
+       A domain that answers in ~1 s stops holding a worker slot, a fleet
+       lease and paid egress for a minute before failing.
+    2. ``access_policy.timeout_ms`` — the operator's explicit per-policy
+       timeout (the only source before this function existed, wired at
+       ISSUES_FULL_RUN_2026-07-17 Issue 4).
+    3. ``None`` — "say nothing", so Scrapy's own ``DOWNLOAD_TIMEOUT``
+       applies. That setting is ALREADY
+       ``SCRAPE_DOWNLOAD_TIMEOUT_SECONDS`` in both spider settings
+       modules, so returning the global here instead would be the same
+       number written twice — and would make this function read
+       ``Settings`` on the reactor thread for no gain.
+
+    The learned value wins over the policy deliberately: it is *measured
+    from this domain's own successful attempts* and is clamped never to
+    exceed the global ceiling, so it can only ever tighten. A ``NULL``
+    column means "use the next source down" — never "unlimited", never
+    "zero", matching that column's own docstring.
+
+    Pure: reads only fields already on the target, no ``Settings``, no
+    I/O. Safe on the reactor thread.
+    """
+    rule = getattr(target, "domain_rule", None)
+    learned = (
+        getattr(rule, "request_timeout_seconds", None) if rule is not None else None
+    )
+    if learned:
+        return float(learned)
+    policy = getattr(target, "access_policy", None)
+    policy_timeout_ms = (
+        getattr(policy, "timeout_ms", None) if policy is not None else None
+    )
+    if policy_timeout_ms:
+        return float(policy_timeout_ms) / 1000.0
+    return None
 
 
 def _mark_target_deferred_rate_limited(
     workspace_id: uuid.UUID,
     scrape_job_id: uuid.UUID,
     match_id: uuid.UUID,
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3): mark one
     overflowed target ``DEFERRED`` + ``RATE_LIMITED`` in a single
@@ -295,6 +495,14 @@ def _mark_target_deferred_rate_limited(
     only ever be called inside :func:`scrape_core.db.run_in_thread`,
     never on the reactor thread. Reuses the single ``mark_target``
     writer (T026) -- no new persistence path.
+
+    EPA B5 (F10): ``error_code`` defaults to ``RATE_LIMITED`` (every
+    pre-existing caller's behaviour, unchanged) and is passed
+    ``FLEET_LIMITED`` when the denial that overflowed this target came
+    from the FLEET-wide host admission gate rather than the tenant's own
+    ceiling. Same status, same path, same single writer -- a different
+    verdict recorded on the attempt, so C1's classification and D5's
+    scorecard read admission pressure separately from host blocking.
     """
     with workspace_txn(workspace_id) as session:
         mark_target(
@@ -303,7 +511,7 @@ def _mark_target_deferred_rate_limited(
             scrape_job_id=scrape_job_id,
             match_id=match_id,
             status=ScrapeTargetStatus.DEFERRED,
-            error_code=ScrapeErrorCode.RATE_LIMITED,
+            error_code=error_code,
         )
 
 
@@ -491,6 +699,16 @@ def load_targets(
     independent line of defense (one cheap scoped ``IN`` query kills the
     entire class of duplicate-fetch bugs regardless of *why* dispatch
     misfired).
+
+    EPA A5 (2026-09-07): once the in-workspace matches are resolved, this
+    also performs the **pickup transition** — every non-terminal
+    (``PENDING``/``DEFERRED``) ``scrape_job_targets`` row for those
+    matches becomes ``STARTED`` with ``started_at`` set, in one statement,
+    inside this same transaction. Before this, nothing in production ever
+    wrote ``STARTED``, so every reader of "work is in flight" (the stale
+    target reaper, the STARTED age gauge, the deploy-survival proof) was
+    inert. A second load is a no-op: the update matches only non-terminal
+    rows and ``COALESCE``s ``started_at``.
     """
     if not match_ids:
         return _LoadedTargets(targets=[])
@@ -547,6 +765,52 @@ def load_targets(
         )
         if not matches:
             return _LoadedTargets(targets=[])
+
+        # --- EPA A5 (2026-09-07): the pickup transition ------------------
+        #
+        # Until this line, NO production code path ever moved a target to
+        # `STARTED`. Targets went `PENDING` -> terminal, `started_at` was
+        # always NULL, and everything that reads "work is in flight" --
+        # the stale-target reaper (`app.workers.tasks_jobs.reap_stale_
+        # targets`, which only reaps `STARTED` rows aged past a ceiling),
+        # the `crawmatic_target_oldest_age_seconds{status="STARTED"}`
+        # gauge, and the deploy-survival proof -- was reading a
+        # permanently empty bucket and reporting health it had not measured.
+        #
+        # Placed HERE, after the match load, deliberately:
+        #   * it is inside the SAME `workspace_txn` transaction as the
+        #     terminal-status filter above, so a target cannot be observed
+        #     half-picked-up (criterion: "in the same transaction");
+        #   * it marks only match_ids that actually resolved in-workspace
+        #     -- a match_id that does not exist here is not work anyone is
+        #     about to do, and claiming it started would be a lie;
+        #   * `mark_targets_started` is the BATCH form (exactly one
+        #     `UPDATE`, whatever `len(match_ids)`), so this bounded load
+        #     stays bounded (Principle IV) -- the per-match `mark_target`
+        #     shape would have added one statement per target to the
+        #     hottest path in the engine.
+        #
+        # Idempotent by construction: the statement's `status IN
+        # ('PENDING','DEFERRED')` predicate matches nothing on a second
+        # load (the rows are `STARTED` by then) and its
+        # `COALESCE(started_at, now())` cannot move a timestamp that is
+        # already set -- so a duplicate spider run leaves every
+        # `started_at` exactly where the first run put it.
+        if scrape_job_id is not None:
+            started = mark_targets_started(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=scrape_job_id,
+                match_ids=[match.id for match in matches],
+            )
+            if started:
+                log_event(
+                    logger,
+                    "dispatch.targets_started",
+                    workspace_id=workspace_id,
+                    scrape_job_id=scrape_job_id,
+                    started=started,
+                )
 
         groups = group_matches(matches)
         competitor_ids = {competitor_id for competitor_id, _url_pattern in groups}
@@ -789,26 +1053,80 @@ def load_targets(
                 .all()
             }
 
+        # EPA C4: one bounded read of the versioned strategies for every
+        # domain in this load, never one per group or per match
+        # (Principle IV). `domain_playbooks` is fleet-wide reference data
+        # with no `workspace_id`, so a plain `select` is the sanctioned
+        # path -- the same one `app_shared.strategy.resolution` uses.
+        playbook_by_domain = _load_playbook_strategies(
+            session, set(competitor_domain_by_id.values())
+        )
+        #: `match_id -> terminal refusal` for every target the ladder
+        #: refused on budget/deadline grounds. Those matches are excluded
+        #: from the returned target list (a refused target must never
+        #: reach a spider) and finalized with that code below.
+        refusals_by_match: dict[uuid.UUID, ScrapeErrorCode] = {}
+        #: `match_id -> domain_playbooks.strategy_version` the selection
+        #: was made under, so the attempt this load produces can be
+        #: attributed to a strategy version.
+        strategy_version_by_match: dict[uuid.UUID, int] = {}
+
         strategy_method_by_match: dict[uuid.UUID, DomainStrategyMethod | None] = {}
         strategy_methods_by_match: dict[uuid.UUID, tuple[DomainStrategyMethod, ...]] = {}
         for (competitor_id, url_pattern), group in groups.items():
             strategy_profile = strategy_profile_by_group[(competitor_id, url_pattern)]
             method_list = strategy_methods_by_profile.get(strategy_profile.id, [])
             method_by_id = {method.id: method for method in method_list}
+            domain_by_group = competitor_domain_by_id.get(competitor_id, "")
+            playbook_by_group = playbook_by_domain.get(domain_by_group)
             for match in group:
                 job_target = job_target_by_match.get(match.id)
                 selected_method = method_by_id.get(
                     job_target.current_strategy_method_id if job_target is not None else None
                 )
                 if selected_method is None:
-                    selection = resolve_method_candidate(
+                    # EPA C4 (closing C1's carry-forward): the ladder is
+                    # gated by this target's physical-attempt budget and
+                    # steered by its domain's versioned strategy. Both are
+                    # optional -- a hand-built/legacy call with neither
+                    # resolves exactly as it did before C1.
+                    budget = _target_attempt_budget(
+                        redis,
+                        scrape_job_id=scrape_job_id,
+                        job_target=job_target,
+                        match_id=match.id,
+                        domain=domain_by_group,
+                        playbook=playbook_by_group,
+                    )
+                    decision = resolve_next_physical_attempt(
                         method_list,
                         preferred_method_id=strategy_profile.preferred_method_id,
                         current_attempt_ordinal=(
                             job_target.strategy_attempt_ordinal if job_target is not None else 0
                         ),
+                        budget=budget,
+                        playbook=playbook_by_group,
                     )
+                    if decision.refusal is not None:
+                        # Terminal for the TARGET: budget spent or
+                        # deadline past. Record it and drop the target
+                        # from this load -- a refused target must never
+                        # reach a spider, and the code is the evidence
+                        # the strategy optimizer reads.
+                        refusals_by_match[match.id] = decision.refusal
+                        logger.info(
+                            "targets: attempt_budget_refusal job=%s match=%s domain=%s "
+                            "code=%s strategy_version=%s",
+                            scrape_job_id,
+                            match.id,
+                            domain_by_group,
+                            decision.refusal.value,
+                            decision.strategy_version,
+                        )
+                    selection = decision.selection
                     selected_method = selection.method if selection is not None else None
+                    if selection is not None:
+                        strategy_version_by_match[match.id] = selection.strategy_version
                 strategy_method_by_match[match.id] = selected_method
                 strategy_methods_by_match[match.id] = tuple(method_list)
 
@@ -866,8 +1184,35 @@ def load_targets(
                 )
                 provider_passwords[row.id] = None
 
+        # EPA C4: finalize every target the ladder refused on budget or
+        # deadline grounds, in ONE bounded pass, before any target is
+        # built. `mark_target` is the single writer of these transitions
+        # and its `only_if_status` guard means an already-terminal target
+        # keeps the outcome it earned -- a refusal is a reason not to
+        # START work, never a reason to overwrite a finished result.
+        for refused_match_id, refusal_code in refusals_by_match.items():
+            if scrape_job_id is None:
+                continue
+            mark_target(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=scrape_job_id,
+                match_id=refused_match_id,
+                status=ScrapeTargetStatus.FAILED,
+                error_code=refusal_code,
+                only_if_status=PICKUP_ELIGIBLE_TARGET_STATUSES,
+            )
+
         targets: list[SpiderTarget] = []
         for match in matches:
+            if match.id in refusals_by_match:
+                # Refused above -- never hand it to a spider.
+                continue
+            # EPA C4: this match's domain strategy, from the one bounded
+            # playbook read above (never a per-match query).
+            match_playbook = playbook_by_domain.get(
+                competitor_domain_by_id.get(match.competitor_id, "")
+            )
             profile_id = resolved_profile_id_by_match.get(match.id)
             selected_strategy_method = strategy_method_by_match.get(match.id)
             if (
@@ -944,8 +1289,29 @@ def load_targets(
                     variant_selector_config=variant_selector_config,
                     match_variant_values=match_variant_values,
                     variant_config_error=variant_config_error,
+                    # EPA C4: carried so the reactor-side escalation
+                    # ladder can apply this domain's versioned strategy
+                    # without a DB round trip (see `SpiderTarget`).
+                    playbook_strategy=match_playbook,
+                    strategy_version=strategy_version_by_match.get(
+                        match.id,
+                        match_playbook.strategy_version
+                        if match_playbook is not None
+                        else DEFAULT_STRATEGY_VERSION,
+                    ),
                 )
             )
+        # EPA B5 (F10): warm the fleet host-limit cache for every domain
+        # this run will touch, in ONE query, inside the transaction that
+        # is already open and already off-reactor. That is what lets
+        # `acquire_fetch_permission` resolve a domain's fleet ceiling as
+        # a pure dict lookup per outbound request -- no DB round trip and
+        # no thread hop on the reactor thread (contracts/reactor-seam.md).
+        prime_fleet_limits_cache(
+            session,
+            {t.domain for t in targets},
+            settings=get_settings(),
+        )
         return _LoadedTargets(
             targets=targets,
             visible_providers=visible_providers,
@@ -1480,6 +1846,19 @@ async def acquire_fetch_permission(
             access_policy=target.access_policy,
             settings=settings,
         )
+        # EPA B5 (F10): the FLEET ceiling for this domain -- the
+        # `domain_rules` override if one exists, else the
+        # `FLEET_HOST_*_DEFAULT` settings. Deliberately called with NO
+        # `session_factory`: `load_targets` primed this cache for every
+        # domain of the run inside its own off-reactor transaction
+        # (`prime_fleet_limits_cache`), so this is a pure dict lookup on
+        # the reactor thread -- no blocking Redis/DB call in the scrape
+        # path (contracts/reactor-seam.md, FR-007/SC-005). A cache that
+        # is cold anyway (a hand-built spider, an expired generation)
+        # resolves to the settings defaults rather than blocking, which
+        # still enforces fleet admission, just without the per-domain
+        # override.
+        fleet_limits = resolve_fleet_limits(target.domain, settings=settings)
         sem_token = secrets.token_hex(16)
         perm = await acquire_permission(
             redis,
@@ -1489,6 +1868,7 @@ async def acquire_fetch_permission(
             limits=limits,
             settings=settings,
             sem_token=sem_token,
+            fleet_limits=fleet_limits,
         )
         if perm.granted:
             return perm
@@ -1497,7 +1877,22 @@ async def acquire_fetch_permission(
         # which gate denied -- `semaphore.denied` (concurrency slot
         # full) vs `rate_limit.hit` (token bucket denied, the
         # semaphore was never touched, Permission.denied_by).
-        if perm.denied_by == "semaphore":
+        # EPA B5 (F10) adds `fleet.denied`: both tenant gates granted and
+        # the FLEET-wide host lease refused. Logged as its own event for
+        # the same reason it gets its own `ScrapeErrorCode` -- admission
+        # pressure the whole fleet shares is not this tenant hitting its
+        # own ceiling.
+        if perm.denied_by == "fleet":
+            log_event(
+                logger,
+                "fleet.denied",
+                workspace_id=ctx.workspace_id,
+                domain=target.domain,
+                access_method=access_method,
+                fleet_concurrency=fleet_limits.concurrency,
+                fleet_rate_per_minute=fleet_limits.rate_per_minute,
+            )
+        elif perm.denied_by == "semaphore":
             log_event(
                 logger,
                 "semaphore.denied",
@@ -1525,7 +1920,22 @@ async def acquire_fetch_permission(
             state.requeue_count > settings.REQUEUE_MAX_ATTEMPTS
             or state.cumulative_wait > settings.REQUEUE_MAX_TOTAL_WAIT_SECONDS
         ):
-            await overflow_to_dispatch(ctx, target, perm, redis=redis)
+            # EPA B5 (F10): the target is deferred through the SAME
+            # `_mark_target_deferred_rate_limited` path either way -- only
+            # the recorded verdict differs, so admission pressure is
+            # never misread as this tenant's ceiling (or as the host
+            # blocking us).
+            await overflow_to_dispatch(
+                ctx,
+                target,
+                perm,
+                redis=redis,
+                error_code=(
+                    ScrapeErrorCode.FLEET_LIMITED
+                    if perm.denied_by == "fleet"
+                    else ScrapeErrorCode.RATE_LIMITED
+                ),
+            )
             return None
 
         log_event(
@@ -1573,7 +1983,11 @@ async def redispatch_job(ctx: AdmissionContext, target: SpiderTarget) -> None:
 
 
 async def defer_rate_limited_target(
-    ctx: AdmissionContext, target: SpiderTarget, *, event: str = "rate_limit.overflow"
+    ctx: AdmissionContext,
+    target: SpiderTarget,
+    *,
+    event: str = "rate_limit.overflow",
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """Hand a rate-limited target back to Celery: mark it ``DEFERRED`` +
     ``RATE_LIMITED`` and re-enqueue ``SCRAPE_DISPATCH_JOB`` so a fresh
@@ -1629,6 +2043,7 @@ async def defer_rate_limited_target(
         ctx.workspace_id,
         scrape_job_id,
         target.match_id,
+        error_code,
     )
     await await_in_thread(
         enqueue,
@@ -1704,7 +2119,12 @@ async def prepare_dispatch_with_backoff(
 
 
 async def overflow_to_dispatch(
-    ctx: AdmissionContext, target: SpiderTarget, perm: Permission, *, redis: object
+    ctx: AdmissionContext,
+    target: SpiderTarget,
+    perm: Permission,
+    *,
+    redis: object,
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """SPEC-11 US3 (T027, `contracts/overflow-dispatch.md` §3):
     requeue-cap exceeded for `target` -- release any held semaphore
@@ -1723,11 +2143,21 @@ async def overflow_to_dispatch(
     """
     if perm.semaphore_key and perm.semaphore_token:
         await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+    # EPA B5 (F10): same defensive no-op for the FLEET lease -- a denied
+    # `Permission` never carries one (a fleet refusal releases the tenant
+    # slot and returns before the lease fields are set, and a tenant
+    # denial never reaches fleet admission at all), but releasing what a
+    # granted permission would hold keeps this the one place that has to
+    # know about overflow cleanup.
+    if perm.fleet_key and perm.fleet_token:
+        await release_fleet_lease(redis, key=perm.fleet_key, token=perm.fleet_token)
 
     # SPEC-11 US4 (T031, contracts/observability.md): `rate_limit.overflow`
     # is emitted after both the DEFERRED mark and the re-dispatch enqueue
     # commit, mirroring the order the outcomes actually happen in.
-    await defer_rate_limited_target(ctx, target, event="rate_limit.overflow")
+    await defer_rate_limited_target(
+        ctx, target, event="rate_limit.overflow", error_code=error_code
+    )
 
 
 async def dispatch_admission(
@@ -1800,6 +2230,14 @@ async def dispatch_admission(
                 key=perm.semaphore_key,
                 token=perm.semaphore_token,
             )
+            # EPA B5 (F10): the FLEET lease is released on this path too
+            # -- no request is going to be built, so holding a fleet slot
+            # for FLEET_LEASE_TTL_SECONDS would throttle every OTHER
+            # workspace on this domain for a config error in one.
+            if perm.fleet_key and perm.fleet_token:
+                await release_fleet_lease(
+                    redis, key=perm.fleet_key, token=perm.fleet_token
+                )
             await release_lock(redis, key=lock_grant.key, token=lock_grant.token)
             selection = next_strategy_method(target, ScrapeErrorCode.SELECTOR_BROKEN)
             return build_scrape_result(
@@ -1838,6 +2276,11 @@ async def dispatch_admission(
     )
     if lock is None:
         await release_slot(redis, key=perm.semaphore_key, token=perm.semaphore_token)
+        # EPA B5 (F10): and the FLEET lease -- this attempt is skipped,
+        # nothing will be fetched, so the fleet slot must go back
+        # immediately rather than waiting out its TTL.
+        if perm.fleet_key and perm.fleet_token:
+            await release_fleet_lease(redis, key=perm.fleet_key, token=perm.fleet_token)
         # SPEC-11 US4 (T031, contracts/observability.md): the match
         # lock was already held -- this attempt is skipped, no fetch
         # (dedup.skip -- LOCKED_ALREADY_RUNNING).

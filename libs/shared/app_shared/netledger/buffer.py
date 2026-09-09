@@ -65,6 +65,7 @@ from typing import Any, Iterable, Sequence
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BUFFER_SCHEMA_VERSION",
     "KIND_CHILD_OPERATION",
     "KIND_CLOSE_RECOVERY",
     "BUFFER_PATH_ENV",
@@ -89,6 +90,21 @@ KIND_CLOSE_RECOVERY = "CLOSE_RECOVERY"
 BUFFER_PATH_ENV = "NETLEDGER_BUFFER_PATH"
 
 _DEFAULT_BUFFER_PATH = "/var/lib/crawmatic/netledger/buffer.sqlite3"
+
+#: Schema version of the on-disk buffer file (``_SCHEMA`` below).
+#:
+#: Bump this whenever ``_SCHEMA`` changes shape in a way a running flusher
+#: would notice — a new column, a renamed one, a changed uniqueness
+#: constraint. It exists so a release can be identified against the buffer
+#: files it will find on scraper hosts: ``scripts/write_release_manifest.py``
+#: records it under ``buffer_versions.netledger_buffer_schema_version``, so
+#: "this host's buffer was written by an older schema than the image that is
+#: now draining it" is a question the manifest can answer instead of one
+#: someone has to reconstruct from the deploy history.
+#:
+#: Version 1 is the original schema (``netledger_events`` with
+#: ``id/kind/payload/created_at/attempts/last_error``).
+BUFFER_SCHEMA_VERSION = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS netledger_events (

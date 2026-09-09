@@ -1,0 +1,43 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "apps/dr-backup/Dockerfile",
+    "watchPatterns": ["apps/dr-backup/**", "scripts/dr/dr_lib.sh"]
+  },
+  "deploy": {
+    "startCommand": "/app/backup.sh",
+    "cronSchedule": "0 */4 * * *",
+    "restartPolicyType": "NEVER",
+    "numReplicas": 1,
+    "healthcheckPath": null
+  },
+  "volumes": [
+    {
+      "name": "dr-backup-store",
+      "mountPath": "/backups"
+    }
+  ],
+  "x-crawmatic": {
+    "task": "C10 (F21) — backups from inside Railway, measured, encrypted, off-host",
+    "why_cron_never_restarts": "restartPolicyType NEVER: a cron run that failed must NOT be retried in a tight loop against production; the next scheduled run is the retry, and the failure is loud (DR-ALERT + non-zero exit).",
+    "volume_note": "A Railway volume attaches to exactly ONE service. If the encrypted sets must also be served to the ops host (scripts/dr/backup_prod.sh --mode pull), do NOT create a second service with a second volume: drop cronSchedule on THIS service, set startCommand to '/app/serve.py' and DR_SCHEDULE_LOOP=1, and the same process both serves /backups and runs the 4-hourly backup itself. Both shapes are written out in scripts/dr/RUNBOOK.md §Owner gate (C11 step 3).",
+    "variable_names_only": [
+      "DR_GPG_PASSPHRASE",
+      "DR_PULL_TOKEN",
+      "DR_REPORT_URL",
+      "DR_REPORT_TOKEN",
+      "ENGINE_PGHOST",
+      "ENGINE_PGPORT",
+      "ENGINE_PGUSER",
+      "ENGINE_PGPASSWORD",
+      "ENGINE_PGDATABASE",
+      "SAAS_PGHOST",
+      "SAAS_PGPORT",
+      "SAAS_PGUSER",
+      "SAAS_PGPASSWORD",
+      "SAAS_PGDATABASE"
+    ],
+    "pghost_must_be": "*.railway.internal — backup.sh refuses to dump over anything else, which is the entire point of the service (0.853 GB/day of public egress removed)."
+  }
+}

@@ -53,27 +53,39 @@ from app_shared.maintenance.health import (
     EVENT_PARTITION_MISSING,
     find_missing_partitions,
 )
+from app_shared.maintenance.domain_timeouts import tune_domain_timeouts
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
+from app_shared.maintenance.ledger_summaries import run_ledger_child_summarization
 from app_shared.maintenance.partitions import create_missing_partitions
 from app_shared.maintenance.retention import run_retention
+from app_shared.maintenance.scorecard import run_daily_scorecard
 from app_shared.maintenance.rollups import (
     recompute_window,
     run_daily_rollup,
     run_rollup_catchup,
 )
 from app_shared.maintenance.soft_refs import count_tolerated_dangling_refs
+from app_shared.messaging import enqueue
 from app_shared.netledger.reconcile import (
     ReconciliationPolicyError,
     reconcile_window,
     windows_pending_reconciliation,
 )
 from app_shared.netledger.rollups import run_cost_rollup
+from app_shared.observations.evidence_store import (
+    store_dir_from_settings,
+    sweep_evidence_retention,
+)
 from app_shared.task_names import (
     COSTAUTH_RESERVATION_SWEEP,
     MAINTENANCE_BREAKER_EVALUATE,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
+    MAINTENANCE_EVIDENCE_RETENTION,
+    MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
+    MAINTENANCE_DAILY_SCORECARD,
+    MAINTENANCE_DOMAIN_TIMEOUT_TUNE,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
@@ -175,6 +187,31 @@ def partition_create() -> None:
     )
 
 
+def _reenqueue_daily_rollup() -> None:
+    """Ask for one more `MAINTENANCE_DAILY_ROLLUP` cadence pass (EPA C7).
+
+    Fired when an invocation stopped on its time/batch budget with work
+    still owed. Best-effort and never raised: the enqueue is an
+    *optimisation over the scheduler's own cadence tick*, not the
+    correctness mechanism. If it fails, the durable
+    `rollup_completion`/`rollup_watermarks` cursors still hold the exact
+    resume point and the next scheduled tick picks the work up — losing
+    only latency, never data. Raising here would instead mark a run that
+    successfully committed many batches as FAILED and retry the whole
+    thing, which is strictly worse. Same best-effort posture as the
+    scheduler's own `_enqueue_*` helpers.
+    """
+    try:
+        enqueue(MAINTENANCE_DAILY_ROLLUP, queue="maintenance")
+    except Exception:  # pragma: no cover - defensive, mirrors the scheduler
+        logger.exception(
+            "maintenance_daily_rollup: failed to re-enqueue %s; the durable "
+            "checkpoint still holds the resume point and the next cadence "
+            "tick will continue",
+            MAINTENANCE_DAILY_ROLLUP,
+        )
+
+
 @maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=MAINTENANCE_DAILY_ROLLUP)
 def daily_rollup(
@@ -210,6 +247,20 @@ def daily_rollup(
     and `variants_skipped_no_state` (a variant with observations that day
     but no SPEC-09 `variant_price_states` row yet), plus the cursor
     fields on the cadence path.
+
+    **Bounded invocation + re-enqueue (EPA C7, F12).** Since the rollup
+    became set-based and batched, one invocation is bounded by
+    `ROLLUP_INVOCATION_BUDGET_SECONDS` (checked between keyset batches,
+    and deliberately below the 1,800 s Celery `time_limit` so the task
+    stops itself rather than being SIGKILLed mid-transaction). If it
+    stops with work still owed — a day part-way through, or owed days
+    `ROLLUP_BACKFILL_MAX_DAYS` did not reach — it re-enqueues itself on
+    the `maintenance` queue and the durable `rollup_completion`
+    checkpoint makes the next invocation resume exactly where this one
+    stopped. The recompute and explicit-day shapes re-enqueue nothing:
+    both are operator-initiated calls with arguments this task cannot
+    invent, so an incomplete run is REPORTED (`complete=False`) for the
+    operator to re-issue.
     """
     parsed_date = date.fromisoformat(target_date) if target_date is not None else None
     parsed_through = (
@@ -221,6 +272,9 @@ def daily_rollup(
         )
 
     settings = get_settings()
+    deadline = datetime.now(timezone.utc) + timedelta(
+        seconds=settings.ROLLUP_INVOCATION_BUDGET_SECONDS
+    )
 
     with _system_session("daily_rollup") as session:
         if parsed_through is not None:
@@ -239,12 +293,15 @@ def daily_rollup(
                 session,
                 max_days=settings.ROLLUP_BACKFILL_MAX_DAYS,
                 seed_lag_days=settings.ROLLUP_WATERMARK_SEED_LAG_DAYS,
+                batch_limit=settings.ROLLUP_BATCH_SIZE,
+                deadline=deadline,
             )
             logger.info(
                 "maintenance_daily_rollup mode=catchup days_processed=%s "
                 "rollups_upserted=%s variants_skipped_no_state=%s "
                 "watermark_available=%s watermark_before=%s watermark_after=%s "
-                "days_remaining=%s seeded=%s",
+                "days_remaining=%s seeded=%s batches=%s complete=%s "
+                "incomplete_day=%s",
                 catchup.days_processed,
                 catchup.rollups_upserted,
                 catchup.variants_skipped_no_state,
@@ -253,17 +310,29 @@ def daily_rollup(
                 catchup.watermark_after,
                 catchup.days_remaining,
                 catchup.seeded,
+                catchup.batches,
+                catchup.complete,
+                catchup.incomplete_day,
             )
+            if not catchup.complete:
+                _reenqueue_daily_rollup()
             return
 
-        report = run_daily_rollup(session, target_date=parsed_date)
+        report = run_daily_rollup(
+            session,
+            target_date=parsed_date,
+            batch_limit=settings.ROLLUP_BATCH_SIZE,
+            deadline=deadline,
+        )
         session.commit()
 
     logger.info(
         "maintenance_daily_rollup mode=single_day rollups_upserted=%s "
-        "variants_skipped_no_state=%s",
+        "variants_skipped_no_state=%s batches=%s complete=%s",
         report.rollups_upserted,
         report.variants_skipped_no_state,
+        report.batches,
+        report.complete,
     )
 
 
@@ -315,6 +384,169 @@ def retention_drop() -> None:
         report.partitions_skipped_pending_rollups,
         report.rollup_rows_deleted,
         dangling_soft_refs_tolerated,
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_EVIDENCE_RETENTION)
+def evidence_retention() -> None:
+    """`MAINTENANCE_EVIDENCE_RETENTION` (`maintenance` queue, EPA C5, F19).
+
+    The FILESYSTEM half of retention: ages out raw-evidence blobs from
+    the content-addressed store behind
+    `price_observations.offer_raw_evidence_hash`, closing the gap
+    `docs/RETENTION_POLICY.md` §2.1 records as *"No deletion mechanism
+    exists today ... evidence currently accumulates indefinitely"*.
+
+    **Two gates, both required.** A blob is removed only when it is
+    older than `EVIDENCE_RETENTION_DAYS` (30) AND no observation younger
+    than `RETENTION_PRICE_OBSERVATIONS_DAYS` (90) still references its
+    hash. Age alone would routinely leave a 60-day stretch of rows whose
+    content addresses resolve to nothing -- a table that looks auditable
+    and is not, which is worse than one that never claimed to be.
+
+    A deployment with no `EVIDENCE_STORE_DIR` has no store to sweep and
+    the task is a logged no-op rather than an error: not being configured
+    for durable evidence is a valid deployment posture (see that
+    setting's own comment), just not the production one.
+
+    Reads only -- the sweep's single query asks which hashes are still
+    referenced -- so there is nothing to commit. It runs on the BYPASSRLS
+    system session because one blob is referenced by whichever workspaces
+    happened to scrape that page, and a per-workspace answer could not
+    decide a fleet-wide filesystem deletion.
+    """
+    settings = get_settings()
+    store_dir = store_dir_from_settings(settings)
+    if store_dir is None:
+        logger.info(
+            "maintenance_evidence_retention skipped=no_evidence_store_dir "
+            "(EVIDENCE_STORE_DIR is unset on this service)"
+        )
+        return
+
+    with _system_session("evidence_retention") as session:
+        report = sweep_evidence_retention(
+            session,
+            store_dir=store_dir,
+            now=datetime.now(timezone.utc),
+            retention_days=settings.EVIDENCE_RETENTION_DAYS,
+            observation_retention_days=settings.RETENTION_PRICE_OBSERVATIONS_DAYS,
+            max_blobs=settings.EVIDENCE_RETENTION_MAX_BLOBS_PER_RUN,
+        )
+
+    logger.info(
+        "maintenance_evidence_retention blobs_scanned=%s blobs_expired=%s "
+        "blobs_deleted=%s blobs_kept_referenced=%s bytes_reclaimed=%s "
+        "truncated=%s delete_errors=%s",
+        report.blobs_scanned,
+        report.blobs_expired,
+        report.blobs_deleted,
+        report.blobs_kept_referenced,
+        report.bytes_reclaimed,
+        report.truncated,
+        report.delete_errors,
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN)
+def ledger_summarize_children() -> None:
+    """`MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN` (`maintenance` queue,
+    EPA C9, F14).
+
+    The LEDGER half of retention, and the only retention job that
+    COMPRESSES instead of deleting: for each browser navigation older
+    than `RETENTION_NETWORK_OPERATION_CHILDREN_DAYS` (30) whose provider
+    settlement has ARRIVED, it writes one
+    `network_operation_resource_summaries` row carrying the children's
+    child count, per-host-class bytes and summed duration, then deletes
+    the children -- in the same transaction, so the fact can never be
+    lost without the summary being lost with it.
+
+    **An UNSETTLED parent keeps every child, however old.** Provider
+    reconciliation apportions a period charge across operations by their
+    transport-observed bytes, and a navigation's bytes are its children's
+    bytes; summarising before the invoice arrives would make the eventual
+    settlement quietly wrong rather than loudly impossible. Those parents
+    are counted in `parents_deferred_unsettled` so "nothing summarised"
+    is legible instead of mysterious.
+
+    **Inert until ratified.** `run_ledger_child_summarization` checks
+    `RETENTION_ENABLED_CLASSES` before it looks at any data, so on a
+    deployment where the owner has not named `network_operation_children`
+    this task logs `class_not_enabled=True` and writes nothing at all.
+    That is the expected state until `docs/RETENTION_POLICY.md` §2.6.a's
+    "Ratified by owner on ____" line is signed.
+
+    FLEET-scoped on the BYPASSRLS system session: `network_operations` is
+    fleet-owned and has no `workspace_id` to scope by at all.
+    """
+    with _system_session("ledger_summarize_children") as session:
+        report = run_ledger_child_summarization(
+            session, now_utc=datetime.now(timezone.utc)
+        )
+        session.commit()
+
+    logger.info(
+        "maintenance_ledger_summarize_children class_not_enabled=%s store_absent=%s "
+        "parents_summarized=%s children_deleted=%s parents_deferred_unsettled=%s",
+        report.class_not_enabled,
+        report.store_absent,
+        len(report.parents_summarized),
+        report.children_deleted,
+        report.parents_deferred_unsettled,
+    )
+
+
+def _scorecard_redis_client():
+    """Best-effort Redis client for the scorecard's backup-egress input.
+
+    Mirrors `apps/api/app/routers/ops_metrics.py`'s `_get_redis`: Redis
+    unavailability must degrade `backup_egress_gb` to `NULL`, never fail
+    the whole scorecard write.
+    """
+    try:
+        from app_shared.redis_client import get_redis_client
+
+        return get_redis_client()
+    except Exception:  # noqa: BLE001 - see docstring
+        return None
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_DAILY_SCORECARD)
+def daily_scorecard() -> None:
+    """`MAINTENANCE_DAILY_SCORECARD` (`maintenance` queue, EPA D5, deep
+    dive §12 item 9).
+
+    Writes yesterday UTC's `fleet_daily_scorecard` row -- see
+    `app_shared.maintenance.scorecard` for the full field-by-field
+    provenance and the NULL-never-0 discipline every metric here
+    follows. Idempotent (an UPSERT on `date`), so a re-run for a day
+    already written simply overwrites it with a freshly-computed answer.
+
+    FLEET-scoped on the BYPASSRLS system session: every metric is a
+    cross-tenant aggregate with no `workspace_id` to scope by at all --
+    the same reasoning `ledger_summarize_children`/`run_daily_rollup`'s
+    driver scan use.
+    """
+    with _system_session("daily_scorecard") as session:
+        report = run_daily_scorecard(
+            session,
+            now=datetime.now(timezone.utc),
+            redis_client=_scorecard_redis_client(),
+        )
+        session.commit()
+
+    logger.info(
+        "maintenance_daily_scorecard date=%s missing_metric_fraction=%s "
+        "valid_fresh_matches=%s browser_share=%s proxied_share=%s",
+        report.date.isoformat(),
+        report.row.missing_metric_fraction,
+        report.row.valid_fresh_matches,
+        report.row.browser_share,
+        report.row.proxied_share,
     )
 
 
@@ -726,4 +958,50 @@ def fleet_budget_rollforward() -> None:
         "maintenance_fleet_budget_rollforward written=%d carried=%d uncapped=0",
         report.written,
         len(report.carried),
+    )
+
+
+@maintenance_task(scope=MaintenanceScope.FLEET)
+@app.task(name=MAINTENANCE_DOMAIN_TIMEOUT_TUNE)
+def domain_timeout_tune() -> None:
+    """`MAINTENANCE_DOMAIN_TIMEOUT_TUNE` (`maintenance` queue, EPA C1/F08).
+
+    Gives every measurable domain its own request timeout, learned from
+    that domain's OWN successful attempts:
+    ``clamp(1.5 x p95(successful attempt duration, 7 d), 10 s, 60 s)``,
+    written to `domain_rules.request_timeout_seconds`.
+
+    **Why this task exists.** The deep dive measured a 46.9 s average on
+    proxied-HTTP attempts. That is not a latency measurement — it is a
+    measurement of `SCRAPE_DOWNLOAD_TIMEOUT_SECONDS` (60 s), the one
+    global ceiling applied to every domain alike. Every fetch that was
+    going to fail therefore costs the full minute of a worker slot, a
+    fleet lease and real proxy egress before anyone learns anything,
+    while a domain that answers in ~1 s at p95 gains nothing from being
+    allowed sixty.
+
+    **What it will not do.** It never raises a domain above the 60 s
+    global default (the clamp's ceiling IS that default), so it can only
+    ever make the fleet faster. It never invents a value for a domain
+    with too few successes to measure — that row stays `NULL`, which
+    already means "use the setting". It writes only
+    `request_timeout_seconds`: an operator's `fleet_concurrency`,
+    `fleet_rate_per_minute` and `notes` are theirs.
+
+    FLEET-scoped on the BYPASSRLS system session: `domain_rules` is
+    global (no `workspace_id`, no RLS, filed SYSTEM in
+    `scripts/rls_table_manifest.txt`) and the p95 is a fleet aggregate —
+    one workspace's view of a domain's latency is not the fleet's.
+
+    Idempotent: a second run in the same window recomputes the same
+    numbers, finds every row already at its value and writes nothing.
+    """
+    with _system_session("domain_timeout_tune") as session:
+        written = tune_domain_timeouts(session)
+        session.commit()
+
+    logger.info(
+        "maintenance_domain_timeout_tune changed=%d domains=%s",
+        len(written),
+        ",".join(f"{plan.domain}:{plan.timeout_seconds}s" for plan in written) or "-",
     )

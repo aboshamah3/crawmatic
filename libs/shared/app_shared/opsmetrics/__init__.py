@@ -35,6 +35,7 @@ from app_shared.opsmetrics.emit import (
     SNAPSHOT_EVENT,
     emit_alerts,
     emit_snapshot,
+    render_costauth_denials_prometheus,
     render_prometheus,
 )
 from app_shared.opsmetrics.rules import (
@@ -67,6 +68,7 @@ __all__ = [
     "emit_alerts",
     "emit_snapshot",
     "evaluate",
+    "render_costauth_denials_prometheus",
     "render_prometheus",
     "usd",
     "worst_severity",

@@ -37,6 +37,33 @@ RUN uv sync --locked --package scrapers-browser --no-dev
 # Playwright's Chromium + required OS-level libraries, baked at build.
 RUN playwright install --with-deps chromium
 
+# READY F01 build gate: prove IN THIS IMAGE that Chromium cannot egress
+# past `scrape_core.browser.egress_guard` — redirect-to-loopback, a
+# privately-resolving sub-resource, service workers, popups, and a proxied
+# context whose leg must really be forwarded upstream. The guard's
+# whole value depends on Chromium honouring the `--proxy-server` /
+# `--proxy-bypass-list=<-loopback>` launch arguments this image's settings
+# module sets, which only a real browser can demonstrate; so if the guard
+# is bypassable, THE IMAGE DOES NOT BUILD.
+#
+# Needs no database, Redis or Scrapyd (a build stage has none) — the test
+# supplies its own fixture HTTP server and its own settings environment.
+# `-p no:cacheprovider` keeps the build layer free of a .pytest_cache.
+#
+# The sync above is `--no-dev`, so pytest is absent: pull the dev group in
+# for the gate and strip it again in the SAME layer, so the shipped image
+# still carries no test dependencies.
+RUN uv sync --locked --package scrapers-browser \
+    && .venv/bin/pytest tests/integration/test_browser_egress_guard_image.py \
+        -m browser -q -p no:cacheprovider \
+    && uv sync --locked --package scrapers-browser --no-dev
+
+# Software inventory baked into the image (F04): pip freeze, dpkg -l, and
+# the ACTUAL installed Playwright/Chromium versions — run after the
+# egress-guard gate above so it reflects the final --no-dev environment,
+# not the temporary pytest-carrying one.
+RUN python scripts/security/image_inventory.py --out /app/packages.json
+
 WORKDIR /app/apps/scrapers-browser
 RUN mkdir -p eggs logs dbs items \
     && chmod +x docker-entrypoint.sh
@@ -47,7 +74,7 @@ RUN mkdir -p eggs logs dbs items \
 # (SCRAPER_FIXES_REPORT_2026-07-27 operational gotcha) — until then the
 # node answered every schedule.json with "project not found".
 RUN mkdir -p eggs/price_monitor_browser \
-    && uvx --from scrapyd-client scrapyd-deploy --build-egg eggs/price_monitor_browser/1_0.egg
+    && uvx --from scrapyd-client==2.0.3 scrapyd-deploy --build-egg eggs/price_monitor_browser/1_0.egg
 
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \

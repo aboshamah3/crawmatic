@@ -110,13 +110,15 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from types import FrameType
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app_shared.config import Settings, get_settings
 from app_shared.config_validation import assert_production_safe
 from app_shared.costauth.service import CostAuthorizationService
 from app_shared.database import get_system_sessionmaker
+from app_shared.heartbeat import HeartbeatEmitter, PeriodicHeartbeat, default_instance_id
 from app_shared.enums import (
     ScrapeJobSource,
     ScrapeJobType,
@@ -139,12 +141,17 @@ from app_shared.models.maintenance_cadence import (
     CADENCE_BREAKER_EVALUATE,
     CADENCE_COST_ROLLUP,
     CADENCE_DAILY_ROLLUP,
+    CADENCE_DISPATCH_RECONCILE,
     CADENCE_ENTITLEMENT_REFRESH,
     CADENCE_FLEET_BUDGET_ROLLFORWARD,
     CADENCE_PARTITION_CREATE,
     CADENCE_RECONCILE_PROVIDER_USAGE,
+    CADENCE_EVIDENCE_RETENTION,
+    CADENCE_LEDGER_SUMMARIZE_CHILDREN,
+    CADENCE_DAILY_SCORECARD,
     CADENCE_RETENTION_DROP,
 )
+from app_shared.models.refresh_rule_occurrences import refresh_rule_occurrences
 from app_shared.models.refresh_rules import RefreshRule
 from app_shared.opsmetrics import collect_snapshot, emit_snapshot
 from app_shared.outbox.writer import write_outbox_message
@@ -160,18 +167,23 @@ from app_shared.scheduling.fair_queue import (
     PassOutcome,
     RetryLedger,
     ScheduleCandidate,
+    default_denial_reason,
     run_pass,
 )
 from app_shared.task_names import (
     MAINTENANCE_BREAKER_EVALUATE,
     COSTAUTH_RESERVATION_SWEEP,
     CREATE_WEBHOOK_EVENT,
+    DISPATCH_RECONCILE_INTENTS,
     MAINTENANCE_COST_ROLLUP,
     MAINTENANCE_DAILY_ROLLUP,
     MAINTENANCE_ENTITLEMENT_REFRESH,
     MAINTENANCE_FLEET_BUDGET_ROLLFORWARD,
     MAINTENANCE_PARTITION_CREATE,
     MAINTENANCE_RECONCILE_PROVIDER_USAGE,
+    MAINTENANCE_EVIDENCE_RETENTION,
+    MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN,
+    MAINTENANCE_DAILY_SCORECARD,
     MAINTENANCE_RETENTION_DROP,
     OUTBOX_DRAIN,
     OUTBOX_RECONCILE,
@@ -183,7 +195,11 @@ from app_shared.task_names import (
     STRATEGY_STATS_FLUSH,
 )
 
-from app.scheduler.refresh import run_refresh_pass
+from app.scheduler.refresh import (
+    clear_rule_failures,
+    record_rule_failure,
+    run_refresh_pass,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scheduler")
@@ -303,6 +319,26 @@ def _enqueue_redispatch_pending() -> None:
         logger.exception("scheduler: failed to enqueue %s", SCRAPE_REDISPATCH_JOBS)
 
 
+def _enqueue_dispatch_reconcile() -> None:
+    """Fire-and-forget `DISPATCH_RECONCILE_INTENTS` on the `maintenance`
+    queue (EPA B3, 2026-09-07, closing B2's owed wiring) — step 5 of the
+    commit-before-send dispatch protocol: settle every `POSTED`
+    `dispatch_intents` row against the node it names.
+
+    On the DURABLE cadence, not one of the in-process accumulators above,
+    and that distinction is the whole point: the rows this settles exist
+    precisely because a worker died between its POST and the node's
+    answer. A countdown that resets on process start would reset on the
+    very class of event it is there to recover from. Errors are logged
+    and swallowed like every other maintenance enqueue — the deadline is
+    still in Postgres, unclaimed, for the next tick.
+    """
+    try:
+        enqueue(DISPATCH_RECONCILE_INTENTS, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", DISPATCH_RECONCILE_INTENTS)
+
+
 def _enqueue_partition_create() -> None:
     """Fire-and-forget `MAINTENANCE_PARTITION_CREATE` on the `maintenance`
     queue (SPEC-15 US1, contracts/partition-creation.md) -- ensures
@@ -386,6 +422,61 @@ def _enqueue_retention_drop() -> None:
         enqueue(MAINTENANCE_RETENTION_DROP, queue="maintenance")
     except Exception:
         logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_RETENTION_DROP)
+
+
+def _enqueue_evidence_retention() -> None:
+    """Fire-and-forget `MAINTENANCE_EVIDENCE_RETENTION` on the
+    `maintenance` queue (EPA C5, F19) -- the age-AND-reference gated
+    sweep of the raw-evidence blob store, closing the deletion gap
+    `docs/RETENTION_POLICY.md` §2.1 records.
+
+    Errors logged and swallowed, same as every sibling here: a missed
+    tick means blobs are swept on the next interval, and evidence
+    retained one day too long is the safe direction of that failure.
+    """
+    try:
+        enqueue(MAINTENANCE_EVIDENCE_RETENTION, queue="maintenance")
+    except Exception:
+        logger.exception(
+            "scheduler: failed to enqueue %s", MAINTENANCE_EVIDENCE_RETENTION
+        )
+
+
+def _enqueue_ledger_summarize_children() -> None:
+    """Fire-and-forget `MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN` on the
+    `maintenance` queue (EPA C9, F14) -- compress a settled browser
+    navigation's subresource children into one
+    `network_operation_resource_summaries` row and delete them.
+
+    Errors logged and swallowed, same as every sibling here. The failure
+    direction is safe by construction: a missed tick means the children
+    survive one more day, and the task itself does nothing at all until
+    the owner names `network_operation_children` in
+    `RETENTION_ENABLED_CLASSES`.
+    """
+    try:
+        enqueue(MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN, queue="maintenance")
+    except Exception:
+        logger.exception(
+            "scheduler: failed to enqueue %s", MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN
+        )
+
+
+def _enqueue_daily_scorecard() -> None:
+    """Fire-and-forget `MAINTENANCE_DAILY_SCORECARD` on the `maintenance`
+    queue (EPA D5, deep dive §12 item 9) -- write yesterday UTC's
+    fleet-wide cost/freshness scorecard row.
+
+    Errors logged and swallowed, same as every sibling here: a missed
+    tick means the row for that day is written on the NEXT tick instead
+    (the write is an idempotent UPSERT on `date`, so a late run is not a
+    lost day), and there is no downstream deletion or spend riding on
+    this task the way there is on retention/rollup.
+    """
+    try:
+        enqueue(MAINTENANCE_DAILY_SCORECARD, queue="maintenance")
+    except Exception:
+        logger.exception("scheduler: failed to enqueue %s", MAINTENANCE_DAILY_SCORECARD)
 
 
 def _enqueue_outbox_drain() -> None:
@@ -617,6 +708,50 @@ _DURABLE_CADENCES = (
         "ENTITLEMENT_REFRESH_INTERVAL_SECONDS",
         _enqueue_fleet_budget_rollforward,
     ),
+    # EPA B3 2026-09-07, closing B2's owed wiring. Its OWN knob
+    # (`DISPATCH_RECONCILE_INTERVAL_SECONDS`, 5m): this interval IS the
+    # bound on how long a `POSTED` dispatch intent can sit unsettled
+    # after the worker that sent it died — a real decision, not a
+    # borrowed daily one. Durable rather than in-process for the reason
+    # given on `_enqueue_dispatch_reconcile`.
+    (
+        CADENCE_DISPATCH_RECONCILE,
+        "DISPATCH_RECONCILE_INTERVAL_SECONDS",
+        _enqueue_dispatch_reconcile,
+    ),
+    # EPA C5 2026-09-08 (F19). Its OWN knob
+    # (`EVIDENCE_RETENTION_INTERVAL_SECONDS`, daily) rather than sharing
+    # `RETENTION_INTERVAL_SECONDS` with the partition drop: the two jobs
+    # delete different kinds of thing with different reversibility, and
+    # an operator who needs to pause irreversible blob deletion must not
+    # have to stop ordinary partition retention to do it.
+    (
+        CADENCE_EVIDENCE_RETENTION,
+        "EVIDENCE_RETENTION_INTERVAL_SECONDS",
+        _enqueue_evidence_retention,
+    ),
+    # EPA C9 2026-09-08 (F14). Its OWN knob
+    # (`LEDGER_SUMMARIZE_INTERVAL_SECONDS`, daily) rather than sharing
+    # `RETENTION_INTERVAL_SECONDS`: this job's work is gated on a
+    # provider settlement having arrived, so an operator tuning how often
+    # to chase newly-settled operations is making a different decision
+    # from how often to drop an expired partition.
+    (
+        CADENCE_LEDGER_SUMMARIZE_CHILDREN,
+        "LEDGER_SUMMARIZE_INTERVAL_SECONDS",
+        _enqueue_ledger_summarize_children,
+    ),
+    # EPA D5 2026-09-08 (deep dive §12 item 9). Its OWN knob
+    # (`SCORECARD_INTERVAL_SECONDS`, daily) rather than sharing another
+    # daily job's: the scorecard row is a closed CALENDAR DAY summary,
+    # not a sweep with a backlog, so an operator tuning how often to
+    # recompute it is making an independent decision from every other
+    # daily cadence here.
+    (
+        CADENCE_DAILY_SCORECARD,
+        "SCORECARD_INTERVAL_SECONDS",
+        _enqueue_daily_scorecard,
+    ),
 )
 
 
@@ -706,6 +841,45 @@ def _run_health_tick(settings: Settings) -> None:
             session.rollback()
     except Exception:
         logger.exception("scheduler: maintenance health tick failed")
+
+
+def _start_scheduler_heartbeat() -> PeriodicHeartbeat | None:
+    """`heartbeat:scheduler:<instance>` every 30s (EPA B9, F22).
+
+    F22 is "heartbeats for every process class", and the scheduler is the
+    one process class whose silence is invisible from the outside: it
+    serves no port, so nothing polls it, and every cadence it drives is
+    slow enough that a dead scheduler looks like a quiet fleet for hours.
+    This is also what makes `READY_REQUIRED_HEARTBEAT_SERVICES=scheduler,worker`
+    (`docs/ops/RELEASE_1_2026-09.md`, checked in RELEASE_2's post-deploy
+    step) a real check rather than a permanent 503: `/ready`'s
+    `check_required_heartbeats` fails a declared service that nothing
+    emits for.
+
+    Started once from `main()`, on a daemon thread, so it keeps beating
+    across the long `time.sleep`s and DB passes of the tick loop; a tick
+    that blocks on a slow query therefore does NOT look like a dead
+    process. The flip side is deliberate: this beat asserts the process
+    is alive, not that its passes are healthy — maintenance *outcomes*
+    are what `_run_health_tick`/`_run_ops_snapshot_tick` assert.
+
+    `get_redis_client` is imported lazily for the same reason
+    `_ops_snapshot_redis` does it, and the whole thing is best-effort:
+    Redis being unreachable at boot must not stop the scheduler from
+    running cadences. Returns the handle so `main()` can stop it on a
+    graceful shutdown, or `None` when it could not start.
+    """
+    try:
+        from app_shared.redis_client import get_redis_client
+
+        return PeriodicHeartbeat(
+            HeartbeatEmitter(
+                get_redis_client(), service="scheduler", instance_id=default_instance_id()
+            )
+        ).start()
+    except Exception:  # noqa: BLE001 - best-effort, see docstring
+        logger.warning("scheduler heartbeat did not start", exc_info=True)
+        return None
 
 
 def _ops_snapshot_redis() -> object | None:
@@ -858,33 +1032,76 @@ def load_due_candidates(
     ``limit`` is deliberately larger than the pass's batch limit at the
     call site: the planner needs to SEE the noisy tenant's backlog in
     order to fairly not schedule most of it.
+
+    **Work-level fairness at the window itself (EPA B3/F07).** Seeing the
+    backlog only helps if the backlog does not fill the window. A single
+    plain ``ORDER BY next_run_at LIMIT n`` hands back the noisiest
+    tenant's oldest ``n`` rules when that tenant is far enough behind —
+    and a workspace that is *absent from the candidate list* cannot be
+    arbitrated for by any downstream fair-share pass, however fair that
+    pass is. So the window is read in two pages: first one
+    ``DISTINCT ON (workspace_id)`` row per workspace (each workspace's
+    single most-overdue rule), then the remainder in plain due order,
+    with the already-taken ids excluded. Every workspace with due work is
+    therefore represented in the window before any workspace gets a
+    second slot, and :func:`~app_shared.scheduling.fair_queue.plan_pass`
+    does the actual admitting from a list that can no longer hide anyone.
     """
-    match_competitor = Competitor.__table__.alias("match_competitor")
-    rows = session.execute(
-        select(  # noqa: workspace-scope
-            RefreshRule,
-            func.coalesce(Competitor.domain, match_competitor.c.domain),
+    if limit <= 0:
+        return []
+
+    def _rows(*, exclude: Sequence[uuid.UUID], distinct_per_workspace: bool, cap: int):
+        """One page of the due window, with each rule's domain resolved."""
+        match_competitor = Competitor.__table__.alias("match_competitor")
+        stmt = (
+            select(  # noqa: workspace-scope
+                RefreshRule,
+                func.coalesce(Competitor.domain, match_competitor.c.domain),
+            )
+            .select_from(RefreshRule)
+            .outerjoin(
+                Competitor,
+                (Competitor.workspace_id == RefreshRule.workspace_id)
+                & (Competitor.id == RefreshRule.competitor_id),
+            )
+            .outerjoin(
+                CompetitorProductMatch,
+                (CompetitorProductMatch.workspace_id == RefreshRule.workspace_id)
+                & (CompetitorProductMatch.id == RefreshRule.match_id),
+            )
+            .outerjoin(
+                match_competitor,
+                (match_competitor.c.workspace_id == CompetitorProductMatch.workspace_id)
+                & (match_competitor.c.id == CompetitorProductMatch.competitor_id),
+            )
+            .where(RefreshRule.enabled, RefreshRule.next_run_at <= now)
         )
-        .select_from(RefreshRule)
-        .outerjoin(
-            Competitor,
-            (Competitor.workspace_id == RefreshRule.workspace_id)
-            & (Competitor.id == RefreshRule.competitor_id),
+        if exclude:
+            stmt = stmt.where(RefreshRule.id.notin_(list(exclude)))
+        if distinct_per_workspace:
+            # Postgres requires the DISTINCT ON expression to lead the
+            # ORDER BY; "most overdue first" therefore orders WITHIN a
+            # workspace, and the resulting page is ordered by workspace.
+            # The pass re-orders by freshness urgency anyway
+            # (`fair_queue._ordering_key`), so the page's own order is
+            # only ever a tie-break.
+            stmt = stmt.distinct(RefreshRule.workspace_id).order_by(
+                RefreshRule.workspace_id, RefreshRule.next_run_at, RefreshRule.id
+            )
+        else:
+            stmt = stmt.order_by(RefreshRule.next_run_at, RefreshRule.id)
+        return session.execute(stmt.limit(cap)).all()
+
+    rows = list(_rows(exclude=(), distinct_per_workspace=True, cap=limit))
+    remaining = limit - len(rows)
+    if remaining > 0:
+        rows.extend(
+            _rows(
+                exclude=[rule.id for rule, _domain in rows],
+                distinct_per_workspace=False,
+                cap=remaining,
+            )
         )
-        .outerjoin(
-            CompetitorProductMatch,
-            (CompetitorProductMatch.workspace_id == RefreshRule.workspace_id)
-            & (CompetitorProductMatch.id == RefreshRule.match_id),
-        )
-        .outerjoin(
-            match_competitor,
-            (match_competitor.c.workspace_id == CompetitorProductMatch.workspace_id)
-            & (match_competitor.c.id == CompetitorProductMatch.competitor_id),
-        )
-        .where(RefreshRule.enabled, RefreshRule.next_run_at <= now)
-        .order_by(RefreshRule.next_run_at, RefreshRule.id)
-        .limit(limit)
-    ).all()
 
     candidates: list[ScheduleCandidate] = []
     for rule, domain in rows:
@@ -920,8 +1137,35 @@ def fire_refresh_rule(
     The per-rule half of `run_refresh_pass`, addressed by id instead of by
     claim order, and holding the SAME row lock (``FOR UPDATE SKIP
     LOCKED``) so two scheduler replicas cannot both fire one rule. Returns
-    False when the row is gone, disabled, or held by another claimant —
-    all three are ordinary, none is an error.
+    False when the row is gone, disabled, held by another claimant, no
+    longer due, or already fired for this occurrence — all five are
+    ordinary, none is an error.
+
+    **Two claims, not one (EPA B3/F07).** The row lock alone only settles
+    a simultaneous race. It does not settle the sequential one, which is
+    the one that actually happened: replica A loads a due candidate;
+    replica B fires it and advances ``next_run_at``; A's lock then
+    succeeds — on a row that is no longer due — and fires the same
+    occurrence twice.
+
+    1. ``.where(RefreshRule.next_run_at <= now)`` is part of the LOCKING
+       select, so the due-ness A observed when it built its candidate list
+       is *rechecked under the lock* rather than trusted. This is what
+       makes a stale candidate cheap to discard.
+    2. The occurrence itself — ``(rule_id, scheduled_for)``, where
+       ``scheduled_for`` is ``next_run_at`` truncated to whole seconds —
+       is INSERTed into ``refresh_rule_occurrences`` **before**
+       `create_scope_job` runs. The primary key is the claim: a second
+       INSERT for the same occurrence raises ``IntegrityError``, this
+       rolls back and returns False, and no job is created. Postgres is
+       the only participant that can see both claimants, so it is the one
+       that decides.
+
+    The recheck without the ledger would still lose to a clock skew or a
+    long-enough pause between the two statements; the ledger without the
+    recheck would turn every stale candidate into a wasted INSERT and
+    rollback. Together they cost one extra predicate and one narrow row
+    per firing.
 
     Enqueue-then-commit, like every other producer here: a crash between
     them re-fires the rule, which the SPEC-08 idempotent dispatch guard
@@ -935,7 +1179,11 @@ def fire_refresh_rule(
     rule = (
         session.execute(
             select(RefreshRule)  # noqa: workspace-scope
-            .where(RefreshRule.id == _as_uuid(rule_id), RefreshRule.enabled)
+            .where(
+                RefreshRule.id == _as_uuid(rule_id),
+                RefreshRule.enabled,
+                RefreshRule.next_run_at <= now,
+            )
             .with_for_update(skip_locked=True)
         )
         .scalars()
@@ -944,8 +1192,27 @@ def fire_refresh_rule(
     if rule is None:
         return False
 
+    scheduled_for = occurrence_key(rule.next_run_at)
+    try:
+        session.execute(
+            insert(refresh_rule_occurrences).values(
+                rule_id=rule.id, scheduled_for=scheduled_for, fired_at=now
+            )
+        )
+        session.flush()
+    except IntegrityError:
+        # Another replica already claimed this occurrence. Not an error:
+        # the work it names is being done, by someone.
+        session.rollback()
+        logger.info(
+            "scheduler: occurrence already claimed rule_id=%s scheduled_for=%s",
+            rule.id,
+            scheduled_for.isoformat(),
+        )
+        return False
+
     target_id = _target_id_for_rule(rule)
-    create_scope_job(
+    job_id, _status = create_scope_job(
         session,
         workspace_id=rule.workspace_id,
         scope=rule.scope,
@@ -954,11 +1221,37 @@ def fire_refresh_rule(
         job_type=ScrapeJobType.SCHEDULED,
         source=ScrapeJobSource.SCHEDULER,
     )
+    if job_id is not None:
+        # `job_id` is NULL when the scope resolved to zero matches
+        # (FR-015: no matches -> no job). The occurrence still stands —
+        # it was claimed and it happened.
+        session.execute(
+            update(refresh_rule_occurrences)
+            .where(
+                refresh_rule_occurrences.c.rule_id == rule.id,
+                refresh_rule_occurrences.c.scheduled_for == scheduled_for,
+            )
+            .values(scrape_job_id=job_id)
+        )
     rule.last_run_at = now
     rule.locked_at = now
     rule.next_run_at = compute_next_run_at(rule, now)
     session.commit()
     return True
+
+
+def occurrence_key(next_run_at: datetime) -> datetime:
+    """``next_run_at`` truncated to whole seconds — the occurrence identity.
+
+    Sub-second precision is noise here, not information: a cadence is
+    expressed in minutes or a cron expression, and `compute_next_run_at`
+    derives the next due time from the previous one. Keeping microseconds
+    in the primary key would let a microsecond of clock or round-trip
+    drift mint a second "distinct" occurrence for what is plainly the
+    same one — which is exactly the duplicate this key exists to prevent.
+    """
+    return next_run_at.replace(microsecond=0)
+
 
 
 def _target_id_for_rule(rule: RefreshRule) -> uuid.UUID | None:
@@ -1170,6 +1463,19 @@ def run_fair_scheduling_pass(
     two planes admit, the gate authorizes, and only then does anything
     fire. An urgent item that the gate refuses appears in
     ``outcome.denied`` and never in ``outcome.dispatched``.
+
+    **Per-rule isolation is two-sided (EPA B3/F07).** `execute_plan`
+    already isolates a failure in-process: the ledger counts it, the pass
+    continues, the bound eventually dead-letters it. What it cannot do
+    from inside a pure planning module is touch the rule row — so a failed
+    rule stayed due and came back as a candidate on the very next poll,
+    consuming a fair-share slot per interval on the way to its bound.
+    `gate` and `dispatch` are therefore wrapped here so that a **fault**
+    (never a denial: a refusal is the system working, and
+    `default_denial_reason` is what tells the two apart) also writes the
+    durable half — ``consecutive_failures += 1`` and an exponential
+    ``next_run_at`` backoff — before the exception is re-raised for the
+    ledger to classify. A success clears the counter on the same row.
     """
     with session_factory() as session:
         usage = read_fleet_domain_usage(session, now)
@@ -1185,15 +1491,35 @@ def run_fair_scheduling_pass(
             service.assert_entitled(candidate.workspace_id)
             return None
 
+    inner_gate = gate
+
+    def gate_with_backoff(candidate: ScheduleCandidate) -> object:
+        try:
+            return inner_gate(candidate)
+        except Exception as exc:  # noqa: BLE001 - re-raised; classified below
+            if default_denial_reason(exc) is None:
+                record_rule_failure(
+                    session_factory, rule_id=candidate.key, error=exc, now=now
+                )
+            raise
+
     def dispatch(candidate: ScheduleCandidate, _grant: object) -> None:
-        with session_factory() as session:
-            fire_refresh_rule(session, rule_id=candidate.key, now=now)
+        try:
+            with session_factory() as session:
+                fired = fire_refresh_rule(session, rule_id=candidate.key, now=now)
+        except Exception as exc:  # noqa: BLE001 - re-raised for the ledger
+            record_rule_failure(
+                session_factory, rule_id=candidate.key, error=exc, now=now
+            )
+            raise
+        if fired:
+            clear_rule_failures(session_factory, rule_id=candidate.key)
 
     outcome = run_pass(
         candidates,
         now=now,
         batch_limit=batch_limit,
-        gate=gate,
+        gate=gate_with_backoff,
         dispatch=dispatch,
         ledger=ledger,
         limits=limits,
@@ -1276,6 +1602,11 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
+
+    # EPA B9 (F22): start beating BEFORE the boot-time passes below, so a
+    # scheduler wedged in its first cadence/health pass is still visibly
+    # alive rather than indistinguishable from one that never booted.
+    heartbeat = _start_scheduler_heartbeat()
 
     settings = get_settings()
     interval = settings.STRATEGY_STATS_FLUSH_INTERVAL_SECONDS
@@ -1398,6 +1729,13 @@ def main() -> None:
         if ops_snapshot_elapsed >= ops_snapshot_interval:
             ops_snapshot_elapsed = 0.0
             _run_ops_snapshot_tick(settings)
+
+    # The thread is a daemon and `HEARTBEAT_TTL_SECONDS` ages a stale beat
+    # out on its own, so this is not load-bearing -- it just makes a
+    # deliberately drained scheduler stop claiming to be alive at once
+    # instead of for one more TTL.
+    if heartbeat is not None:
+        heartbeat.stop()
 
     logger.info("scheduler stopped")
 

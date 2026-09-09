@@ -14,6 +14,13 @@ dependencies = [
     # Chrome TLS-fingerprint impersonation for the amazon.sa/noon.com
     # download path (scrape_core.impersonate).
     "curl_cffi>=0.7,<1",
+    # A2/F02: the ONLY regex engine allowed to run DB-supplied
+    # `price_regex`/`old_price_regex`/`currency_regex`/`stock_regex` on the
+    # live path. CPython's stdlib `re` cannot be interrupted mid-match, so a
+    # catastrophic backtrack on customer-supplied text pins a scraper core
+    # forever; `regex` accepts a `timeout=` on `search()` and raises
+    # `TimeoutError` instead. See `scrape_core.extraction.regex`.
+    "regex>=2024.11",
 ]
 
 [tool.uv.sources]

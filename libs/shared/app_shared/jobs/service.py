@@ -1,10 +1,10 @@
 """Job-creation service (`contracts/job-service.md`, FR-006, FR-007, FR-010, FR-020).
 
-Pure-ish orchestration — SQLAlchemy + the `app_shared.messaging` enqueue
-seam only (no scrapy/twisted/fastapi). The API router
-(`apps/api/app/routers/jobs.py`) resolves the match/variant in-workspace
-(`scoped_get`) and delegates job/target creation here, so creation logic
-is unit-testable against a fake session + fake `enqueue`.
+Pure-ish orchestration — SQLAlchemy + the transactional-outbox producer
+seam only (no scrapy/twisted/fastapi, and since EPA B2 no Redis either).
+The API router (`apps/api/app/routers/jobs.py`) resolves the
+match/variant in-workspace (`scoped_get`) and delegates job/target
+creation here, so creation logic is unit-testable against a fake session.
 
 `create_match_job` (US1) creates a single-target `scope=MATCH` job.
 `create_variant_job` (US2) fans a `scope=VARIANT` job out to one target
@@ -29,9 +29,12 @@ with workspace scoping enforced at the application layer instead
 (`scoped_select`/explicit `workspace_id=` on every insert). Counters
 start at 0 and are only ever set by `app_shared.jobs.targets.aggregate_counts`
 — this module never increments them. This module does not call Scrapyd —
-it only creates rows and enqueues the dispatch task, and it never
-commits — the caller owns the transaction (enqueue-before-commit,
-FR-012).
+it only creates rows — including the `outbox_messages` row that *is*
+the dispatch request (EPA B2 / F06) — and it never commits; the caller
+owns the transaction. FR-012's "enqueue before commit" is preserved in
+the only form that is actually safe: the enqueue is a row in the same
+transaction, so a rollback takes the message with it and a commit makes
+it as durable as the job.
 """
 
 from __future__ import annotations
@@ -50,21 +53,63 @@ from app_shared.enums import (
     ScrapeTargetStatus,
 )
 from app_shared.jobs.scopes import resolve_scope_matches
-from app_shared.messaging import enqueue
+from app_shared.outbox.writer import write_outbox_message
 from app_shared.models.catalog import ProductVariant
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.repository import scoped_select
 from app_shared.task_names import SCRAPE_DISPATCH_JOB
 
-__all__ = ["create_match_job", "create_variant_job", "create_scope_job"]
+__all__ = [
+    "JOB_CREATED_DEDUP_PREFIX",
+    "create_match_job",
+    "create_variant_job",
+    "create_scope_job",
+]
 
 
-def _enqueue_dispatch(job_id: uuid.UUID, workspace_id: uuid.UUID | str) -> None:
-    enqueue(
-        SCRAPE_DISPATCH_JOB,
+#: The outbox "kind" every job-creation seam writes (EPA B2 / F06).
+#:
+#: ``outbox_messages`` has no ``kind`` column — a message's *kind* is its
+#: ``task_name`` (the dispatcher publishes ``payload`` verbatim as the
+#: task's kwargs and deliberately knows nothing about any task's
+#: semantics), and its logical identity is ``dedup_key``. So "kind
+#: ``job_created``" is expressed as ``task_name=SCRAPE_DISPATCH_JOB``
+#: plus this dedup prefix, which is also what makes a replayed creation
+#: collapse onto one PENDING row instead of two dispatch deliveries.
+JOB_CREATED_DEDUP_PREFIX = "job_created"
+
+
+def _enqueue_dispatch(
+    session: Session, job_id: uuid.UUID, workspace_id: uuid.UUID | str
+) -> None:
+    """Record "dispatch this job" **in the caller's transaction** (EPA B2 / F06).
+
+    This was ``enqueue(...)`` — a Redis ``send_task`` fired before the
+    caller's ``COMMIT``. Two failures followed from that ordering and
+    both were real:
+
+    * a job creation that **rolled back** (a later constraint violation,
+      the scheduler's per-rule isolation, an API request that failed
+      after this point) still put a ``SCRAPE_DISPATCH_JOB`` message on the
+      broker, naming a ``scrape_job_id`` that does not exist;
+    * a Redis outage, or a process death between ``COMMIT`` and
+      ``send_task``, committed the job and its targets and then lost the
+      dispatch entirely — a PENDING job nothing would ever pick up.
+
+    Writing an ``outbox_messages`` row instead makes the message exactly
+    as durable, and exactly as conditional, as the rows that caused it:
+    it disappears with a rollback and survives with a commit, and
+    :func:`app_shared.outbox.dispatcher.drain_outbox` publishes it within
+    ``OUTBOX_DRAIN_INTERVAL_SECONDS``.
+    """
+    write_outbox_message(
+        session,
+        workspace_id=workspace_id,
+        task_name=SCRAPE_DISPATCH_JOB,
         queue="scrape_dispatch",
         kwargs={"scrape_job_id": str(job_id), "workspace_id": str(workspace_id)},
+        dedup_key=f"{JOB_CREATED_DEDUP_PREFIX}:{job_id}",
     )
 
 
@@ -109,7 +154,7 @@ def create_match_job(
     session.add(target)
     session.flush()
 
-    _enqueue_dispatch(job.id, workspace_id)
+    _enqueue_dispatch(session, job.id, workspace_id)
 
     return job.id, ScrapeJobStatus.PENDING
 
@@ -180,7 +225,7 @@ def create_scope_job(
         session.add(target)
     session.flush()
 
-    _enqueue_dispatch(job.id, workspace_id)
+    _enqueue_dispatch(session, job.id, workspace_id)
 
     return job.id, ScrapeJobStatus.PENDING
 
@@ -251,6 +296,6 @@ def create_variant_job(
         session.add(target)
     session.flush()
 
-    _enqueue_dispatch(job.id, workspace_id)
+    _enqueue_dispatch(session, job.id, workspace_id)
 
     return job.id, ScrapeJobStatus.PENDING

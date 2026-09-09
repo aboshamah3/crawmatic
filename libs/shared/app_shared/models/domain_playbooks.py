@@ -27,8 +27,17 @@ learned divergence lives in its ``domain_strategy_profiles`` rows.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import ForeignKeyConstraint, Index, Integer, String, Text, text
+from sqlalchemy import (
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -175,6 +184,59 @@ class DomainPlaybook(Base, TimestampMixin):
     #: domain", not "known to be empty". Defaults to ``{}`` so every row
     #: (including C2's seeded ones) starts from a valid, empty profile.
     profile_fields: Mapped[dict] = mapped_column(JSONB(), nullable=False, default=dict)
+
+    # ------------------------------------------------------------------
+    # C4 (EPA, 2026-09-08, F08 / plan §11 items 2 and 5): the versioned
+    # ESCALATION STRATEGY. Read by
+    # ``app_shared.strategy.methods.PlaybookStrategy.from_row`` and
+    # applied by the ladder (``resolve_next_physical_attempt``); seeded
+    # by ``scripts/seed_domain_playbooks.sql``.
+    #
+    # Why a second counter next to ``profile_version`` above: that one is
+    # bumped by every ``app_shared.domains.lifecycle.transition`` — an
+    # approval/evidence event about whether the domain may be scraped at
+    # all. This one moves only when the strategy SHAPE changes. Stamping
+    # an attempt with a counter that also moves on an unrelated approval
+    # would make "which strategy produced this attempt" unanswerable,
+    # which is exactly the question a regressed canary has to answer.
+    #: Version of this domain's escalation strategy, stamped onto every
+    #: ladder decision (``StrategyMethodSelection.strategy_version``,
+    #: ``LadderDecision.strategy_version``). Never ``NULL``: a domain with
+    #: no explicit strategy is version 1, not "unknown version".
+    strategy_version: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=1, server_default=text("1")
+    )
+    #: ``AccessMethod`` value naming the near-free rung that should be
+    #: tried FIRST for this domain when nothing else pins the start (no
+    #: durable cursor, no preferred method). ``NULL`` = no hint; the
+    #: ladder's ordinary priority order applies. Stored as text, not an
+    #: enum column, deliberately: this is curated operator data on a
+    #: fleet reference table, and an unrecognised value must degrade to
+    #: "no hint" (``PlaybookStrategy`` validates it against
+    #: ``AccessMethod``) rather than fail a seed INSERT.
+    cheap_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: ``AccessMethod`` value naming the EXPENSIVE rung whose use is
+    #: rationed by ``fallback_cap_per_refresh`` (in practice a browser
+    #: method — ``PLAYWRIGHT_DIRECT``/``PLAYWRIGHT_PROXY``). ``NULL`` =
+    #: nothing is treated as the rationed fallback for this domain.
+    fallback_path: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: How many times ONE target may take :attr:`fallback_path` in ONE
+    #: refresh. ``NULL`` = uncapped (the pre-C4 behaviour, so an
+    #: unseeded row changes nothing); ``0`` = never. Enforced by the
+    #: ladder against the per-target counter the scraping runtime's
+    #: attempt budget holds, so the cap is a property of the ladder
+    #: rather than of each call site's discipline.
+    fallback_cap_per_refresh: Mapped[int | None] = mapped_column(
+        Integer(), nullable=True
+    )
+    #: Per-domain override of ``Settings.SCRAPE_RECOVERY_PROBE_FRACTION``
+    #: — the sampled share of targets that ignore a DOMAIN-scope method
+    #: suppression and probe it anyway (C1). ``NULL`` = use the setting.
+    #: ``Numeric`` (not float) so the seeded value is exact; the ladder
+    #: and the budget both coerce it to ``float`` at the boundary.
+    recovery_probe_fraction: Mapped[Decimal | None] = mapped_column(
+        Numeric(), nullable=True
+    )
 
 
 class DomainLifecycleAudit(Base):

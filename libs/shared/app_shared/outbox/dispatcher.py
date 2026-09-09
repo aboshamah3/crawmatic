@@ -33,6 +33,27 @@ idempotency first (audit §H1/§12). The reverse order
 (commit-then-publish) would reintroduce exactly the lost-work window the
 outbox exists to close.
 
+Message kinds, and why there is no ``kind`` column
+-------------------------------------------------
+EPA B2 / F06 adds the ``job_created`` producer: every job-creation seam
+(:func:`app_shared.jobs.service.create_scope_job` and its two siblings)
+now records "dispatch this job" as an outbox row inside the job's own
+transaction instead of firing ``SCRAPE_DISPATCH_JOB`` at Redis before
+the ``COMMIT``.
+
+That kind needs **no code here**, and that is the design, not an
+oversight. A message's kind IS its ``task_name``, and its logical
+identity is its ``dedup_key`` (``job_created:<scrape_job_id>``); this
+pass publishes ``payload`` verbatim as the task's kwargs and knows
+nothing about any task's semantics. A ``kind`` column with a
+``match``/``case`` here would be a second routing table to keep in sync
+with ``app_shared.task_names``, and every new producer would have to
+edit the consumer — exactly the coupling the generic shape avoids.
+``job_created`` therefore arrives as
+``task_name=SCRAPE_DISPATCH_JOB, queue="scrape_dispatch",
+payload={"scrape_job_id": ..., "workspace_id": ...}`` and is published
+like anything else.
+
 Failure handling
 ----------------
 Every attempt increments ``attempts`` and is committed even when the

@@ -16,6 +16,143 @@ was collected by EPA task G5 from `BLOCKERS.md` and the phase reviews of run
 [`PRODUCTION_READINESS_SCORE_2026-09.md`](./PRODUCTION_READINESS_SCORE_2026-09.md)
 for the scored checklist those findings came from.
 
+## 2026-09-08 batch — surfaced by EPA run `plan-core-production-readiness-2026-09-07`, Stage D (D1–D6)
+
+Collected from `.epa/plan-core-production-readiness-2026-09-07/{BLOCKERS.md,ASSUMPTIONS.md}` and
+the Stage D task reports by EPA task D6; see
+[`PRODUCTION_READINESS_SCORE_2026-09.md`](./PRODUCTION_READINESS_SCORE_2026-09.md)'s "2026-09
+post-Stage-D re-score" section for the gate table these items block.
+
+## 2026-09-08 — No `pool_wait_p95` metric exists anywhere in the engine
+
+`scripts/fleet_test_report.py`'s Database gate row needs a DB-connection-pool
+wait-time p95 to judge the audit's "< 100 ms" bar, and no such metric is
+collected anywhere in the codebase today (checked: `app_shared.opsmetrics`
+collects gauges from live tables, not from the SQLAlchemy pool itself). The
+report script reads it from an operator-supplied measurements file as a
+stopgap. Fix: instrument `SQLAlchemy`'s pool checkout/checkin events (or sample
+`pg_stat_activity` wait events) and emit a real gauge. Owner: engine
+maintainer. Trigger: before the Database gate row can be marked PASS, or
+before the D4 rollout's step 3 (20 stores) if pool contention becomes
+observable informally first. Evidence: `reports/D1.md` Blockers.
+
+## 2026-09-08 — `VACUUM ANALYZE` must run before the first rollup after any restore or bulk seed
+
+D1 found the rollup batch statement is catastrophically plan-sensitive to
+stale table statistics: one batch of 500 variants over 100,000 freshly
+bulk-loaded observations had not completed after 18 minutes at 100% CPU: the
+planner chose a nested-loop plan from statistics that still described the
+partition as empty. The same statement took 0.19 s after `ANALYZE`. This is
+now documented as a manual step in `docs/ops/STAGING_ENVIRONMENT.md` §5 and
+`docs/ops/FLEET_TEST_2026-09.md` §2.2, but it is not wired into
+`scripts/dr/rehearse_upgrade.sh` or any restore runbook as an automatic step —
+a human has to remember it. A monthly partition rollover (a much smaller
+version of "just-created, statistics describe it as empty") is the same
+failure mode at production scale. Owner: engine maintainer (whoever owns
+C7/C8/the restore tooling). Trigger: before the next restore-runbook or
+rollup-benchmark change, or the first production incident that looks like a
+"rollup hung" report.
+
+## 2026-09-08 — The audit's "cost per valid refresh" bound was never set
+
+Audit §13's Economics gate and this plan's own D4 ADVANCE bar both require
+"cost per valid refresh <= the C11-approved bound," but no task in this plan
+set that number: `docs/ops/RELEASE_3_2026-09.md` §2.11 records three owner
+decisions (retention ratification, `EXTRACTION_RANKING_POLICY`,
+`BROWSER_DOCUMENT_ONLY_DOMAINS`) and none of them is a cost-per-refresh
+ceiling. `docs/ops/ROLLOUT_2026-09.md` §2 flags this explicitly: the D4
+rollout cannot honestly evaluate its own ADVANCE condition 4 until this number
+exists. Owner: owner, informed by `docs/ops/COST_MODEL_2026-09.md`'s
+calibrated cost table and the D3 canary reconciliation. Trigger: before D4
+Step 1 (enabling the first production store) can honestly evaluate its
+ADVANCE bar.
+
+## 2026-09-08 — The audit's 55-minute startup-gap finding (Tail latency, audit §13) was never investigated
+
+Audit §13's Tail latency row explicitly asks to "investigate the observed
+55-minute startup gap." No task in this plan (Stage A through D) investigated
+it — `grep` across every task report finds no mention of it. The D5 scorecard
+now carries phase p95 fields (`queue_oldest_seconds_p95`,
+`persistence_lag_seconds_p95`) that could support the investigation once real
+traffic exists, but the gap itself remains unexplained. Owner: engine
+maintainer. Trigger: before the Tail latency gate row can be marked PASS, or
+the D1 staging fleet test's `due_to_dispatch`/`dispatch_to_first_network` p95
+figures if they reproduce something like the gap.
+
+## 2026-09-08 — The live cross-tenant RLS integration test has not been re-run since Stage A
+
+`tests/integration/test_tenant_isolation_roles.py` (141 assertions across all
+reviewed tables) last ran, and passed, in task A3 against a real compose
+Postgres — before B3 added `refresh_rule_occurrences`, C7 added
+`rollup_completion`, C9 partitioned `network_operations`, and D5 added
+`fleet_daily_scorecard`. Every one of those new tables was individually
+classified in `scripts/rls_table_manifest.txt` and unit-checked by
+`scripts/check_workspace_scoping.py` (a static check, not a live-DB RLS
+enforcement test) at the time it was added, but the full live suite that
+actually exercises Postgres RLS policies under the provisioned roles has not
+been run end-to-end against the tree as it stands after Stage D. Owner: engine
+maintainer. Trigger: before the Security gate row can be marked PASS —
+`sudo -u mahmoud .venv/bin/pytest tests/integration/test_tenant_isolation_roles.py tests/integration/test_grants_manifest.py -q -m integration`
+against a throwaway or compose Postgres provisioned by `provision_db_roles.sql`
+at the current head.
+
+## 2026-09-08 — `EVIDENCE_STORE_DIR` / Railway volume not yet mounted in production
+
+C5's raw-evidence hash (`offer_raw_evidence_hash`) is wired end-to-end in code
+and tests but stays `NULL` in production until a Railway volume is mounted on
+the relevant service(s) and `EVIDENCE_STORE_DIR` is set — by design, not a
+bug. No size cap on `raw_evidence` beyond Scrapy's `DOWNLOAD_MAXSIZE` is a
+related follow-up. Owner: owner (volume + variable) / engine maintainer (size
+cap). Trigger: before the Quality gate's labeled-sample evidence needs raw
+page bodies for a real (non-fixture) domain, or the C11 release-3 deploy
+window.
+
+## 2026-09-08 — Disk on the build host is at 99% (1.4 GB free), worse than the 97–98% recorded through Stages A–C
+
+Every Docker-backed or disk-backed verification in this run had to route
+around this (tmpfs Postgres data directories, throwaway containers torn down
+immediately, deferred integration suites). It is not merely a build-host
+inconvenience: the SaaS deploy script's own backup-freshness gate and any real
+staging/production restore both need headroom this host does not have. Owner:
+owner (H12 in the 2026-09-03 review's own re-score is the same underlying
+item, still open). Trigger: before any staging environment (D1) or production
+restore rehearsal that needs disk-backed Postgres is attempted on this host;
+consider ephemeral tmpfs-based verification the standing workaround, not a
+fix.
+
+## 2026-09-08 — ~110/122 Stage-C files (and more since) are root-owned in the working tree
+
+Flagged by the phase-C review (2026-09-08): most files this run's workers
+touched are owned by `root:root` rather than `mahmoud:mahmoud`, an artifact of
+how the box's Docker/root-privileged steps interact with file creation. Not a
+security issue in itself (single-operator host), but it means the next worker
+to touch one of these files needs `chown mahmoud:mahmoud <file>` before an
+edit succeeds as `mahmoud`. Owner: engine maintainer / whoever administers
+this build host. Trigger: before granting a second human or a lower-privilege
+CI runner write access to this tree.
+
+## 2026-09-08 — Compose Postgres major (17.5) does not match production (18.4/18.6)
+
+Re-confirmed independently by A10, B10, C10, C11 and D1: `docker-compose.yml`
+pins `postgres:17.5-bookworm`; the newest production backup manifests say
+18.4 (engine) / 18.6 (SaaS). Every throwaway-container rehearsal in this run
+that needed the *real* major used a dedicated container at the manifest's
+version, not compose — `docker-compose.yml` itself is the one place still
+carrying the stale pin. Owner: engine maintainer. Trigger: the next
+`docker-compose.yml` edit, or before trusting a compose-based integration run
+as representative of production behavior.
+
+## 2026-09-08 — Two pre-existing integration test files have known bugs, unrelated to this plan's own code
+
+`tests/integration/test_partition_create_live.py` (a stale `webhook_events`-absent
+assertion; a `(scraped_at, id)` vs `(id, scraped_at)` identity-key ordering bug
+on `price_observations`) and `tests/integration/test_retention_drop_live.py`
+(missing `latest_alert_type` on insert; needs a `rollup_completion` row once
+the first bug is fixed). Confirmed pre-existing and out of every Stage C/D
+task's declared scope (`reports/C9.md`, `docs/ops/RELEASE_3_2026-09.md` owner
+item 10). Owner: engine maintainer. Trigger: the next change to either test
+file's subject area, or a dedicated test-debt sweep.
+
 ## 2026-09-05 — `BLOCKERS.md` records a stale SaaS release-ordering note
 
 The run's `BLOCKERS.md` says `STRIPE_PRICE_STARTER/GROWTH/SCALE` must be set
@@ -28,14 +165,45 @@ order; `BLOCKERS.md` itself is a run artifact outside this repo and was not
 edited. Owner: owner. Trigger: reading `BLOCKERS.md` while planning Phase R —
 prefer the §5 runbook where the two disagree.
 
-## 2026-09-05 — Cost lever: Amazon HTTP-leg extraction research
+## 2026-09-05 — Cost lever: Amazon HTTP-leg extraction research — **TOOLING CLOSED 2026-09-08 (EPA C2); LIVE RUN STILL DEFERRED**
 
 The 2026-09-03 cost report ranks this the single largest remaining cost lever:
 amazon.sa is **77.5 % of all proxy bytes** and drives the browser path, which is
 the largest compute line. Extracting the Amazon leg over plain HTTP would make
-the browser path rare. No research has been done; this is a spike, not a fix.
-Owner: owner. Trigger: monthly proxy spend above $30, or before onboarding a
-second Amazon-heavy catalogue.
+the browser path rare.
+
+**What EPA plan task C2 closed (2026-09-08):** the "no research tooling exists"
+gap. `scripts/probe_amazon_http_leg.py` (new) implements the full probe: a
+`--targets/--runs/--max-usd/--report` CLI, the exact >=80% / 30–80% / <30%
+decision table from `docs/ops/AMAZON_STRATEGY_2026-09.md`, spend-guarded
+(`SpendGuard`, refuses without `--max-usd`), and reuses `scrape_core.targets`'s
+own `resolve_effective_policy`/`assign_proxy` (the real spider's dispatch path)
+for target resolution — not a probe-specific reimplementation. 29 unit tests
+(`tests/unit/test_probe_amazon_report.py`) cover the report math and every
+decision-table boundary. Evidence: `reports/C2.md`.
+
+**What is still deferred, and is now its own item below:** the live run itself
+(<= $1 spend) has not happened — no Amazon request has been made under this
+tooling. `docs/ops/RELEASE_3_2026-09.md` §2.11 ("Decision 3", related paragraph)
+carries the exact command. Owner: owner. Trigger: monthly proxy spend above
+$30, or before onboarding a second Amazon-heavy catalogue — unchanged from the
+original trigger, since the underlying business signal has not changed, only
+the tooling to measure it now exists.
+
+## 2026-09-08 — Run the Amazon HTTP-leg probe (spend <= $1, tooling ready)
+
+Follow-up to the item above: `scripts/probe_amazon_http_leg.py` is built,
+tested, and spend-guarded, but has never been run against real Amazon targets.
+Command (from `docs/ops/RELEASE_3_2026-09.md` §2.11):
+
+```bash
+uv run python scripts/probe_amazon_http_leg.py \
+  --targets 50 --runs 3 --max-usd 1.00 --report /tmp/probe-amazon-http.json
+```
+
+Owner: owner. Trigger: same window as C11's other deferred spend decisions
+(Decision 3, `BROWSER_DOCUMENT_ONLY_DOMAINS`), since this probe's result feeds
+that same domain's `domain_playbooks` seeding.
 
 ## 2026-09-05 — Cost lever: direct-first for extra.com
 
@@ -191,13 +359,28 @@ carried forward — an operator typing `0` to mean "stop all spend" will not get
 that. Owner: engine maintainer. Trigger: the next docs pass, or any operator
 confusion report.
 
-## 2026-09-05 — `proxy_bytes` excludes browser sub-resource bytes
+## 2026-09-05 — `proxy_bytes` excludes browser sub-resource bytes — **CLOSED 2026-09-08 (EPA A7/C6)**
 
 The usage-export aggregation counts only network operations reachable from an
 attempt row, so a browser page's child operations' bytes are excluded. Harmless
 today; it understates bytes the moment `PROXY_BROWSER` calibration goes
 byte-based. Owner: engine maintainer. Trigger: any move to byte-based
 `PROXY_BROWSER` pricing.
+
+**Closed by EPA plan tasks A7 and C6 (2026-09-08).** A7 added
+`WireBytesMiddleware` (`libs/scrape-core/scrape_core/middlewares/wire_bytes.py`)
+so every operation — parent and child alike — carries a real measured
+`wire_bytes`/`bytes_compressed` figure instead of the old signal-derived total.
+C6 rewrote `apps/api/app/services/admin_usage.py`'s aggregation (F17): a new
+`per_op` CTE walks children via `parent_operation_id` and folds them with
+`op_totals`, so `proxy_bytes` and the `proxied_browser` count are now summed
+over the parent **and every child** operation, not the parent alone. Verified
+live against a throwaway `postgres:18-alpine` container
+(`tests/integration/test_admin_usage_fixtures.py`, 7 passed) with a before/after
+comparison on the same fixture data: `OLD-RULE bytes (summed per attempt):
+3,290,000` (children missing) vs the new per-op rule counting `1 proxied + 1
+parent + 2 children = 4` operations correctly. Evidence: `reports/A7.md`,
+`reports/C6.md` (attempt 2, "Files changed" and Verification §4).
 
 ## 2026-09-05 — No integration-DB test for the usage-export aggregation
 
@@ -315,13 +498,26 @@ a real business signal, not a test artifact — it is a pricing, cadence or COGS
 decision, and no code change will move it. Owner: owner. Trigger: before the
 Scenario 2 pricing release goes live.
 
-## 2026-09-04 — `SCHEDULER_FAIR_QUEUE_ENABLED` left `False`
+## 2026-09-04 — `SCHEDULER_FAIR_QUEUE_ENABLED` left `False` — **CLOSED 2026-09-07 (EPA B3/F07)**
 
 Single-tenant fleet in production today — weighted fair queuing
 (`app_shared.scheduling.fair_queue`) has nothing to arbitrate fairly
 between when there is only one workspace generating scheduler load.
 Revisit at 3+ tenants. (EPA plan task B4.)
 Owner: engine maintainer. Trigger: a third tenant generating scheduler load.
+
+**Closed by EPA plan task B3 (2026-09-07): the default is now `True`**
+(`libs/shared/app_shared/config.py`). The deferral's premise was that the
+flag gated *fairness only*. It does not: the fair pass is also the only
+scheduling path with per-rule failure isolation (a bounded-retry ledger
+and a dead-letter sink instead of the legacy loop's pass-ending `break`),
+the only one with the fleet/domain concurrency caps that bound what a
+single merchant's WAF sees, and — as of B3 — the only one that claims a
+due occurrence durably in `refresh_rule_occurrences` before creating a
+job. None of those is a tenant-count question. An operator can still set
+`SCHEDULER_FAIR_QUEUE_ENABLED=false` to fall back to the legacy loop,
+which B3 also gave per-rule isolation, and `tests/unit/
+test_w4_flag_defaults.py` still pins both the default and the override.
 
 ## 2026-09-03 — `UsageSnapshotArchive` (SaaS) not extended with the B3 proxy counters
 

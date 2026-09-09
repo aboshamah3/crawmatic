@@ -4,10 +4,12 @@ T008, `contracts/rate-limiter.md`, FR-001..FR-009, FR-023; SC-001, SC-004).
 No Docker daemon in this build env (project memory) -- these tests MUST
 actually run and pass, not skip. Per the project convention (mirrors
 `tests/unit/test_access_budget.py`'s `_FakeRedis`/`_BrokenRedis` pair),
-against a real ephemeral Redis when ``REDIS_URL`` is set, else a small
-hand-rolled in-memory double (`fakeredis` is not a dependency anywhere in
-this repo -- see ``pyproject.toml``/``uv.lock`` -- so a hand-rolled fake
-is used per the task's own fallback guidance, not a new dependency).
+against a small hand-rolled in-memory double (`fakeredis` is not a
+dependency anywhere in this repo -- see ``pyproject.toml``/``uv.lock`` --
+so a hand-rolled fake is used per the task's own fallback guidance, not a
+new dependency). Set ``CRAWMATIC_TEST_REDIS_URL`` to run the same
+assertions against a real ephemeral Redis; ``REDIS_URL`` is deliberately
+NOT consulted -- see ``_redis_client`` below.
 
 The fake does not interpret Lua text; it recognizes the two production
 scripts in ``bucket.py`` by their embedded marker comments (``-- SPEC-11
@@ -160,9 +162,22 @@ class _BrokenRedis:
 
 
 def _redis_client() -> Any:
-    """Real ephemeral Redis if `REDIS_URL` is set (per project convention),
-    else the in-memory fake -- these tests must always actually run."""
-    url = os.environ.get("REDIS_URL")
+    """The in-memory fake, unless a real Redis is EXPLICITLY offered.
+
+    Opt-in is `CRAWMATIC_TEST_REDIS_URL`, deliberately not `REDIS_URL`.
+    Keying off `REDIS_URL` made which client these tests exercise a
+    property of the ambient environment: unset (a bare CI runner) meant the
+    fake, set meant whatever server that variable happened to name. Since
+    `tests/conftest.py` now points `REDIS_URL` at a dead port for every unit
+    session (production-readiness audit §2), that opt-in reads as "connect
+    to 127.0.0.1:1" and the whole file fails on `ConnectionError` — the
+    right response is a dedicated opt-in variable, not a weaker fixture.
+    The fake is the deterministic default everywhere; running the same
+    assertions against a real server is a deliberate act::
+
+        CRAWMATIC_TEST_REDIS_URL=redis://127.0.0.1:6379/15 uv run pytest tests/unit/test_rate_limiter.py
+    """
+    url = os.environ.get("CRAWMATIC_TEST_REDIS_URL")
     if url:
         import redis as redis_pkg
 

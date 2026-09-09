@@ -17,7 +17,8 @@ from typing import Any
 
 from app_shared.enums import AccessMethod, StockStatus
 
-from scrape_core.items import ScrapeResult
+from scrape_core.extraction.pipeline import persisted_provenance
+from scrape_core.items import EXTRACTOR_VERSION, ScrapeResult
 
 __all__ = ["build_scrape_result"]
 
@@ -55,6 +56,7 @@ def build_scrape_result(
     main_document_bytes: int | None = None,
     subresource_bytes: int | None = None,
     network_operation_id: uuid.UUID | None = None,
+    raw_evidence: bytes | None = None,
 ) -> ScrapeResult:
     """Build one attempt's `ScrapeResult` (SPEC-10 US3, T034; extracted SPEC-14 T007).
 
@@ -117,6 +119,23 @@ def build_scrape_result(
     `match_audit_classifications` sidecar to ``NEEDS_REVIEW`` when it is
     ``True``. Defaults ``False`` -- every ordinary result is unaffected.
 
+    ``raw_evidence`` (EPA C5, F19) is the raw response body this result
+    was extracted from, carried only as far as
+    ``scrape_core.pipelines._flush_batch``, which writes it into the
+    content-addressed evidence store and keeps the hash on the row.
+    Bytes rather than the decoded string, because the content address
+    must name what actually arrived on the wire. ``None`` (the default)
+    leaves ``offer_raw_evidence_hash`` NULL, which is the honest value
+    for an attempt with no replayable evidence.
+
+    The provenance quintet (``extractor_version``/``profile_version``/
+    ``confidence``/``provenance``) is derived here rather than taken as
+    parameters: all four are facts about the EXTRACTION this function is
+    already looking at, and asking every call site to restate them is
+    how they would drift. ``provenance`` is a function of the CURRENT
+    ranking policy (``persisted_provenance``) -- in ``shadow`` the first
+    hit is still what gets persisted, so it stays ``first_hit``.
+
     ``main_document_bytes``/``subresource_bytes`` (EPA B6) are the
     TRANSPORT-OBSERVED byte-accounting pair -- see
     ``ScrapeResult``'s own field docstring and the migration that added
@@ -127,13 +146,21 @@ def build_scrape_result(
     if stock_status is not None:
         kwargs["stock_status"] = stock_status
     if candidate_extras is not None:
+        confidence = Decimal(str(candidate_extras.confidence))
         kwargs.update(
             currency=candidate_extras.currency,
             stock_status=candidate_extras.stock,
             raw_title=candidate_extras.raw_title,
             extraction_method=candidate_extras.method,
-            extraction_confidence=Decimal(str(candidate_extras.confidence)),
+            extraction_confidence=confidence,
             selector_used=candidate_extras.selector_used,
+            # EPA C5: the same number on the non-nullable column the
+            # `match_current_prices` confidence guard compares. A result
+            # with NO candidate keeps the field's `Decimal("0")` default,
+            # which is a positive statement (nothing was read, nothing is
+            # trusted) rather than a missing value.
+            confidence=confidence,
+            provenance=persisted_provenance(),
         )
     return ScrapeResult(
         workspace_id=workspace_id,
@@ -166,6 +193,14 @@ def build_scrape_result(
         scrape_profile_version=(
             getattr(getattr(target, "profile", None), "version", None)
         ),
+        # EPA C5: the same revision on the provenance column. `0` where no
+        # profile resolved -- not "version 0" (profiles start at 1) but
+        # "no profile", which the pipeline writes as NULL.
+        profile_version=(
+            getattr(getattr(target, "profile", None), "version", None) or 0
+        ),
+        extractor_version=EXTRACTOR_VERSION,
+        raw_evidence=raw_evidence,
         adapter_key=(
             getattr(getattr(target, "profile", None), "adapter_key", None)
         ),

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "apps/fixture-origin/Dockerfile",
+    "watchPatterns": ["apps/fixture-origin/**"]
+  },
+  "deploy": {
+    "startCommand": "sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers ${FIXTURE_ORIGIN_WORKERS:-1} --no-access-log'",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "numReplicas": 1,
+    "healthcheckPath": "/healthz"
+  },
+  "x-crawmatic": {
+    "task": "D1 (F22) — controlled origin for the 100 x 5,000 fleet test (audit §13)",
+    "staging_only": "This service is created ONLY inside the temporary staging environment of docs/ops/STAGING_ENVIRONMENT.md and is deleted with it. It must never exist in the production environment.",
+    "must_be_public": "The engine's save-time SSRF validator (libs/shared/app_shared/url_safety.py) rejects *.railway.internal, so the seeded competitor_url values MUST use this service's PUBLIC Railway domain. That is safe here precisely because the service holds no data and reaches nothing.",
+    "variable_names_only": [
+      "PORT",
+      "FIXTURE_ORIGIN_WORKERS",
+      "FIXTURE_ORIGIN_MAX_SKU",
+      "FIXTURE_ORIGIN_STORE_COUNT",
+      "FIXTURE_ORIGIN_LATENCY_SCALE",
+      "FIXTURE_ORIGIN_PROFILE_OVERRIDES"
+    ],
+    "no_secrets": "This service takes no credential of any kind. If it ever needs one, something has gone wrong with the test design."
+  }
+}

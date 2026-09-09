@@ -200,6 +200,18 @@ class FakeOrmSession:
         self.flush()
         self.committed = True
 
+    def rollback(self) -> None:
+        """No-op — the fake has no undo log.
+
+        Present so code that opens its own short transactions (EPA B2's
+        `DispatchIntentStore(session_factory=...)`) can be exercised
+        against this fake at all. Tests that need real rollback semantics
+        belong in `tests/integration/`, against Postgres.
+        """
+
+    def close(self) -> None:
+        """No-op — this fake outlives every "session" taken from it."""
+
     def execute(self, stmt: Select) -> _FakeExecResult:
         descriptions = stmt.column_descriptions
         entity = descriptions[0]["entity"]

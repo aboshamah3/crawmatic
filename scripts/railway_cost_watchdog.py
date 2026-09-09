@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""railway_cost_watchdog.py — daily Railway memory/CPU/cost telemetry + leak alarm.
+"""railway_cost_watchdog.py — daily Railway memory/CPU/egress telemetry + leak alarm.
 
-Pulls the last 24 hours of per-service ``MEMORY_USAGE_GB`` and
-``CPU_USAGE`` from Railway's ``usage`` GraphQL API, compares each
-service's **average resident memory** against a hand-measured baseline,
-prints a table plus ALERT lines, and appends a dated one-line summary
-(total resident GB + estimated $/day) to
+Pulls the last 24 hours of per-service ``MEMORY_USAGE_GB``, ``CPU_USAGE``
+and ``NETWORK_TX_GB`` (egress) from Railway's ``usage`` GraphQL API for
+the project named by ``RAILWAY_PROJECT_ID``, compares each service's
+**average resident memory** against a hand-measured baseline, prints a
+table plus ALERT lines, and appends a dated one-line summary (total
+resident GB + estimated $/day + the hourly-vs-window reconciliation) to
 ``~/.crawmatic/railway_cost_watchdog.log``.
 
 Why it exists: on 2026-08-03 the ``scrapers`` service leaked to a
@@ -23,14 +24,29 @@ above 3× baseline while the service spent under
 idle-plateau shape of the 2026-08-03 incident, and is reported
 separately from the plain >2× "heavy" alert.
 
-**Read-only**: issues nothing but ``usage`` queries; it never mutates a
-Railway resource.
+**Read-only**: issues nothing but ``usage``/``project`` queries; it never
+mutates a Railway resource.
 
-Query shape matters: Railway's ``usage`` aggregate under-reports by
-~3.7× when a long window is requested with ``groupBy: [SERVICE_ID]``
-(measured 2026-08-03 against per-hour sums), so this queries **one hour
-at a time** and sums client-side. Do not "optimise" it into a single
-24-hour call.
+**Project by environment, not by a hard-coded ID (deep dive §8.3).** The
+old script pointed at a project ID and a ``{serviceId: name}`` map that
+belonged to a DIFFERENT Railway project than this one — its output was
+never a core-project cost read. ``RAILWAY_PROJECT_ID`` is now required
+(the script refuses to run without it, loudly, rather than silently
+reporting someone else's numbers), and the service ID → name map is
+pulled from the API's own ``project.services`` for that project instead
+of being copy-pasted and left to rot.
+
+Query shape matters: Railway's ``usage`` aggregate was suspected of
+under-reporting by ~3.7× when a long window is requested with
+``groupBy: [SERVICE_ID]`` (measured 2026-08-03 against per-hour sums) —
+**not reproduced on 2026-09-06** (hourly and single-window CPU/egress
+sums agreed; memory differed by ~0.003%, deep dive §8.3). The per-hour
+query stays (it is still the more conservative shape and costs nothing
+extra), but this script now also runs the single-window query itself and
+reports ``hourly_sum_vs_window_delta_pct`` for CPU/RAM/egress every day,
+warning above :data:`RECONCILIATION_WARN_PCT` — so a *future*
+recurrence of the discrepancy is caught fresh rather than an inherited
+correction factor being trusted blindly.
 
 Auth comes from the Railway CLI's own credentials
 (``~/.railway/config.json`` → ``user.accessToken``); the API rejects the
@@ -38,13 +54,14 @@ default urllib User-Agent, hence the explicit header.
 
 Usage::
 
-    python3 scripts/railway_cost_watchdog.py
+    RAILWAY_PROJECT_ID=<project id> python3 scripts/railway_cost_watchdog.py
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -57,21 +74,12 @@ RAILWAY_CONFIG_PATH = Path.home() / ".railway" / "config.json"
 RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2"
 USER_AGENT = "crawmatic-cost-watchdog/1.0"
 
-PROJECT_ID = "76296e99-f8d6-4001-b6ac-10b9d2e20ea1"
+#: The core project's id, from the environment — never hard-coded (deep
+#: dive §8.3: the previous constant pointed at a DIFFERENT project).
+#: :func:`project_id` is the only place this is read.
+RAILWAY_PROJECT_ID_ENV_VAR = "RAILWAY_PROJECT_ID"
 
 LOG_PATH = Path.home() / ".crawmatic" / "railway_cost_watchdog.log"
-
-SERVICE_NAMES = {
-    "2658aa25-3ad6-46f6-b0d0-b0cb1b1b453f": "scrapers",
-    "2cbe7c21-3cc4-4438-adcd-fa65db210338": "postgres",
-    "5cdd7fc5-9d30-441e-a120-b900b615ab50": "api",
-    "6fb3959d-40ba-4657-b2e7-2a01560d8f73": "pgbouncer",
-    "7b9f7c1b-b006-41be-9c07-16f1b60b8d9f": "scheduler",
-    "82783a46-cecb-4de9-98ec-e0deb0c50efb": "redis",
-    "cbfcc0c3-45c1-4285-8b89-7ab69da45745": "worker",
-    "dfcc8c8a-76ea-4772-9413-b5f1b313d786": "migrate",
-    "e0115ef8-17da-4eac-a2a5-7c19768ed10c": "scrapers-browser",
-}
 
 # Hand-measured healthy steady-state resident memory, GB (2026-08-02,
 # after the concurrency=4 fix). Deliberately *not* the observed peak: a
@@ -103,14 +111,52 @@ CPU_RATE_PER_VCPU_MINUTE = 20 / MINUTES_PER_MONTH
 HOURS = 24
 MINUTES_PER_DAY = HOURS * 60
 
+#: Railway measurement names -> the short label this script reports them
+#: under (deep dive §8.3: "CPU/RAM/egress"). ``NETWORK_TX_GB`` is
+#: outbound traffic — egress is what is billed.
+MEASUREMENTS = ("MEMORY_USAGE_GB", "CPU_USAGE", "NETWORK_TX_GB")
+MEASUREMENT_LABELS = {
+    "MEMORY_USAGE_GB": "ram",
+    "CPU_USAGE": "cpu",
+    "NETWORK_TX_GB": "egress",
+}
+
+#: Percent difference between the hourly-summed and single-window usage
+#: totals above which the reconciliation warns (deep dive §8.3).
+RECONCILIATION_WARN_PCT = 2.0
+
 USAGE_QUERY = """
 query($p:String!,$s:DateTime!,$e:DateTime!){
-  usage(projectId:$p,measurements:[MEMORY_USAGE_GB,CPU_USAGE],
+  usage(projectId:$p,measurements:[MEMORY_USAGE_GB,CPU_USAGE,NETWORK_TX_GB],
         startDate:$s,endDate:$e,groupBy:[SERVICE_ID]){
     measurement value tags{serviceId}
   }
 }
 """
+
+SERVICES_QUERY = """
+query($p:String!){
+  project(id:$p){
+    services{
+      edges{ node{ id name } }
+    }
+  }
+}
+"""
+
+
+def project_id() -> str:
+    """The core project's id from ``RAILWAY_PROJECT_ID`` — refuses to run
+    without it (deep dive §8.3: a hard-coded id silently pointed this
+    script at a project that was not this one)."""
+    value = os.environ.get(RAILWAY_PROJECT_ID_ENV_VAR, "").strip()
+    if not value:
+        sys.exit(
+            f"{RAILWAY_PROJECT_ID_ENV_VAR} is not set — refusing to guess which "
+            "Railway project to read (deep dive §8.3: the old hard-coded project "
+            "id pointed at a DIFFERENT project than this one)"
+        )
+    return value
 
 
 def _read_token() -> str:
@@ -147,12 +193,68 @@ def _graphql(token: str, query: str, variables: dict) -> dict:
         return {"error": str(exc)}
 
 
-def fetch_last_24h(token: str) -> tuple[dict[str, dict[str, float]], list[str], str]:
-    """Return ``({service: {measurement: total}}, failed_hours, window)``.
+def fetch_service_names(token: str, pid: str) -> dict[str, str]:
+    """``{serviceId: name}`` for ``pid``, from the API itself.
+
+    Replaces the old hand-maintained ``SERVICE_NAMES`` dict (deep dive
+    §8.3) — a hard-coded copy belonging to a different project drifts
+    silently the moment a service is added, renamed or removed; this
+    reads the live truth on every run. A service id the API did not
+    return a name for falls back to the raw id (never dropped from the
+    report — an unnamed service is still a service being billed).
+    """
+    result = _graphql(token, SERVICES_QUERY, {"p": pid})
+    edges = (
+        ((result.get("data") or {}).get("project") or {}).get("services") or {}
+    ).get("edges") or []
+    names: dict[str, str] = {}
+    for edge in edges:
+        node = (edge or {}).get("node") or {}
+        service_id = node.get("id")
+        name = node.get("name")
+        if service_id:
+            names[service_id] = name or service_id
+    return names
+
+
+def _usage_totals_for_window(
+    token: str, pid: str, start: dt.datetime, end: dt.datetime, service_names: dict[str, str]
+) -> dict[str, dict[str, float]]:
+    """One ``usage`` call over ``[start, end)`` — the single-window shape
+    the 2026-08-03 incident suspected of under-reporting. Used both by
+    the reconciliation check and, per-hour, by :func:`fetch_last_24h`."""
+    result = _graphql(
+        token,
+        USAGE_QUERY,
+        {
+            "p": pid,
+            "s": start.strftime("%Y-%m-%dT%H:00:00Z"),
+            "e": end.strftime("%Y-%m-%dT%H:00:00Z"),
+        },
+    )
+    usage = (result.get("data") or {}).get("usage")
+    if usage is None:
+        return {}
+    totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for entry in usage:
+        name = service_names.get(entry["tags"]["serviceId"], entry["tags"]["serviceId"])
+        totals[name][entry["measurement"]] += entry["value"]
+    return {name: dict(values) for name, values in totals.items()}
+
+
+def fetch_last_24h(
+    token: str, pid: str, service_names: dict[str, str]
+) -> tuple[dict[str, dict[str, float]], list[str], str, dict[str, dict[str, float]]]:
+    """Return ``({service: {measurement: total}}, failed_hours, window,
+    single_window_totals)``.
 
     One query per hour (see the module docstring on why), summed
-    client-side. Hours that never returned data are reported rather than
-    silently counted as zero.
+    client-side, PLUS one single 24h-window query — the shape a 2026-08-03
+    incident suspected of under-reporting by ~3.7×, not reproduced on
+    2026-09-06 (deep dive §8.3). Both are returned so :func:`main` can
+    reconcile them fresh every run instead of trusting an inherited
+    correction factor. Hours that never returned data are reported
+    rather than silently counted as zero.
     """
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
     start = now - dt.timedelta(hours=HOURS)
@@ -166,7 +268,7 @@ def fetch_last_24h(token: str) -> tuple[dict[str, dict[str, float]], list[str], 
                 token,
                 USAGE_QUERY,
                 {
-                    "p": PROJECT_ID,
+                    "p": pid,
                     "s": hour.strftime("%Y-%m-%dT%H:00:00Z"),
                     "e": nxt.strftime("%Y-%m-%dT%H:00:00Z"),
                 },
@@ -184,13 +286,54 @@ def fetch_last_24h(token: str) -> tuple[dict[str, dict[str, float]], list[str], 
                 failed.append(label)
                 continue
             for entry in usage:
-                name = SERVICE_NAMES.get(
+                name = service_names.get(
                     entry["tags"]["serviceId"], entry["tags"]["serviceId"]
                 )
                 totals[name][entry["measurement"]] += entry["value"]
 
     window = f"{start:%Y-%m-%d %H:00}Z..{now:%Y-%m-%d %H:00}Z"
-    return {name: dict(values) for name, values in totals.items()}, failed, window
+    window_totals = _usage_totals_for_window(token, pid, start, now, service_names)
+    return {name: dict(values) for name, values in totals.items()}, failed, window, window_totals
+
+
+def aggregate_measurement_totals(totals: dict[str, dict[str, float]]) -> dict[str, float]:
+    """Sum every service's per-measurement total into one project-wide
+    figure per measurement — what the hourly-vs-window reconciliation
+    compares."""
+    aggregate: dict[str, float] = defaultdict(float)
+    for measurements in totals.values():
+        for measurement, value in measurements.items():
+            aggregate[measurement] += value
+    return dict(aggregate)
+
+
+def reconcile_hourly_vs_window(
+    hourly_totals: dict[str, dict[str, float]],
+    window_totals: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Percent difference between the hour-by-hour sum and the single
+    whole-window query, per measurement label (``cpu``/``ram``/``egress``).
+
+    This is the check that would have caught the 2026-08-03 suspected
+    3.7x under-report. It was NOT reproduced on 2026-09-06 (deep dive
+    §8.3: "do not apply an inherited correction factor blindly"), so
+    rather than hard-coding a fixed correction, the comparison itself
+    runs fresh on every invocation.
+    """
+    hourly_by_measurement = aggregate_measurement_totals(hourly_totals)
+    window_by_measurement = aggregate_measurement_totals(window_totals)
+    deltas: dict[str, float] = {}
+    for measurement in MEASUREMENTS:
+        label = MEASUREMENT_LABELS[measurement]
+        hourly = hourly_by_measurement.get(measurement, 0.0)
+        window = window_by_measurement.get(measurement, 0.0)
+        if hourly == 0.0 and window == 0.0:
+            deltas[label] = 0.0
+        elif hourly == 0.0:
+            deltas[label] = 100.0
+        else:
+            deltas[label] = 100.0 * abs(hourly - window) / hourly
+    return deltas
 
 
 def analyse(totals: dict[str, dict[str, float]]) -> tuple[list[str], list[str], float, float]:
@@ -238,13 +381,27 @@ def analyse(totals: dict[str, dict[str, float]]) -> tuple[list[str], list[str], 
     return rows, alerts, total_gb, cost
 
 
-def append_log(window: str, total_gb: float, cost: float, alerts: list[str]) -> None:
+def _format_reconciliation(deltas: dict[str, float]) -> str:
+    """``cpu:0.12%,ram:0.00%,egress:1.87%`` — the log/print form of
+    :func:`reconcile_hourly_vs_window`'s result, ordered CPU/RAM/egress."""
+    order = ("cpu", "ram", "egress")
+    return ",".join(f"{label}:{deltas.get(label, 0.0):.2f}%" for label in order)
+
+
+def append_log(
+    window: str,
+    total_gb: float,
+    cost: float,
+    alerts: list[str],
+    reconciliation: dict[str, float],
+) -> None:
     """Append the dated summary line (+ any alerts) to the ops log."""
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         f"{stamp} window={window} total_resident={total_gb:.2f}GB "
-        f"est=${cost:.2f}/day (${cost * 30.4:.2f}/mo) alerts={len(alerts)}"
+        f"est=${cost:.2f}/day (${cost * 30.4:.2f}/mo) alerts={len(alerts)} "
+        f"hourly_sum_vs_window_delta_pct={_format_reconciliation(reconciliation)}"
     ]
     lines += [f"{stamp}   {alert}" for alert in alerts]
     with LOG_PATH.open("a", encoding="utf-8") as handle:
@@ -252,14 +409,26 @@ def append_log(window: str, total_gb: float, cost: float, alerts: list[str]) -> 
 
 
 def main() -> int:
+    pid = project_id()
     token = _read_token()
-    totals, failed, window = fetch_last_24h(token)
+    service_names = fetch_service_names(token, pid)
+    totals, failed, window, window_totals = fetch_last_24h(token, pid, service_names)
     if not totals:
         print("no usage data returned — check credentials/network", file=sys.stderr)
         return 1
 
     rows, alerts, total_gb, cost = analyse(totals)
-    print(f"Railway usage {window} (project {PROJECT_ID})")
+
+    reconciliation = reconcile_hourly_vs_window(totals, window_totals)
+    for label, delta_pct in reconciliation.items():
+        if delta_pct > RECONCILIATION_WARN_PCT:
+            alerts.append(
+                f"ALERT RECONCILE  {label}: hourly-sum-vs-single-window delta "
+                f"{delta_pct:.2f}% exceeds the {RECONCILIATION_WARN_PCT:.0f}% ceiling "
+                "(deep dive §8.3 — verify before trusting this run's cost figures)"
+            )
+
+    print(f"Railway usage {window} (project {pid})")
     print(f"  {'service':<18}{'avg resident':>11}{'ratio':>10}{'':10}{'CPU':>9}")
     print("\n".join(rows))
     if failed:
@@ -268,9 +437,10 @@ def main() -> int:
         f"\ntotal resident {total_gb:.2f} GB | est ${cost:.2f}/day "
         f"(${cost * 30.4:.2f}/mo, mem @$10/GB-mo + cpu @$20/vCPU-mo)"
     )
+    print(f"hourly-sum-vs-window delta: {_format_reconciliation(reconciliation)}")
     print("\n".join(alerts) if alerts else "no alerts")
 
-    append_log(window, total_gb, cost, alerts)
+    append_log(window, total_gb, cost, alerts, reconciliation)
     print(f"appended to {LOG_PATH}")
     return 2 if alerts else 0
 

@@ -16,7 +16,8 @@ configuration is parsed exactly once per process.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Literal
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -205,6 +206,86 @@ class Settings(BaseSettings):
     # --- Scrape-profile resolution cache (SPEC-06 FR-019) ---
     PROFILE_RESOLUTION_CACHE_TTL_SECONDS: int = 30
 
+    # --- Customer-supplied regex execution bounds (A2/F02) ---
+    # `price_regex`/`old_price_regex`/`currency_regex`/`stock_regex` are
+    # DB-supplied, learned, competitor-page-influenced text. They run on the
+    # live scraping path through `regex.compile(...).search(..., timeout=)`
+    # (the `regex` package — CPython's stdlib `re` cannot be interrupted
+    # mid-match), so a catastrophic backtrack costs a bounded slice of one
+    # page instead of pinning a scraper core forever.
+    #: Per-pattern, per-node wall-clock deadline. The whole-page budget the
+    #: extraction module applies is 4x this value across every text node.
+    EXTRACTION_REGEX_TIMEOUT_SECONDS: float = 0.25
+    #: Write-time cap on a profile regex's source length (validation refuses
+    #: anything longer before it is ever compiled).
+    EXTRACTION_REGEX_MAX_PATTERN_CHARS: int = 512
+    #: Consecutive-window REGEX_TIMEOUT count (per rolling 24 h) after which a
+    #: scrape profile's regex strategy is quarantined.
+    EXTRACTION_REGEX_QUARANTINE_AFTER: int = 3
+    # Promoted from module constants in the scraping-side library's regex
+    # extraction module (named indirectly: this package must not reference
+    # that library even in a comment - see
+    # `tests/unit/test_import_boundaries.py`). They are the W3.2 pattern
+    # pre-flight + input-truncation bounds, and they stay DEFAULT OFF: the
+    # per-pattern execution deadline above is the primary containment now.
+    EXTRACTION_REGEX_BOUNDS_ENABLED: bool = False
+    #: Longest single text node any bounded pattern may see.
+    EXTRACTION_REGEX_BOUNDS_MAX_NODE_CHARS: int = 65_536
+    #: Total characters one bounded pattern may scan across every node.
+    EXTRACTION_REGEX_BOUNDS_MAX_TOTAL_CHARS: int = 1_048_576
+
+    # --- Ranked-extraction rollout flag (EPA C5, F19) -------------------
+    # The W3.2 ranked path (`collect_extraction_candidates` ->
+    # `rank`) has existed, tested, since 2026-08-26 and has never
+    # decided a live price: turning it on is a pricing-behaviour change,
+    # not a refactor, so it stayed opt-in per call.
+    #
+    #   `off`     the historical first-hit chain, nothing else runs.
+    #   `shadow`  the first hit is STILL what the caller gets and what
+    #             gets persisted; the ranker also runs and every
+    #             material disagreement is recorded as an
+    #             `extraction_shadow_events` row. This is how the
+    #             disagreement rate becomes a measured number instead of
+    #             an argument.
+    #   `v1`      the ranker decides. **An OWNER decision at C11**, taken
+    #             only if the shadow disagreement rate is < 1% on the C4
+    #             labeled sets AND the ranker wins >= 99% of labeled
+    #             conflicts (`scripts/run_offer_benchmark.py
+    #             --from-shadow-events`).
+    #
+    # `shadow` is the default because a rollout flag whose default is
+    # `off` produces no evidence, and one whose default is `v1` changes
+    # prices before anybody has any.
+    EXTRACTION_RANKING_POLICY: Literal["off", "shadow", "v1"] = "shadow"
+
+    # --- Raw-evidence blob store (EPA C5 / W3.1, F19) -------------------
+    # Where `app_shared.observations.evidence_store` writes the bytes an
+    # observation's `offer_raw_evidence_hash` names. In production this
+    # is a Railway VOLUME mounted on both scraper services — the store is
+    # content-addressed, so two services writing the same page write the
+    # same path with the same content, and a replay from either resolves.
+    #
+    # `None` is not a default location, it is "evidence storage is not
+    # configured": the pipeline then writes NO blob and leaves
+    # `offer_raw_evidence_hash` NULL. That is deliberate. A container's
+    # ephemeral filesystem would accept every write and lose them on the
+    # next deploy, leaving a table full of content addresses that resolve
+    # to nothing — exactly the "a hash pointing at deleted data proves
+    # nothing" failure `docs/RETENTION_POLICY.md` §2.1 is about. A NULL
+    # column is an honest absence; a dangling hash is a false claim.
+    EVIDENCE_STORE_DIR: str | None = None
+    #: How long a blob is kept once nothing needs it any more. The sweep
+    #: (`MAINTENANCE_EVIDENCE_RETENTION`) is age-AND-reference gated: a
+    #: blob past this window is still kept while any observation inside
+    #: `RETENTION_PRICE_OBSERVATIONS_DAYS` still references its hash.
+    EVIDENCE_RETENTION_DAYS: int = 30
+    #: Cadence of that sweep. Daily, like every other retention job.
+    EVIDENCE_RETENTION_INTERVAL_SECONDS: int = 86400
+    #: Blobs one sweep run may delete. Bounds the run's wall clock and
+    #: the number of reference queries it issues; a truncated run simply
+    #: continues on the next tick (the report says `truncated=True`).
+    EVIDENCE_RETENTION_MAX_BLOBS_PER_RUN: int = 5000
+
     # --- Batched persistence flush knobs (SPEC-07 FR-017, Principle VIII) ---
     # The scraping runtime's batched persistence pipeline (consumed via
     # get_settings(), never imported the other way — app_shared MUST NOT
@@ -213,6 +294,40 @@ class Settings(BaseSettings):
     # DB-tunable so a live deployment can retune without a code change.
     SCRAPE_FLUSH_MAX_ITEMS: int = 50
     SCRAPE_FLUSH_INTERVAL_SECONDS: float = 2.0
+
+    # --- Durable result spool (EPA F05, plan task B1) --------------------
+    # The spider-side SQLite/WAL queue every scrape result is written to
+    # BEFORE it enters the in-memory flush buffer, drained by the
+    # scraping-core library's `result_spool.ResultSpool` (deliberately not
+    # named in full here -- `tests/unit/test_import_boundaries.py` forbids
+    # this package from mentioning that one at all, even in a comment, so
+    # the reverse dependency edge cannot creep back in via a lazy import).
+    # Placed alongside the network
+    # ledger's own buffer (`NETLEDGER_BUFFER_PATH`, an env-only per-host
+    # fact) so both durable queues live on the same volume and one mount
+    # makes the host crash-safe rather than two.
+    SCRAPE_RESULT_SPOOL_PATH: Path = Path("/var/lib/crawmatic/spool/scrape_results.sqlite3")
+    #: How many flushes may be in flight before `process_item` starts
+    #: returning an unfired Deferred. Scrapy honours that by stopping its
+    #: pull from the scheduler, so the downloader stalls and admission
+    #: pauses -- backpressure instead of an unbounded spool when Postgres
+    #: is slower than the crawl.
+    SCRAPE_FLUSH_MAX_PENDING_BATCHES: int = 8
+    #: Delay before each successive replay of a failed batch, indexed by
+    #: the batch's attempt count (the last entry repeats). Comma-separated
+    #: in env (`"1,5,30,120,600"`), never JSON -- same convention as the
+    #: Scrapyd URL pools.
+    SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS: Annotated[tuple[float, ...], NoDecode] = (
+        1.0,
+        5.0,
+        30.0,
+        120.0,
+        600.0,
+    )
+    #: Failed attempts after which a spooled batch stops being retried and
+    #: moves to `kind='quarantined'` in the spool -- kept on disk for an
+    #: operator, never deleted (the fetch was already paid for).
+    SCRAPE_FLUSH_QUARANTINE_AFTER: int = 5
 
     # --- Auth DB role (optional — direct BYPASSRLS role for pre-auth
     # credential lookups only; see app_shared.database.get_auth_session).
@@ -236,6 +351,24 @@ class Settings(BaseSettings):
     # instead of SCRAPE_DISPATCH_HTTP_BATCH_MAX.
     SCRAPE_BATCH_BROWSER_MAX: int = 15
     SCRAPE_STALL_TIMEOUT_SECONDS: int = 900
+    # --- EPA B3 (F07, 2026-09-07): work-level fairness in the redispatch
+    # sweep. `redispatch_pending_jobs` used to walk `_scan_job_refs`'s
+    # rows in whatever order Postgres returned them -- which, for a
+    # backlogged tenant, is that tenant's jobs first and all of them. One
+    # workspace with 400 wedged jobs therefore filled every re-dispatch
+    # tick, and a second tenant's single stuck job waited behind the
+    # whole backlog. The sweep now interleaves workspaces round-robin and
+    # re-enqueues at most this many jobs per workspace per tick; the rest
+    # of that workspace's backlog is picked up by the following tick, in
+    # the same round-robin order.
+    #
+    # 4 rather than 1: a tick must still make real progress on a genuine
+    # backlog (the sweep runs on the 60s maintenance cadence), and every
+    # re-enqueue is idempotent and paced further downstream by the
+    # dispatch client's Redis guard TTL. It is a fairness knob, not a
+    # rate limit -- the rate limits live in the fleet/domain concurrency
+    # caps and the cost gate.
+    SCRAPE_DISPATCH_PER_WORKSPACE_BATCHES_PER_TICK: int = 4
     # --- EPA A3/B2 (2026-09-03): the two maintenance-sweep deadlines that
     # stop a job dangling RUNNING forever after a scrapyd container is
     # replaced mid-run. See `app_shared.jobs.reaper`.
@@ -280,6 +413,38 @@ class Settings(BaseSettings):
     # never finalizes.
     SCRAPE_MAX_DEFER_CYCLES: int = 3
 
+    # --- EPA C1 (F08): per-TARGET deadline + physical attempt budget ------
+    # `SCRAPE_JOB_MAX_RUNTIME_SECONDS` (12h) and `SCRAPE_MAX_DEFER_CYCLES`
+    # bound the JOB and the DEFER loop respectively. Neither bounds what
+    # ONE target may spend on physical fetches, which is where the money
+    # goes: a target that escalates DIRECT -> IMPERSONATE -> PROXY ->
+    # BROWSER and then retries each of those pays for every one of them,
+    # and the deep dive found targets doing exactly that for the whole
+    # job window.
+    #
+    # Wall-clock seconds one TARGET may stay non-terminal before it is
+    # finalized `FAILED`/`TARGET_DEADLINE_EXCEEDED` WITHOUT another
+    # fetch. Deliberately far below `SCRAPE_JOB_MAX_RUNTIME_SECONDS`:
+    # one slow target may not hold a whole refresh open, and 15 minutes
+    # is already ~20x the p95 target lifetime A5 measures.
+    SCRAPE_TARGET_DEADLINE_SECONDS: int = 900
+    # Physical fetches (one HTTP request or one browser navigation each;
+    # a retry counts again) one target may spend in ONE refresh across
+    # every method on its ladder. The 5th is refused
+    # `ATTEMPT_BUDGET_EXHAUSTED`. 4 is the full ladder once with one
+    # retry -- past that the evidence says the target is not gettable
+    # today, and paying for a 5th attempt buys nothing.
+    SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS: int = 4
+    # Fraction of targets whose cheap method has been suppressed by a
+    # DOMAIN-level rule that still get one sampled recovery probe with
+    # it. Without this a domain-wide suppression is permanent by
+    # construction: the cheap method is never tried again, so it can
+    # never produce the success that would lift the suppression. 5% is a
+    # deliberate, bounded cost paid to keep the suppression falsifiable.
+    # Per-TARGET suppression (this target, this refresh) is never probed
+    # -- it is a fact about this fetch, not a standing rule.
+    SCRAPE_RECOVERY_PROBE_FRACTION: float = 0.05
+
     # Domains whose fetches go through the scraping runtime's
     # Chrome-impersonating TLS transport (2026-08-05) instead of the
     # Scrapy/Twisted HTTP client. amazon.sa and noon.com reject that
@@ -302,6 +467,25 @@ class Settings(BaseSettings):
     # queue depth grows during a full run (under-provisioning shows up as
     # backlog, not errors).
     CELERY_WORKER_CONCURRENCY: int = 4
+
+    # --- Two consumer pools, one service (EPA B4, F09) -----------------
+    #
+    # `apps/workers/start.sh` launches exactly two `celery worker`
+    # processes in the one container: `critical@%h` (`scrape_dispatch`,
+    # `maintenance` — dispatch plus the sweeps that keep jobs/breaker/
+    # outbox state machines from getting stuck) and `bulk@%h`
+    # (`price_analysis`, `strategy_discovery`, `webhook_events` — traffic
+    # that can tolerate more queueing latency). Each process is started
+    # with an explicit `-c` flag from these two settings, which
+    # supersedes `CELERY_WORKER_CONCURRENCY` above for both pools (that
+    # setting only still matters if a process is ever started without
+    # `start.sh`'s explicit `-c`, e.g. a one-off `celery worker` shell
+    # invocation). Isolating the two pools means an overloaded
+    # `price_analysis`/`strategy_discovery` backlog can never starve the
+    # `maintenance` consumers the fleet's reapers/reconcilers depend on.
+    # See `docs/ops/CAPACITY.md` for the RAM budget this implies.
+    CELERY_CRITICAL_CONCURRENCY: int = 2
+    CELERY_BULK_CONCURRENCY: int = 2
 
     # Prefork child recycling (2026-08-03 memory-leak hardening). A child
     # is retired after this many tasks, and after its resident set passes
@@ -371,6 +555,27 @@ class Settings(BaseSettings):
     # message counts as "stuck" for alerting.
     OUTBOX_RECONCILE_INTERVAL_SECONDS: int = 300
     OUTBOX_STUCK_AFTER_SECONDS: int = 900
+    # --- EPA B3 (2026-09-07), closing B2's owed wiring: how often the
+    # scheduler claims the durable `dispatch_reconcile` cadence, which
+    # enqueues `DISPATCH_RECONCILE_INTENTS` -- step 5 of B2's
+    # commit-before-send protocol
+    # (`app_shared.jobs.dispatch_intents.reconcile_inflight_intents`).
+    # B2 shipped that function with no schedule at all, so a worker
+    # killed between its POST and the node's answer left a `POSTED` row
+    # nothing ever settled.
+    #
+    # DURABLE, not an in-process accumulator: the whole point of the
+    # protocol is to survive the process dying, so the cadence that
+    # settles its leftovers must survive a restart too -- an in-process
+    # float would reset on exactly the event it exists to clean up after.
+    # 300s matches the outbox reconcile beside it: this is a bounded
+    # scan of at most `DISPATCH_RECONCILE_LIMIT` POSTED rows plus one
+    # `listjobs` call per distinct node.
+    DISPATCH_RECONCILE_INTERVAL_SECONDS: int = 300
+    # Rows examined per reconcile pass. Bounded for the same reason
+    # `OUTBOX_DRAIN_BATCH_LIMIT` is: one pass must not hold a worker (or
+    # its 300s time limit) for an unbounded time; the next tick continues.
+    DISPATCH_RECONCILE_LIMIT: int = 200
     # How long a PUBLISHED row is kept before deletion (DEAD rows are kept
     # `DEAD_RETENTION_MULTIPLIER` times longer — they are incident
     # evidence). The table is a drain-to-empty queue, not a history table,
@@ -527,6 +732,17 @@ class Settings(BaseSettings):
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
     STRATEGY_STATS_KEY_TTL_SECONDS: int = 3600
 
+    # --- Discovery fleet-wide chunked scan (EPA B4, F09) ---------------
+    # `STRATEGY_DISCOVERY_SCAN` (`app.workers.tasks_strategy.
+    # strategy_discovery_scan`) processes at most this many
+    # `DISCOVERY_REQUIRED` profiles per invocation, persisting how far it
+    # got in `strategy_discovery_state` and re-enqueueing itself while a
+    # pass is still in progress -- "resumable long maintenance" so a task
+    # time limit or a worker restart mid-scan can never lose its place.
+    # 20 keeps one invocation's outbox-write work (bounded DB work, no
+    # blocking fetch) comfortably inside that task's own time_limit.
+    STRATEGY_DISCOVERY_MAX_DOMAINS_PER_RUN: int = 20
+
     # --- Rediscovery/discovery local rate bounds (2026-08-15 runaway
     # backstop). These are NOT tuning knobs for how eagerly the optimizer
     # re-learns; they are the structural ceiling that keeps ANY future
@@ -623,13 +839,47 @@ class Settings(BaseSettings):
     # is a plain comma-separated string, never JSON.
     BROWSER_PROXIED_DOCUMENT_ONLY_DOMAINS: Annotated[tuple[str, ...], NoDecode] = ()
 
+    # --- Connection-time browser egress guard (READY F01, plan task A1,
+    # Principle IV — env-tunable, never a hardcoded literal). Chromium
+    # performs its own DNS and follows redirects internally, so the
+    # `PLAYWRIGHT_ABORT_REQUEST` route hook only ever sees the FIRST
+    # request of a chain; the browser egress guard (in the scraping-core
+    # library, module `browser.egress_guard` -- deliberately NOT named in
+    # full here: `tests/unit/test_import_boundaries.py` forbids that
+    # package's name anywhere under `app_shared`, comments included, so the
+    # reverse dependency edge cannot be reintroduced by a lazy import) is
+    # the enforcement point that every connection (redirect hop,
+    # sub-resource, worker, popup, WebSocket) must pass through, because
+    # Chromium is launched with `--proxy-server=http://127.0.0.1:<port>`.
+    #
+    # ON by default and intended to stay on: with it off, the browser node
+    # is back to route-hook-only coverage, which is the exact gap F01
+    # exists to close. The switch exists so an operator can prove a
+    # production incident is or is not the guard, not as a routine knob.
+    BROWSER_EGRESS_GUARD_ENABLED: bool = True
+    # Wall clock for the guard's own upstream dial (origin or proxy leg).
+    # Bounds a black-holed destination without waiting out the OS SYN
+    # retry ladder; the navigation timeout above still bounds the page.
+    BROWSER_EGRESS_GUARD_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    # Service workers persist past the page that registered them and can
+    # re-issue fetches with no route hook attached, so they are blocked at
+    # context creation. `"allow"` exists only for a diagnostic run against
+    # a site that genuinely will not render without one.
+    BROWSER_SERVICE_WORKERS: Literal["block", "allow"] = "block"
+
     # --- Retention, rollups & partition maintenance tuning (SPEC-15,
     # data-model.md §6, Principle IV — env/DB-tunable, never a hardcoded
     # literal). Five per-table retention windows, three maintenance-task
     # cadence intervals, and the partition create-ahead lookahead. Reused
     # unchanged: SYSTEM_DATABASE_URL (-> AUTH_DATABASE_URL fallback) — no
     # new session knob added here. ---
-    RETENTION_PRICE_OBSERVATIONS_DAYS: int = 90
+    # 180, not 90 (EPA C9 / owner decision 11, 2026-09-07): the raw
+    # observation is the evidence a pricing decision traces back to, and
+    # a 90-day window put it BELOW the 180-day dispute horizon the policy
+    # doc now records. Changed in place rather than re-declared in C9's
+    # append block below because two contradictory declarations of one
+    # knob is a landmine, not a merge strategy.
+    RETENTION_PRICE_OBSERVATIONS_DAYS: int = 180
     RETENTION_REQUEST_ATTEMPTS_DAYS: int = 90
     RETENTION_PRICE_ALERT_EVENTS_DAYS: int = 365
     RETENTION_WEBHOOK_EVENTS_DAYS: int = 90
@@ -673,6 +923,21 @@ class Settings(BaseSettings):
     # number from observed spend and prints its full derivation.
     FLEET_BUDGET_MONTHLY_CAP_USD_PROXY: float | None = None
     FLEET_BUDGET_MONTHLY_CAP_USD_BROWSER: float | None = None
+
+    # --- Proxy billing unit (EPA A8, deep dive §8.3). `costauth.pricing`
+    # used to divide by a bare `2**30` literal named `BYTES_PER_GIB` —
+    # a real ambiguity, because the September 3 pricing note itself
+    # confuses `$/GB` with `$/GiB` twice, and a provider contract that
+    # actually bills decimal GB would silently under/over-price every
+    # proxied byte by ~7.4% with no setting anywhere to point at. Named
+    # here so the unit is a visible, overridable choice rather than an
+    # implicit constant: default `1073741824` (2**30, one GiB — the
+    # DataImpulse pool rate this repo has actually recorded) reproduces
+    # today's numbers bit-for-bit; a provider whose contract says decimal
+    # `GB` sets this to `1000000000` and every downstream price recomputes
+    # from the same rate.
+    PROXY_BILLING_UNIT_BYTES: int = 1_073_741_824
+
     # Raised 1 -> 3 in the 2026-08-15 readiness cycle. With a lookahead of
     # 1 the entire safety margin between "maintenance stops working" and
     # "every INSERT into four partitioned tables fails" is however many
@@ -759,13 +1024,26 @@ class Settings(BaseSettings):
     # --- Scheduler two-plane limits + weighted fair queuing (EPA W4.2,
     # report §6; `app_shared.scheduling.fair_queue`). ---
     #
-    # Master switch, DEFAULT OFF. `False` keeps the SPEC-13 due-rule pass
-    # (`app.scheduler.refresh.run_refresh_pass`) exactly as it is, so a
-    # deploy that merely carries the W4.2 code changes no live scheduling
-    # behaviour. `True` swaps in the fair pass on the SAME
-    # `SCHEDULER_POLL_INTERVAL_SECONDS` cadence and the SAME
-    # `SCHEDULER_CLAIM_BATCH_LIMIT` ceiling -- no new interval knob.
-    SCHEDULER_FAIR_QUEUE_ENABLED: bool = False
+    # Master switch, DEFAULT ON since EPA B3 (F07, 2026-09-07). `False`
+    # keeps the SPEC-13 due-rule pass
+    # (`app.scheduler.refresh.run_refresh_pass`) exactly as it is; `True`
+    # swaps in the fair pass on the SAME `SCHEDULER_POLL_INTERVAL_SECONDS`
+    # cadence and the SAME `SCHEDULER_CLAIM_BATCH_LIMIT` ceiling -- no new
+    # interval knob.
+    #
+    # Shipped dark through W4.2..B4 and deferred on 2026-09-04 with the
+    # reasoning "one tenant, so weighted fair queuing has nothing to
+    # arbitrate" (`docs/DEFERRED-ITEMS.md`). B3 closes that deferral,
+    # because fairness was never the only thing this flag gated. The fair
+    # pass is also the ONLY path that carries per-rule failure isolation
+    # with a bounded-retry ledger and a dead-letter sink, the two-plane
+    # fleet/domain concurrency caps that keep one merchant's WAF from
+    # seeing the fleet's whole backlog at once, and (B3) the durable
+    # occurrence claim in `refresh_rule_occurrences`. None of those is a
+    # tenant-count question, so the flag's value stopped being one.
+    # FLEET-WIDE SCHEDULING BEHAVIOUR CHANGE, made deliberately -- see
+    # EPA B3's report.
+    SCHEDULER_FAIR_QUEUE_ENABLED: bool = True
     # FLEET PLANE: simultaneous in-flight fetches ONE DOMAIN may receive
     # from the whole fleet, counting every tenant. This is the number a
     # merchant's WAF sees; the per-workspace cap it replaces multiplied it
@@ -828,6 +1106,49 @@ class Settings(BaseSettings):
     # exercised by the W4.3 canary script), not by any live dispatch path.
     JOBS_COALESCING_FRESHNESS_SECONDS: int = 300
 
+    # --- Capacity-aware Scrapyd placement (EPA B6, F11) -----------------
+    # The most batches `choose_node` will queue behind ONE node before it
+    # calls that node saturated and looks elsewhere; when every node in
+    # the pool is at this bound the batch is DEFERRED, not POSTed (see
+    # `app_shared.jobs.nodes.choose_node`). It bounds `pending`, not
+    # `running`: the browser nodes run `max_proc = 1`
+    # (`apps/scrapers-browser/scrapyd.conf`), so anything beyond the one
+    # running spider is queue depth that a POST cannot shorten -- it only
+    # holds a cost-authorization grant and a `claimed_at` stamp open
+    # while the phase clock runs. 4 is ~4 browser runs deep, a few
+    # minutes of work at current run times, which is enough buffer to
+    # absorb a burst without letting one job monopolise a node.
+    SCRAPYD_MAX_PENDING_PER_NODE: int = 4
+
+    # --- EPA B5 (F10): FLEET-wide host admission ---------------------------
+    # Every limiter setting above this block is per-WORKSPACE. These three
+    # are the opposite and that is the point: the host sees one fleet, so
+    # ten tenants each politely inside their own ceiling still hit
+    # `amazon.sa` with ten times that. `app_shared.limiter.fleet.admit_fleet`
+    # takes one lease per physical request (a browser navigation and an
+    # HTTP request are one lease each; a retry re-acquires) against these
+    # defaults, overridable per domain by the `domain_rules` row's
+    # `fleet_concurrency` / `fleet_rate_per_minute` (NULL = use the
+    # default here).
+    #
+    # Simultaneous in-flight physical requests the WHOLE fleet may hold
+    # against one (domain, transport). Deliberately small: this is a
+    # politeness ceiling toward a third-party host, not a throughput
+    # target -- exceeding it is what gets the fleet's whole IP range
+    # blocked, and the queueing it causes is absorbed by the existing
+    # backoff/requeue/DEFERRED path, not by failing work.
+    FLEET_HOST_CONCURRENCY_DEFAULT: int = 6
+    # Physical requests per minute the WHOLE fleet may make against one
+    # (domain, transport) -- the shared token bucket's capacity.
+    FLEET_HOST_RATE_PER_MINUTE_DEFAULT: int = 90
+    # Crash-recovery window for a fleet lease. A holder that dies without
+    # releasing frees its slot this many seconds later (the semaphore
+    # Lua purges expired members on every acquire -- no reaper). It must
+    # comfortably exceed the longest single physical request, browser
+    # navigations included, or a live fetch's slot is reclaimed while it
+    # is still on the wire and the fleet quietly over-admits.
+    FLEET_LEASE_TTL_SECONDS: int = 120
+
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod
     def _parse_url_pool(cls, value: object) -> object:
@@ -859,6 +1180,194 @@ class Settings(BaseSettings):
                 f"{self.ENCRYPTION_PRIMARY_KEY_VERSION} not present in ENCRYPTION_KEYS"
             )
         return self
+
+    @field_validator("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS", mode="before")
+    @classmethod
+    def _parse_retry_backoff(cls, value: object) -> object:
+        """``"1,5,30"`` -> ``(1.0, 5.0, 30.0)``.
+
+        Same comma-separated convention as the Scrapyd URL pools (never
+        JSON). An empty value is rejected rather than silently meaning
+        "retry immediately, forever": the tuple is a schedule, and a
+        schedule with no entries is a misconfiguration.
+        """
+        if isinstance(value, str):
+            parsed = tuple(float(item.strip()) for item in value.split(",") if item.strip())
+        elif isinstance(value, (list, tuple)):
+            parsed = tuple(float(item) for item in value)
+        else:
+            return value
+        if not parsed:
+            raise ValueError("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS must have at least one delay")
+        if any(delay < 0 for delay in parsed):
+            raise ValueError("SCRAPE_FLUSH_RETRY_BACKOFF_SECONDS delays must be >= 0")
+        return parsed
+
+    # --- BEGIN EPA C7 (F12) APPEND BLOCK -- set-based daily rollups ------
+    #
+    # Appended here rather than beside the other `ROLLUP_*` fields above
+    # so this task could land alongside a concurrent edit to the same
+    # file without either side rewriting the other's region. Pydantic
+    # collects annotated class attributes regardless of where they sit
+    # relative to the validators, so these are ordinary `Settings` fields.
+    #
+    #: Keyset window: how many `(workspace_id, product_variant_id)` pairs
+    #: ONE rollup statement covers. Each batch is its own transaction and
+    #: its own durable checkpoint, so this is the granularity at which a
+    #: killed invocation loses work -- and the granularity at which it
+    #: resumes. 5,000 amortises the per-statement planning cost while
+    #: keeping one transaction short.
+    ROLLUP_BATCH_SIZE: int = 5000
+    #: Wall-clock budget for ONE `MAINTENANCE_DAILY_ROLLUP` invocation,
+    #: checked BETWEEN batches. Deliberately below the task's 1,800 s
+    #: Celery `time_limit` (`apps/workers/app/workers/celery_app.py`,
+    #: `_ROLLUP_LIMITS`) so the task stops itself cleanly and re-enqueues
+    #: instead of being SIGKILLed mid-transaction: a self-stop keeps the
+    #: last batch's checkpoint, a SIGKILL rolls it back. The 300 s of
+    #: slack is one batch's worth of headroom on a slow day.
+    ROLLUP_INVOCATION_BUDGET_SECONDS: int = 1500
+    # --- END EPA C7 (F12) APPEND BLOCK -----------------------------------
+
+    # --- BEGIN EPA C9 (F14) APPEND BLOCK -- retention per data class -----
+    #
+    # Appended (not interleaved with the SPEC-15 retention block above)
+    # for the same reason C7's block is: this file is edited by several
+    # concurrent tasks and an append cannot conflict with theirs.
+    #
+    # The three windows the plan re-states -- `RETENTION_REQUEST_ATTEMPTS_DAYS`
+    # (90), `RETENTION_PRICE_OBSERVATIONS_DAYS` (180) and
+    # `RETENTION_VARIANT_PRICE_DAILY_ROLLUPS_DAYS` (730) -- are NOT
+    # re-declared here: they already exist above and the only one whose
+    # value changed (price observations, 90 -> 180) was edited in place
+    # so there is exactly one declaration of each knob.
+    #
+    #: Browser SUBRESOURCE operations (`network_operations` rows carrying a
+    #: `parent_operation_id`). 30 days, deliberately the shortest window in
+    #: this block: a subresource is a means, not evidence. What must survive
+    #: is the PARENT's exact totals, and
+    #: `app_shared.maintenance.ledger_summaries` preserves those by writing
+    #: one `network_operation_resource_summaries` row before the children go
+    #: -- summarised, never merely deleted.
+    RETENTION_NETWORK_OPERATION_CHILDREN_DAYS: int = 30
+    #: Parent (non-child) physical operations. 730 days because this is the
+    #: fleet's own cost evidence: it is what a provider invoice is
+    #: reconciled against, and a financial record's window is set by the
+    #: longest applicable obligation, not by storage cost.
+    RETENTION_NETWORK_OPERATIONS_DAYS: int = 730
+    #: `network_operation_allocations` -- the tenant-visible half of the
+    #: same fact. Deliberately EQUAL to `RETENTION_NETWORK_OPERATIONS_DAYS`:
+    #: an allocation outliving its operation is an orphan, and an operation
+    #: outliving its allocations is a cost nobody owns. Two knobs rather
+    #: than one because a future jurisdiction may demand tenant-side
+    #: deletion earlier than fleet-side; if they ever diverge the
+    #: allocation window must be the SHORTER one.
+    RETENTION_COST_ALLOCATIONS_DAYS: int = 730
+    #: `scrape_job_targets` -- per-target execution state. 90 days: it is
+    #: operational telemetry whose durable outcome already lives in
+    #: `price_observations`/`match_current_prices`.
+    RETENTION_SCRAPE_JOB_TARGETS_DAYS: int = 90
+    #: `dispatch_intents` -- the commit-before-send protocol's in-flight
+    #: record. 30 days: a TERMINAL intent older than the reconcile window
+    #: (`DISPATCH_RECONCILE_INTERVAL_SECONDS`, 5 min) by four orders of
+    #: magnitude answers no question anyone can still ask.
+    RETENTION_DISPATCH_INTENTS_DAYS: int = 30
+    #: `cost_reservations` -- one row per C3 authorization grant. 30 days
+    #: past SETTLED/RELEASED. The money fact it produced is on
+    #: `cost_budgets` and in the ledger; the reservation itself is a lease.
+    RETENTION_COSTAUTH_RESERVATIONS_DAYS: int = 30
+    #: **The owner-ratification switch, and the reason nothing above can
+    #: delete anything today.** Empty means EVERY retention family is
+    #: inert: `app_shared.maintenance.retention.run_retention` and
+    #: `app_shared.maintenance.ledger_summaries` both consult
+    #: `app_shared.maintenance.registry.retention_class_enabled` before any
+    #: DROP, DELETE or summarisation, and report the family as skipped
+    #: instead. A window above is therefore a PROPOSED default, not a live
+    #: policy, until the owner signs the matching "Ratified by owner on
+    #: ____" line in `docs/RETENTION_POLICY.md` and names the class here.
+    #:
+    #: Values are the `RetentionFamily.class_key` strings in
+    #: `app_shared.maintenance.registry.RETENTION_FAMILIES` (e.g.
+    #: `"price_observations"`); `"*"` enables every registered family at
+    #: once and exists so a post-ratification deployment is one value
+    #: rather than nine. An UNKNOWN class name raises at `Settings`
+    #: construction: a typo'd class must fail the deploy, never silently
+    #: leave a family disabled that the owner believes they enabled.
+    #:
+    #: Env form is the repo's comma-separated pool convention (`NoDecode` +
+    #: the validator below), never JSON.
+    RETENTION_ENABLED_CLASSES: Annotated[list[str], NoDecode] = []
+    #: How many parent operations one `MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN`
+    #: invocation summarises. Each parent is its own transaction, so this
+    #: bounds the invocation, not the lock.
+    LEDGER_SUMMARIZE_BATCH_SIZE: int = 500
+    #: Cadence for that task. Daily, like every other retention-shaped job.
+    LEDGER_SUMMARIZE_INTERVAL_SECONDS: int = 86400
+    #: How many rows ONE bounded retention `DELETE` removes
+    #: (`app_shared.maintenance.retention._delete_expired_rows`). Each
+    #: batch is its own transaction, so this is the granularity at which a
+    #: killed invocation stops -- and the size of the largest lock and WAL
+    #: record it can produce.
+    RETENTION_ROW_DELETE_BATCH_SIZE: int = 5000
+    #: How many such batches ONE `MAINTENANCE_RETENTION_DROP` invocation
+    #: runs per family before leaving the rest to the next tick. 200 x
+    #: 5,000 = one million rows per family per day, which clears any
+    #: realistic day's arrivals while keeping the task far inside its
+    #: Celery time limit even on the first (backlog-clearing) run.
+    RETENTION_ROW_DELETE_MAX_BATCHES: int = 200
+
+    @field_validator("RETENTION_ENABLED_CLASSES", mode="before")
+    @classmethod
+    def _parse_retention_enabled_classes(cls, value: object) -> object:
+        """``"price_observations,request_attempts"`` -> ``[...]``.
+
+        Comma-separated, the same convention as the Scrapyd URL pools --
+        never JSON. An empty/whitespace value is the DEFAULT posture
+        (nothing enabled), not an error: "delete nothing" is always a
+        valid configuration of a deletion switch.
+        """
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return value
+
+    @field_validator("RETENTION_ENABLED_CLASSES", mode="after")
+    @classmethod
+    def _validate_retention_enabled_classes(cls, value: list[str]) -> list[str]:
+        """Reject a class name no registry family answers to.
+
+        Imported lazily inside the validator: `app_shared.maintenance.
+        registry` imports `Settings` from this module, so a module-level
+        import here would be circular.
+        """
+        from app_shared.maintenance.registry import RETENTION_CLASS_KEYS
+
+        unknown = [item for item in value if item != "*" and item not in RETENTION_CLASS_KEYS]
+        if unknown:
+            raise ValueError(
+                "RETENTION_ENABLED_CLASSES names unknown retention classes "
+                f"{unknown!r}; known classes are {sorted(RETENTION_CLASS_KEYS)!r} "
+                "(or '*' for all)"
+            )
+        return value
+
+    # --- END EPA C9 (F14) APPEND BLOCK -----------------------------------
+
+    # --- BEGIN EPA D5 (deep dive §12 item 9) APPEND BLOCK -- daily scorecard
+    #
+    # Appended (not interleaved with any block above) for the same reason
+    # every other EPA append block here is: this file is edited by
+    # several concurrent tasks and an append cannot conflict with theirs.
+    #
+    #: Cadence for `MAINTENANCE_DAILY_SCORECARD`
+    #: (`app_shared.maintenance.scorecard.run_daily_scorecard`). Daily,
+    #: like every other retention/rollup-shaped job — the scorecard row
+    #: it writes is itself a closed CALENDAR DAY, so running it more than
+    #: once a day would not produce a more current row, only a repeated
+    #: one (the write is an idempotent UPSERT on `date`).
+    SCORECARD_INTERVAL_SECONDS: int = 86400
+
+    # --- END EPA D5 APPEND BLOCK -------------------------------------------
 
     @field_validator("STRATEGY_PROFILE_SCOPE")
     @classmethod

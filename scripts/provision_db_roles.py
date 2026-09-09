@@ -81,13 +81,16 @@ APP_ROLE = "crawmatic_app"
 #: every service DSN authenticates as it; see provision_db_roles.sql's
 #: header for why the deployed name is kept rather than duplicated.
 SYSTEM_ROLE = "crawmatic_auth"
+#: EPA A3/F03: the scrapyd services' narrow ingestion role. See
+#: provision_db_roles.sql section 3a and scripts/sql/grants_expected.yaml.
+SCRAPER_ROLE = "crawmatic_scraper"
 MIGRATE_ROLE = "crawmatic_migrate"
 
 #: Roles a RUNNING SERVICE authenticates as. Nothing in `public` may be
 #: owned by one of these: an owner can `ALTER TABLE ... NO FORCE ROW
 #: LEVEL SECURITY` and `DROP POLICY`, so an owner that is also a live
 #: login can switch its own isolation off.
-RUNTIME_LOGIN_ROLES = (APP_ROLE, SYSTEM_ROLE)
+RUNTIME_LOGIN_ROLES = (APP_ROLE, SYSTEM_ROLE, SCRAPER_ROLE)
 
 #: Manifest classes. See scripts/rls_table_manifest.txt's header.
 CLASS_WORKSPACE = "WORKSPACE"
@@ -338,7 +341,7 @@ def _check_roles(conn: Connection) -> list[Finding]:
         conn,
         "SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreaterole "
         "FROM pg_roles WHERE rolname = ANY(:names)",
-        names=list((APP_ROLE, SYSTEM_ROLE, MIGRATE_ROLE)),
+        names=list((APP_ROLE, SYSTEM_ROLE, SCRAPER_ROLE, MIGRATE_ROLE)),
     ).all()
     found = {row.rolname: row for row in rows}
 
@@ -353,6 +356,12 @@ def _check_roles(conn: Connection) -> list[Finding]:
             "rolsuper": False,
             # BYPASSRLS is intentional here and ONLY here.
             "rolbypassrls": True,
+            "rolcanlogin": True,
+            "rolcreaterole": False,
+        },
+        SCRAPER_ROLE: {
+            "rolsuper": False,
+            "rolbypassrls": False,
             "rolcanlogin": True,
             "rolcreaterole": False,
         },
@@ -617,6 +626,7 @@ def provision(
     *,
     app_password: str | None = None,
     auth_password: str | None = None,
+    scraper_password: str | None = None,
     migrate_password: str | None = None,
     adopt_ownership: bool = False,
 ) -> None:
@@ -634,6 +644,7 @@ def provision(
             for guc, value in (
                 ("provision_db_roles.app_password", app_password),
                 ("provision_db_roles.auth_password", auth_password),
+                ("provision_db_roles.scraper_password", scraper_password),
                 ("provision_db_roles.migrate_password", migrate_password),
                 ("provision_db_roles.adopt_ownership", "on" if adopt_ownership else "off"),
             ):
@@ -932,6 +943,7 @@ def main(argv: list[str] | None = None) -> int:
                 url,
                 app_password=os.environ.get("CRAWMATIC_APP_DB_PASSWORD") or None,
                 auth_password=os.environ.get("CRAWMATIC_AUTH_DB_PASSWORD") or None,
+                scraper_password=os.environ.get("CRAWMATIC_SCRAPER_DB_PASSWORD") or None,
                 migrate_password=os.environ.get("CRAWMATIC_MIGRATE_DB_PASSWORD") or None,
                 adopt_ownership=args.adopt_ownership,
             )

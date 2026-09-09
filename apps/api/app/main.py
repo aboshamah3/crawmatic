@@ -149,6 +149,7 @@ from app.thread_pool import configure_thread_pool
 from app.routers import (
     access_policies,
     admin,
+    admin_ops,
     alerts,
     api_keys,
     auth,
@@ -156,6 +157,7 @@ from app.routers import (
     control_plane,
     cost_rollups,
     domain_access_rules,
+    health,
     jobs,
     jobs_admin,
     matches,
@@ -231,7 +233,15 @@ app.include_router(control_plane.router)
 app.include_router(jobs_admin.router)
 app.include_router(version.router)
 app.include_router(ready.router)
+# EPA B8 (F16): `/live` (process liveness) and `/health/scraping`
+# (scraping-pipeline signal, never gates `/ready`) — see
+# `routers/health.py`'s module docstring for the three-way split.
+app.include_router(health.router)
 app.include_router(ops_metrics.router)
+# EPA B9 (F22): cross-workspace alert poll target for the existing
+# ops cron -- same service-token seam as `ops_metrics.router`, never the
+# tenant auth seam. See `routers/admin_ops.py`'s module docstring.
+app.include_router(admin_ops.router)
 
 
 # H2 (production-readiness audit): bound the anyio worker-thread pool that

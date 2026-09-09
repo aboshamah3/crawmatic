@@ -20,6 +20,19 @@ SCRAPE_RECOVER_STALLED = "maintenance.recover_stalled_batches"
 SCRAPE_FINALIZE_JOBS = "maintenance.finalize_jobs"
 SCRAPE_REDISPATCH_JOBS = "maintenance.redispatch_pending_jobs"
 SCRAPE_RECONCILE_FALSE_FAILURES = "maintenance.reconcile_false_failed_targets"
+# EPA B3 (2026-09-07), closing B2's owed wiring. Step 5 of B2's
+# commit-before-send dispatch protocol: settle every ``POSTED``
+# ``dispatch_intents`` row against the node it names
+# (``app_shared.jobs.dispatch_intents.reconcile_inflight_intents``). B2
+# shipped that function with no schedule at all — it deliberately stopped
+# short of touching the scheduler's beat loop — so a worker killed between
+# its POST and the node's answer left a ``POSTED`` row nothing ever
+# settled: not confirmable, and not re-postable either (only
+# ``RECONCILED_MISSING`` authorizes a re-POST). Driven by the DURABLE
+# ``dispatch_reconcile`` cadence, not an in-process accumulator: the
+# protocol exists to survive a process dying, so the sweep that cleans up
+# after that death has to survive it too.
+DISPATCH_RECONCILE_INTENTS = "maintenance.reconcile_dispatch_intents"
 
 # --- Price analysis (SPEC-09 FR-012, D4) ---
 # Enqueued via ``app_shared.messaging.enqueue`` from three triggers (scrape
@@ -38,6 +51,21 @@ STRATEGY_STATS_FLUSH = "maintenance.strategy_stats_flush"
 STRATEGY_LIGHT_RECHECK = "maintenance.strategy_light_recheck"
 STRATEGY_PATTERN_BACKFILL = "maintenance.strategy_pattern_backfill"
 
+# --- Discovery fleet-wide chunked scan (EPA B4, F09) ---
+# "Resumable long maintenance": bounded, cursor-driven sweep over
+# `domain_strategy_profiles` rows stuck at `DISCOVERY_REQUIRED` (any
+# path that reset a profile back to that status without itself
+# enqueueing `STRATEGY_DISCOVERY_RUN`, e.g. a restored/imported
+# dataset). Processes at most `Settings.
+# STRATEGY_DISCOVERY_MAX_DOMAINS_PER_RUN` profiles per invocation,
+# persists how far it got in `strategy_discovery_state`, and
+# re-enqueues itself to continue a still-in-progress pass -- so neither
+# a task time limit nor a worker restart mid-scan loses its place or
+# doubles up on already-forwarded profiles. A `maintenance`-queue task
+# (bounded DB scan + outbox writes, no blocking fetch), the same queue
+# as its `STRATEGY_PATTERN_BACKFILL` sibling.
+STRATEGY_DISCOVERY_SCAN = "maintenance.strategy_discovery_scan"
+
 # --- Retention, rollups & partition maintenance (SPEC-15, research R8) ---
 # Enqueued via the same ``app_shared.messaging.enqueue`` producer seam by the
 # scheduler's fixed-cadence accumulators; consumed by
@@ -46,6 +74,45 @@ STRATEGY_PATTERN_BACKFILL = "maintenance.strategy_pattern_backfill"
 MAINTENANCE_PARTITION_CREATE = "maintenance.partition_create"
 MAINTENANCE_DAILY_ROLLUP = "maintenance.daily_rollup"
 MAINTENANCE_RETENTION_DROP = "maintenance.retention_drop"
+
+# --- Evidence-blob retention (EPA C5, F19) ---------------------------------
+# The FILESYSTEM half of retention, and the only retention job in this
+# system whose objects are not rows: the content-addressed raw-evidence
+# store behind `price_observations.offer_raw_evidence_hash`.
+#
+# It is a separate task from `MAINTENANCE_RETENTION_DROP` rather than a
+# step inside it because the two have opposite failure modes. A partition
+# drop that does not run costs disk; a blob deletion that runs when it
+# should not costs the evidence a price was ever justified by, and is
+# irreversible. Keeping them apart means the gated, irreversible one can
+# be paused, rate-limited or dry-run without touching the routine one.
+#
+# `maintenance` queue, daily (`EVIDENCE_RETENTION_INTERVAL_SECONDS`),
+# consumed by `apps/workers/app/workers/tasks_maintenance.py`. Closes the
+# gap `docs/RETENTION_POLICY.md` §2.1 records as "No deletion mechanism
+# exists today".
+MAINTENANCE_EVIDENCE_RETENTION = "maintenance.evidence_retention"
+
+# --- Ledger child summarization (EPA C9, F14) ------------------------------
+# The LEDGER half of retention, and the only retention job here that
+# COMPRESSES rather than deletes: for a settled browser navigation older
+# than `RETENTION_NETWORK_OPERATION_CHILDREN_DAYS`, it writes one
+# `network_operation_resource_summaries` row carrying the children's
+# totals and deletes the children in the same transaction
+# (`app_shared.maintenance.ledger_summaries`).
+#
+# Its own task rather than a step inside `MAINTENANCE_RETENTION_DROP`
+# for the same reason `MAINTENANCE_EVIDENCE_RETENTION` is: the partition
+# drop is bounded, cheap and reversible-by-restore, while this one reads
+# and rewrites a fan-out that can be hundreds of rows per parent and is
+# gated on a provider settlement having ARRIVED. An operator who needs to
+# pause one must not have to pause the other.
+#
+# `maintenance` queue, daily (`LEDGER_SUMMARIZE_INTERVAL_SECONDS`),
+# consumed by `apps/workers/app/workers/tasks_maintenance.py`. Inert
+# until the owner names `network_operation_children` in
+# `RETENTION_ENABLED_CLASSES`.
+MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN = "maintenance.ledger_summarize_children"
 
 # --- Webhook events (SPEC-16 FR-008, FR-009) ---
 # Enqueued via the same ``app_shared.messaging.enqueue`` producer seam by
@@ -147,6 +214,18 @@ MAINTENANCE_BREAKER_EVALUATE = "maintenance.breaker_evaluate"
 # configured. See ``app_shared.costauth.fleet_budget_policy``.
 MAINTENANCE_FLEET_BUDGET_ROLLFORWARD = "maintenance.fleet_budget_rollforward"
 
+# --- Per-domain request timeout tuner (EPA C1/F08, 2026-09-07) ---
+# Rewrites ``domain_rules.request_timeout_seconds`` for every domain with
+# enough successful attempts to measure: ``clamp(1.5 x p95(successful
+# attempt duration, 7 d), 10 s, 60 s)``. Bounds the 46.9 s average
+# proxied-HTTP attempt the deep dive found -- a number that measures the
+# 60 s GLOBAL default rather than any domain, because every doomed fetch
+# pays the full ceiling before anyone learns anything. Reads a 7-day
+# aggregate and writes at most one row per domain, so it is cheap and
+# strictly idempotent within a window. See
+# ``app_shared.maintenance.domain_timeouts``.
+MAINTENANCE_DOMAIN_TIMEOUT_TUNE = "maintenance.domain_timeout_tune"
+
 # --- STARTED-target reaper + hard job deadline (EPA A3/B2, 2026-09-03) ---
 # Enqueued by the scheduler on the same 60s maintenance tick as
 # ``SCRAPE_FINALIZE_JOBS`` (and deliberately BEFORE it, so a target the
@@ -164,3 +243,23 @@ MAINTENANCE_FLEET_BUDGET_ROLLFORWARD = "maintenance.fleet_budget_rollforward"
 # ``SCRAPE_REDISPATCH_JOBS`` only jobs holding ``PENDING``/``DEFERRED``
 # work. See ``app_shared.jobs.reaper``.
 SCRAPE_REAP_STALE_TARGETS = "maintenance.reap_stale_targets"
+
+# --- Daily cost and freshness scorecard (EPA D5, deep dive §12 item 9) ---
+# Writes one ``fleet_daily_scorecard`` row per UTC day (yesterday's,
+# closed window) carrying the fleet's own cost/freshness figures --
+# provider bytes, valid-fresh-match rate and its attempt amplification,
+# browser/proxy mix, queue and persistence p95s, budget reserved/settled,
+# backup egress (fed by C10's ``POST /admin/ops/backup-report``
+# receiver), and cost per valid-fresh match. See
+# ``app_shared.maintenance.scorecard`` for the full field-by-field
+# provenance, including which three columns are always ``NULL`` today
+# (no durable Railway usage-API store exists yet) and why a missing
+# input is written as ``NULL``, never a fabricated ``0``.
+#
+# ``maintenance`` queue, daily (``SCORECARD_INTERVAL_SECONDS``), on the
+# scheduler's durable cadence -- the same shape as
+# ``MAINTENANCE_LEDGER_SUMMARIZE_CHILDREN``/``MAINTENANCE_DAILY_ROLLUP``.
+# Read back by ``GET /admin/scorecard?days=30``
+# (``apps/api/app/routers/admin_ops.py``), same service-token guard as
+# the rest of that router.
+MAINTENANCE_DAILY_SCORECARD = "maintenance.daily_scorecard"

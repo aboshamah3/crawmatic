@@ -62,10 +62,27 @@ class _FakeEnqueue:
         self.calls.append({"name": name, "queue": queue, "kwargs": kwargs})
 
 
+def _outbox_shim(fake):
+    """Adapt EPA B2's outbox producer to this file's `_FakeEnqueue`.
+
+    `create_*_job` no longer calls `enqueue` — it writes an
+    `outbox_messages` row in the caller's transaction and the outbox
+    dispatcher publishes it (EPA B2 / F06). The assertions below are
+    about *what would be published*, which is exactly the row's
+    `task_name`/`queue`/`payload`, so the fake keeps its old shape and
+    this adapter maps the writer's signature onto it.
+    """
+
+    def _write(session, *, workspace_id, task_name, queue, kwargs=None, **rest):
+        fake(task_name, queue=queue, kwargs=kwargs)
+
+    return _write
+
+
 @pytest.fixture()
 def fake_enqueue(monkeypatch: pytest.MonkeyPatch) -> _FakeEnqueue:
     fake = _FakeEnqueue()
-    monkeypatch.setattr(service_module, "enqueue", fake)
+    monkeypatch.setattr(service_module, "write_outbox_message", _outbox_shim(fake))
     return fake
 
 

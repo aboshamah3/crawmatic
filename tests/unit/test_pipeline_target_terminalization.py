@@ -169,7 +169,15 @@ class _RecordingMarkTarget:
         match_id: Any,
         status: ScrapeTargetStatus,
         error_code: ScrapeErrorCode | None = None,
+        **phases: Any,
     ) -> None:
+        # EPA A5: the pipeline now also hands `mark_target` the per-phase
+        # lifecycle timestamps (`first_network_at`/`document_received_at`/
+        # `extraction_finished_at`/`persisted_at`) on the same call that
+        # makes the transition — no extra statement. Captured under
+        # "phases" so the transition assertions below keep their exact
+        # historical record shape and a new timestamp kwarg can never
+        # silently break this double.
         self.calls.append(
             {
                 "session": session,
@@ -178,8 +186,26 @@ class _RecordingMarkTarget:
                 "match_id": match_id,
                 "status": status,
                 "error_code": error_code,
+                "phases": phases,
             }
         )
+
+
+class _RecordingStampTimestamps:
+    """Stand-in for `app_shared.jobs.targets.stamp_target_timestamps`.
+
+    EPA A5. The intermediate-attempt path (a link in a strategy chain
+    that owns no status transition) records its phase boundaries through
+    this instead of `mark_target` — it fetched a document and spent money,
+    and that is still a fact worth timing.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, session: Any, **kwargs: Any) -> int:
+        self.calls.append({"session": session, **kwargs})
+        return 1
 
 
 class _RecordingEnqueue:
@@ -256,7 +282,22 @@ def _install_fakes(
     enqueue = _RecordingEnqueue()
     fake_redis = _FakeRedis()
     monkeypatch.setattr(pipelines_mod, "workspace_txn", txn)
+    # EPA F05 (plan task B1): the observation/attempt inserts are now
+    # `ON CONFLICT DO NOTHING` Core statements rather than ORM `add_all`,
+    # so this file's `session.added`-based assertions -- which are about
+    # WHICH rows a flush writes, not about how they reach the driver --
+    # keep their meaning by routing the instances back through `add_all`.
+    # The conflict clause itself is covered in
+    # `tests/unit/test_pipeline_flush_retry.py`.
+    monkeypatch.setattr(
+        pipelines_mod,
+        "_insert_ignoring_replays",
+        lambda session, model, instances, index_elements: session.add_all(instances),
+    )
     monkeypatch.setattr(pipelines_mod, "mark_target", mark_target)
+    monkeypatch.setattr(
+        pipelines_mod, "stamp_target_timestamps", _RecordingStampTimestamps()
+    )
     monkeypatch.setattr(pipelines_mod, "write_outbox_message", enqueue)
     monkeypatch.setattr(pipelines_mod, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(pipelines_mod, "get_redis_client", lambda: fake_redis)
