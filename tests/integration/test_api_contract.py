@@ -321,32 +321,45 @@ def test_jobs_run_is_a_dead_scope() -> None:
         )
 
 
-def test_no_engine_key_the_saas_issues_can_start_a_job() -> None:
-    """FINDING W5.1-F2: `runVariantJob` is unreachable with either issued key.
+def test_the_connector_key_the_saas_issues_can_start_a_job() -> None:
+    """FINDING W5.1-F2, RESOLVED by review R03 (2026-09-09).
 
-    Two key shapes exist, and neither can call the run endpoints:
+    This test used to pin the OPPOSITE: that `CONNECTOR_SCOPES` granted no
+    jobs scope at all, so `runVariantJob` / the plugin's "refresh prices now"
+    403'd for every merchant. It said the gap "needs a deliberate decision,
+    not a scope-list edit". The decision was taken — grant `jobs:read` +
+    `jobs:write`, keep `jobs:cancel` out — and the reasoning lives on
+    `CONNECTOR_SCOPES` itself in `apps/api/app/routers/admin.py`, with the
+    blast-radius proof (a connector key minted for workspace A gets 404, not
+    403, on workspace B's rows) in
+    `tests/unit/test_connector_key_live_checks.py`.
 
-      * the SaaS's `DEFAULT_CUSTOMER_API_KEY_SCOPES` grants `jobs:read`;
-      * the engine's `CONNECTOR_SCOPES` grants no jobs scope at all.
+    So the pin flips rather than disappears: the route's required scope and
+    the connector key's granted scope must AGREE. If either side moves alone
+    this goes red, which is the same early-warning the original test gave.
 
-    `monitoringClient.runVariantJob` therefore 403s for every merchant. It has
-    not yet caused an incident only because nothing in the SaaS calls it — it
-    is a client method waiting for a "Refresh now" button. Wiring that button
-    up without also widening the key would ship a control that fails 100% of
-    the time, which is precisely the class of failure the W5.1 contract tests
-    exist to catch BEFORE the deploy rather than after.
-
-    Pinned from the engine side as the required scope; the SaaS twin
-    (`contract.test.ts`) pins the granted scope, so whichever side moves
-    first, one of the two goes red.
+    Note the operational half, which a scope list cannot express: keys minted
+    before the widening keep their old scopes (they are copied onto the
+    `api_keys` row), so those stores stay broken until reissued —
+    `docs/ops/CONNECTOR_KEY_REISSUE.md`.
     """
     from app.routers.admin import CONNECTOR_SCOPES
 
-    required = _required_scopes(_route("/v1/jobs/run/variant/{variant_id}", "POST"))
-    assert required == ("jobs:write",)
-    assert "jobs:write" not in {str(s) for s in CONNECTOR_SCOPES}, (
-        "the connector key gained jobs:write — a WordPress-resident credential can now "
-        "start engine work; this needs a deliberate decision, not a scope-list edit"
+    granted = {str(scope) for scope in CONNECTOR_SCOPES}
+
+    for path in ("/v1/jobs/run/variant/{variant_id}", "/v1/variants/{variant_id}/rescrape"):
+        required = _required_scopes(_route(path, "POST"))
+        assert required == ("jobs:write",), f"POST {path} no longer gates on jobs:write"
+        assert set(required) <= granted, (
+            f"POST {path} requires {required}, which the connector key no longer grants — "
+            "the plugin's live check would 403 on every store"
+        )
+
+    poll_required = _required_scopes(_route("/v1/jobs/{job_id}", "GET"))
+    assert poll_required == ("jobs:read",)
+    assert set(poll_required) <= granted, (
+        "the connector key can start a job it cannot poll — the plugin's live check "
+        "would hang on every store"
     )
 
 
@@ -356,11 +369,25 @@ def test_connector_scopes_never_include_a_destructive_capability() -> None:
     `jobs:cancel` terminalizes rows nobody can get back, and the connector key
     is the most exposed credential in the system — it sits on a merchant's
     server, on a host we do not control.
+
+    `jobs:write` was on this forbidden list until review R03 (2026-09-09)
+    granted it for the plugin's live check; `jobs:cancel` was NOT granted in
+    the same change and stays here, together with the write scopes that are
+    SaaS-worker business. Widening for one feature must not become widening
+    by habit.
     """
     from app.routers.admin import CONNECTOR_SCOPES  # imported here: router import is heavier
 
     connector = {str(s) for s in CONNECTOR_SCOPES}
-    forbidden = {"jobs:cancel", "jobs:write"} & connector
+    forbidden = {
+        "jobs:cancel",
+        "products:write",
+        "variants:write",
+        "refresh_rules:write",
+        "webhooks:write",
+        "scrape_profiles:write",
+        "domain_rules:write",
+    } & connector
     assert not forbidden, f"the connector key grants destructive scopes: {sorted(forbidden)}"
     assert "alerts:read" in connector, (
         "the connector key must keep alerts:read — the plugin renders price comparisons"

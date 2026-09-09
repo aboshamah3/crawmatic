@@ -63,13 +63,24 @@ class _AsyncFakeScript:
         if self._redis.fail:
             raise ConnectionError("redis unavailable")
         self._redis.script_calls += 1
-        key = (keys or [""])[0]
-        ttl = int((args or [60])[0])
-        count = self._redis.counters.get(key, 0) + 1
-        self._redis.counters[key] = count
-        if count == 1:
-            self._redis.expirations[key] = ttl
-        return count
+        argv = list(args or [60])
+        ttl = int(argv[0])
+        limits = [int(value) for value in argv[1:]]
+        # B4: the script takes a LIST of keys (origin bound, then the
+        # credential bucket) plus a limit per key, returns one count per
+        # key EVALUATED, and stops at the first key over its limit so a
+        # refused attempt never creates the keys after it. Still ONE
+        # call, which is what `script_calls` pins.
+        counts = []
+        for index, key in enumerate(keys or [""]):
+            count = self._redis.counters.get(key, 0) + 1
+            self._redis.counters[key] = count
+            if count == 1:
+                self._redis.expirations[key] = ttl
+            counts.append(count)
+            if index < len(limits) and count > limits[index]:
+                break
+        return counts
 
 
 class _AsyncFakeRedis:
@@ -118,8 +129,11 @@ def test_one_script_call_increments_and_expires_atomically():
     resp = client.get("/v1/things", headers=HEADERS)
 
     assert resp.status_code == 200
+    # ONE script call, still -- B4 moves both counters (the origin bound
+    # and the credential bucket) inside that single call rather than
+    # adding a second round trip.
     assert redis.script_calls == 1
-    assert list(redis.counters.values()) == [1]
+    assert list(redis.counters.values()) == [1, 1]
     assert list(redis.expirations.values())  # EXPIRE set on first hit
 
 
@@ -131,9 +145,12 @@ def test_expire_is_only_set_on_the_first_hit():
     client.get("/v1/things", headers=HEADERS)
 
     assert redis.script_calls == 2
-    # Only one EXPIRE recorded even though INCR ran twice -- the Lua
-    # script only calls EXPIRE when the counter is freshly created.
-    assert len(redis.expirations) == 1
+    # Two counters exist (origin + credential) and each recorded exactly
+    # ONE EXPIRE even though INCR ran twice on both -- the Lua script
+    # only calls EXPIRE when a counter is freshly created.
+    assert len(redis.counters) == 2
+    assert len(redis.expirations) == 2
+    assert set(redis.counters.values()) == {2}
 
 
 # --- fail-open on a slow Redis, within the deadline, without blocking -------

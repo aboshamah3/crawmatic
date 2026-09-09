@@ -149,7 +149,17 @@ BOOTSTRAP_SCOPES: list[str] = [
 #: copied onto the `api_keys` row at mint time (see
 #: `create_connector_key`), so an existing connector key keeps the set it
 #: was issued with until the SaaS re-mints it. That is the safe direction,
-#: and the operational cost of this change.
+#: and the operational cost of this change — every store paired before this
+#: deploy keeps 403-ing on the live check until its key is REPLACED. There
+#: is no in-place scope upgrade and there must not be one: mutating
+#: `api_keys.scopes` would widen a credential whose holder never
+#: re-consented and leave no audit row saying when. The deliberate
+#: migration is mint-then-revoke, driven from the SaaS (the only component
+#: that can persist the new plaintext) — see
+#: `docs/ops/CONNECTOR_KEY_REISSUE.md` for the three paths (merchant
+#: re-pair, single-store operator reissue, fleet sweep) and for how to tell
+#: a stale key from a current one (`GET
+#: /v1/admin/workspaces/{id}/api-keys` reports `scopes`).
 CONNECTOR_SCOPES: list[str] = [
     "products:read",
     "variants:read",
@@ -283,9 +293,18 @@ def create_connector_key(
     Unlike `create_workspace_api_key` above, the scope set is NOT
     caller-suppliable here: a connector key is always exactly
     `CONNECTOR_SCOPES`, never wider, so WordPress can never end up
-    holding `jobs:write`/`webhooks:write`/etc. by passing `scopes` in
-    the request body -- there is no such field on
-    `ConnectorKeyCreateRequest`.
+    holding `webhooks:write`/`scrape_profiles:write`/etc. by passing
+    `scopes` in the request body -- there is no such field on
+    `ConnectorKeyCreateRequest`. (`jobs:write` used to be named here as
+    an example of something WordPress must never hold; review R03 granted
+    it deliberately, bounded by `scoped_get(..., workspace_id)` on both
+    live-check routes. See the `CONNECTOR_SCOPES` rationale above.)
+
+    `scopes=list(CONNECTOR_SCOPES)` COPIES the list onto the row rather
+    than referencing it, so a later widening of the constant never
+    retroactively widens a key already living on a merchant's host --
+    and reissuing those keys is therefore a deliberate operation, not a
+    deploy side effect (`docs/ops/CONNECTOR_KEY_REISSUE.md`).
 
     404s on an unknown `workspace_id`, same rationale as
     `create_workspace_api_key`: the caller is the trusted,

@@ -52,7 +52,7 @@ _FIXTURES = '''
 import sys
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, "apps/workers")
 sys.path.insert(0, "tests/unit")
@@ -169,12 +169,20 @@ class KillingStore(RealStore):
 def client_factory(*, settings=None, intents=None):
     http_session = requests.Session()
     http_session.post = node.post
-    return RealClient(
+    client = RealClient(
         settings=settings,
         redis_client=fake_redis,
         session=http_session,
         intents=intents,
     )
+    # R11: a recovery re-POST asks the RECEIVER whether it already holds
+    # the run before sending -- Scrapyd 1.6.0 hands `jobid` to the
+    # scheduler as `_job` with no dedup, so a duplicate would queue a
+    # second execution under a colliding name. That check goes through
+    # `client.list_jobs`, so the fake node has to answer the GET side too;
+    # before R11 nothing in the dispatch path ever read it.
+    client.list_jobs = node.list_jobs
+    return client
 
 
 tasks_jobs.ScrapydDispatchClient = client_factory
@@ -320,8 +328,26 @@ jobid = str(row.scrapyd_job_id)
 # The node lost it: restarted, or the entry aged out of the 100-deep
 # finished history. Absence is bounded evidence -- which is exactly why
 # the re-POST has to carry the same name.
+#
+# R11 (2026-09-09): and why it now takes TWO independent denials, past
+# the in-flight lease and separated by the absence window, to get there.
+# A single negative answer is `RECONCILED_AMBIGUOUS`, which authorizes
+# nothing -- the sweep used to reach `RECONCILED_MISSING` on the first
+# one, at any age, which cleared a re-POST for dispatches whose
+# `schedule.json` request was still on the wire.
 node.forget_all()
-report = reconcile_inflight_intents(fake_get_session, node)
+posted_at = the_intent().posted_at
+first_look = posted_at + timedelta(seconds=300)
+report = reconcile_inflight_intents(fake_get_session, node, now=first_look)
+
+if report.ambiguous != 1 or report.missing != 0:
+    fail("FIRST_DENIAL_WAS_NOT_AMBIGUOUS:" + repr(report))
+if the_intent().state != DispatchIntentState.RECONCILED_AMBIGUOUS:
+    fail("INTENT_IS_NOT_RECONCILED_AMBIGUOUS:" + str(the_intent().state))
+
+report = reconcile_inflight_intents(
+    fake_get_session, node, now=first_look + timedelta(seconds=300)
+)
 
 if report.missing != 1 or report.confirmed != 0:
     fail("UNEXPECTED_RECONCILE_REPORT:" + repr(report))

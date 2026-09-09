@@ -13,12 +13,15 @@ Two claims, and they are the two the audit actually made:
    `dispatched_at`.
 
 2. **A node that has no record of the job is re-POSTed with the SAME
-   id.** Absence moves the row to `RECONCILED_MISSING` -- the only state
-   from which a re-POST is authorized -- and the re-POST carries the
-   identical `jobid`, so a node that *did* receive the original request
-   (finished history is capped at 100 entries and lost on restart, so
-   "absent" is bounded evidence) dedups it rather than running the batch
-   twice.
+   id -- but only once absence has been CORROBORATED.** R11 (2026-09-09)
+   put an evidence bar in front of that transition: the first denial
+   past the in-flight lease parks the row in `RECONCILED_AMBIGUOUS`,
+   which authorizes nothing, and only a second independent denial a real
+   interval later reaches `RECONCILED_MISSING` -- the only state from
+   which a re-POST is authorized. The re-POST then carries the identical
+   `jobid`, so a node that *did* receive the original request (finished
+   history is capped at 100 entries and lost on restart, so "absent" is
+   bounded evidence) can be asked about it by name.
 
 Everything below drives the REAL `ScrapydDispatchClient`, the REAL
 `DispatchIntentStore` in its short-transaction mode, and the REAL
@@ -32,6 +35,7 @@ from __future__ import annotations
 import sys
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator
@@ -276,7 +280,22 @@ def test_missing_on_node_reposts_with_the_same_jobid(world: _World) -> None:
     # The node has no record of it (restarted, or the entry aged out of
     # the 100-deep finished history).
     world.node.forget_all()
-    report = reconcile_inflight_intents(world.factory, world.node)
+
+    # R11: absence is now EVIDENCE, gathered, not a snap verdict. The
+    # first pass past the in-flight lease records one denial and parks
+    # the row in `RECONCILED_AMBIGUOUS` -- which authorizes nothing.
+    posted_at = world.intent().posted_at
+    first = posted_at + timedelta(seconds=200)
+    report = reconcile_inflight_intents(world.factory, world.node, now=first)
+
+    assert report.ambiguous == 1 and report.missing == 0
+    assert world.intent().state == DispatchIntentState.RECONCILED_AMBIGUOUS
+
+    # The second, independent denial -- taken a real interval later, not
+    # twice in one pass -- is what corroborates it.
+    report = reconcile_inflight_intents(
+        world.factory, world.node, now=first + timedelta(seconds=200)
+    )
 
     assert report.missing == 1 and report.confirmed == 0
     assert world.intent().state == DispatchIntentState.RECONCILED_MISSING

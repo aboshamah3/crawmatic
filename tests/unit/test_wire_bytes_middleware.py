@@ -282,9 +282,29 @@ class TestAssembledResponseChain:
         out = _run_response_chain(chain, request, response)
 
         assert len(out.body) == 8000, "the chain really did decompress the body"
-        assert request.meta[META_WIRE_BYTES] == expected, (
+        recorded = request.meta[META_WIRE_BYTES]
+        assert recorded == expected, (
             "the configured chain recorded the DECODED size — WireBytesMiddleware "
             "is running after HttpCompressionMiddleware on the response path"
+        )
+
+        # The shape of the defect, stated as a magnitude rather than as an
+        # equality, because the equality above would still hold if
+        # `compute_wire_bytes` itself started counting the wrong body. R12's
+        # probe recorded 177 wire bytes as 18,053 — a ~100x overstatement.
+        # The corrected number must be framing-estimate-close to the
+        # COMPRESSED length (1,000 bytes here) and nowhere near the decoded
+        # 8,000: the only slack is the reconstructed status line plus the
+        # re-serialised headers, both small and both bounded here.
+        framing = recorded - 1000
+        assert 0 < framing < 500, (
+            f"the framing estimate around a 1,000-byte body is {framing} bytes — "
+            "either the wrong body is being counted or the framing reconstruction "
+            "has grown into a guess"
+        )
+        assert recorded < len(out.body), (
+            f"recorded {recorded} bytes for a response whose compressed body was 1,000 "
+            f"and whose decoded body is {len(out.body)} — this is the R12 defect"
         )
 
     def test_wire_bytes_precedes_http_compression_in_the_response_order(

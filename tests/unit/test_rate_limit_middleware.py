@@ -29,10 +29,19 @@ class FakeAsyncRedis:
                 if redis.fail:
                     raise ConnectionError("redis down")
                 redis.script_calls += 1
-                key = (keys or [""])[0]
-                count = redis.counters.get(key, 0) + 1
-                redis.counters[key] = count
-                return count
+                # B4: a list of keys in (origin bound first, credential
+                # bucket second) plus a limit per key in `args[1:]`; one
+                # count per key EVALUATED out, stopping at the first key
+                # over its limit.
+                limits = [int(value) for value in list(args or [60])[1:]]
+                counts = []
+                for index, key in enumerate(keys or [""]):
+                    count = redis.counters.get(key, 0) + 1
+                    redis.counters[key] = count
+                    counts.append(count)
+                    if index < len(limits) and count > limits[index]:
+                        break
+                return counts
 
         return _Script()
 

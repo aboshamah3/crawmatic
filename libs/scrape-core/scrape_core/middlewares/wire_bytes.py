@@ -94,9 +94,30 @@ def compute_wire_bytes(response: Any) -> int:
     number is HIGHER, not lower — so ``response.body`` here is still the
     compressed bytes that actually crossed the wire.
 
-    The status-line component is an ESTIMATE and is documented as one in
-    :func:`_status_line_bytes`: Scrapy discards the raw status line, so
-    that part of the framing is reconstructed, not observed.
+    THE FRAMING HALF OF THIS NUMBER IS A RECONSTRUCTION, NOT A
+    MEASUREMENT, and stays one after review R12 — R12 corrected *which
+    body* is counted, not how the framing around it is derived. Only
+    ``len(response.body)`` is a byte count of something Scrapy actually
+    kept:
+
+    * the status line is rebuilt from ``status`` (+ the standard reason
+      phrase) because Scrapy discards the raw line — see
+      :func:`_status_line_bytes`;
+    * ``headers.to_string()`` RE-SERIALISES Scrapy's parsed header
+      mapping. Header order, capitalisation and any repeated-header
+      folding the server used are gone by then, and the blank line that
+      terminates the header block is not included, so this is close to
+      what the connection spent on headers rather than equal to it;
+    * transport-level costs the application layer never sees — TLS
+      records, TCP/IP headers, HTTP/2 HPACK compression of exactly these
+      headers — are not in the number at all.
+
+    So treat the result as "the compressed body, plus an estimate of its
+    framing". It is materially better than the ``bytes_received`` signal
+    it replaced (raw chunks, no framing) and materially better than the
+    pre-R12 reading (the DECODED body, which overstated a 177-byte gzip
+    response as 18,053), but it is not a wire capture and the ledger must
+    not be described as if it were.
     """
     status_line = _status_line_bytes(response)
     headers_bytes = response.headers.to_string()

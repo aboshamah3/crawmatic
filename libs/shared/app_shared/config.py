@@ -576,6 +576,39 @@ class Settings(BaseSettings):
     # `OUTBOX_DRAIN_BATCH_LIMIT` is: one pass must not hold a worker (or
     # its 300s time limit) for an unbounded time; the next tick continues.
     DISPATCH_RECONCILE_LIMIT: int = 200
+    # --- R11 (2026-09-09): what it takes before absence counts as proof.
+    #
+    # The reconciler used to move a `POSTED` intent to
+    # `RECONCILED_MISSING` — the one state that authorizes a re-POST, and
+    # therefore a second cost authorization — on the strength of a SINGLE
+    # `listjobs.json` answer that did not mention it, at any age. A pass
+    # that ran while the original `schedule.json` request was still
+    # travelling to the node got exactly that answer, so the reconciler
+    # authorized a re-run of work already on its way. These four knobs are
+    # the evidence bar that transition now has to clear.
+    #
+    # MIN_AGE is the in-flight LEASE: below it the request may simply not
+    # have arrived yet, so a denial says nothing and is not even recorded.
+    # 120s is 4x `ScrapydDispatchClient`'s own 30s HTTP timeout, so it
+    # covers the whole life of a request the poster has not yet given up
+    # on, plus a retry, plus clock skew between the worker and this sweep.
+    DISPATCH_RECONCILE_MIN_AGE_SECONDS: int = 120
+    # How many independent denials, and how far apart, before absence is
+    # corroborated. Two answers spanning 120s cannot both be the same
+    # in-flight window, and at the 300s pass cadence this costs one extra
+    # pass (~5 min) before a genuinely lost dispatch is recovered — the
+    # price of never re-running work that was merely slow.
+    DISPATCH_RECONCILE_ABSENCE_QUORUM: int = 2
+    DISPATCH_RECONCILE_ABSENCE_WINDOW_SECONDS: int = 120
+    # Beyond this age a node cannot testify about the intent at all: both
+    # deployed nodes run `MemoryJobStorage` with `finished_to_keep = 100`
+    # and lose the whole history on restart, so a run that finished long
+    # ago is indistinguishable from one that never started. Such an
+    # intent goes to `RECONCILED_AMBIGUOUS` and waits for an operator
+    # rather than being re-POSTed on evidence the node does not have.
+    # 24h: comfortably longer than any real batch, far shorter than the
+    # interval over which a node is certain to have restarted.
+    DISPATCH_RECONCILE_ABSENCE_HORIZON_SECONDS: int = 86_400
     # How long a PUBLISHED row is kept before deletion (DEAD rows are kept
     # `DEAD_RETENTION_MULTIPLIER` times longer — they are incident
     # evidence). The table is a drain-to-empty queue, not a history table,

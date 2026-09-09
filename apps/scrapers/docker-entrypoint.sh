@@ -23,4 +23,13 @@ mv scrapyd.conf.rendered scrapyd.conf
 # this runs before scrapyd starts, and nothing else runs in this container.
 rm -f twistd.pid
 
+# Review R10 (2026-09-09): the durable result spool must be writable BEFORE
+# scrapyd starts accepting schedules. `ResultSpool` refuses to build a
+# pipeline over an unwritable directory, but that check is per-spider and
+# after the fact -- the daemon would come up healthy and then kill every job
+# in `BatchedPersistencePipeline.__init__`, one `[Errno 13]` per per-job log.
+# A node that cannot spool has nowhere to put results it has already paid to
+# fetch, so it refuses to start instead, once, on stderr.
+python -m scrape_core.result_spool
+
 exec "$@"

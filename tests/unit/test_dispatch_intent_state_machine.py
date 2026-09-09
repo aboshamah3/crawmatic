@@ -252,11 +252,24 @@ def test_mark_missing_only_moves_a_posted_intent(world) -> None:
     assert _row(session).state == DispatchIntentState.PLANNED
 
     store.record_post(identity, node_url=_NODE)
+    # R11: POSTED alone is no longer enough. `mark_missing` authorizes a
+    # re-POST -- a second Scrapyd run and a second cost reservation --
+    # so it now refuses unless the row's own absence ledger says the
+    # denial was corroborated. A caller that simply asserts "it's gone"
+    # is exactly the pre-R11 sweep, which declared work missing while
+    # its `schedule.json` request was still travelling.
+    store.mark_missing(identity, "node says no")
+    assert _row(session).state == DispatchIntentState.POSTED
+
+    # With the ledger filled in by the only writer that may fill it, the
+    # transition goes through.
+    _row(session).absent_observations = 2
     store.mark_missing(identity, "node says no")
     assert _row(session).state == DispatchIntentState.RECONCILED_MISSING
 
     # And a CONFIRMED row is never talked back into a re-POST.
     store.confirm(identity, str(_row(session).scrapyd_job_id))
+    _row(session).absent_observations = 2
     store.mark_missing(identity, "a racing sweep")
     assert _row(session).state == DispatchIntentState.CONFIRMED
 

@@ -321,7 +321,10 @@ def test_minted_keys_carry_their_scopes_on_the_row_not_by_reference() -> None:
     `api_keys` row, so an existing key keeps the set it was minted with
     and only a re-mint picks the new one up. That is the safe direction
     (no silent privilege growth) and it is also the operational cost of
-    this change — see the reissue note in the review report.
+    this change: every store paired before the widening keeps 403-ing on
+    the live check until its key is replaced, mint-then-revoke, driven
+    from the SaaS. The three reissue paths and how to spot a stale key
+    are in `docs/ops/CONNECTOR_KEY_REISSUE.md`.
     """
     import inspect
 

@@ -49,7 +49,12 @@ from app_shared.costauth import (
 from app_shared.database import get_session, get_system_session, set_workspace_context
 from app_shared.domains.lifecycle import unsupported_target_outcome
 from app_shared.domains.state_lookup import get_domain_state
-from app_shared.enums import ScrapeJobStatus, ScrapeProfileMode, ScrapeTargetStatus
+from app_shared.enums import (
+    DispatchIntentState,
+    ScrapeJobStatus,
+    ScrapeProfileMode,
+    ScrapeTargetStatus,
+)
 from app_shared.ids import new_uuid7
 from app_shared.jobs.batching import (
     DEFAULT_STRATEGY_METHOD,
@@ -59,8 +64,10 @@ from app_shared.jobs.batching import (
 )
 from app_shared.jobs.coalescing import cluster_for_coalescing
 from app_shared.jobs.dispatch_intents import (
+    OPEN_QUESTION_STATES,
     DispatchIntentStore,
     reconcile_inflight_intents,
+    receiver_holds_execution,
 )
 from app_shared.jobs.reaper import (
     fail_targets_past_job_deadline,
@@ -332,6 +339,13 @@ class PlannedDispatch:
     #: released in the failure path if the batch never reaches Scrapyd.
     grant: Any
     targets: list[ScrapeJobTarget]
+    #: True when this batch's durable intent was already in
+    #: ``RECONCILED_MISSING`` at plan time — i.e. this POST is a RECOVERY
+    #: re-send, not a first dispatch (R11). It is the only case where the
+    #: node may already be holding a run under the very ``jobid`` we are
+    #: about to send, and Scrapyd 1.6.0 will NOT dedup it for us, so step
+    #: 3 asks the node first. A first dispatch skips that round trip.
+    recovery: bool = False
 
 
 def _batch_authorization_request(
@@ -1168,6 +1182,32 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                     job.id,
                 )
                 continue
+            # R11: ask the durable ledger BEFORE reserving anything. An
+            # intent that is an open question -- `POSTED` (a request may
+            # be on the wire right now) or `RECONCILED_AMBIGUOUS` (the
+            # sweep looked and could not establish what happened) -- must
+            # not be re-planned at all. The POST itself would be refused
+            # further down (the Redis claim, and `schedule()`'s step 0b
+            # reconcile gate), but the C3 grant is reserved HERE, several
+            # steps before either of those runs, and a reservation taken
+            # for a dispatch that is then refused is a second live hold
+            # against the same logical batch. "Exactly one cost
+            # authorization per logical job" is a property of the order
+            # these two things happen in, not of the gates downstream.
+            durable_state = intents.current_state(identity)
+            if durable_state in OPEN_QUESTION_STATES:
+                logger.info(
+                    "dispatch: SKIPPED batch domain=%s mode=%s -- its durable "
+                    "intent is %s (unsettled); not authorizing or re-POSTing "
+                    "until the reconciler resolves it workspace_id=%s "
+                    "scrape_job_id=%s",
+                    batch.domain,
+                    batch.mode,
+                    durable_state,
+                    workspace_uuid,
+                    job.id,
+                )
+                continue
             # Paid dispatch site 1 (REFRESH) and site 2
             # (BROWSER_ESCALATION) -- the same pass, distinguished by
             # the batch's mode, because a browser batch is exactly the
@@ -1219,6 +1259,9 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                     jobid=str(intent.scrapyd_job_id),
                     grant=grant,
                     targets=batch_targets,
+                    recovery=(
+                        durable_state == DispatchIntentState.RECONCILED_MISSING
+                    ),
                 )
             )
 
@@ -1249,6 +1292,47 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 # A worker killed anywhere in here leaves a committed
                 # POSTED row naming the node and the jobid, which is
                 # exactly what `reconcile_inflight_intents` settles.
+                #
+                # --- STEP 2-pre (R11): execution identity, at the receiver
+                # A recovery re-POST is the one case where the node may
+                # ALREADY hold a run under the exact `jobid` we are about
+                # to send, and Scrapyd 1.6.0 does not protect us from
+                # that: its `Schedule.render_POST` hands the supplied
+                # `jobid` to the scheduler as `_job` with no dedup, so a
+                # duplicate queues a SECOND run under a colliding name.
+                # The deterministic id makes a re-POST traceable; only
+                # this check makes it idempotent. Ask the one node the
+                # intent recorded, with no transaction open.
+                if item.recovery:
+                    holds = receiver_holds_execution(
+                        client,
+                        node_url=item.node_url,
+                        node_class=item.identity.node_class,
+                        scrapyd_job_id=item.jobid,
+                    )
+                    if holds is not False:
+                        # True: the run is there -- adopt it and never
+                        # send a second copy. None: the node could not be
+                        # asked, and absence of an answer is not an
+                        # answer. Both give the grant straight back: this
+                        # batch spends nothing on this pass, and its
+                        # targets stay unstamped so a later pass (by
+                        # which time the intent is CONFIRMED, or the
+                        # node is reachable) offers them again.
+                        if holds:
+                            dispatching_intents.confirm(item.identity, item.jobid)
+                        logger.warning(
+                            "dispatch: RECOVERY NOT RE-POSTED jobid=%s node_url=%s "
+                            "receiver_holds=%s workspace_id=%s scrape_job_id=%s",
+                            item.jobid,
+                            item.node_url,
+                            holds,
+                            workspace_uuid,
+                            job.id,
+                        )
+                        costauth.release(item.grant.authorization_id)
+                        undispatched.remove(item)
+                        continue
                 try:
                     client.schedule(
                         item.project,
@@ -1725,13 +1809,22 @@ def reconcile_dispatch_intents() -> None:
         client,
         limit=int(settings.DISPATCH_RECONCILE_LIMIT),
         now=datetime.now(timezone.utc),
+        # R11: the four `DISPATCH_RECONCILE_ABSENCE_*` knobs -- the
+        # in-flight lease, the corroboration quorum and window, and the
+        # horizon past which a node's bounded history cannot testify.
+        # Passed explicitly rather than re-read inside the sweep so the
+        # pass runs under one snapshot of the policy.
+        settings=settings,
     )
     logger.info(
-        "reconcile_dispatch_intents: examined=%d confirmed=%d missing=%d unreachable=%d",
+        "reconcile_dispatch_intents: examined=%d confirmed=%d missing=%d "
+        "unreachable=%d in_flight=%d ambiguous=%d",
         report.examined,
         report.confirmed,
         report.missing,
         report.unreachable,
+        report.in_flight,
+        report.ambiguous,
     )
 
 

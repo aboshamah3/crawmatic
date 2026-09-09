@@ -53,6 +53,9 @@ from scrape_core.result_spool import (
     SPOOL_PATH_SETTING,
     ResultSpool,
     SpoolNotWritableError,
+    configured_spool_path,
+    main as spool_preflight_main,
+    preflight as spool_preflight,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -305,3 +308,94 @@ def test_compose_gives_each_scraper_service_a_spool_volume(service: str) -> None
     for name in named:
         if not name.startswith((".", "/")):
             assert name in declared, f"volume {name!r} is used but never declared"
+
+
+# --- 4. the daemon refuses to start when it cannot spool --------------------
+#
+# Tests 1-3 leave one hole: an image that provisions the directory correctly
+# and a VOLUME that mounts over it root-owned (Railway attaches volumes as
+# root; compose copies the image's ownership only when the volume is empty).
+# In that world the Dockerfile text is right, the compose text is right, and
+# every spider still dies in `BatchedPersistencePipeline.__init__` — one
+# `[Errno 13]` per per-job log, on a daemon whose own health check is green.
+# So the writability check also runs at container start, before scrapyd is
+# exec'd, where a failure is a container that will not come up.
+
+
+def test_preflight_accepts_a_writable_directory(tmp_path: Path) -> None:
+    target = tmp_path / "spool" / "scrape_results.sqlite3"
+
+    checked = spool_preflight(target)
+
+    assert checked == target
+    assert target.parent.is_dir(), "the preflight provisions the directory it checks"
+    assert not target.exists(), "the preflight must not create the spool FILE"
+
+
+def test_preflight_refuses_an_unwritable_directory(tmp_path: Path) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_bytes(b"")
+
+    with pytest.raises(SpoolNotWritableError):
+        spool_preflight(blocker / "spool" / "scrape_results.sqlite3")
+
+
+def test_preflight_honours_the_env_override_and_otherwise_the_settings_default(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The command takes no arguments in the entrypoints, so the path it
+    checks must be the same one the pipeline will open: the env var if set,
+    the `Settings` field default otherwise. Read off `model_fields` rather
+    than by instantiating `Settings`, so a container missing an unrelated
+    required env var still gets the spool answer."""
+    monkeypatch.delenv(SPOOL_PATH_SETTING, raising=False)
+    assert configured_spool_path() == Settings.model_fields[SPOOL_PATH_SETTING].default
+
+    override = tmp_path / "elsewhere" / "scrape_results.sqlite3"
+    monkeypatch.setenv(SPOOL_PATH_SETTING, str(override))
+    assert configured_spool_path() == override
+
+
+def test_preflight_command_exits_nonzero_and_says_why(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """`python -m scrape_core.result_spool` is what the entrypoints run, so
+    the contract that matters is the EXIT STATUS (`set -eu` turns it into a
+    refusal to start) plus a message on stderr naming the directory."""
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"")
+
+    assert spool_preflight_main([str(blocker / "spool" / "scrape_results.sqlite3")]) == 1
+    captured = capsys.readouterr()
+    assert str(blocker / "spool") in captured.err
+    assert SPOOL_PATH_SETTING in captured.err
+
+    good = tmp_path / "spool" / "scrape_results.sqlite3"
+    assert spool_preflight_main([str(good)]) == 0
+    assert "ok" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["apps/scrapers/docker-entrypoint.sh", "apps/scrapers-browser/docker-entrypoint.sh"],
+)
+def test_both_entrypoints_preflight_the_spool_before_exec(entrypoint: str) -> None:
+    """A static read of the shell script, for the same reason as the
+    Dockerfile assertions above: no container is started here. The two facts
+    that matter are that the check runs at all, and that it runs BEFORE
+    `exec "$@"` — after the exec it would never run, since exec replaces the
+    process."""
+    text = (REPO_ROOT / entrypoint).read_text()
+
+    assert text.lstrip().startswith("#!"), entrypoint
+    assert "set -eu" in text, (
+        f"{entrypoint} must keep `set -eu`, or a failing preflight would be ignored "
+        "and scrapyd would start anyway"
+    )
+
+    check = text.find("python -m scrape_core.result_spool")
+    assert check != -1, f"{entrypoint} never preflights the spool"
+    exec_line = text.find('exec "$@"')
+    assert exec_line != -1 and check < exec_line, (
+        f"{entrypoint} preflights the spool after `exec`, where it never runs"
+    )

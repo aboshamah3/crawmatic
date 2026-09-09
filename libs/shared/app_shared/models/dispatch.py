@@ -167,3 +167,35 @@ class DispatchIntent(Base, WorkspaceScopedBase, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
     posted_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+    # --- the absence ledger (R11, 2026-09-09) --------------------------------
+    #
+    # Why absence needs a LEDGER rather than a boolean: one
+    # ``listjobs.json`` answer that omits this run is not the same fact
+    # as several of them, taken minutes apart, from a node whose history
+    # is demonstrably intact. Before R11 the reconciler could not tell
+    # those apart — it had only the row's ``state`` — so the very first
+    # negative answer moved the intent to ``RECONCILED_MISSING`` and
+    # authorized a re-POST. A reconciler pass that ran while the
+    # original ``schedule.json`` request was still travelling therefore
+    # authorized a second run of work already on its way. These three
+    # columns are the evidence that transition now requires.
+    #: How many independent ``listjobs.json`` answers have denied this
+    #: run. Only answers taken *after* the in-flight lease expired are
+    #: counted — a denial from a node that could not yet have received
+    #: the request is not evidence about anything, so it is not recorded
+    #: at all rather than recorded and discounted.
+    absent_observations: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default=text("0")
+    )
+    #: When the FIRST of those denials was recorded. The absence window
+    #: is measured from here, so the corroborating answers have to be
+    #: genuinely separated in time rather than two calls in one pass.
+    first_absent_at: Mapped[datetime | None] = mapped_column(
+        TZDateTime(), nullable=True
+    )
+    #: When a node last positively LISTED this run. Once set, a later
+    #: absence is a *disappearance* — the node's ``MemoryJobStorage``
+    #: history is capped at 100 finished entries and lost on restart —
+    #: and a disappearance is never proof that the work never happened.
+    last_seen_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)

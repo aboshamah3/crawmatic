@@ -82,6 +82,8 @@ __all__ = [
     "ResultSpool",
     "SpoolNotWritableError",
     "SpooledBatch",
+    "configured_spool_path",
+    "preflight",
 ]
 
 #: The setting (and, because ``Settings`` reads its fields from the
@@ -185,6 +187,70 @@ def _ensure_spool_directory(path: str | os.PathLike[str]) -> None:
             f"and mount a volume there, or point {SPOOL_PATH_SETTING} at a directory "
             "this process can write."
         ) from exc
+
+
+def configured_spool_path() -> Path:
+    """Where the spool WILL be opened, without constructing ``Settings``.
+
+    Reads the env var if it is set, otherwise the declared default off
+    the ``Settings`` field. Deliberately does NOT instantiate
+    ``Settings``: the startup preflight below runs before Scrapyd, in a
+    container whose other required settings (database URL, proxy
+    credentials) are none of this check's business -- a preflight that
+    died on an unrelated missing env var would report the wrong problem
+    at the worst moment.
+    """
+    override = os.environ.get(SPOOL_PATH_SETTING)
+    if override:
+        return Path(override)
+
+    # Imported here, not at module scope: `scrape_core` is imported by the
+    # Scrapy project at egg-build time, and `app_shared.config` is the
+    # heavier of the two edges.
+    from app_shared.config import Settings
+
+    return Path(str(Settings.model_fields[SPOOL_PATH_SETTING].default))
+
+
+def preflight(path: str | os.PathLike[str] | None = None) -> Path:
+    """Prove the spool directory is writable, at DAEMON START.
+
+    `_ensure_spool_directory` already refuses to build a pipeline over an
+    unwritable directory, but that is per-spider and after the fact: the
+    daemon comes up healthy, accepts schedules, and every single one dies
+    in `BatchedPersistencePipeline.__init__`. From the outside that looks
+    like "the scrapers are broken", not like "one directory is
+    root-owned", and Scrapyd reports it once per job in a per-job log.
+
+    So both `docker-entrypoint.sh` scripts call this BEFORE `exec
+    scrapyd`. A node that cannot spool refuses to come up at all, which
+    is the failure the orchestrator already knows how to see: a container
+    that will not start, with the reason on stderr, once (review R10).
+
+    Returns the path it checked, so the caller can print it.
+    """
+    resolved = configured_spool_path() if path is None else Path(str(path))
+    _ensure_spool_directory(resolved)
+    return resolved
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """`python -m scrape_core.result_spool [PATH]` -- the preflight as a command.
+
+    Exit 0 and one line on stdout when the spool is writable; exit 1 and
+    the `SpoolNotWritableError` message on stderr when it is not. No
+    argparse: one optional positional argument, called from `sh`.
+    """
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        checked = preflight(args[0] if args else None)
+    except SpoolNotWritableError as exc:
+        print(f"spool preflight FAILED: {exc}", file=sys.stderr)
+        return 1
+    print(f"spool preflight ok: {checked}")
+    return 0
 
 
 class ResultSpool:
@@ -474,3 +540,7 @@ def _decoder_for(annotation: Any) -> Any:
         if annotation is Decimal:
             return Decimal
     return lambda value: value
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised as a subprocess
+    raise SystemExit(main())

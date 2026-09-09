@@ -15,9 +15,9 @@ must read the committed intent in the very transaction it stamps
 ``dispatched_at`` in, so the read and the stamp are atomic.
 
 **Store-owned (``DispatchIntentStore(None, session_factory=...)``, B2).**
-Each of :meth:`plan`, :meth:`record_post`, :meth:`confirm`, :meth:`fail`
-and :meth:`mark_missing` opens its **own short transaction** from the
-injected factory and commits it before returning. This is not a
+Each of :meth:`plan`, :meth:`record_post`, :meth:`confirm`, :meth:`fail`,
+:meth:`record_absence` and :meth:`mark_missing` opens its **own short
+transaction** from the injected factory and commits it before returning. This is not a
 refactor for tidiness: the five-step dispatch protocol requires the
 ``POSTED`` row to be *committed* before the ``schedule.json`` POST is
 issued, and requires the POST itself to run with **no transaction
@@ -44,6 +44,29 @@ before anything is claimed or POSTed. This is the read side of A2's
 persistence-side fence already discards late results, so this check is
 what stops us *paying* for them.
 
+Absence is evidence, and evidence has a bar (R11, 2026-09-09)
+-------------------------------------------------------------
+``POSTED`` is committed *before* the ``schedule.json`` POST is issued —
+that is the whole point of the protocol — so there is a window in which
+the row exists and the node has never heard of the job. The maintenance
+sweep used to read one ``listjobs.json`` answer taken in that window as
+proof the dispatch never happened, move the row to
+``RECONCILED_MISSING``, and thereby authorize a re-POST *and* a second
+C3 reservation for work that was at that instant being accepted. The
+deterministic ``scrapyd_job_id`` does not save us: Scrapyd 1.6.0 passes
+a client-supplied ``jobid`` to the scheduler as ``_job`` **without
+deduplicating it**.
+
+So negative answers now go through :meth:`DispatchIntentStore.record_absence`,
+which applies :class:`AbsencePolicy` — an in-flight lease, a
+corroboration quorum over a window, a horizon past which a node's
+bounded history cannot testify — and parks anything short of proof in
+``RECONCILED_AMBIGUOUS``, a state that authorizes nothing. Positive
+answers are unchanged and unconditional: a sighting is always safe to
+act on at any age. And the last gate before a recovery re-POST is
+:func:`receiver_holds_execution`, which asks the receiver itself whether
+it already holds the execution, because Scrapyd will not.
+
 Scoping: every query goes through
 :func:`app_shared.repository.scoped_select` with an explicit
 ``workspace_id`` (Principle II / ``scripts/check_workspace_scoping.py``),
@@ -58,6 +81,7 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
@@ -76,13 +100,40 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AbsenceOutcome",
+    "AbsencePolicy",
+    "AbsenceVerdict",
     "DispatchIntentStore",
+    "MIN_CORROBORATING_DENIALS",
+    "OPEN_QUESTION_STATES",
+    "REPOST_AUTHORIZING_STATES",
     "ReconcileReport",
     "SCRAPYD_JOB_ID_NAMESPACE",
     "deterministic_scrapyd_job_id",
     "iter_dispatch_scrapyd_job_ids",
     "reconcile_inflight_intents",
+    "receiver_holds_execution",
 ]
+
+#: The states that mean "something may exist on a node and nobody has
+#: settled it" — the sweep re-examines exactly these, retention never
+#: ages them out, and NEITHER of them authorizes a re-POST (R11).
+OPEN_QUESTION_STATES: tuple[DispatchIntentState, ...] = (
+    DispatchIntentState.POSTED,
+    DispatchIntentState.RECONCILED_AMBIGUOUS,
+)
+
+#: The states a re-POST may proceed from. Deliberately a named constant
+#: rather than an inline check: R11's finding was that "may we send this
+#: again?" was answered in three different places with three different
+#: readings of the same enum. ``PLANNED`` = never sent;
+#: ``RECONCILED_MISSING`` = looked for, corroborated absent.
+#: ``RECONCILED_AMBIGUOUS`` is NOT here and must never be added — that is
+#: the whole point of its existing.
+REPOST_AUTHORIZING_STATES: tuple[DispatchIntentState, ...] = (
+    DispatchIntentState.PLANNED,
+    DispatchIntentState.RECONCILED_MISSING,
+)
 
 #: The uuid5 namespace every deterministic Scrapyd job id is minted under
 #: (EPA B2 / F06). A fixed, hard-coded constant on purpose: the whole
@@ -149,6 +200,190 @@ def iter_dispatch_scrapyd_job_ids(
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+# --- R11: when absence is evidence, and when it is merely absence -----------
+
+#: The floor :meth:`DispatchIntentStore.mark_missing` enforces on its own,
+#: independent of whatever ``AbsencePolicy`` the sweep was configured
+#: with. A configured quorum may be higher; it may never be lower. Two,
+#: because one answer cannot distinguish "never arrived" from "arrived
+#: and is not indexed yet", and that ambiguity is what R11 is about.
+MIN_CORROBORATING_DENIALS = 2
+
+#: How many CONFIRMED rows one pass reads per node to date that node's
+#: memory (see :func:`_confirmed_witnesses`). Bounded because the sweep
+#: runs every 300s on a fleet-wide table; the newest few hundred are the
+#: only ones that can date a memory 100 entries deep anyway.
+_WITNESS_SCAN_LIMIT = 500
+
+
+def _age_seconds(stamp: datetime | None, now: datetime) -> float | None:
+    """``now - stamp`` in seconds, or ``None`` when there is no stamp.
+
+    Tolerates a naive ``stamp`` (a hand-repaired row, or a fake session
+    that skipped the ``TZDateTime`` round trip) by reading it as UTC:
+    refusing to age such a row would push it down the ``None`` branch and
+    make it permanently un-settleable, which is a worse failure than
+    assuming the timezone every writer in this codebase actually uses.
+    """
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (now - stamp).total_seconds()
+
+
+class AbsenceVerdict(str, Enum):
+    """What one ``listjobs.json`` answer that omitted a run established."""
+
+    #: The intent is not an open question (not ``POSTED`` /
+    #: ``RECONCILED_AMBIGUOUS``). Nothing to settle.
+    NOT_INFLIGHT = "not_inflight"
+    #: The intent is younger than the in-flight lease: the
+    #: ``schedule.json`` request may not have reached the node yet, so
+    #: this answer is not about it. **Nothing is recorded** — a denial
+    #: from before the request could have arrived is not weak evidence,
+    #: it is no evidence, and counting it would let a fast enough pass
+    #: cadence accumulate a quorum out of pure noise.
+    IN_FLIGHT = "in_flight"
+    #: We looked and did not see it, but the absence proves nothing: the
+    #: node's history has demonstrably rolled, the intent is past the
+    #: horizon that history can speak about, or this is the first
+    #: uncorroborated denial. The row is ``RECONCILED_AMBIGUOUS``.
+    #: **Never authorizes a re-POST.**
+    AMBIGUOUS = "ambiguous"
+    #: Corroborated absence: past the lease, node history intact, and
+    #: ``quorum`` independent denials spanning the absence window. The
+    #: row is ``RECONCILED_MISSING`` and a same-id re-POST is authorized.
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class AbsenceOutcome:
+    """The result of recording one negative observation about an intent."""
+
+    verdict: AbsenceVerdict
+    #: The intent's state *after* the observation was recorded.
+    state: DispatchIntentState | None
+    detail: str
+    #: How many independent denials now stand against this intent.
+    observations: int = 0
+
+    @property
+    def authorizes_repost(self) -> bool:
+        """Only :attr:`AbsenceVerdict.MISSING` ever does."""
+        return self.verdict is AbsenceVerdict.MISSING
+
+
+@dataclass(frozen=True)
+class AbsencePolicy:
+    """The evidence bar a ``RECONCILED_MISSING`` verdict has to clear.
+
+    Every number here exists because the pre-R11 reconciler had none of
+    them: it scanned every ``POSTED`` row regardless of age and moved the
+    first one a node failed to mention straight to the state that
+    authorizes spending money on a second run.
+
+    ``min_age_seconds``
+        The in-flight lease. A ``POSTED`` row younger than this may have
+        a ``schedule.json`` request still on the wire — the worker
+        commits ``POSTED`` *before* it sends, which is the whole point of
+        the protocol — so a node that does not list it has not yet been
+        asked about it. Must comfortably exceed the dispatch client's own
+        HTTP timeout.
+    ``quorum`` / ``window_seconds``
+        How many independent answers must deny the run, and how far apart
+        the first and last must be. One answer cannot distinguish "never
+        arrived" from "arrived a moment ago and has not been indexed";
+        two, separated by a real interval, can.
+    ``horizon_seconds``
+        The age past which the node cannot testify at all. Scrapyd's
+        ``MemoryJobStorage`` keeps 100 finished entries and loses them on
+        restart, so beyond this an absent run is indistinguishable from a
+        completed one whose history entry has gone. Such intents are
+        ``RECONCILED_AMBIGUOUS`` forever, for an operator, rather than
+        re-POSTed on evidence nobody has.
+    """
+
+    min_age_seconds: float = 120.0
+    quorum: int = 2
+    window_seconds: float = 120.0
+    horizon_seconds: float = 86_400.0
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "AbsencePolicy":
+        """Read the four knobs off ``settings``, falling back to defaults.
+
+        ``getattr`` with a default rather than attribute access: the
+        reconciler is also driven from tests and operator scripts with a
+        ``SimpleNamespace`` that carries only the Scrapyd fields, and a
+        missing knob must degrade to the conservative default rather than
+        crash a sweep.
+        """
+        if settings is None:
+            return cls()
+        return cls(
+            min_age_seconds=float(
+                getattr(settings, "DISPATCH_RECONCILE_MIN_AGE_SECONDS", 120)
+            ),
+            quorum=int(getattr(settings, "DISPATCH_RECONCILE_ABSENCE_QUORUM", 2)),
+            window_seconds=float(
+                getattr(settings, "DISPATCH_RECONCILE_ABSENCE_WINDOW_SECONDS", 120)
+            ),
+            horizon_seconds=float(
+                getattr(settings, "DISPATCH_RECONCILE_ABSENCE_HORIZON_SECONDS", 86_400)
+            ),
+        )
+
+
+def receiver_holds_execution(
+    client: Any,
+    *,
+    node_url: str,
+    node_class: str,
+    scrapyd_job_id: str,
+) -> bool | None:
+    """Does the receiver already hold an execution under this name? (R11)
+
+    The receiver-side half of execution identity, and it has to be ours:
+    **Scrapyd 1.6.0's ``Schedule.render_POST`` passes the client-supplied
+    ``jobid`` through to the scheduler as ``_job`` without deduplicating
+    it** (``webservice.py``; the ``@param("jobid", ...)`` declaration does
+    nothing but default it). A second ``schedule.json`` carrying the same
+    id therefore does not collapse onto the first — it queues a second
+    run with a colliding name, which is strictly worse than a plain
+    double-run because the two are then indistinguishable in
+    ``listjobs.json``. The deterministic id makes a re-POST *traceable*;
+    it does not make it *idempotent*. This check is what does.
+
+    Called immediately before a recovery re-POST, against the one node
+    the intent recorded, with no transaction open.
+
+    Returns:
+        ``True`` the node lists this id — do NOT POST, adopt the run.
+        ``False`` the node answered and does not know it — the re-POST
+        the ``RECONCILED_MISSING`` verdict authorized may proceed.
+        ``None`` the node could not be asked. Absence of an answer is
+        not an answer: the caller must refuse to POST, exactly as the
+        sweep refuses to issue a verdict.
+    """
+    if not node_url:
+        return None
+    project = node_class.split(":", 1)[0] if node_class else None
+    try:
+        known = client.list_jobs(node_url, project)
+    except Exception as exc:  # noqa: BLE001 - "unknown" is a verdict, not a crash
+        logger.warning(
+            "dispatch.receiver_check_unreachable node_url=%s jobid=%s error=%r",
+            node_url,
+            scrapyd_job_id,
+            exc,
+        )
+        return None
+    if known is None:
+        return None
+    return str(scrapyd_job_id) in {str(value) for value in known}
 
 
 class DispatchIntentStore:
@@ -362,12 +597,58 @@ class DispatchIntentStore:
         :meth:`confirm` this dispatch path uses), so this module cannot
         import it back at module scope.
         """
+        from app_shared.scrapyd.reconcile import (
+            InflightReconciliation,
+            InflightVerdict,
+        )
         from app_shared.scrapyd.reconcile import reconcile_inflight as _reconcile_inflight
 
+        policy = AbsencePolicy.from_settings(settings)
         with self._txn() as session:
             intent = self._load(identity, session)
-            if intent is None or intent.state != DispatchIntentState.POSTED:
+            if intent is None or intent.state not in OPEN_QUESTION_STATES:
                 return None
+
+            if intent.state == DispatchIntentState.RECONCILED_AMBIGUOUS:
+                # R11: the maintenance sweep already looked and could not
+                # establish anything. The dispatch path must not quietly
+                # get a second, softer answer to the same question — if it
+                # asked the node again and the run were merely un-indexed,
+                # `reconcile_inflight` would report ABSENT and roll the
+                # row back to PLANNED, which is precisely the re-POST
+                # authorization the ambiguous verdict withheld. Refuse.
+                return InflightReconciliation(
+                    verdict=InflightVerdict.AMBIGUOUS,
+                    intent_id=str(intent.id),
+                    scrapyd_job_id=None,
+                    state=intent.state,
+                    mechanism="none",
+                    detail=(
+                        "the reconciler looked and could not establish whether "
+                        f"this dispatch reached the node ({intent.error_message}); "
+                        "refusing to re-POST on an unresolved question"
+                    ),
+                )
+
+            age = _age_seconds(intent.posted_at, datetime.now(timezone.utc))
+            if age is not None and age < policy.min_age_seconds:
+                # R11, the dispatch-path half of the same race: an
+                # at-least-once redelivery arriving seconds behind the
+                # original would ask the node about a `schedule.json`
+                # request still on the wire, be told "no such job", and
+                # take that as authorization to send it again.
+                return InflightReconciliation(
+                    verdict=InflightVerdict.AMBIGUOUS,
+                    intent_id=str(intent.id),
+                    scrapyd_job_id=None,
+                    state=intent.state,
+                    mechanism="none",
+                    detail=(
+                        f"the POST for this intent is {age:.0f}s old, inside the "
+                        f"{policy.min_age_seconds:.0f}s in-flight lease; the node "
+                        "cannot yet have been asked about it"
+                    ),
+                )
 
             return _reconcile_inflight(
                 session,
@@ -465,9 +746,21 @@ class DispatchIntentStore:
                 )
             elif answered != intent.scrapyd_job_id:
                 intent.scrapyd_job_id = answered
+            now = datetime.now(timezone.utc)
             intent.state = DispatchIntentState.CONFIRMED
-            intent.confirmed_at = datetime.now(timezone.utc)
+            intent.confirmed_at = now
             intent.error_message = None
+            # R11: a confirmation IS a sighting — either a node listed the
+            # run or Scrapyd answered ``status=ok`` for it. Recording when
+            # is what makes a *later* absence a disappearance (the node's
+            # 100-deep, restart-losing history) rather than proof that the
+            # work never happened. Reaching CONFIRMED also retires any
+            # absence the sweep had accumulated: the row is settled, and
+            # leaving stale denials on it would mislead the next operator
+            # to read it.
+            intent.last_seen_at = now
+            intent.absent_observations = 0
+            intent.first_absent_at = None
             session.flush()
 
     def fail(self, identity: DispatchIdentity, error: str) -> None:
@@ -492,22 +785,214 @@ class DispatchIntentStore:
             intent.error_message = error[:2000]
             session.flush()
 
-    def mark_missing(self, identity: DispatchIdentity, detail: str = "") -> None:
-        """Move a ``POSTED`` intent to ``RECONCILED_MISSING`` — re-POST allowed.
+    def current_state(self, identity: DispatchIdentity) -> DispatchIntentState | None:
+        """This identity's durable state, or ``None`` when it has no row.
 
-        Step 5's only positive outcome. Written **only** by
-        :func:`reconcile_inflight_intents`, and only after every node in
-        the pool answered ``listjobs.json`` and none of them listed this
-        intent's ``scrapyd_job_id``. A node that could not be reached
-        leaves the row ``POSTED``: absence of an answer is not an answer.
+        R11: the planner needs this *before* it authorizes anything.
+        A batch whose intent is an open question (``POSTED`` or
+        ``RECONCILED_AMBIGUOUS``) must not be re-planned at all — not
+        because the POST would be wrong (the guard and the reconcile
+        gate both refuse it) but because the C3 grant is reserved
+        **before** any of those gates run, and a reservation taken for a
+        dispatch that is then refused is a second live hold against the
+        same logical batch. One authorization per logical job means
+        asking the ledger first.
+        """
+        intent = self._load_read_only(identity)
+        return None if intent is None else intent.state
+
+    def record_absence(
+        self,
+        identity: DispatchIdentity,
+        *,
+        now: datetime | None = None,
+        policy: "AbsencePolicy | None" = None,
+        node_url: str = "",
+        history_intact: bool = True,
+        detail: str = "",
+    ) -> AbsenceOutcome:
+        """Record one ``listjobs.json`` answer that did NOT list this run.
+
+        R11's core. The pre-R11 reconciler had no method like this: it
+        called :meth:`mark_missing` directly on the first denial, at any
+        age, from any node, which made "one node did not mention it once"
+        indistinguishable from "we established the work never left". The
+        difference matters because only the second may authorize spending
+        — a re-POST is a second run and a second cost authorization.
+
+        The ladder, in the order the checks have to happen:
+
+        1. **Not an open question** -> :attr:`AbsenceVerdict.NOT_INFLIGHT`.
+           Nothing is written. A ``CONFIRMED``/``FAILED``/``PLANNED`` row
+           is not the sweep's business.
+        2. **Younger than the lease** -> :attr:`AbsenceVerdict.IN_FLIGHT`,
+           and *nothing is recorded*. This is the exact race R11 names:
+           the worker commits ``POSTED`` before it sends, so a pass that
+           runs in that window asks the node about a request that has not
+           arrived. The answer is not weak evidence; it is evidence about
+           a different question.
+        3. **The node's history is not intact** (a run it certainly
+           accepted is no longer listed — it restarted, or the 100-deep
+           finished buffer rolled) -> :attr:`AbsenceVerdict.AMBIGUOUS`.
+           A recently disappeared history entry is not proof the work
+           never happened.
+        4. **Past the horizon** -> :attr:`AbsenceVerdict.AMBIGUOUS`, and
+           permanently: no node can testify about a run that old.
+        5. Otherwise the denial is recorded, and the intent becomes
+           ``RECONCILED_MISSING`` only once ``quorum`` denials span
+           ``window_seconds``. Until then it is ``RECONCILED_AMBIGUOUS``.
+
+        Args:
+            now: the pass clock. Injected, never read from the wall here,
+                so a test can drive the lease and the window exactly.
+            policy: the evidence bar; :class:`AbsencePolicy` defaults when
+                omitted.
+            node_url: the node that answered, for the audit trail.
+            history_intact: False when the caller established that this
+                node has forgotten runs it definitely accepted (see
+                :func:`reconcile_inflight_intents`).
+            detail: the caller's description of the answer.
+        """
+        policy = policy or AbsencePolicy()
+        now = now or datetime.now(timezone.utc)
+        with self._txn() as session:
+            intent = self._load(identity, session)
+            if intent is None or intent.state not in OPEN_QUESTION_STATES:
+                return AbsenceOutcome(
+                    verdict=AbsenceVerdict.NOT_INFLIGHT,
+                    state=None if intent is None else intent.state,
+                    detail="the intent is not an open question; nothing to settle",
+                )
+
+            age = _age_seconds(intent.posted_at, now)
+            if age is None or age < policy.min_age_seconds:
+                # Step 2. Deliberately BEFORE any write: an observation
+                # taken inside the lease must leave no trace at all, or a
+                # tight enough pass cadence would build a quorum out of
+                # answers that were never about this request.
+                return AbsenceOutcome(
+                    verdict=AbsenceVerdict.IN_FLIGHT,
+                    state=intent.state,
+                    detail=(
+                        f"intent is {'un-aged' if age is None else f'{age:.0f}s'} old, "
+                        f"inside the {policy.min_age_seconds:.0f}s in-flight lease; "
+                        "the schedule.json request may not have arrived yet"
+                    ),
+                    observations=int(intent.absent_observations or 0),
+                )
+
+            if not history_intact or intent.last_seen_at is not None:
+                return self._ambiguous(
+                    session,
+                    intent,
+                    detail
+                    or (
+                        f"node {node_url} has forgotten runs it accepted "
+                        "(restart, or the 100-deep finished history rolled); "
+                        "its silence about this one proves nothing"
+                    ),
+                )
+
+            if age > policy.horizon_seconds:
+                return self._ambiguous(
+                    session,
+                    intent,
+                    f"intent is {age:.0f}s old, past the "
+                    f"{policy.horizon_seconds:.0f}s horizon a node's bounded "
+                    "finished history can testify about; needs an operator",
+                )
+
+            # Step 5. The denial counts.
+            if intent.first_absent_at is None:
+                intent.first_absent_at = now
+            intent.absent_observations = int(intent.absent_observations or 0) + 1
+            observations = int(intent.absent_observations)
+            spanned = _age_seconds(intent.first_absent_at, now) or 0.0
+            if observations >= policy.quorum and spanned >= policy.window_seconds:
+                intent.state = DispatchIntentState.RECONCILED_MISSING
+                intent.error_message = (
+                    detail
+                    or f"node {node_url} answered listjobs.json and does not know it"
+                )[:1900] + (
+                    f" [{observations} denials over {spanned:.0f}s]"
+                )
+                session.flush()
+                return AbsenceOutcome(
+                    verdict=AbsenceVerdict.MISSING,
+                    state=intent.state,
+                    detail=str(intent.error_message),
+                    observations=observations,
+                )
+
+            return self._ambiguous(
+                session,
+                intent,
+                f"{observations} denial(s) over {spanned:.0f}s; "
+                f"{policy.quorum} spanning {policy.window_seconds:.0f}s are "
+                "required before absence authorizes a re-POST",
+                observations=observations,
+            )
+
+    def _ambiguous(
+        self,
+        session: Session,
+        intent: DispatchIntent,
+        detail: str,
+        observations: int = 0,
+    ) -> AbsenceOutcome:
+        """Park an intent in ``RECONCILED_AMBIGUOUS`` and say why.
+
+        A single writer for the state, so "we looked and learned nothing"
+        always reads the same way in the table and can never be spelled
+        as ``RECONCILED_MISSING`` by a caller in a hurry.
+        """
+        intent.state = DispatchIntentState.RECONCILED_AMBIGUOUS
+        intent.error_message = detail[:2000]
+        session.flush()
+        return AbsenceOutcome(
+            verdict=AbsenceVerdict.AMBIGUOUS,
+            state=intent.state,
+            detail=detail,
+            observations=observations or int(intent.absent_observations or 0),
+        )
+
+    def mark_missing(self, identity: DispatchIdentity, detail: str = "") -> None:
+        """Move an open-question intent to ``RECONCILED_MISSING`` — re-POST allowed.
+
+        Step 5's only positive outcome, and the ONE transition in this
+        module that authorizes spending: the re-POST it clears is a
+        second Scrapyd run and, upstream, a second C3 reservation.
+
+        **The evidence gate is enforced here, not only in the caller**
+        (R11). Before this, the method moved any ``POSTED`` row on the
+        strength of its argument alone, so the sweep's judgement was the
+        only thing between an in-flight request and a duplicate run — and
+        that judgement did not exist. It now refuses unless the row's own
+        absence ledger says the denial was corroborated: at least two
+        recorded denials, and the ledger is only ever written by
+        :meth:`record_absence`, which will not record one inside the
+        in-flight lease. A caller that wants the ladder (and the
+        ``RECONCILED_AMBIGUOUS`` outcomes) should call
+        :meth:`record_absence`; this stays the single writer of the
+        terminal transition.
 
         The re-POST that this state authorizes carries the **same**
-        ``scrapyd_job_id``, so a node that did in fact receive the
-        original request dedups it.
+        ``scrapyd_job_id``, and — since Scrapyd 1.6.0 does not dedup
+        ``_job`` — must additionally pass
+        :func:`receiver_holds_execution` immediately before it is sent.
         """
         with self._txn() as session:
             intent = self._load(identity, session)
-            if intent is None or intent.state != DispatchIntentState.POSTED:
+            if intent is None or intent.state not in OPEN_QUESTION_STATES:
+                return
+            if int(intent.absent_observations or 0) < MIN_CORROBORATING_DENIALS:
+                logger.warning(
+                    "dispatch.mark_missing_refused intent=%s observations=%s "
+                    "state=%s reason=uncorroborated",
+                    intent.id,
+                    intent.absent_observations,
+                    intent.state,
+                )
                 return
             intent.state = DispatchIntentState.RECONCILED_MISSING
             intent.error_message = (detail or "no such job on any node in the pool")[
@@ -634,16 +1119,29 @@ def _coerce_job_uuid(value: object) -> uuid.UUID | None:
 class ReconcileReport:
     """What one :func:`reconcile_inflight_intents` pass established."""
 
-    #: ``POSTED`` rows examined.
+    #: Open-question rows (``POSTED`` / ``RECONCILED_AMBIGUOUS``) examined.
     examined: int = 0
     #: Rows a node listed — advanced to ``CONFIRMED``. Never re-POSTed.
     confirmed: int = 0
-    #: Rows every node denied — advanced to ``RECONCILED_MISSING``. These,
-    #: and only these, may be re-POSTed (with the same ``scrapyd_job_id``).
+    #: Rows whose absence was CORROBORATED — advanced to
+    #: ``RECONCILED_MISSING``. These, and only these, may be re-POSTed
+    #: (with the same ``scrapyd_job_id``, and only after
+    #: :func:`receiver_holds_execution` says the node does not already
+    #: hold the run).
     missing: int = 0
     #: Rows left ``POSTED`` because a node could not be reached. No
     #: verdict; they are examined again next pass.
     unreachable: int = 0
+    #: R11: rows still inside the in-flight lease. The node was asked (a
+    #: sighting is always safe to act on) but a denial was DISCARDED, not
+    #: recorded — the ``schedule.json`` request may not have arrived yet.
+    #: The row keeps its state and is examined again next pass.
+    in_flight: int = 0
+    #: R11: rows a node denied where the denial proves nothing — the
+    #: node's history has rolled, the intent is past the horizon, or the
+    #: denial is not yet corroborated. Now ``RECONCILED_AMBIGUOUS``.
+    #: **Never re-POSTed.**
+    ambiguous: int = 0
     #: ``intent_id`` values now in ``RECONCILED_MISSING``, for the caller
     #: that wants to re-POST them immediately rather than next tick.
     reposted_candidates: tuple[str, ...] = field(default_factory=tuple)
@@ -657,23 +1155,68 @@ def reconcile_inflight_intents(
     scrape_job_id: uuid.UUID | str | None = None,
     limit: int = 200,
     now: datetime | None = None,
+    settings: Any = None,
+    policy: AbsencePolicy | None = None,
 ) -> ReconcileReport:
-    """Settle every ``POSTED`` dispatch intent against the node it names.
+    """Settle every open-question dispatch intent against the node it names.
 
     Step 5 of the five-step protocol, and the reason step 3 is allowed to
-    die without taking the system's knowledge with it. For each ``POSTED``
-    row this asks ``client.list_jobs(node_url, project)`` — the node the
-    row itself recorded, and the project half of its ``node_class`` — and
-    then:
+    die without taking the system's knowledge with it. For each
+    ``POSTED`` or ``RECONCILED_AMBIGUOUS`` row this asks
+    ``client.list_jobs(node_url, project)`` — the node the row itself
+    recorded, and the project half of its ``node_class`` — and then:
 
     * the node lists ``scrapyd_job_id``  -> :meth:`DispatchIntentStore.confirm`
-      (``CONFIRMED``). **Never re-POST**: the run exists.
-    * the node answers and does not list it -> :meth:`DispatchIntentStore.mark_missing`
-      (``RECONCILED_MISSING``). This is the *only* state from which a
-      re-POST is authorized, and it re-POSTs the **same** id.
+      (``CONFIRMED``). **Never re-POST**: the run exists. A sighting is
+      acted on at ANY age — it is the negative answer that needs a
+      policy, never the positive one.
     * the node cannot be reached (``list_jobs`` raises or returns
-      ``None``) -> the row is left ``POSTED``. Absence of an answer is
+      ``None``) -> the row is left as it was. Absence of an answer is
       not evidence of absence; it is examined again next pass.
+    * the node answers and does not list it -> the answer goes to
+      :meth:`DispatchIntentStore.record_absence`, which decides between
+      "not evidence" (``RECONCILED_AMBIGUOUS``, or discarded entirely
+      inside the in-flight lease) and "evidence"
+      (``RECONCILED_MISSING``, the only state a re-POST may proceed
+      from). See :class:`AbsencePolicy` for the bar and R11 for why a
+      bar is needed at all.
+
+    What R11 changed, and why (2026-09-09)
+    --------------------------------------
+    This function used to ``del now`` — it discarded its own clock — and
+    scan every ``POSTED`` row with no minimum age, calling
+    ``mark_missing`` on the first node answer that omitted the job. Every
+    piece of that was load-bearing in the wrong direction, because the
+    protocol deliberately commits ``POSTED`` **before** the
+    ``schedule.json`` POST is issued:
+
+        worker commits POSTED -> this sweep lists the node before the
+        schedule request arrives -> the job is (correctly) not there ->
+        RECONCILED_MISSING -> the original POST then succeeds
+
+    and the row now says a re-POST is authorized for work that is
+    running. A re-POST is not free even with a deterministic id: Scrapyd
+    1.6.0's schedule handler hands ``jobid`` to the scheduler as ``_job``
+    **without deduplicating it**, so the node queues a second run under a
+    colliding name; and upstream, the re-plan takes a second C3
+    reservation against the workspace's budget. One logical job, two
+    executions, two cost authorizations.
+
+    Three things close it, and all three are needed:
+
+    1. **A lease.** ``now`` is real again and a row younger than
+       ``policy.min_age_seconds`` yields no negative verdict at all.
+    2. **Corroboration, in an explicit ambiguous state.** One denial is
+       recorded, not acted on; ``RECONCILED_AMBIGUOUS`` is where a row
+       waits, and it authorizes nothing.
+    3. **A node-history check.** Both nodes run ``MemoryJobStorage``
+       (100 finished entries, lost on restart). Before declaring a run
+       absent, this pass verifies the node still lists every run it
+       CONFIRMED *after* this one was posted. If even one of those has
+       disappeared, the node has forgotten something newer than the
+       intent under test, so its silence about the intent proves nothing
+       — a recently disappeared history entry is not evidence the work
+       never happened.
 
     Each row is settled through a :class:`DispatchIntentStore` built on
     ``session_factory``, so each verdict commits in its own short
@@ -693,20 +1236,28 @@ def reconcile_inflight_intents(
             scan query is annotated ``# noqa: workspace-scope``.
         scrape_job_id: restrict the sweep to one job.
         limit: maximum rows examined in one pass.
-        now: injectable clock (unused for selection today; accepted so
-            callers can pass their pass clock without a signature churn).
+        now: the pass clock. Defaults to the wall clock; injected by
+            tests and by the Celery task so every age in one pass is
+            measured against the same instant.
+        settings: source of the four ``DISPATCH_RECONCILE_ABSENCE_*``
+            knobs when ``policy`` is not given.
+        policy: the evidence bar, pre-built. Overrides ``settings``.
 
     Returns:
         ReconcileReport: counts plus the ids now safe to re-POST.
     """
-    del now  # accepted for caller symmetry; selection is state-only today
+    now = now or datetime.now(timezone.utc)
+    policy = policy or AbsencePolicy.from_settings(settings)
 
-    # --- scan: read the POSTED rows, then CLOSE the transaction ----------
+    # --- scan: read the open-question rows, then CLOSE the transaction ---
     # The node calls below must not run with a transaction open (the same
-    # rule step 3 obeys), so the scan is its own short read.
+    # rule step 3 obeys), so the scan is its own short read. The CONFIRMED
+    # witnesses are read here too, in the same transaction, for the same
+    # reason -- and because a witness read after the listing would be
+    # racing the very thing it is meant to date-stamp.
     with session_factory() as scan:
         query = select(DispatchIntent).where(  # noqa: workspace-scope - system sweep
-            DispatchIntent.state == DispatchIntentState.POSTED
+            DispatchIntent.state.in_(OPEN_QUESTION_STATES)
         )
         if workspace_id is not None:
             query = query.where(DispatchIntent.workspace_id == _as_uuid(workspace_id))
@@ -725,29 +1276,44 @@ def reconcile_inflight_intents(
                 str(row.node_url or ""),
                 str(row.node_class or ""),
                 str(row.scrapyd_job_id),
+                row.posted_at,
                 identity_from_intent_row(row),
             )
             for row in rows
         ]
+        witnesses = _confirmed_witnesses(
+            scan, {node_url for _w, _j, _i, node_url, *_rest in pending if node_url}
+        )
         scan.commit()
 
-    examined = confirmed = missing = unreachable = 0
+    examined = confirmed = missing = unreachable = in_flight = ambiguous = 0
     candidates: list[str] = []
+    #: One listing per node per pass. Two intents on the same node must
+    #: be judged against the SAME answer -- otherwise the history check
+    #: and the denials it gates could disagree within one sweep.
+    listings: dict[tuple[str, str | None], set[str] | None] = {}
 
-    for ws_id, job_id, intent_id, node_url, node_class, jobid, identity in pending:
+    for ws_id, job_id, intent_id, node_url, node_class, jobid, posted_at, identity in (
+        pending
+    ):
         examined += 1
         project = node_class.split(":", 1)[0] if node_class else None
-        try:
-            known = client.list_jobs(node_url, project)
-        except Exception as exc:  # noqa: BLE001 - unreachable is a non-verdict
-            logger.warning(
-                "dispatch.reconcile_node_unreachable intent=%s node_url=%s error=%r",
-                intent_id,
-                node_url,
-                exc,
+        cache_key = (node_url, project)
+        if cache_key not in listings:
+            try:
+                answered = client.list_jobs(node_url, project)
+            except Exception as exc:  # noqa: BLE001 - unreachable is a non-verdict
+                logger.warning(
+                    "dispatch.reconcile_node_unreachable intent=%s node_url=%s error=%r",
+                    intent_id,
+                    node_url,
+                    exc,
+                )
+                answered = None
+            listings[cache_key] = (
+                None if answered is None else {str(value) for value in answered}
             )
-            unreachable += 1
-            continue
+        known = listings[cache_key]
         if known is None:
             unreachable += 1
             continue
@@ -758,7 +1324,7 @@ def reconcile_inflight_intents(
             scrape_job_id=job_id,
             session_factory=session_factory,
         )
-        if jobid in {str(value) for value in known}:
+        if jobid in known:
             store.confirm(identity, jobid)
             confirmed += 1
             logger.info(
@@ -768,26 +1334,134 @@ def reconcile_inflight_intents(
                 node_url,
             )
             continue
-        store.mark_missing(
+
+        outcome = store.record_absence(
             identity,
-            f"node {node_url} answered listjobs.json and does not know {jobid}",
+            now=now,
+            policy=policy,
+            node_url=node_url,
+            history_intact=_history_is_intact(
+                known, witnesses.get(node_url, ()), since=posted_at
+            ),
+            detail=f"node {node_url} answered listjobs.json and does not know {jobid}",
         )
-        missing += 1
-        candidates.append(intent_id)
-        logger.warning(
-            "dispatch.reconcile_missing intent=%s jobid=%s node_url=%s",
-            intent_id,
-            jobid,
-            node_url,
-        )
+        if outcome.verdict is AbsenceVerdict.MISSING:
+            missing += 1
+            candidates.append(intent_id)
+            logger.warning(
+                "dispatch.reconcile_missing intent=%s jobid=%s node_url=%s detail=%s",
+                intent_id,
+                jobid,
+                node_url,
+                outcome.detail,
+            )
+        elif outcome.verdict is AbsenceVerdict.IN_FLIGHT:
+            in_flight += 1
+            logger.info(
+                "dispatch.reconcile_in_flight intent=%s jobid=%s node_url=%s detail=%s",
+                intent_id,
+                jobid,
+                node_url,
+                outcome.detail,
+            )
+        elif outcome.verdict is AbsenceVerdict.AMBIGUOUS:
+            ambiguous += 1
+            logger.warning(
+                "dispatch.reconcile_ambiguous intent=%s jobid=%s node_url=%s detail=%s",
+                intent_id,
+                jobid,
+                node_url,
+                outcome.detail,
+            )
 
     return ReconcileReport(
         examined=examined,
         confirmed=confirmed,
         missing=missing,
         unreachable=unreachable,
+        in_flight=in_flight,
+        ambiguous=ambiguous,
         reposted_candidates=tuple(candidates),
     )
+
+
+def _confirmed_witnesses(
+    session: Any, node_urls: set[str]
+) -> dict[str, tuple[tuple[str, datetime | None], ...]]:
+    """Runs each node is KNOWN to have accepted, newest first (R11).
+
+    A witness is a ``CONFIRMED`` intent on that node: the node itself
+    told us, at ``confirmed_at``, that it had this run. It is the only
+    thing available that can date a node's memory from the outside, and
+    dating that memory is what turns "the node did not mention our job"
+    into evidence or into nothing.
+
+    Cross-tenant by construction — a node pool is fleet-wide, and a
+    workspace's own rows cannot date a node that serves every workspace.
+    """
+    if not node_urls:
+        return {}
+    rows = (
+        session.execute(
+            select(DispatchIntent)  # noqa: workspace-scope - system sweep
+            .where(
+                DispatchIntent.state == DispatchIntentState.CONFIRMED,
+                DispatchIntent.node_url.in_(sorted(node_urls)),
+            )
+            .order_by(DispatchIntent.confirmed_at.desc())
+            .limit(_WITNESS_SCAN_LIMIT)
+        )
+        .scalars()
+        .all()
+    )
+    grouped: dict[str, list[tuple[str, datetime | None]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.node_url or ""), []).append(
+            (str(row.scrapyd_job_id), row.confirmed_at)
+        )
+    return {node: tuple(values) for node, values in grouped.items()}
+
+
+def _history_is_intact(
+    known: set[str],
+    witnesses: Iterable[tuple[str, datetime | None]],
+    *,
+    since: datetime | None,
+) -> bool:
+    """Can this node's silence about a run posted at ``since`` be trusted?
+
+    Only witnesses confirmed **at or after** ``since`` are consulted, and
+    that cut-off is the whole idea. A node running ``MemoryJobStorage``
+    with ``finished_to_keep = 100`` legitimately forgets old runs, so an
+    ancient witness going missing says nothing. A run the node accepted
+    *after* ours going missing says a great deal: the node's memory does
+    not reach back as far as our intent, either because it restarted or
+    because the finished buffer has rolled past that point. In that case
+    our own run could have been forgotten the same way, and its absence
+    is not evidence.
+
+    With no qualifying witness there is nothing to disprove intactness
+    with, so this answers ``True`` and the age horizon in
+    :class:`AbsencePolicy` is what bounds the claim instead.
+    """
+    if since is None:
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    for jobid, confirmed_at in witnesses:
+        if confirmed_at is None:
+            continue
+        stamp = (
+            confirmed_at.replace(tzinfo=timezone.utc)
+            if confirmed_at.tzinfo is None
+            else confirmed_at
+        )
+        if stamp < since:
+            continue
+        if jobid not in known:
+            return False
+    return True
+
 
 
 def identity_from_intent_row(intent: DispatchIntent) -> DispatchIdentity:

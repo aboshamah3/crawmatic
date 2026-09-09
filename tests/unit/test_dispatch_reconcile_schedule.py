@@ -81,13 +81,20 @@ def fake_reconcile(session_factory, client, **kwargs):
     calls.append({"factory": session_factory, "client": client, **kwargs})
 
     class _Report:
-        examined = confirmed = missing = unreachable = 0
+        # R11 added `in_flight` and `ambiguous`: a pass now reports the
+        # rows it deliberately declined to rule on as well as the ones it
+        # settled, and the task logs all six.
+        examined = confirmed = missing = unreachable = in_flight = ambiguous = 0
 
     return _Report()
 
 
 class _Settings:
     DISPATCH_RECONCILE_LIMIT = 77
+    DISPATCH_RECONCILE_MIN_AGE_SECONDS = 120
+    DISPATCH_RECONCILE_ABSENCE_QUORUM = 2
+    DISPATCH_RECONCILE_ABSENCE_WINDOW_SECONDS = 120
+    DISPATCH_RECONCILE_ABSENCE_HORIZON_SECONDS = 86400
 
 
 tasks_jobs.reconcile_inflight_intents = fake_reconcile
@@ -101,6 +108,9 @@ call = calls[0]
 assert call["factory"] is tasks_jobs.get_system_session, call["factory"]
 assert call["limit"] == 77
 assert call["client"] == "client-sentinel"
+# R11: the absence policy travels with the pass, so one sweep runs under
+# one snapshot of the four knobs rather than re-reading them per row.
+assert call["settings"].DISPATCH_RECONCILE_MIN_AGE_SECONDS == 120
 # No workspace/job narrowing: this is a registered system sweep.
 assert "workspace_id" not in call and "scrape_job_id" not in call
 print("OK")

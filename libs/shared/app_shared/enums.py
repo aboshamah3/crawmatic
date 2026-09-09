@@ -581,15 +581,33 @@ class DispatchIntentState(StrEnum):
     * ``FAILED``    — the POST failed before any confirmation. The Redis
       claim is released so a legitimate retry proceeds; the row survives
       so "tried and failed" stays distinguishable from "never tried".
+    * ``RECONCILED_AMBIGUOUS`` — the maintenance reconciler looked and
+      did not see the run, but the absence **does not prove anything**
+      (R11, 2026-09-09). Three things produce it: a node whose bounded
+      ``MemoryJobStorage`` history has demonstrably rolled or restarted
+      (a run it certainly accepted is no longer listed, so this one's
+      absence is uninformative); an intent older than the horizon that
+      history can testify about at all; and a single uncorroborated
+      denial that has not yet been repeated across the absence window.
+      A row here is an OPEN QUESTION, exactly like ``POSTED`` — it is
+      re-examined every pass, it is never aged out by retention, and it
+      **never authorizes a re-POST**. It exists because collapsing "we
+      did not see it" into "it never happened" is precisely how a
+      reconciler that raced an in-flight ``schedule.json`` request used
+      to authorize a second run of work that was already on its way.
     * ``RECONCILED_MISSING`` — a ``POSTED`` intent the maintenance
-      reconciler looked for and did **not** find: every node in the
-      pool answered ``listjobs.json`` and none of them knows this job's
-      ``scrapyd_job_id``. This is the ONLY state from which a re-POST is
-      authorized, and it must re-POST with the **same** id (EPA B2/F06)
-      so a node that did in fact receive the original request dedups it
-      rather than running the batch twice. It is deliberately distinct
-      from ``PLANNED``: "we looked and it is not there" is a positive
-      finding an operator can audit, where "never sent" is not.
+      reconciler looked for and did **not** find, *with corroboration*:
+      the intent is past the in-flight lease, the node's history is
+      intact, and independent ``listjobs.json`` answers spanning the
+      absence window all denied this job's ``scrapyd_job_id``. This is
+      the ONLY state from which a re-POST is authorized, and it must
+      re-POST with the **same** id (EPA B2/F06) so a node that did in
+      fact receive the original request dedups it rather than running
+      the batch twice. It is deliberately distinct from ``PLANNED``:
+      "we looked and it is not there" is a positive finding an operator
+      can audit, where "never sent" is not. And it is deliberately
+      distinct from ``RECONCILED_AMBIGUOUS``: only one of the two is
+      evidence, and only evidence may authorize spending.
     * ``SUPERSEDED`` — a later planning generation replaced this intent.
       Kept, never deleted: it is the evidence of what the job was asked
       to do under the previous plan.
@@ -599,6 +617,7 @@ class DispatchIntentState(StrEnum):
     POSTED = "POSTED"
     CONFIRMED = "CONFIRMED"
     FAILED = "FAILED"
+    RECONCILED_AMBIGUOUS = "RECONCILED_AMBIGUOUS"
     RECONCILED_MISSING = "RECONCILED_MISSING"
     SUPERSEDED = "SUPERSEDED"
 
