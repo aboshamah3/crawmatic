@@ -46,4 +46,104 @@
 #   expires: 2026-12-31
 #   reason: "Timing side-channel requiring a specific S/MIME-gateway shape we do not run."
 
-advisories: []
+advisories:
+  # ── Triaged 2026-09-09 (EPA review-and-bounty run, task B-deps) ───────────
+  # Every entry below was written after REPRODUCING the reachability check in
+  # this tree — not by citing a prior review document. The reproduction
+  # commands and their output are recorded in
+  # `.epa/review-and-bounty-2026-09-09/reports/B-deps.md`. No entry is
+  # justified by "the unit tests pass"; each names the structural reason the
+  # vulnerable code path cannot be entered from this codebase.
+  #
+  # `owner` is deliberately NOT a person: no human has signed these off yet.
+  # `expires` is 30 days out on all four so the owner is forced to confirm or
+  # replace them (and so a lapse fails CI closed) rather than inheriting a
+  # machine-written risk acceptance indefinitely.
+
+  - id: GHSA-g6cj-pr64-35w5
+    decision: accept
+    owner: "epa-b-deps-2026-09-09 (PENDING OWNER SIGN-OFF)"
+    expires: 2026-10-09
+    reason: >-
+      cryptography 49.0.0 — Bleichenbacher oracle in `pkcs7_decrypt_der` /
+      `pkcs7_decrypt_pem` / `pkcs7_decrypt_smime` (CVE-2026-69247,
+      PYSEC-2026-3552; fixed in 50.0.0). NOT REACHABLE: this workspace's only
+      use of `cryptography` is `cryptography.fernet.Fernet` — the four import
+      sites are libs/shared/app_shared/security/encryption.py,
+      scripts/encrypt_proxy_password.py, tests/unit/test_encryption.py and
+      tests/unit/test_key_rotation.py. A repo-wide search for
+      pkcs7/S-MIME/EnvelopedData/`load_*_pkcs7` across apps, libs, scripts,
+      tests and alembic returns no hit outside this file's own comments, and
+      no locked third-party package calls those APIs either. Nothing here
+      decrypts attacker-supplied `EnvelopedData` or reflects a decryption
+      outcome, so there is no oracle to probe. NOT FIXED IN PLACE because the
+      fix is cryptography 50.0.0 and libs/shared/pyproject.toml pins
+      `cryptography>=49,<50`: crossing that bound is a major runtime bump and
+      an owner decision, not a triage decision. Fix plan for the owner: widen
+      the pin to `>=50,<51` and re-run the encryption/key-rotation unit tests.
+
+  - id: GHSA-76g3-c3x4-crvx
+    decision: fix
+    owner: "epa-b-deps-2026-09-09 (PENDING OWNER SIGN-OFF)"
+    expires: 2026-10-09
+    reason: >-
+      scrapy 2.16.0 — `S3DownloadHandler` sends SIGNED `s3://` requests over
+      plaintext HTTP unless `request.meta["is_secure"]` is set
+      (CVE-2026-84366; fixed in 2.17). NOT REACHABLE TODAY, on three
+      independent grounds: (1) no `s3://` URL is constructed anywhere in
+      apps/, libs/, scripts/ or tests/ — the only literal "boto3" in the tree
+      is inside tests/unit/test_fixture_origin_pages.py's FORBIDDEN_IMPORTS
+      denylist; (2) botocore/boto3 are not in uv.lock at all, and
+      `S3DownloadHandler.__init__` raises `NotConfigured("missing botocore
+      library")` before it can construct a URL; (3) the signing branch only
+      runs when AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are set, and neither
+      scrapy project sets them — both override only the `http`/`https` entries
+      of DOWNLOAD_HANDLERS (apps/scrapers/price_monitor/settings.py and
+      apps/scrapers-browser/price_monitor_browser/settings.py). Marked `fix`
+      rather than `accept` because 2.17 IS inside the existing
+      `scrapy>=2.16,<3` range, so this one has a real remediation path: bump
+      the lock and re-run the scraper suites. Not bumped in this run —
+      scrapy is load-bearing here (custom download handlers, impersonating
+      transport, SSRF/egress middlewares), so it needs a full scraper test
+      pass rather than a lockfile edit made alongside an unrelated audit.
+
+  - id: GHSA-h35f-9h28-mq5c
+    decision: accept
+    owner: "epa-b-deps-2026-09-09 (PENDING OWNER SIGN-OFF)"
+    expires: 2026-10-09
+    reason: >-
+      setuptools 80.10.2 — `FileList` matches MANIFEST.in exclude/prune
+      directives without Unicode normalization, so an NFD filename can escape
+      an NFC exclusion rule and be packed into an sdist (CVE-2026-59890,
+      PYSEC-2026-3447; fixed in 83.0.0). NOT REACHABLE: (1) setuptools is not
+      a build backend for anything here — all eight workspace packages declare
+      `build-backend = "hatchling.build"`; (2) there is no first-party
+      MANIFEST.in in the tree (the only match is inside .uvcache-a2, a
+      downloaded third-party sdist); (3) setuptools is present only as a
+      transitive of scrapyd/scrapyd-client, and the one setuptools command
+      this repo actually invokes is `scrapyd-deploy --build-egg`
+      (apps/scrapers/Dockerfile, apps/scrapers-browser/Dockerfile), which runs
+      `bdist_egg` (scrapyd_client/deploy.py) — not `sdist`, so FileList's
+      MANIFEST.in matcher is never entered; (4) the bug only manifests on
+      normalization-preserving filesystems (macOS APFS/HFS+), and every build
+      here runs on Linux (ubuntu-latest runners, Linux container images).
+      Nothing in this repo is published to PyPI.
+
+  - id: PYSEC-2026-1845
+    decision: accept
+    owner: "epa-b-deps-2026-09-09 (PENDING OWNER SIGN-OFF)"
+    expires: 2026-10-09
+    reason: >-
+      pytest 8.4.2 — predictable `/tmp/pytest-of-{user}` base temp directory
+      allows a local user on the same host to cause a DoS or possibly escalate
+      privileges (CVE-2025-71176, GHSA-6w46-j5rx-g56g; fixed in 9.0.3). NOT
+      SHIPPED: pytest is declared only in `[dependency-groups] dev` of the
+      root pyproject.toml, and every service image syncs with
+      `uv sync --locked --package <svc> --no-dev` (apps/api, apps/workers,
+      apps/scheduler, apps/migrate, apps/scrapers, apps/scrapers-browser
+      Dockerfiles), so it is absent from every production runtime. The
+      remaining exposure is the test host itself, and the attack requires a
+      second, untrusted local user racing the tmp path — not the case on
+      ephemeral single-tenant CI runners or inside the test container. NOT
+      FIXED IN PLACE because 9.0.3 crosses the root pin `pytest>=8.3,<9`;
+      a pytest major bump is a test-suite migration, not an audit edit.
