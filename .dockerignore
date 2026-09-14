@@ -23,6 +23,15 @@ specs
 .ruff_cache
 .uv-cache
 tests
+# Exceptions for the scrapers-browser READY F01 build gate
+# (apps/scrapers-browser/Dockerfile runs this one test INSIDE the image).
+# Without them the gate died with "file or directory not found" on the
+# 2026-09-14 production build — the `tests` line above removes the whole
+# tree from every build context. Only the gate's own file, the root
+# conftest it relies on, and the package marker are re-included.
+!tests/conftest.py
+!tests/integration/__init__.py
+!tests/integration/test_browser_egress_guard_image.py
 README.md
 node_modules
 package.json
