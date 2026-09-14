@@ -108,7 +108,7 @@ class ControlPlaneRule(Base, WorkspaceScopedBase, TimestampMixin):
     #: ``MONITOR`` | ``REPRICE``. Free text by design — see the module
     #: docstring for why the vocabulary is not pinned in the schema.
     kind: Mapped[str] = mapped_column(Text(), nullable=False)
-    #: ``HOURLY`` | ``EVERY_6H`` | ``TWICE_DAILY`` | ``DAILY`` | ``WEEKLY``.
+    #: ``HOURLY`` | ``EVERY_6H`` | ``TWICE_DAILY`` | ``DAILY`` | ``WEEKLY`` | ``BIWEEKLY``.
     #: The COARSE, named cadence the SaaS sells; the engine translates it
     #: into the exact `refresh_rules` cron/interval it schedules on.
     cadence: Mapped[str] = mapped_column(Text(), nullable=False)

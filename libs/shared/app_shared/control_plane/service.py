@@ -101,6 +101,7 @@ CADENCE_INTERVAL_MINUTES: dict[str, int] = {
     "TWICE_DAILY": 720,
     "DAILY": 1440,
     "WEEKLY": 10080,
+    "BIWEEKLY": 20160,
 }
 
 #: SaaS status -> engine entitlement state. ``KILLED`` and ``PAUSED``
