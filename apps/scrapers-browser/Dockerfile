@@ -56,11 +56,12 @@ RUN playwright install --with-deps chromium
 # `pytest` lives in the ROOT workspace's `[dependency-groups] dev`, and
 # `uv sync --package <member>` does not pull the root's groups in on its
 # own: the 2026-09-14 production build died here with
-# `.venv/bin/pytest: not found`. Ask for the group explicitly, and fall back
-# to a direct install in case the pinned uv treats `--group` per-member.
-RUN uv sync --locked --package scrapers-browser --group dev \
-    && (.venv/bin/pytest --version >/dev/null 2>&1 \
-        || uv pip install --python .venv/bin/python "pytest>=8.3,<9") \
+# `.venv/bin/pytest: not found`. The pinned uv 0.7.13 resolves `--group`
+# against the member package (which has no groups: "Group `dev` is not
+# defined"), so install pytest into the venv directly for the gate; the
+# final `--no-dev` sync below makes the environment exact again and drops it.
+RUN uv sync --locked --package scrapers-browser \
+    && uv pip install --python .venv/bin/python "pytest>=8.3,<9" \
     && .venv/bin/pytest tests/integration/test_browser_egress_guard_image.py \
         -m browser -q -p no:cacheprovider \
     && uv sync --locked --package scrapers-browser --no-dev
