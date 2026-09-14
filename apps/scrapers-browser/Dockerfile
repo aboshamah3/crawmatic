@@ -53,7 +53,14 @@ RUN playwright install --with-deps chromium
 # The sync above is `--no-dev`, so pytest is absent: pull the dev group in
 # for the gate and strip it again in the SAME layer, so the shipped image
 # still carries no test dependencies.
-RUN uv sync --locked --package scrapers-browser \
+# `pytest` lives in the ROOT workspace's `[dependency-groups] dev`, and
+# `uv sync --package <member>` does not pull the root's groups in on its
+# own: the 2026-09-14 production build died here with
+# `.venv/bin/pytest: not found`. Ask for the group explicitly, and fall back
+# to a direct install in case the pinned uv treats `--group` per-member.
+RUN uv sync --locked --package scrapers-browser --group dev \
+    && (.venv/bin/pytest --version >/dev/null 2>&1 \
+        || uv pip install --python .venv/bin/python "pytest>=8.3,<9") \
     && .venv/bin/pytest tests/integration/test_browser_egress_guard_image.py \
         -m browser -q -p no:cacheprovider \
     && uv sync --locked --package scrapers-browser --no-dev
