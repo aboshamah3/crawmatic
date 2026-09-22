@@ -1270,6 +1270,15 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
         # step 3 below -- the POST must not be issued with a Postgres
         # backend pinned open behind it.
         session.commit()
+        # That commit also ended the transaction `set_workspace_context`
+        # above was LOCAL to. Under FORCE RLS the next transaction sees NO
+        # rows of this workspace until the GUC is set again -- and the
+        # per-batch target stamps below are ORM UPDATEs by primary key, so
+        # a missing context surfaces as SQLAlchemy's StaleDataError
+        # ("expected to update N rows; 0 were matched") at the first
+        # per-batch commit, every dispatch attempt, forever
+        # (prod 2026-09-22: workspace 01a020de, 26 attempts in 7 minutes).
+        set_workspace_context(session, workspace_uuid)
 
         # Steps 2-4 run per batch through a store that owns its own short
         # transactions, so `POSTED` is committed before the POST and
@@ -1420,11 +1429,17 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 # it is also what keeps the next POST from running with a
                 # transaction open.
                 session.commit()
+                # Same rule as after the plan commit: every commit drops the
+                # LOCAL workspace GUC, and the next batch's stamps are ORM
+                # UPDATEs on RLS-protected rows.
+                set_workspace_context(session, workspace_uuid)
         except Exception:
             # Grants reserved in step 1 for batches this pass never got to
             # are released rather than left to age out of their lease --
             # a task that raised on batch 3 must not hold batches 4..N's
             # budget until the reaper notices.
+            session.rollback()
+            set_workspace_context(session, workspace_uuid)
             for item in undispatched:
                 costauth.release(item.grant.authorization_id)
             session.commit()
