@@ -1544,96 +1544,135 @@ def finalize_jobs() -> None:
     or not at all, and the outbox dispatcher publishes them with
     at-least-once delivery and bounded retries.
     """
+    failures = 0
+    first_failure: Exception | None = None
     with get_session() as session:
         for job_id, workspace_id in _scan_job_refs(_NON_TERMINAL_JOB_STATUSES):
-            set_workspace_context(session, workspace_id)
-
-            job = scoped_get(session, ScrapeJob, job_id, workspace_id)
-            if job is None or job.status in _TERMINAL_JOB_STATUSES:
-                continue
-
-            targets = list(
-                session.execute(
-                    scoped_select(ScrapeJobTarget, workspace_id).where(
-                        ScrapeJobTarget.scrape_job_id == job.id
-                    )
+            # ONE transaction per job (2026-09-23, mushtryati run 01a0cfd6).
+            # The sweep spans workspaces and `app.workspace_id` is a
+            # transaction-LOCAL GUC. With a single commit at the end, the
+            # first job's counter UPDATE stayed dirty in the session while
+            # the context was re-pointed at the NEXT workspace; the autoflush
+            # on that job's `scoped_get` then ran the UPDATE under the wrong
+            # RLS predicate, matched 0 rows, and `StaleDataError` killed the
+            # whole task -- every minute, for every tenant -- as soon as two
+            # workspaces had a non-terminal job at the same time. Committing
+            # per job means the context switch never sees dirty state, and
+            # one broken job can no longer stop every other job finalizing.
+            # The first failure is re-raised AFTER the sweep so the task run
+            # still reads as failed (audit H1: an outbox write that fails
+            # must abort that job's finalize AND stay visible), while every
+            # other job has already had its own transaction committed.
+            try:
+                set_workspace_context(session, workspace_id)
+                _finalize_one_job(session, job_id, workspace_id)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                failures += 1
+                if first_failure is None:
+                    first_failure = exc
+                logger.exception(
+                    "finalize_jobs: job %s (workspace %s) failed; continuing with the rest",
+                    job_id,
+                    workspace_id,
                 )
-                .scalars()
-                .all()
+        if first_failure is not None:
+            logger.error("finalize_jobs: %d job(s) failed this sweep; re-raising the first", failures)
+            raise first_failure
+
+
+def _finalize_one_job(session: Session, job_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+    """Refresh one job's counters and finalize it if every target is terminal.
+
+    Runs inside the caller's transaction, whose `app.workspace_id` GUC the
+    caller has already set for `workspace_id`; the caller commits or rolls
+    back. Split out of `finalize_jobs` so each job gets its own transaction.
+    """
+    job = scoped_get(session, ScrapeJob, job_id, workspace_id)
+    if job is None or job.status in _TERMINAL_JOB_STATUSES:
+        return
+
+    targets = list(
+        session.execute(
+            scoped_select(ScrapeJobTarget, workspace_id).where(
+                ScrapeJobTarget.scrape_job_id == job.id
             )
+        )
+        .scalars()
+        .all()
+    )
 
-            counts = refresh_job_counters(session, job, workspace_id)
+    counts = refresh_job_counters(session, job, workspace_id)
 
-            all_terminal = all(target.status in _TERMINAL_TARGET_STATUSES for target in targets)
-            if not all_terminal:
-                continue
+    all_terminal = all(target.status in _TERMINAL_TARGET_STATUSES for target in targets)
+    if not all_terminal:
+        return
 
-            job.status = resolve_finalized_status(
-                counts.success, counts.failure, counts.skipped, counts.total
-            )
-            job.completed_at = datetime.now(timezone.utc)
+    job.status = resolve_finalized_status(
+        counts.success, counts.failure, counts.skipped, counts.total
+    )
+    job.completed_at = datetime.now(timezone.utc)
 
-            # Audit H1: this was a *pre-commit* `enqueue` — it fired the
-            # stats flush before the finalize it depends on had
-            # committed, so a rollback below left a flush racing (or
-            # preceding) a job that never finalized. Written to the
-            # outbox instead, it now commits atomically with the
-            # finalize and is published afterwards.
-            profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
-            if profile_ids:
-                write_outbox_message(
-                    session,
-                    workspace_id=workspace_id,
-                    task_name=STRATEGY_STATS_FLUSH,
-                    queue="maintenance",
-                    kwargs={
-                        "workspace_id": str(workspace_id),
-                        "profile_ids": [str(profile_id) for profile_id in profile_ids],
-                    },
-                    dedup_key=f"statsflush:{job.id}",
-                    now=job.completed_at,
-                )
+    # Audit H1: this was a *pre-commit* `enqueue` — it fired the
+    # stats flush before the finalize it depends on had
+    # committed, so a rollback below left a flush racing (or
+    # preceding) a job that never finalized. Written to the
+    # outbox instead, it now commits atomically with the
+    # finalize and is published afterwards.
+    profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
+    if profile_ids:
+        write_outbox_message(
+            session,
+            workspace_id=workspace_id,
+            task_name=STRATEGY_STATS_FLUSH,
+            queue="maintenance",
+            kwargs={
+                "workspace_id": str(workspace_id),
+                "profile_ids": [str(profile_id) for profile_id in profile_ids],
+            },
+            dedup_key=f"statsflush:{job.id}",
+            now=job.completed_at,
+        )
 
-            # SPEC-16 US3 (T034, contracts/events.md #2), reworked for
-            # audit H1: the job event was a post-commit fire-and-forget
-            # enqueue whose failure was swallowed, so a broker outage
-            # silently dropped the terminal-status event of a job that
-            # had genuinely finished. It is now an outbox row written in
-            # the same transaction as the finalize. `CANCELLED` (never
-            # produced by this path) and any non-terminal status still
-            # emit nothing (`build_job_event` returns `None`).
-            built = build_job_event(
-                scrape_job_id=job.id,
-                status=job.status,
-                success_count=counts.success,
-                failure_count=counts.failure,
-                skipped_count=counts.skipped,
-                total=counts.total,
-            )
-            if built is not None:
-                webhook_event_type, webhook_payload, dedup_key = built
-                # The message id doubles as the consumer's idempotency
-                # key -- see `create_webhook_event`.
-                message_id = new_uuid7()
-                write_outbox_message(
-                    session,
-                    workspace_id=workspace_id,
-                    task_name=CREATE_WEBHOOK_EVENT,
-                    queue="webhook_events",
-                    kwargs={
-                        "workspace_id": str(workspace_id),
-                        "event_type": webhook_event_type,
-                        "payload": webhook_payload,
-                        "dedup_key": dedup_key,
-                        "event_id": str(message_id),
-                        "occurred_at": job.completed_at.isoformat(),
-                    },
-                    dedup_key=dedup_key,
-                    now=job.completed_at,
-                    message_id=message_id,
-                )
-
-        session.commit()
+    # SPEC-16 US3 (T034, contracts/events.md #2), reworked for
+    # audit H1: the job event was a post-commit fire-and-forget
+    # enqueue whose failure was swallowed, so a broker outage
+    # silently dropped the terminal-status event of a job that
+    # had genuinely finished. It is now an outbox row written in
+    # the same transaction as the finalize. `CANCELLED` (never
+    # produced by this path) and any non-terminal status still
+    # emit nothing (`build_job_event` returns `None`).
+    built = build_job_event(
+        scrape_job_id=job.id,
+        status=job.status,
+        success_count=counts.success,
+        failure_count=counts.failure,
+        skipped_count=counts.skipped,
+        total=counts.total,
+    )
+    if built is not None:
+        webhook_event_type, webhook_payload, dedup_key = built
+        # The message id doubles as the consumer's idempotency
+        # key -- see `create_webhook_event`.
+        message_id = new_uuid7()
+        write_outbox_message(
+            session,
+            workspace_id=workspace_id,
+            task_name=CREATE_WEBHOOK_EVENT,
+            queue="webhook_events",
+            kwargs={
+                "workspace_id": str(workspace_id),
+                "event_type": webhook_event_type,
+                "payload": webhook_payload,
+                "dedup_key": dedup_key,
+                "event_id": str(message_id),
+                "occurred_at": job.completed_at.isoformat(),
+            },
+            dedup_key=dedup_key,
+            now=job.completed_at,
+            message_id=message_id,
+        )
 
 
 def _interleave_by_workspace(
