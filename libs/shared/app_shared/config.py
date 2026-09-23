@@ -857,6 +857,15 @@ class Settings(BaseSettings):
     SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS: int = 30000
     BROWSER_CONCURRENT_REQUESTS: int = 2
     BROWSER_MAX_CONTEXTS: int = 1
+    # Hard wall-clock cap on ONE browser spider process (Scrapy
+    # CLOSESPIDER_TIMEOUT). The browser node runs max_proc=1, so a single
+    # Playwright process that wedges (seen 2026-09-22 17:50Z for 25 h and
+    # again 2026-09-23 21:00Z) blocks every browser batch behind it, and the
+    # STARTED reaper cannot help: it keys off `started_at`, which a spider
+    # that never claimed its targets never wrote. Kept BELOW
+    # SCRAPE_STARTED_REAP_AFTER_SECONDS (2100) so a batch closed by this cap
+    # is over before the reaper hands its targets back to the dispatcher.
+    SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS: int = 1500
     # EPA B5 (canary-gated): domains whose PROXIED browser legs fetch the
     # document and nothing else — every sub-resource is aborted before its
     # body crosses the paid proxy

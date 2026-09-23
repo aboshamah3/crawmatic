@@ -205,6 +205,13 @@ PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = _settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT
 DOWNLOAD_MAXSIZE = _settings.SCRAPE_DOWNLOAD_MAXSIZE_BYTES
 DOWNLOAD_WARNSIZE = _settings.SCRAPE_DOWNLOAD_WARNSIZE_BYTES
 DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
+# Hard cap on the whole spider process (Scrapy's built-in CloseSpider
+# extension, reason `closespider_timeout`). Without it a wedged Playwright
+# process holds the browser node's single slot forever -- 2026-09-22 one
+# did for 25 h and every amazon browser escalation queued behind it. See
+# `SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS` for why it sits below the
+# STARTED reaper horizon.
+CLOSESPIDER_TIMEOUT = _settings.SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS
 
 # Batched-flush thresholds (contracts/persistence-pipeline.md, parity with
 # price_monitor/settings.py) -- read from `Settings`/config, never
