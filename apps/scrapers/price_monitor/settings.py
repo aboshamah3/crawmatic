@@ -193,6 +193,18 @@ REACTOR_THREADPOOL_MAXSIZE = 20
 DOWNLOAD_MAXSIZE = _settings.SCRAPE_DOWNLOAD_MAXSIZE_BYTES
 DOWNLOAD_WARNSIZE = _settings.SCRAPE_DOWNLOAD_WARNSIZE_BYTES
 DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
+# Hard cap on the whole spider process. Graceful first (Scrapy's CloseSpider
+# extension, reason `closespider_timeout`), then `HardDeadlineExtension`
+# terminates a process that is still alive `HARD_DEADLINE_GRACE_SECONDS`
+# later -- a spider wedged inside a download handler never closes
+# gracefully, and on 2026-09-23 four such noon batches held four of this
+# node's eight slots for over an hour. Kept below the STARTED reaper
+# horizon (`SCRAPE_STARTED_REAP_AFTER_SECONDS`).
+CLOSESPIDER_TIMEOUT = _settings.SCRAPE_SPIDER_MAX_RUNTIME_SECONDS
+HARD_DEADLINE_GRACE_SECONDS = _settings.SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS
+EXTENSIONS = {
+    "scrape_core.extensions.hard_deadline.HardDeadlineExtension": 0,
+}
 
 # Batched-flush thresholds (contracts/persistence-pipeline.md) — read from
 # `Settings`/config (env/DB-tunable), never hardcoded literals here.

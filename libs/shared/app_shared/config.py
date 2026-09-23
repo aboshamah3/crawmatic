@@ -866,6 +866,15 @@ class Settings(BaseSettings):
     # SCRAPE_STARTED_REAP_AFTER_SECONDS (2100) so a batch closed by this cap
     # is over before the reaper hands its targets back to the dispatcher.
     SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS: int = 1500
+    # Same cap for the HTTP project (CLOSESPIDER_TIMEOUT). Four noon batches
+    # wedged in four of the node's eight slots for >1 h on 2026-09-23 while
+    # everything behind them queued. Also below the 2100 s reaper horizon.
+    SCRAPE_SPIDER_MAX_RUNTIME_SECONDS: int = 1800
+    # CLOSESPIDER_TIMEOUT is graceful: the engine waits for in-flight
+    # downloads, so a spider wedged inside a download handler never closes.
+    # `scrape_core.extensions.hard_deadline` terminates the process this many
+    # seconds after the graceful deadline, freeing the Scrapyd slot.
+    SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS: int = 120
     # EPA B5 (canary-gated): domains whose PROXIED browser legs fetch the
     # document and nothing else — every sub-resource is aborted before its
     # body crosses the paid proxy

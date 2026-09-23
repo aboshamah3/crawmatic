@@ -212,6 +212,13 @@ DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
 # `SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS` for why it sits below the
 # STARTED reaper horizon.
 CLOSESPIDER_TIMEOUT = _settings.SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS
+# CLOSESPIDER_TIMEOUT is graceful and waits for in-flight navigations; a
+# wedged Playwright process never finishes them. The hard deadline below
+# terminates the process `HARD_DEADLINE_GRACE_SECONDS` after that.
+HARD_DEADLINE_GRACE_SECONDS = _settings.SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS
+EXTENSIONS = {
+    "scrape_core.extensions.hard_deadline.HardDeadlineExtension": 0,
+}
 
 # Batched-flush thresholds (contracts/persistence-pipeline.md, parity with
 # price_monitor/settings.py) -- read from `Settings`/config, never

@@ -29,27 +29,40 @@ _ENV = {
 }
 
 
-def _load_browser_settings(monkeypatch: pytest.MonkeyPatch):
+_HARD_DEADLINE = "scrape_core.extensions.hard_deadline.HardDeadlineExtension"
+
+
+def _load_project_settings(monkeypatch: pytest.MonkeyPatch, module_name: str):
     for key, value in _ENV.items():
         monkeypatch.setenv(key, value)
-    from app_shared.config import get_settings
-
-    get_settings.cache_clear() if hasattr(get_settings, "cache_clear") else None
-    spec = importlib.util.find_spec("price_monitor_browser.settings")
+    spec = importlib.util.find_spec(module_name)
     if spec is None or spec.loader is None:
-        pytest.skip("price_monitor_browser is not importable in this environment")
+        pytest.skip(f"{module_name} is not importable in this environment")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 def test_the_browser_project_caps_each_spider_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = _load_browser_settings(monkeypatch)
+    settings = _load_project_settings(monkeypatch, "price_monitor_browser.settings")
     from app_shared.config import get_settings
 
     cfg = get_settings()
     assert settings.CLOSESPIDER_TIMEOUT == cfg.SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS
     assert settings.CLOSESPIDER_TIMEOUT > 0
+    assert settings.HARD_DEADLINE_GRACE_SECONDS == cfg.SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS
+    assert _HARD_DEADLINE in settings.EXTENSIONS
+
+
+def test_the_http_project_caps_each_spider_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _load_project_settings(monkeypatch, "price_monitor.settings")
+    from app_shared.config import get_settings
+
+    cfg = get_settings()
+    assert settings.CLOSESPIDER_TIMEOUT == cfg.SCRAPE_SPIDER_MAX_RUNTIME_SECONDS
+    assert settings.CLOSESPIDER_TIMEOUT > 0
+    assert settings.HARD_DEADLINE_GRACE_SECONDS == cfg.SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS
+    assert _HARD_DEADLINE in settings.EXTENSIONS
 
 
 def test_the_cap_sits_below_the_started_reaper_horizon(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -61,3 +74,4 @@ def test_the_cap_sits_below_the_started_reaper_horizon(monkeypatch: pytest.Monke
     # A batch the cap closes must be over BEFORE the reaper reverts its
     # targets to PENDING, or the same URLs get fetched twice.
     assert cfg.SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS < cfg.SCRAPE_STARTED_REAP_AFTER_SECONDS
+    assert cfg.SCRAPE_SPIDER_MAX_RUNTIME_SECONDS < cfg.SCRAPE_STARTED_REAP_AFTER_SECONDS
