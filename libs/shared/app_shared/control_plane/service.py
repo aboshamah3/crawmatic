@@ -51,7 +51,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -441,6 +441,18 @@ def _linked_refresh_rule(
 # --- entitlement --------------------------------------------------------
 
 
+def _as_aware(moment: datetime) -> datetime:
+    """Treat a naive timestamp as UTC (mirror of ``costauth.service._as_aware``).
+
+    ``observed_at`` is ``TIMESTAMPTZ`` and always aware when the ORM wrote
+    it; a naive value can only come from a seed or a manual UPDATE, and
+    assuming UTC beats raising inside a replication decision.
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
 def replicate_entitlement(
     session: Session,
     workspace_id: uuid.UUID,
@@ -448,14 +460,33 @@ def replicate_entitlement(
 ) -> bool:
     """Apply replicated billing evidence. ``False`` == ignored as stale.
 
-    Monotonic by ``evidence_version``: an incoming version at or below
-    the stored one changes nothing and is reported as ignored, so an
+    Monotonic by ``evidence_version``: an incoming version BELOW the
+    stored one changes nothing and is reported as ignored, so an
     out-of-order redelivery can never roll a tenant back onto older
-    evidence.
+    evidence. An incoming version EQUAL to the stored one is applied
+    only when its ``as_of`` is newer than the stored ``observed_at`` —
+    that is the SaaS reconciler's periodic refresh ("evidence is N
+    minutes old and must be refreshed before it expires"), sent with the
+    same desired-state version and ``as_of = now``. Rejecting it (as this
+    function did until 2026-09-23) meant a tenant whose desired state
+    never changed lost its entitlement exactly
+    ``DEFAULT_ENTITLEMENT_MAX_EVIDENCE_AGE_SECONDS`` after the last
+    version bump: C3 then denied every dispatch with
+    ``ENTITLEMENT_INACTIVE`` while the SaaS kept logging "engine ignored:
+    stale_evidence". Same version with an older-or-equal ``as_of`` is
+    still ignored (an out-of-order redelivery of the same refresh).
     """
     row = get_entitlement(session, workspace_id)
-    if row is not None and payload.evidence_version <= stored_evidence_version(row):
-        return False
+    if row is not None:
+        stored_version = stored_evidence_version(row)
+        if payload.evidence_version < stored_version:
+            return False
+        if (
+            payload.evidence_version == stored_version
+            and row.observed_at is not None
+            and _as_aware(payload.as_of) <= _as_aware(row.observed_at)
+        ):
+            return False
 
     if row is None:
         row = WorkspaceEntitlement(workspace_id=workspace_id)
