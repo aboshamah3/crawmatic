@@ -118,6 +118,38 @@ class TestWireBytesMiddleware:
             "and the spider must see the same value off either object"
         )
 
+    def test_process_response_survives_a_response_not_yet_tied_to_its_request(self) -> None:
+        """Regression for the 2026-09-23 production outage (3,049 targets).
+
+        Scrapy's HTTP11 handler returns responses built by
+        ``scrapy.utils._download_handlers.make_response`` WITHOUT
+        ``request=``; the engine ties them only after the whole
+        downloader-middleware chain has run. So at priority 595 the
+        response has ``request is None`` and ``response.meta`` raises
+        ``AttributeError``. The middleware must stamp ``request.meta``
+        directly — which is the same dict ``response.meta`` resolves to
+        once the engine ties them.
+        """
+        request = Request("https://example.test/p/1")
+        body = _gzip_fixture_body()
+        untied = Response(
+            url=request.url,
+            status=200,
+            headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+            body=body,
+        )
+        assert untied.request is None
+        with pytest.raises(AttributeError):
+            untied.meta  # noqa: B018 — proving the precondition, not a no-op
+
+        result = WireBytesMiddleware().process_response(request, untied, spider=None)
+
+        assert result is untied
+        assert request.meta[META_WIRE_BYTES] == compute_wire_bytes(untied)
+        # What the engine does next; the ledger then reads the same value off either object.
+        untied.request = request
+        assert untied.meta[META_WIRE_BYTES] == request.meta[META_WIRE_BYTES]
+
     def test_wire_bytes_is_greater_than_the_decoded_size_for_this_fixture(self) -> None:
         """Not a general law (small responses can compress *larger*), but
         for THIS fixture the compressed count is the smaller of the two —
