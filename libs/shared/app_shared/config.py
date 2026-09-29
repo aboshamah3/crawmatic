@@ -400,6 +400,15 @@ class Settings(BaseSettings):
     # 2026-09-29 (E7): how far back the daily provider-usage reconciliation
     # looks for imported windows that still have no settlement.
     PROVIDER_RECONCILE_LOOKBACK_DAYS: int = 7
+    # 2026-09-29 (E7): DataImpulse plan login/password for its documented
+    # gateway usage API (`GET https://gw.dataimpulse.com:777/api/
+    # stats_with_history`, HTTP basic). From the environment ONLY; unset
+    # means provider evidence is not fetched and cost reconciliation has
+    # nothing to reconcile against (owner gate). See
+    # app_shared.netledger.provider_usage_clients.
+    DATAIMPULSE_USAGE_API_LOGIN: str | None = None
+    DATAIMPULSE_USAGE_API_PASSWORD: str | None = None
+    DATAIMPULSE_USAGE_API_BASE_URL: str = "https://gw.dataimpulse.com:777"
     # Hard ceiling on a single job's wall-clock runtime. Past it, every
     # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
     # `finalize_jobs` can close the job. 12h is far beyond any legitimate

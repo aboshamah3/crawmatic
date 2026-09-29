@@ -112,3 +112,62 @@ print("OK")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip().endswith("OK")
+
+
+def test_configured_providers_are_fetched_and_imported_before_reconciling() -> None:
+    """E7.6: evidence is fetched by the cadence itself; no human export."""
+    result = _run(
+        """
+WINDOWS = []
+PAID = 0
+order = []
+class Client:
+    provider = "dataimpulse"
+    def fetch(self, *, since, until, now=None):
+        order.append(("fetch", since, until))
+        return ["day-1", "day-2"]
+tm.configured_usage_clients = lambda settings: [Client()]
+tm.import_provider_usage = lambda source: order.append(("import", source))
+real_awaiting = tm.windows_awaiting_settlement
+def awaiting_after(sess, **kw):
+    order.append(("select",))
+    return real_awaiting(sess, **kw)
+tm.windows_awaiting_settlement = awaiting_after
+tm.reconcile_provider_usage()
+kinds = [o[0] for o in order]
+assert kinds == ["fetch", "import", "import", "select"], order
+since, until = order[0][1], order[0][2]
+assert (until - since).days == tm.get_settings().PROVIDER_RECONCILE_LOOKBACK_DAYS
+print("OK")
+"""
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("OK")
+
+
+def test_an_unconfigured_fetch_is_a_named_warning_and_a_failed_one_does_not_stop_reconciling() -> None:
+    result = _run(
+        """
+WINDOWS = [MagicMock(id=1)]
+PAID = 0
+tm.configured_usage_clients = lambda settings: []
+tm.reconcile_provider_usage()
+assert [m for lvl, m in records if lvl == "WARNING" and "provider_usage_fetch_unconfigured" in m], records
+
+records.clear()
+from app_shared.netledger.provider_usage_clients import ProviderUsageFetchError
+class Broken:
+    provider = "dataimpulse"
+    def fetch(self, **kw):
+        raise ProviderUsageFetchError("https://gw answered HTTP 401")
+tm.configured_usage_clients = lambda settings: [Broken()]
+reconciled = []
+tm.reconcile_window = lambda w: reconciled.append(w) or MagicMock(passed=True)
+tm.reconcile_provider_usage()
+assert [m for lvl, m in records if lvl == "ERROR" and "provider_usage_fetch_failed" in m], records
+assert len(reconciled) == 1
+print("OK")
+"""
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("OK")
