@@ -567,18 +567,44 @@ def _r_cost_rollup(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
         )
     else:
         if c.total_operation_count > 0 and c.reconciled_operation_count == 0:
-            out.append(
-                _alert(
-                    "cost_rollup.reconciliation_missing",
-                    Severity.CRITICAL,
-                    Category.COST,
-                    f"No reconciled cost for any of {c.total_operation_count} "
-                    f"operation(s) rolled up on {c.latest_rollup_date} -- every "
-                    "reported dollar is an unchecked estimate.",
-                    _J_COST_ROLLUP,
-                    observed={"total_operation_count": c.total_operation_count},
+            # E7.4 (2026-09-29): two different failures, two fixes. With no
+            # provider evidence imported at all, nothing downstream could
+            # ever reconcile (fix: the import). With evidence imported but
+            # nothing matched, the matching is broken (fix: reconciliation).
+            # Both remain CRITICAL: either way every dollar is unchecked.
+            if c.provider_evidence_windows == 0:
+                out.append(
+                    _alert(
+                        "cost_rollup.provider_evidence_missing",
+                        Severity.CRITICAL,
+                        Category.COST,
+                        f"No provider usage evidence has been imported, so none of "
+                        f"{c.total_operation_count} operation(s) rolled up on "
+                        f"{c.latest_rollup_date} can be reconciled -- every reported "
+                        "dollar is an unchecked estimate.",
+                        _J_COST_ROLLUP,
+                        observed={
+                            "total_operation_count": c.total_operation_count,
+                            "provider_evidence_windows": 0,
+                        },
+                    )
                 )
-            )
+            else:
+                out.append(
+                    _alert(
+                        "cost_rollup.reconciliation_missing",
+                        Severity.CRITICAL,
+                        Category.COST,
+                        f"No reconciled cost for any of {c.total_operation_count} "
+                        f"operation(s) rolled up on {c.latest_rollup_date} -- every "
+                        "reported dollar is an unchecked estimate.",
+                        _J_COST_ROLLUP,
+                        observed={
+                            "total_operation_count": c.total_operation_count,
+                            "provider_evidence_windows": c.provider_evidence_windows,
+                        },
+                    )
+                )
         variance = c.estimated_vs_reconciled_variance_pct
         if variance is not None and variance > t.cost_rollup_variance_critical_pct:
             out.append(

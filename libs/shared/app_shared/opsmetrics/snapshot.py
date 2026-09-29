@@ -132,6 +132,10 @@ class RollupHealth:
     unrolled_observations: int = 0
 
 
+#: E7.4: how far back "was any provider evidence imported?" looks.
+PROVIDER_EVIDENCE_LOOKBACK_DAYS = 7
+
+
 @dataclass(frozen=True)
 class CostRollupHealth:
     """Fleet-wide cost-rollup health (EPA C6).
@@ -176,6 +180,11 @@ class CostRollupHealth:
     #: Age of the ledger's own freshness clock (a bare ``MAX``, not the
     #: rollup's).
     ledger_freshness_seconds: float | None = None
+    #: E7.4 (2026-09-29): distinct provider-usage windows imported in the
+    #: last ``PROVIDER_EVIDENCE_LOOKBACK_DAYS``. Separates "nothing was
+    #: ever imported" from "imported, but it matched nothing" -- two
+    #: failures with two different fixes. ``None`` = not measured.
+    provider_evidence_windows: int | None = None
 
     @property
     def _dominant_currency(self) -> str | None:
@@ -1188,11 +1197,26 @@ def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
                     reconciled_by_currency.get(bucket.currency, 0)
                     + bucket.reconciled_cost_micro_units
                 )
-                reconciled_operation_count += bucket.operation_count
+            # E7.5: the exact per-bucket count, not the whole bucket's
+            # operation_count as soon as ONE of its operations settled.
+            reconciled_operation_count += int(bucket.reconciled_operation_count or 0)
 
     last_closed = session.execute(
         select(func.max(NetworkOperation.closed_at))
     ).scalar_one_or_none()
+
+    # E7.4: bounded (indexed-by-time window, distinct count only).
+    from app_shared.models.provider_usage import ProviderUsageRecord
+
+    provider_evidence_windows = int(
+        session.execute(
+            select(func.count(func.distinct(ProviderUsageRecord.window_id))).where(
+                ProviderUsageRecord.window_start
+                >= now - timedelta(days=PROVIDER_EVIDENCE_LOOKBACK_DAYS)
+            )
+        ).scalar_one()
+        or 0
+    )
 
     return CostRollupHealth(
         available=True,
@@ -1206,6 +1230,7 @@ def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
         reconciled_operation_count=reconciled_operation_count,
         total_operation_count=total_operation_count,
         ledger_freshness_seconds=_age(now, last_closed),
+        provider_evidence_windows=provider_evidence_windows,
     )
 
 

@@ -257,6 +257,9 @@ class CostBucketRow:
     estimated_cost_micro_units: int
     #: ``None`` iff not one operation in the bucket has a settlement yet.
     reconciled_cost_micro_units: int | None
+    #: E7.5 (2026-09-29): how many of ``operation_count`` actually have a
+    #: settlement folded into ``reconciled_cost_micro_units``.
+    reconciled_operation_count: int = 0
 
 
 def latest_settlements_by_operation(
@@ -287,6 +290,7 @@ class _MutableBucket:
     estimated_cost_micro_units: int = 0
     reconciled_cost_micro_units: int = 0
     has_reconciled: bool = False
+    reconciled_operation_count: int = 0
 
 
 def _collapse_to_top_n(
@@ -314,6 +318,7 @@ def _collapse_to_top_n(
         if bucket.has_reconciled:
             other.has_reconciled = True
             other.reconciled_cost_micro_units += bucket.reconciled_cost_micro_units
+            other.reconciled_operation_count += bucket.reconciled_operation_count
 
     for currency, other in other_by_currency.items():
         key = (
@@ -331,6 +336,7 @@ def _collapse_to_top_n(
             if other.has_reconciled:
                 existing.has_reconciled = True
                 existing.reconciled_cost_micro_units += other.reconciled_cost_micro_units
+                existing.reconciled_operation_count += other.reconciled_operation_count
     return kept
 
 
@@ -358,6 +364,7 @@ def aggregate_fleet_cost_buckets(
         if settlement is not None and settlement.currency == op.currency:
             bucket.has_reconciled = True
             bucket.reconciled_cost_micro_units += settlement.reconciled_cost_micro_units
+            bucket.reconciled_operation_count += 1
 
     bounded = _collapse_to_top_n(buckets, top_n=top_n)
     return tuple(
@@ -372,6 +379,7 @@ def aggregate_fleet_cost_buckets(
             reconciled_cost_micro_units=(
                 b.reconciled_cost_micro_units if b.has_reconciled else None
             ),
+            reconciled_operation_count=b.reconciled_operation_count,
         )
         for (domain, method, profile_version, currency), b in sorted(bounded.items())
     )
@@ -415,6 +423,7 @@ def aggregate_tenant_cost_buckets(
             share = (alloc.fraction_ppb * settlement.reconciled_cost_micro_units) // FRACTION_SCALE
             bucket.has_reconciled = True
             bucket.reconciled_cost_micro_units += share
+            bucket.reconciled_operation_count += 1
 
     out: list[CostBucketRow] = []
     for workspace_id, ws_buckets in per_workspace.items():
@@ -559,6 +568,7 @@ def _upsert_fleet_buckets(session: Session, target_date: date_type, buckets: Seq
             operation_count=bucket.operation_count,
             estimated_cost_micro_units=bucket.estimated_cost_micro_units,
             reconciled_cost_micro_units=bucket.reconciled_cost_micro_units,
+            reconciled_operation_count=bucket.reconciled_operation_count,
             currency=bucket.currency,
         )
         stmt = stmt.on_conflict_do_update(
@@ -569,6 +579,7 @@ def _upsert_fleet_buckets(session: Session, target_date: date_type, buckets: Seq
                 "operation_count": stmt.excluded.operation_count,
                 "estimated_cost_micro_units": stmt.excluded.estimated_cost_micro_units,
                 "reconciled_cost_micro_units": stmt.excluded.reconciled_cost_micro_units,
+                "reconciled_operation_count": stmt.excluded.reconciled_operation_count,
                 "updated_at": func.now(),
             },
         )
