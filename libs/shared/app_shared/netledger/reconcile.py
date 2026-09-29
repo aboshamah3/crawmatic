@@ -546,7 +546,7 @@ def ledger_provider_keys(session: Session, provider: str) -> list[str]:
     2026-09-29 (plan E7.1). An import names the VENDOR (``"dataimpulse"``,
     ``scripts/import_dataimpulse_usage.py``'s default), but the ledger
     records the ``proxy_providers`` ROW id the spider resolved
-    (``scrape_core.netledger_middleware._provider_for`` -- in production
+    (scrape-core's ``netledger_middleware._provider_for`` -- in production
     ``0e80a9c2-…`` = ``dataimpulse-residential``, 98,403 operations in 30
     days). Filtering ``provider == window.provider`` could therefore never
     match a single real operation. A provider row belongs to the vendor
