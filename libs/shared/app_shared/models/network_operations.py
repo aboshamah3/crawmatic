@@ -305,6 +305,14 @@ class NetworkOperation(Base):
         Index("ix_network_operations_network_request_id", "network_request_id"),
         Index("ix_network_operations_provider_created_at", "provider", "created_at"),
         Index("ix_network_operations_scrape_job_id", "scrape_job_id"),
+        # E6 (2026-09-29, migration e6a1c0d4f2b9): the usage export finds a
+        # browser page's subresources by `parent_operation_id`; without this
+        # every attempt scanned the ledger (28.9 s for one busy hour).
+        Index(
+            "ix_network_operations_parent_operation_id",
+            "parent_operation_id",
+            postgresql_where=text("parent_operation_id IS NOT NULL"),
+        ),
         Index(
             "ix_network_operations_canonical_url_hash_created_at",
             "canonical_url_hash",
