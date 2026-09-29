@@ -408,3 +408,56 @@ def test_the_two_sweeps_compose_without_fighting_each_other(
     session.refresh(orphan)
     assert orphan.status is ScrapeTargetStatus.FAILED
     assert orphan.error_code is ScrapeErrorCode.JOB_DEADLINE_EXCEEDED
+
+
+# --- started_at is per CLAIM, not first-claim (2026-09-29, plan E2.2) --
+
+
+def test_a_browser_claim_restarts_the_started_clock(session: Session) -> None:
+    """An HTTP spider claims a target at 20:00, hands it to the browser
+    (DEFERRED keeps `started_at`), and the browser spider claims it at
+    22:30. With first-writer-wins `started_at` the row looked 2.5 h into
+    its claim the moment the browser took it, so the 2100 s reaper
+    reverted it under a LIVE spider (and a duplicate POST followed). The
+    clock must restart on every claim."""
+    from app_shared.jobs.targets import mark_target, mark_targets_started
+
+    real_now = datetime.now(timezone.utc)
+    job = _make_job(session, started_seconds_ago=3 * 3_600)
+    deferred = _make_target(
+        session, job, status=ScrapeTargetStatus.DEFERRED, started_seconds_ago=9_000
+    )
+    single = _make_target(
+        session, job, status=ScrapeTargetStatus.DEFERRED, started_seconds_ago=9_000
+    )
+
+    assert (
+        mark_targets_started(
+            session,
+            workspace_id=WORKSPACE_ID,
+            scrape_job_id=job.id,
+            match_ids=[deferred.match_id],
+        )
+        == 1
+    )
+    mark_target(
+        session,
+        workspace_id=WORKSPACE_ID,
+        scrape_job_id=job.id,
+        match_id=single.match_id,
+        status=ScrapeTargetStatus.STARTED,
+        only_if_status=(ScrapeTargetStatus.PENDING, ScrapeTargetStatus.DEFERRED),
+    )
+    session.flush()
+
+    for target in (deferred, single):
+        session.refresh(target)
+        assert target.status is ScrapeTargetStatus.STARTED
+        started = target.started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        assert real_now - started < timedelta(minutes=5), started
+
+    assert revert_stale_started_targets(
+        session, now=real_now, older_than_seconds=REAP_AFTER
+    ) == 0

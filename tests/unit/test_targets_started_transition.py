@@ -207,7 +207,9 @@ def test_pickup_is_one_statement_for_the_whole_batch(db_session: Session) -> Non
     assert changed == 25
     assert len(recorder.updates) == 1
     statement = recorder.updates[0].lower()
-    assert "coalesce" in statement
+    # 2026-09-29 (E2.2): `started_at` is stamped per claim, no COALESCE.
+    assert "coalesce" not in statement
+    assert "started_at" in statement
     assert "status in" in statement
 
 
@@ -218,8 +220,8 @@ def test_second_pickup_is_a_no_op(db_session: Session) -> None:
     Both halves are checked, because they fail differently: the second
     call must change ZERO rows (the `status IN ('PENDING','DEFERRED')`
     predicate no longer matches a STARTED row), and `started_at` must
-    still hold its first value (the `COALESCE`, which is what protects
-    the timestamp even if a row were somehow re-matched).
+    still hold its first value (the row is not re-matched, so the claim's
+    clock does not move).
     """
     match_id = _add_target(db_session, match_id=uuid.uuid4(), status=ScrapeTargetStatus.PENDING)
 
@@ -244,13 +246,17 @@ def test_second_pickup_is_a_no_op(db_session: Session) -> None:
     assert row.started_at == first_started_at
 
 
-def test_re_pickup_of_a_deferred_target_keeps_the_original_started_at(
+def test_re_pickup_of_a_deferred_target_restarts_started_at(
     db_session: Session,
 ) -> None:
     """A DEFERRED target that already ran once is eligible again — and
-    the re-pickup must NOT move `started_at`. This is the `COALESCE`
-    isolated from the `status IN` predicate: the row genuinely matches,
-    and the timestamp still does not move."""
+    the re-pickup restarts `started_at` (2026-09-29, plan E2.2).
+
+    This test used to pin the opposite (first claim wins, via COALESCE).
+    That was the bug: the browser claim of an HTTP-escalated target
+    inherited the HTTP claim's clock, so the 2100 s STARTED reaper
+    treated a live browser run as stale and reverted it under the
+    spider. `started_at` now means "the current owner claimed it at"."""
     match_id = _add_target(
         db_session,
         match_id=uuid.uuid4(),
@@ -267,7 +273,7 @@ def test_re_pickup_of_a_deferred_target_keeps_the_original_started_at(
 
     row = _reload(db_session, match_id)
     assert row.status == ScrapeTargetStatus.STARTED
-    assert row.started_at.replace(tzinfo=timezone.utc) == _OLD_STARTED_AT
+    assert row.started_at.replace(tzinfo=timezone.utc) > _OLD_STARTED_AT
 
 
 @pytest.mark.parametrize(
@@ -361,7 +367,9 @@ def test_mark_target_only_if_status_issues_exactly_one_conditional_update(
     assert len(recorder.updates) == 1
     assert not [s for s in recorder.statements if s.lstrip().upper().startswith("SELECT")]
     statement = recorder.updates[0].lower()
-    assert "started_at=coalesce" in statement.replace(" =", "=").replace("= ", "=")
+    # 2026-09-29 (E2.2): per-claim clock, no first-writer-wins COALESCE.
+    assert "started_at=coalesce" not in statement.replace(" =", "=").replace("= ", "=")
+    assert "started_at" in statement
     assert "status in" in statement
 
     row = _reload(db_session, match_id)

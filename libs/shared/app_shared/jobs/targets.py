@@ -208,7 +208,7 @@ def mark_targets_started(
     identical semantics:
 
     ``UPDATE scrape_job_targets SET status='STARTED',
-    started_at = COALESCE(started_at, now())
+    started_at = now()
     WHERE workspace_id=... AND scrape_job_id=... AND match_id IN (...)
       AND status IN ('PENDING','DEFERRED')``
 
@@ -216,9 +216,17 @@ def mark_targets_started(
 
     * **Idempotent.** The ``status IN`` predicate excludes rows already
       ``STARTED`` or terminal, so a second load — a duplicate spider run,
-      a re-dispatch — matches zero rows and changes nothing. The
-      ``COALESCE`` is the belt to that braces: even if a row were somehow
-      re-matched, ``started_at`` keeps its first value.
+      a re-dispatch — matches zero rows and changes nothing.
+    * **``started_at`` is the CURRENT claim's clock** (2026-09-29, E2.2).
+      It used to be ``COALESCE(started_at, now())`` — first claim wins —
+      but a target is claimed more than once in its life: the HTTP spider
+      claims it, hands it to the browser as ``DEFERRED`` (which keeps
+      ``started_at``), and the browser spider claims it again hours later.
+      With the first claim's clock the STARTED reaper (2100 s) saw that
+      live browser claim as already stale and reverted it under a running
+      spider, which then produced a duplicate POST. Every consumer of
+      ``started_at`` (the reaper, the oldest-STARTED gauge) asks "how long
+      has the CURRENT owner held this row", so each claim restarts it.
     * **Never resurrects a finished target.** Terminal statuses are simply
       not in the eligible set, so this can no more re-open a COMPLETED
       target than :func:`mark_target` can (the same invariant that lets
@@ -239,7 +247,7 @@ def mark_targets_started(
         )
         .values(
             status=ScrapeTargetStatus.STARTED,
-            started_at=func.coalesce(ScrapeJobTarget.started_at, func.now()),
+            started_at=func.now(),
         )
     )
     return session.execute(stmt).rowcount or 0
@@ -348,7 +356,8 @@ def mark_target(
         now = datetime.now(timezone.utc)
         values: dict[str, Any] = {"status": status}
         if status == ScrapeTargetStatus.STARTED:
-            values["started_at"] = func.coalesce(ScrapeJobTarget.started_at, func.now())
+            # Per claim, not first claim — see `mark_targets_started`.
+            values["started_at"] = func.now()
         if status in _TERMINAL_TARGET_STATUSES:
             values["completed_at"] = now
         if status == ScrapeTargetStatus.CANCELLED:
