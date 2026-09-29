@@ -386,6 +386,12 @@ class Settings(BaseSettings):
     # are left out of that decision entirely (a guard against acting on a
     # row written moments ago, not a wait for the run).
     SCRAPE_ENDED_RUN_REAP_MIN_AGE_SECONDS: int = 120
+    # 2026-09-29 (E3.2): a cross-mode handoff (HTTP -> browser) schedules the
+    # job's re-dispatch this many seconds out, and every further handoff of
+    # the same job inside the window joins that one dispatch. Long enough
+    # for a few HTTP flushes to accumulate a full browser batch, short
+    # against a multi-hour run.
+    SCRAPE_HANDOFF_DISPATCH_DEBOUNCE_SECONDS: int = 30
     # Hard ceiling on a single job's wall-clock runtime. Past it, every
     # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
     # `finalize_jobs` can close the job. 12h is far beyond any legitimate

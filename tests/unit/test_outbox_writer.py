@@ -201,3 +201,25 @@ def test_model_declares_the_partial_unique_dedup_index() -> None:
     assert claim.unique is False
     assert [column.name for column in claim.columns] == ["available_at", "id"]
     assert "PENDING" in str(claim.dialect_options["postgresql"]["where"])
+
+
+def test_a_delayed_message_becomes_available_after_its_delay() -> None:
+    """2026-09-29 (E3.2): the browser-handoff debounce. With a dedup key,
+    the first write of a window sets `available_at`; later writes in the
+    window are ON CONFLICT no-ops against that still-PENDING row."""
+    from datetime import timedelta
+
+    session = _RecordingSession()
+    write_outbox_message(
+        session,
+        workspace_id=WORKSPACE_ID,
+        task_name="scrape.dispatch_job",
+        queue="scrape_dispatch",
+        kwargs={"scrape_job_id": "j"},
+        dedup_key="strategy-handoff:j",
+        now=NOW,
+        available_after_seconds=30,
+    )
+    params = _params(session.statements[0])
+    assert params["available_at"] == NOW + timedelta(seconds=30)
+    assert params["created_at"] == NOW

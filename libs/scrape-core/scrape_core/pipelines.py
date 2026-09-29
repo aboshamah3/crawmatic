@@ -1185,10 +1185,17 @@ def _flush_batch(
                         "scrape_job_id": str(item.scrape_job_id),
                         "workspace_id": str(item.workspace_id),
                     },
-                    dedup_key=(
-                        f"strategy-handoff:{item.scrape_job_id}:{item.match_id}:"
-                        f"{item.next_strategy_method_id}:{item.strategy_attempt_ordinal + 1}"
-                    ),
+                    # 2026-09-29 (E3.2): keyed per JOB and delayed by the
+                    # debounce window, not keyed per match. Per-match keys
+                    # made every handoff its own dispatch, so handoffs
+                    # trickling out of successive flushes became ~1-target
+                    # browser Scrapyd jobs. Now the first handoff of the
+                    # window schedules one dispatch, later ones collapse into
+                    # it (outbox pending-row dedup), and that one dispatch
+                    # plans every DEFERRED target of the job into full
+                    # batches (`dispatch_job` selects them all).
+                    dedup_key=f"strategy-handoff:{item.scrape_job_id}",
+                    available_after_seconds=get_settings().SCRAPE_HANDOFF_DISPATCH_DEBOUNCE_SECONDS,
                 )
                 continue
             elif item.defer_target and consume_defer_budget(

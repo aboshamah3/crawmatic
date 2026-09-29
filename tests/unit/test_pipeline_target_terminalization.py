@@ -232,6 +232,7 @@ class _RecordingEnqueue:
         kwargs: dict[str, Any] | None = None,
         dedup_key: str | None = None,
         now: Any = None,
+        available_after_seconds: float = 0,
     ) -> None:
         self.calls.append(
             {
@@ -241,6 +242,7 @@ class _RecordingEnqueue:
                 "session": session,
                 "workspace_id": workspace_id,
                 "dedup_key": dedup_key,
+                "available_after_seconds": available_after_seconds,
             }
         )
 
@@ -255,6 +257,7 @@ class _FakeSettings:
     satisfying."""
 
     PRICE_ANALYSIS_DEDUP_TTL_SECONDS = 21600
+    SCRAPE_HANDOFF_DISPATCH_DEBOUNCE_SECONDS = 30
     STRATEGY_STATS_KEY_TTL_SECONDS = 3600
     STRATEGY_PROMOTION_CONFIDENCE_THRESHOLD = 0.85
 
@@ -406,6 +409,39 @@ def test_cross_mode_handoff_persists_cursor_and_reenters_dispatch(
     dispatches = [call for call in enqueue.calls if call["name"] == SCRAPE_DISPATCH_JOB]
     assert len(dispatches) == 1
     assert [call for call in enqueue.calls if call["name"] == SCRAPE_FINALIZE_JOBS] == []
+
+
+def test_handoffs_of_one_job_share_one_delayed_dispatch(monkeypatch: Any) -> None:
+    """2026-09-29 (plan E3.2). Each handoff used to enqueue its own
+    dispatch keyed per MATCH, so handoffs trickling out of the HTTP
+    spider's flushes became a stream of ~1-target browser Scrapyd jobs
+    (SCRAPE_BATCH_BROWSER_MAX=15 was rarely reached). Keyed per JOB and
+    delayed by the debounce window, the outbox's pending-row dedup collapses
+    every handoff of that window into one dispatch, which then plans them
+    as full batches."""
+    session, _txn, _mark_target, enqueue, _redis = _install_fakes(monkeypatch)
+    job_id = uuid.uuid4()
+    session.target_row = SimpleNamespace(
+        current_strategy_method_id=None,
+        strategy_attempt_ordinal=0,
+        chain_token=None,
+        strategy_url_override=None,
+        dispatched_at=object(),
+    )
+    items = []
+    for _ in range(15):
+        item = _make_result(success=False, chain_complete=False, scrape_job_id=job_id)
+        item.next_strategy_method_id = uuid.uuid4()
+        item.strategy_attempt_ordinal = 1
+        items.append(item)
+
+    _flush_batch(WORKSPACE_ID, items[:7])
+    _flush_batch(WORKSPACE_ID, items[7:])
+
+    dispatches = [call for call in enqueue.calls if call["name"] == SCRAPE_DISPATCH_JOB]
+    assert len(dispatches) == 15
+    assert {call["dedup_key"] for call in dispatches} == {f"strategy-handoff:{job_id}"}
+    assert {call["available_after_seconds"] for call in dispatches} == {30}
 
 
 def test_failed_attempt_followed_by_success_only_completes_target(
