@@ -84,6 +84,9 @@ _RT_MS_SUM = "rt_ms_sum"
 _CONF_SUM = "conf_sum"
 _QUAL_SUCCESS = "qual_success"
 _OPERATIONAL_FAILURE = "operational_failure"
+#: 2026-09-29 (E9.2): attempts the target answered with a bot/block page
+#: (``ScrapeErrorCode.BLOCKED``) -- the rung-demotion signal.
+_BLOCKED = "blocked"
 
 #: Scale factor `confidence` (a `Decimal`/`float` in `[0, 1]`) is multiplied
 #: by before `HINCRBY` — Redis hash counters are integers only
@@ -194,6 +197,7 @@ class PendingDelta:
     qualifying_success: int
     distinct_urls: int
     operational_failure: int = 0
+    blocked: int = 0
 
 
 @dataclass(frozen=True)
@@ -212,6 +216,7 @@ class DrainedDelta:
     qualifying_success: int
     distinct_urls: int
     operational_failure: int = 0
+    blocked: int = 0
 
 
 def record_attempt(
@@ -229,6 +234,7 @@ def record_attempt(
     ttl_seconds: int,
     strategy_method_id: uuid.UUID | str | None = None,
     operational_failure: bool = False,
+    blocked: bool = False,
 ) -> None:
     """Atomically buffer one attempt's outcome (contracts/stats-buffer.md
     `record_attempt`, O(1), no read-modify-write in Python):
@@ -267,6 +273,8 @@ def record_attempt(
         redis.hincrby(stat_key, _SUCCESS if success else _FAILURE, 1)
         if operational_failure:
             redis.hincrby(stat_key, _OPERATIONAL_FAILURE, 1)
+        if blocked:
+            redis.hincrby(stat_key, _BLOCKED, 1)
         if response_time_ms is not None:
             redis.hincrby(stat_key, _RT_MS_SUM, int(response_time_ms))
         if success and confidence is not None:
@@ -332,6 +340,7 @@ def read_pending(
         qualifying_success=_as_int(normalized.get(_QUAL_SUCCESS)),
         distinct_urls=int(distinct_urls),
         operational_failure=_as_int(normalized.get(_OPERATIONAL_FAILURE)),
+        blocked=_as_int(normalized.get(_BLOCKED)),
     )
 
 
@@ -379,4 +388,5 @@ def drain(
         qualifying_success=_as_int(fields.get(_QUAL_SUCCESS)),
         distinct_urls=int(distinct_urls or 0),
         operational_failure=_as_int(fields.get(_OPERATIONAL_FAILURE)),
+        blocked=_as_int(fields.get(_BLOCKED)),
     )

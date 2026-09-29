@@ -1461,6 +1461,8 @@ def _flush_batch(
             ttl_seconds=stats_ttl_seconds,
             strategy_method_id=item.strategy_method_id,
             operational_failure=is_method_health_failure(item.error_code),
+            # E9.2: the ACCESS rung's block rate is what demotes it.
+            blocked=item.error_code == ScrapeErrorCode.BLOCKED,
         )
         if item.extraction_method is not None:
             record_attempt(

@@ -156,6 +156,56 @@ def _batch_confidence(drained: stats_buffer.DrainedDelta) -> Decimal | None:
     return Decimal(drained.conf_sum) / _CONFIDENCE_SCALE / Decimal(drained.success)
 
 
+def _blocked_rate_demotes(
+    method: DomainStrategyMethod,
+    drained: stats_buffer.DrainedDelta,
+    settings: Settings,
+    now: datetime,
+) -> bool:
+    """Quarantine ``method`` when this batch's BLOCKED share is too high.
+
+    Needs ``STRATEGY_METHOD_BLOCKED_MIN_ATTEMPTS`` attempts in the batch --
+    a single canary is never evidence either way -- and a BLOCKED share at
+    or above ``STRATEGY_METHOD_BLOCKED_RATE_THRESHOLD``. The reason is
+    logged as one structured WARNING. (Not written to
+    ``strategy_method_switches``: that table is the PROMOTION history the
+    hysteresis rollback logic reads back as "the method now preferred", and
+    a demotion row would be misread as a switch.)
+    """
+    minimum = max(1, int(getattr(settings, "STRATEGY_METHOD_BLOCKED_MIN_ATTEMPTS", 20)))
+    threshold = float(getattr(settings, "STRATEGY_METHOD_BLOCKED_RATE_THRESHOLD", 0.5))
+    attempts = drained.attempt
+    if attempts < minimum or not drained.blocked:
+        return False
+    rate = drained.blocked / attempts
+    if rate < threshold:
+        return False
+    cooldown_seconds = max(
+        0, int(getattr(settings, "STRATEGY_METHOD_BREAKER_COOLDOWN_SECONDS", 1800))
+    )
+    canary_seconds = max(
+        1, int(getattr(settings, "STRATEGY_METHOD_BREAKER_CANARY_INTERVAL_SECONDS", 600))
+    )
+    method.proof_state = StrategyMethodProofState.QUARANTINED
+    method.cooldown_until = now + timedelta(seconds=cooldown_seconds)
+    method.next_canary_at = now + timedelta(seconds=canary_seconds)
+    logger.warning(
+        "strategy_method_demoted reason=blocked_rate blocked_rate=%.2f blocked=%d "
+        "attempts=%d successes=%d threshold=%.2f method_id=%s access_method=%s "
+        "profile_id=%s cooldown_seconds=%d",
+        rate,
+        drained.blocked,
+        attempts,
+        drained.success,
+        threshold,
+        method.id,
+        getattr(method.access_method, "value", method.access_method),
+        method.domain_strategy_profile_id,
+        cooldown_seconds,
+    )
+    return True
+
+
 def _update_method_circuit(
     method: DomainStrategyMethod,
     drained: stats_buffer.DrainedDelta,
@@ -178,6 +228,15 @@ def _update_method_circuit(
     method.circuit_failure_count = (
         method.circuit_failure_count or 0
     ) + operational_failures
+    # 2026-09-29 (plan E9.2): a rung the target mostly BLOCKS is demoted on
+    # THIS batch's evidence, successes or not. The success path below
+    # returns early, and the lifetime failure rate is diluted by months of
+    # history against an 80% bar -- so amazon.sa PROXY_HTTP, BLOCKED 677 /
+    # OK 251 in 24 h, was bought for every target, every night. Quarantine
+    # routes the ladder to the next rung and keeps a canary probing this
+    # one (`methods._is_eligible`); a canary success re-opens it as before.
+    if _blocked_rate_demotes(method, drained, settings, now):
+        return
     if drained.success:
         method.consecutive_failure_count = 0
         method.proof_sample_size = (method.proof_sample_size or 0) + drained.success

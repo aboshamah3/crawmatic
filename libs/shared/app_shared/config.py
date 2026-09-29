@@ -789,6 +789,13 @@ class Settings(BaseSettings):
     STRATEGY_METHOD_BREAKER_FAILURE_RATE: float = 0.80
     STRATEGY_METHOD_BREAKER_COOLDOWN_SECONDS: int = 1800
     STRATEGY_METHOD_BREAKER_CANARY_INTERVAL_SECONDS: int = 600
+    # 2026-09-29 (E9.2): a rung whose share of BLOCKED answers in one
+    # stats-flush batch reaches this rate (with at least the minimum
+    # attempts in the batch) is quarantined like a broken rung: the ladder
+    # moves on, a canary keeps probing it. amazon.sa PROXY_HTTP measured
+    # 0.60-0.73 over 24 h and was bought for every target.
+    STRATEGY_METHOD_BLOCKED_RATE_THRESHOLD: float = 0.50
+    STRATEGY_METHOD_BLOCKED_MIN_ATTEMPTS: int = 20
     STRATEGY_DISCOVERY_MIN_SAMPLE: int = 3
     STRATEGY_DISCOVERY_MAX_SAMPLE: int = 10
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
