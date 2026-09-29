@@ -761,3 +761,65 @@ class TestWindowsAwaitingSettlement:
             session.commit()
             after = count_paid_operations(session, since=day, until=day + timedelta(days=1))
         assert after - before == 1
+
+
+class TestRerollAfterLateSettlement:
+    """2026-09-29 (plan E7.3): cost_rollup rolls a day once and advances its
+    watermark, and the day's settlements typically arrive AFTER that (the
+    provider export lands the next morning), so the rollup kept reporting
+    the day as unreconciled forever."""
+
+    def test_a_day_whose_settlements_postdate_its_rollup_is_rolled_again(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        from app_shared.models.network_cost_rollups import FleetNetworkCostRollup
+        from app_shared.netledger.rollups import (
+            days_with_late_settlements,
+            reroll_days_with_late_settlements,
+            run_cost_rollup,
+        )
+
+        provider = f"dataimpulse-reroll-{uuid.uuid4().hex[:6]}"
+        day_start = datetime(2026, 7, 25, 0, 0, tzinfo=timezone.utc)
+        host = f"reroll-{uuid.uuid4().hex[:6]}.example"
+        with session_scope() as session:
+            session.add(
+                _make_operation(
+                    provider=provider, domain=host, bytes_compressed=2_000,
+                    closed_at=day_start + timedelta(hours=3), cost_micro_units=40,
+                )
+            )
+            session.commit()
+            run_cost_rollup(session, target_date=day_start.date())
+            session.commit()
+            assert day_start.date() not in days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
+
+        window = import_provider_usage(
+            _provider_source(provider=provider, host=host, window_start=day_start,
+                             window_end=day_start + timedelta(days=1), row_bytes=[2_000]),
+            session_scope=session_scope,
+        )
+        assert reconcile_window(window, session_scope=session_scope).settlements_written
+
+        with session_scope() as session:
+            late = days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
+            assert day_start.date() in late
+            rerolled = reroll_days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
+            session.commit()
+            assert day_start.date() in rerolled
+            bucket = session.execute(
+                select(FleetNetworkCostRollup).where(
+                    FleetNetworkCostRollup.rollup_date == day_start.date(),
+                    FleetNetworkCostRollup.domain == host,
+                )
+            ).scalar_one()
+            assert bucket.reconciled_cost_micro_units == 40
+            assert day_start.date() not in days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
