@@ -75,3 +75,20 @@ def test_the_cap_sits_below_the_started_reaper_horizon(monkeypatch: pytest.Monke
     # targets to PENDING, or the same URLs get fetched twice.
     assert cfg.SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS < cfg.SCRAPE_STARTED_REAP_AFTER_SECONDS
     assert cfg.SCRAPE_SPIDER_MAX_RUNTIME_SECONDS < cfg.SCRAPE_STARTED_REAP_AFTER_SECONDS
+
+
+def test_the_browser_project_uses_the_bounded_download_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """scrapy-playwright ignores DOWNLOAD_TIMEOUT and has unbounded awaits;
+    the project must route both schemes through the bounded subclass
+    (2026-09-29, plan E1.1), with its margins from config."""
+    settings = _load_project_settings(monkeypatch, "price_monitor_browser.settings")
+    from app_shared.config import get_settings
+
+    cfg = get_settings()
+    bounded = "price_monitor_browser.handler.BoundedPlaywrightDownloadHandler"
+    assert settings.DOWNLOAD_HANDLERS == {"http": bounded, "https": bounded}
+    assert settings.BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS == cfg.BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS
+    assert settings.BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS == cfg.BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS
+    assert cfg.BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS > 0

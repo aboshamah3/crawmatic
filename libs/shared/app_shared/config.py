@@ -875,6 +875,15 @@ class Settings(BaseSettings):
     # `scrape_core.extensions.hard_deadline` terminates the process this many
     # seconds after the graceful deadline, freeing the Scrapyd slot.
     SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS: int = 120
+    # scrapy-playwright ignores DOWNLOAD_TIMEOUT and awaits new_context,
+    # new_page, page.content and page.close with no bound, so one hung await
+    # wedged the browser node's only slot (2026-09-29, E1).
+    # `price_monitor_browser.handler` bounds every browser download by the
+    # request's own declared timeouts plus this margin (context/page
+    # creation, content and close carry no timeout of their own), and the
+    # handler's shutdown by the second knob.
+    BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS: int = 30
+    BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS: int = 30
     # EPA B5 (canary-gated): domains whose PROXIED browser legs fetch the
     # document and nothing else — every sub-resource is aborted before its
     # body crosses the paid proxy

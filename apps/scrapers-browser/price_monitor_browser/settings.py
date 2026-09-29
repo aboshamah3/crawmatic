@@ -110,11 +110,17 @@ DEFAULT_REQUEST_HEADERS = {
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
-# scrapy-playwright download handlers (browser-driven scraping).
+# scrapy-playwright download handlers (browser-driven scraping), through
+# the bounded subclass: the stock handler ignores DOWNLOAD_TIMEOUT and has
+# unbounded awaits, so one hung page.content()/page.close() held this
+# node's only slot until the 12 h job deadline (2026-09-29, E1). See
+# `price_monitor_browser.handler`.
 DOWNLOAD_HANDLERS = {
-    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+    "http": "price_monitor_browser.handler.BoundedPlaywrightDownloadHandler",
+    "https": "price_monitor_browser.handler.BoundedPlaywrightDownloadHandler",
 }
+BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS = _settings.BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS
+BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS = _settings.BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
 
 # Per-navigation-hop resolved-IP SSRF guard (T030/T031, Constitution §VI
