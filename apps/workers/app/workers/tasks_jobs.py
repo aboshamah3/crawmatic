@@ -83,6 +83,7 @@ from app_shared.messaging import enqueue
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.netledger.recorder import canonical_url_hash
+from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.domain_playbooks import DomainPlaybook, DomainState
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
@@ -1884,6 +1885,52 @@ def reconcile_dispatch_intents() -> None:
     )
 
 
+#: Scrapyd run states in which a dispatched batch is still waiting its
+#: turn or working: its targets are queued, not stalled.
+_LIVE_RUN_STATES = frozenset({"pending", "running"})
+
+
+def _own_run_states(
+    session: Any,
+    workspace_id: Any,
+    targets: list[ScrapeJobTarget],
+    lookup: Callable[[str, str | None], dict[str, str] | None],
+) -> dict[Any, str | None]:
+    """``target.id -> state of the Scrapyd run its dispatch intent names``.
+
+    2026-09-29 (plan E2.3). The state is ``pending``/``running``/
+    ``finished``, ``absent`` when the node answered without listing the run
+    (restarted or rolled history: the run is gone), or ``None`` when there
+    is no verdict -- no intent recorded, no node recorded, or the node did
+    not answer. One read of the intents for the whole list; the listing
+    itself is cached by ``lookup`` per (node, project) for the sweep.
+    """
+    intent_ids = {t.dispatch_intent_id for t in targets if t.dispatch_intent_id is not None}
+    if not intent_ids:
+        return {t.id: None for t in targets}
+    intents = {
+        intent.id: intent
+        for intent in session.execute(
+            scoped_select(DispatchIntent, workspace_id).where(DispatchIntent.id.in_(intent_ids))
+        )
+        .scalars()
+        .all()
+    }
+    states: dict[Any, str | None] = {}
+    for target in targets:
+        intent = intents.get(target.dispatch_intent_id)
+        if intent is None or not intent.node_url:
+            states[target.id] = None
+            continue
+        project = intent.node_class.split(":", 1)[0] if intent.node_class else None
+        listing = lookup(intent.node_url, project)
+        if listing is None:
+            states[target.id] = None
+            continue
+        states[target.id] = listing.get(str(intent.scrapyd_job_id), "absent")
+    return states
+
+
 @maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=SCRAPE_RECOVER_STALLED)
 def recover_stalled_batches() -> None:
@@ -1913,9 +1960,22 @@ def recover_stalled_batches() -> None:
     # One liveness probe per node per task invocation — N batches landing
     # on the same node must not become N `daemonstatus.json` round-trips.
     node_status_cache: dict = {}
+    # Same for `listjobs.json` per (node, project): the per-intent run state
+    # that replaced "node depth > 0 -> skip" (E2.3).
+    run_listing_cache: dict[tuple[str, str | None], dict[str, str] | None] = {}
 
     with get_session() as session:
         client = ScrapydDispatchClient(settings=settings)
+
+        def run_listing(node_url: str, project: str | None) -> dict[str, str] | None:
+            key = (node_url, project)
+            if key not in run_listing_cache:
+                try:
+                    run_listing_cache[key] = client.list_job_states(node_url, project)
+                except (ScrapydDispatchError, TypeError, ValueError, AttributeError):
+                    run_listing_cache[key] = None
+            return run_listing_cache[key]
+
         # EPA B6 (F11): one placement decision-maker for the WHOLE sweep,
         # not one per job. The pool is fleet-wide, so the batches this
         # sweep has already placed must count against the next job's
@@ -1951,6 +2011,24 @@ def recover_stalled_batches() -> None:
             )
             if not stalled_targets:
                 continue
+
+            # 2026-09-29 (E2.3): ask the node about each stalled target's OWN
+            # run. Still pending/running there -> it is queued, not stalled,
+            # whatever else the node is doing; finished/absent -> stalled,
+            # even on a node whose queue is deep. Only targets with no verdict
+            # (no intent recorded, node silent) fall back to the old
+            # node-depth heuristic below.
+            own_runs = _own_run_states(session, workspace_id, stalled_targets, run_listing)
+            stalled_targets = [
+                t for t in stalled_targets if own_runs.get(t.id) not in _LIVE_RUN_STATES
+            ]
+            if not stalled_targets:
+                continue
+            run_ended_match_ids = {
+                t.match_id
+                for t in stalled_targets
+                if own_runs.get(t.id) in ("finished", "absent")
+            }
 
             resolved_targets, _ = _resolve_domains_and_modes(
                 session,
@@ -2069,17 +2147,21 @@ def recover_stalled_batches() -> None:
                             job.id,
                         )
                         continue
-                    status_payload = node_status_cache.get(node_url, _UNPROBED)
-                    if status_payload is _UNPROBED:
-                        status_payload = client.daemon_status(node_url)
-                        node_status_cache[node_url] = status_payload
-                    depth = (
-                        None if status_payload is None else _queue_depth(status_payload)
-                    )
-                    if depth is not None and depth > 0:
-                        # Node alive and working its queue: these targets are
-                        # queued behind max_proc/rate limits, not stalled.
-                        continue
+                    # E2.3: a batch whose every target's own run is known to
+                    # have ended is stalled by direct evidence; node depth is
+                    # irrelevant to it (a wedged node's depth never drains).
+                    if not set(batch.match_ids) <= run_ended_match_ids:
+                        status_payload = node_status_cache.get(node_url, _UNPROBED)
+                        if status_payload is _UNPROBED:
+                            status_payload = client.daemon_status(node_url)
+                            node_status_cache[node_url] = status_payload
+                        depth = (
+                            None if status_payload is None else _queue_depth(status_payload)
+                        )
+                        if depth is not None and depth > 0:
+                            # No run evidence for these targets, node alive and
+                            # working its queue: assume queued, not stalled.
+                            continue
                     # Paid dispatch site 6 (RETRY): a stall re-POST is a
                     # SECOND physical fetch of work already paid for once,
                     # so it must clear the gate on its own account. Its
