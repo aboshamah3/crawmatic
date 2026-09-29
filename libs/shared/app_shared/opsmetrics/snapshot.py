@@ -286,6 +286,29 @@ class QueueHealth:
 
 
 @dataclass(frozen=True)
+class LinkOutcomes:
+    """E9.1 (2026-09-29): FINAL outcome per target (link), per domain, 24h.
+
+    ``request_attempts`` counts tries, not links, and a target the job
+    deadline failed never wrote an attempt at all (the reaper fails it in
+    bulk) -- ~940 of them a night were invisible to every attempt-based
+    rule. This reads ``scrape_job_targets`` that reached a terminal state in
+    the window. ``failed`` includes ``deadline_failed``.
+    """
+
+    domain: str
+    completed: int
+    failed: int
+    skipped: int
+    deadline_failed: int
+
+    @property
+    def link_success_rate(self) -> float | None:
+        decided = self.completed + self.failed
+        return None if decided == 0 else self.completed / decided
+
+
+@dataclass(frozen=True)
 class DomainStats:
     """Per-domain fetch economics over one window.
 
@@ -314,6 +337,10 @@ class DomainStats:
     proxied: int
     failed_paid: int
     successful_prices: int = 0
+    #: E9.1 (2026-09-29): failed attempts by ``error_code`` over the same
+    #: window, so an alert says WHAT is failing (BLOCKED vs TIMEOUT vs
+    #: PRICE_NOT_FOUND need three different fixes), not only how much.
+    error_codes: dict[str, int] = field(default_factory=dict)
 
     @property
     def success_rate(self) -> float | None:
@@ -746,6 +773,9 @@ class OpsSnapshot:
     discovery: tuple[DomainDiscovery, ...] = ()
     discovery_available: bool = True
     discovery_unavailable_reason: str | None = None
+    link_outcomes_24h: tuple[LinkOutcomes, ...] = ()
+    link_outcomes_available: bool = True
+    link_outcomes_unavailable_reason: str | None = None
     spend: SpendVelocity = field(default_factory=lambda: SpendVelocity(available=False))
     freshness: Freshness = field(default_factory=lambda: Freshness(available=False))
     optimizer: OptimizerChurn = field(
@@ -951,6 +981,7 @@ def collect_snapshot(
     partitions, part_ok, part_reason = _collect_partitions(session, now)
     domains_24h, domains_7d, dom_ok, dom_reason = _collect_domains(session, now)
     discovery, disc_ok, disc_reason = _collect_discovery(session, now)
+    links, links_ok, links_reason = _collect_link_outcomes(session, now)
 
     return OpsSnapshot(
         collected_at=now,
@@ -983,6 +1014,9 @@ def collect_snapshot(
             session,
         ),
         domains_24h=domains_24h,
+        link_outcomes_24h=links,
+        link_outcomes_available=links_ok,
+        link_outcomes_unavailable_reason=links_reason,
         domains_7d=domains_7d,
         domains_available=dom_ok,
         domains_unavailable_reason=dom_reason,
@@ -1388,6 +1422,69 @@ GROUP BY 1
 """
 
 
+#: E9.1: failed attempts per (domain, error_code) -- same partition-pruned
+#: window as ``_DOMAIN_AGG_SQL``.
+_DOMAIN_ERROR_CODES_SQL = f"""
+SELECT {_DOMAIN_SQL} AS domain, error_code, count(*) AS n
+FROM request_attempts
+WHERE created_at >= :since AND NOT success
+GROUP BY 1, 2
+"""
+
+#: E9.1: terminal targets per domain in the window, deadline failures split
+#: out. `scrape_job_targets` has no domain; attribution is match ->
+#: competitor, the same join `_SUCCESSFUL_PRICES_SQL` uses.
+_LINK_OUTCOMES_SQL = """
+SELECT c.domain AS domain,
+       count(*) FILTER (WHERE t.status = 'COMPLETED') AS completed,
+       count(*) FILTER (WHERE t.status = 'FAILED')    AS failed,
+       count(*) FILTER (WHERE t.status = 'SKIPPED')   AS skipped,
+       count(*) FILTER (WHERE t.status = 'FAILED'
+                          AND t.error_code = 'JOB_DEADLINE_EXCEEDED') AS deadline_failed
+FROM scrape_job_targets t
+JOIN competitor_product_matches cpm
+  ON cpm.workspace_id = t.workspace_id AND cpm.id = t.match_id
+JOIN competitors c
+  ON c.workspace_id = cpm.workspace_id AND c.id = cpm.competitor_id
+WHERE t.completed_at >= :since
+  AND t.status IN ('COMPLETED', 'FAILED', 'SKIPPED')
+GROUP BY 1
+ORDER BY count(*) DESC
+LIMIT :limit
+"""
+
+
+def _collect_link_outcomes(
+    session: Any, now: datetime, *, limit: int = 50
+) -> tuple[tuple[LinkOutcomes, ...], bool, str | None]:
+    from sqlalchemy import text
+
+    try:
+        rows = session.execute(
+            text(_LINK_OUTCOMES_SQL), {"since": now - timedelta(hours=24), "limit": limit}
+        ).all()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return (), False, f"{exc.__class__.__name__}: {exc}"[:300]
+    return (
+        tuple(
+            LinkOutcomes(
+                domain=r[0] or "(unknown)",
+                completed=int(r[1] or 0),
+                failed=int(r[2] or 0),
+                skipped=int(r[3] or 0),
+                deadline_failed=int(r[4] or 0),
+            )
+            for r in rows
+        ),
+        True,
+        None,
+    )
+
+
 def _collect_domains(
     session: Any, now: datetime, *, limit: int = 50
 ) -> tuple[tuple[DomainStats, ...], tuple[DomainStats, ...], bool, str | None]:
@@ -1411,6 +1508,13 @@ def _collect_domains(
             (r[0] or "(unparsed)"): int(r[1])
             for r in session.execute(text(_SUCCESSFUL_PRICES_SQL), {"since": since}).all()
         }
+        # E9.1: same window, failures by code (a third bounded pass; merged
+        # by domain name like the prices above).
+        codes_by_domain: dict[str, dict[str, int]] = {}
+        for domain, code, n in session.execute(
+            text(_DOMAIN_ERROR_CODES_SQL), {"since": since}
+        ).all():
+            codes_by_domain.setdefault(domain or "(unparsed)", {})[code or "UNKNOWN"] = int(n)
         return tuple(
             DomainStats(
                 domain=r[0] or "(unparsed)",
@@ -1420,6 +1524,7 @@ def _collect_domains(
                 proxied=int(r[4]),
                 failed_paid=int(r[5]),
                 successful_prices=successful_by_domain.get(r[0] or "(unparsed)", 0),
+                error_codes=codes_by_domain.get(r[0] or "(unparsed)", {}),
             )
             for r in rows
         )
@@ -1769,6 +1874,7 @@ __all__ = [
     "DatabaseRoleHealth",
     "DomainDiscovery",
     "DomainStats",
+    "LinkOutcomes",
     "Freshness",
     "OpsSnapshot",
     "OptimizerChurn",

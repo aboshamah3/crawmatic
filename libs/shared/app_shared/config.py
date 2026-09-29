@@ -796,6 +796,14 @@ class Settings(BaseSettings):
     # 0.60-0.73 over 24 h and was bought for every target.
     STRATEGY_METHOD_BLOCKED_RATE_THRESHOLD: float = 0.50
     STRATEGY_METHOD_BLOCKED_MIN_ATTEMPTS: int = 20
+    # 2026-09-29 (E9.1): per-domain ops-alert thresholds, environment-
+    # tunable. Defaults are exactly the measured constants in
+    # app_shared.opsmetrics.rules.Thresholds -- tunable, not quieter.
+    OPS_DOMAIN_SUCCESS_RATE_HIGH: float = 0.70
+    OPS_DOMAIN_SUCCESS_RATE_WARNING: float = 0.90
+    OPS_DOMAIN_SUCCESS_MIN_ATTEMPTS: int = 50
+    OPS_WASTED_PAID_RATE_HIGH: float = 0.40
+    OPS_WASTED_PAID_MIN_ATTEMPTS: int = 200
     STRATEGY_DISCOVERY_MIN_SAMPLE: int = 3
     STRATEGY_DISCOVERY_MAX_SAMPLE: int = 10
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60

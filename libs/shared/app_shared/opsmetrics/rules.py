@@ -44,7 +44,7 @@ gets muted — which is how you end up back at silent failures.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Callable
 
@@ -234,6 +234,43 @@ class Thresholds:
 
 
 DEFAULT_THRESHOLDS = Thresholds()
+
+#: E9.1 (2026-09-29): the per-domain thresholds are environment-tunable
+#: (``OPS_*`` settings, defaults = the measured constants above). Tunable is
+#: not quieter: the defaults are unchanged and the alert text reports the
+#: threshold it was judged against.
+_SETTINGS_TO_THRESHOLD = {
+    "OPS_DOMAIN_SUCCESS_RATE_HIGH": "domain_success_rate_high",
+    "OPS_DOMAIN_SUCCESS_RATE_WARNING": "domain_success_rate_warning",
+    "OPS_DOMAIN_SUCCESS_MIN_ATTEMPTS": "domain_success_min_attempts",
+    "OPS_WASTED_PAID_RATE_HIGH": "wasted_paid_rate_high",
+    "OPS_WASTED_PAID_MIN_ATTEMPTS": "wasted_paid_min_attempts",
+}
+
+
+def thresholds_from_settings(settings: Any) -> Thresholds:
+    """``DEFAULT_THRESHOLDS`` with every ``OPS_*`` value the settings carry."""
+    overrides = {
+        field_name: getattr(settings, setting)
+        for setting, field_name in _SETTINGS_TO_THRESHOLD.items()
+        if getattr(settings, setting, None) is not None
+    }
+    return replace(DEFAULT_THRESHOLDS, **overrides) if overrides else DEFAULT_THRESHOLDS
+
+
+def _configured_thresholds() -> Thresholds:
+    try:
+        from app_shared.config import get_settings
+
+        return thresholds_from_settings(get_settings())
+    except Exception:  # noqa: BLE001 - an unconfigurable process still alerts, on defaults
+        return DEFAULT_THRESHOLDS
+
+
+def _top_error_codes(codes: dict[str, int], n: int = 6) -> dict[str, int]:
+    """Most frequent failure codes first (E9.1) -- the part of a domain
+    alert that says which fix it needs."""
+    return dict(sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))[:n])
 
 
 # --------------------------------------------------------------------------
@@ -877,6 +914,7 @@ def _r_wasted_spend(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
                         "proxied": d.proxied,
                         "wasted_usd": cost.usd(d.failed_paid),
                         "threshold": t.wasted_paid_rate_high,
+                        "error_codes": _top_error_codes(d.error_codes),
                     },
                     runbook="#stop-proxy-spend-now",
                 )
@@ -1199,11 +1237,41 @@ def _r_domain_success(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
                     "success_rate": round(rate, 4),
                     "attempts": d.attempts,
                     "threshold": threshold,
+                    "error_codes": _top_error_codes(d.error_codes),
                 },
                 runbook="#per-domain-success-drop",
             )
         )
     return out
+
+
+_J_DEADLINE = (
+    "E9.1 (2026-09-29): targets the job deadline fails write no request "
+    "attempt, so every attempt-based rule is blind to them -- and they were "
+    "the night's largest failure (~940 a night: amazon.sa 629, noon.com 297). "
+    "A link that was never tried is a failure the customer sees."
+)
+
+
+def _r_deadline_failed_targets(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
+    by_domain = {
+        lo.domain: lo.deadline_failed for lo in snapshot.link_outcomes_24h if lo.deadline_failed
+    }
+    if not by_domain:
+        return []
+    total = sum(by_domain.values())
+    return [
+        _alert(
+            "jobs.deadline_failed_targets",
+            Severity.HIGH,
+            Category.RELIABILITY,
+            f"{total} target(s) were failed by the job deadline in 24h without "
+            "ever being fetched.",
+            _J_DEADLINE,
+            observed={"deadline_failed": total, "by_domain": by_domain},
+            runbook="#per-domain-success-drop",
+        )
+    ]
 
 
 _J_QUEUE = (
@@ -1987,6 +2055,13 @@ RULES: tuple[Rule, ...] = (
         _J_SUCCESS,
         _r_domain_success,
     ),
+    Rule(
+        "jobs.deadline_failed_targets",
+        Category.RELIABILITY,
+        "Targets failed by the job deadline without a fetch",
+        "E9.1 (2026-09-29).",
+        _r_deadline_failed_targets,
+    ),
     Rule("queue.*", Category.RELIABILITY, "Queue depth and age", _J_QUEUE, _r_queue),
     Rule(
         "freshness.*",
@@ -2105,7 +2180,7 @@ def evaluate(
     because one rule has a bug is the failure mode this whole module
     exists to prevent.
     """
-    t = thresholds or DEFAULT_THRESHOLDS
+    t = thresholds or _configured_thresholds()
     alerts: list[Alert] = []
     for rule in RULES:
         try:
