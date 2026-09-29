@@ -891,7 +891,7 @@ class Settings(BaseSettings):
     SCRAPE_SPIDER_MAX_RUNTIME_SECONDS: int = 1800
     # CLOSESPIDER_TIMEOUT is graceful: the engine waits for in-flight
     # downloads, so a spider wedged inside a download handler never closes.
-    # `scrape_core.extensions.hard_deadline` terminates the process this many
+    # scrape-core's `extensions.hard_deadline` terminates the process this many
     # seconds after the graceful deadline, freeing the Scrapyd slot.
     SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS: int = 120
     # scrapy-playwright ignores DOWNLOAD_TIMEOUT and awaits new_context,
@@ -901,7 +901,7 @@ class Settings(BaseSettings):
     # request's own declared timeouts plus this margin (context/page
     # creation, content and close carry no timeout of their own), and the
     # handler's shutdown by the second knob.
-    # The out-of-reactor watchdog (`scrape_core.process_watchdog`, armed by
+    # The out-of-reactor watchdog (scrape-core's `process_watchdog`, armed by
     # both Scrapyd runners) kills a crawl's whole process group this many
     # seconds AFTER max runtime + hard-kill grace -- i.e. only when the
     # graceful close and the in-reactor hard deadline both failed to end it
