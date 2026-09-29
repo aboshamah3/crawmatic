@@ -37,6 +37,15 @@ RUN uv sync --locked --package scrapers-browser --no-dev
 # Playwright's Chromium + required OS-level libraries, baked at build.
 RUN playwright install --with-deps chromium
 
+# A real init as PID 1 (2026-09-29, E1.3). The crawl watchdog kills a wedged
+# crawl's whole process group, and Chromium forks helpers that can outlive
+# their parent; without an init nothing reaps them and they pile up as
+# zombies in a long-lived container. `-g` forwards stop signals to the
+# child's process group.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 # READY F01 build gate: prove IN THIS IMAGE that Chromium cannot egress
 # past `scrape_core.browser.egress_guard` — redirect-to-loopback, a
 # privately-resolving sub-resource, service workers, popups, and a proxied
@@ -107,5 +116,5 @@ USER app
 
 EXPOSE 6800
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "./docker-entrypoint.sh"]
 CMD ["scrapyd"]

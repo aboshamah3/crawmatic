@@ -889,6 +889,13 @@ class Settings(BaseSettings):
     # request's own declared timeouts plus this margin (context/page
     # creation, content and close carry no timeout of their own), and the
     # handler's shutdown by the second knob.
+    # The out-of-reactor watchdog (`scrape_core.process_watchdog`, armed by
+    # both Scrapyd runners) kills a crawl's whole process group this many
+    # seconds AFTER max runtime + hard-kill grace -- i.e. only when the
+    # graceful close and the in-reactor hard deadline both failed to end it
+    # (blocked loop, pre-open hang, hung Playwright shutdown). Must keep the
+    # sum below SCRAPE_STARTED_REAP_AFTER_SECONDS; a unit test pins that.
+    SCRAPE_PROCESS_WATCHDOG_EXTRA_SECONDS: int = 120
     BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS: int = 30
     BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS: int = 30
     # EPA B5 (canary-gated): domains whose PROXIED browser legs fetch the

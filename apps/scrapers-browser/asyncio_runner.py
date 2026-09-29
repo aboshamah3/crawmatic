@@ -12,9 +12,19 @@ this node cannot capitulate, Playwright genuinely needs asyncio).
 Referenced by ``scrapyd.conf`` ``runner = asyncio_runner``; importable
 because Scrapyd spawns crawl subprocesses with this directory as cwd
 (``python -m`` puts cwd on ``sys.path``).
+
+The runner is also where the out-of-reactor watchdog is armed
+(2026-09-29, E1.3): before Twisted or Scrapy is imported, so it covers a
+hang at browser launch, a blocked event loop, and Playwright's unbounded
+shutdown after ``spider_closed`` -- none of which the in-reactor
+``HardDeadlineExtension`` can see. See ``scrape_core.process_watchdog``.
 """
 
-from twisted.internet import asyncioreactor
+from scrape_core.process_watchdog import arm_crawl_watchdog
+
+arm_crawl_watchdog("browser")
+
+from twisted.internet import asyncioreactor  # noqa: E402
 
 asyncioreactor.install()
 
