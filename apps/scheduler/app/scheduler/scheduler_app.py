@@ -117,7 +117,7 @@ from sqlalchemy.orm import Session
 from app_shared.config import Settings, get_settings
 from app_shared.config_validation import assert_production_safe
 from app_shared.costauth.service import CostAuthorizationService
-from app_shared.database import get_system_sessionmaker
+from app_shared.database import get_engine, get_system_sessionmaker
 from app_shared.heartbeat import HeartbeatEmitter, PeriodicHeartbeat, default_instance_id
 from app_shared.enums import (
     ScrapeJobSource,
@@ -938,6 +938,9 @@ def _run_ops_snapshot_tick(settings: Settings) -> None:
                 now=datetime.now(timezone.utc),
                 redis=_ops_snapshot_redis(),
                 settings=settings,
+                # E8: probe the tenant role; this session is the BYPASSRLS
+                # system role by design.
+                tenant_bind=get_engine,
             )
             alerts = emit_snapshot(snapshot)
             if alerts:

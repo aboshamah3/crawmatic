@@ -90,7 +90,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app_shared.config import get_settings
-from app_shared.database import get_auth_session
+from app_shared.database import get_auth_session, get_engine
 from app_shared.opsmetrics import (
     collect_snapshot,
     emit_snapshot,
@@ -223,6 +223,9 @@ def ops_metrics(
         redis=redis_client,
         settings=settings,
         scrapyd_status=_get_scrapyd_status(settings, redis_client),
+        # E8: probe the role tenant requests actually run as; `session` is
+        # the BYPASSRLS auth session by design and says nothing about it.
+        tenant_bind=get_engine,
     )
     alerts = evaluate(snapshot)
 

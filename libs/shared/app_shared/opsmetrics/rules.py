@@ -1571,15 +1571,48 @@ def _r_optimizer(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
 
 
 def _r_rls(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
+    """E8 (2026-09-29): about the TENANT role, and never silent on no verdict.
+
+    ``db_role`` describes the role behind the ordinary (tenant) engine, not
+    the BYPASSRLS session the snapshot was collected on -- that was the
+    permanent false CRITICAL. A tenant probe that ran and failed is
+    CRITICAL too: isolation that cannot be verified is not verified. The
+    privileged session has its own rule, ``_r_privileged_role``.
+    """
     d = snapshot.db_role
-    if d.available and d.rls_effective is False:
-        return [
+    alerts: list[Alert] = []
+    if not d.available and d.unavailable_reason:
+        alerts.append(
             _alert(
                 "security.rls_inert",
                 Severity.CRITICAL,
                 Category.SECURITY,
-                f"This service connects as {d.role!r}, which is "
-                f"{'superuser' if d.is_superuser else 'BYPASSRLS'} — every "
+                "The role that serves tenant requests could not be probed, so "
+                "workspace isolation is unverified.",
+                "Audit C3 / E8: RLS is only as good as the role it applies to. "
+                "A probe that cannot run gives no evidence the tenant role is "
+                "confined, and 'no evidence' must not read as 'fine'.",
+                observed={"unavailable_reason": d.unavailable_reason},
+                runbook="#rls-inert",
+            )
+        )
+    if d.available and d.rls_effective is False:
+        reasons = [
+            label
+            for label, flag in (
+                ("superuser", d.is_superuser),
+                ("BYPASSRLS", d.bypasses_rls),
+                (f"owner of {d.owned_public_tables} public table(s)", (d.owned_public_tables or 0) > 0),
+            )
+            if flag
+        ]
+        alerts.append(
+            _alert(
+                "security.rls_inert",
+                Severity.CRITICAL,
+                Category.SECURITY,
+                f"Tenant requests run as {d.role!r}, which is "
+                f"{' and '.join(reasons)} — every "
                 "workspace-isolation policy in the schema is inert.",
                 "Audit C3: RLS protection depends on unverified, manually "
                 "created roles, and production was found connecting as a "
@@ -1590,11 +1623,41 @@ def _r_rls(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
                     "role": d.role,
                     "is_superuser": d.is_superuser,
                     "bypasses_rls": d.bypasses_rls,
+                    "owned_public_tables": d.owned_public_tables,
                 },
                 runbook="#rls-inert",
             )
-        ]
-    return []
+        )
+    return alerts
+
+
+def _r_privileged_role(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
+    """E8: the BYPASSRLS session is fine as such; alert only on the two
+    configurations that are not (see ``DatabaseRoleHealth.system_role_status``)."""
+    d = snapshot.db_role
+    alerts: list[Alert] = []
+    status = d.system_role_status
+    if status in ("superuser", "same_as_tenant"):
+        alerts.append(
+            _alert(
+                "security.privileged_role_misconfigured",
+                Severity.HIGH,
+                Category.SECURITY,
+                f"The privileged (BYPASSRLS) session connects as {d.system_role!r}, "
+                + (
+                    "a SUPERUSER."
+                    if status == "superuser"
+                    else "the same role that serves tenant requests."
+                ),
+                "E8: the auth/system session is meant to bypass RLS -- for "
+                "credential lookup and fleet sweeps -- but not as a superuser "
+                "(DDL, role changes, server-side COPY) and never as the tenant "
+                "role, which would make every tenant request privileged.",
+                observed={"role": d.system_role, "status": status},
+                runbook="#rls-inert",
+            )
+        )
+    return alerts
 
 
 # --------------------------------------------------------------------------
@@ -1925,9 +1988,16 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "security.rls_inert",
         Category.SECURITY,
-        "RLS effectiveness of the connected role",
-        "Audit C3.",
+        "RLS effectiveness of the role that serves tenants",
+        "Audit C3; E8 (2026-09-29): probes the tenant engine, not the session.",
         _r_rls,
+    ),
+    Rule(
+        "security.privileged_role_misconfigured",
+        Category.SECURITY,
+        "The BYPASSRLS session is a superuser or the tenant role",
+        "E8 (2026-09-29).",
+        _r_privileged_role,
     ),
     # --- EPA B9 (F22) — inert until a later task wires the named
     # attribute onto a real OpsSnapshot; see the section comment above.

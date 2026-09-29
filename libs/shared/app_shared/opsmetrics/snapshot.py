@@ -68,6 +68,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, date as date_type, datetime, timedelta
 from typing import Any
 
+from app_shared.db.rls_guard import inspect_ordinary_role
 from app_shared.opsmetrics import cost
 
 #: ``access_method`` values that cost money. Kept identical to
@@ -656,12 +657,25 @@ class ScrapydHealth:
 
 @dataclass(frozen=True)
 class DatabaseRoleHealth:
-    """Whether the connected role can actually be constrained by RLS.
+    """Whether the role that SERVES TENANTS is actually confined by RLS.
 
-    Audit **C3**: RLS is inert in production because every service
-    connects as a superuser that bypasses it. A superuser/``BYPASSRLS``
-    connection makes every workspace-isolation policy in the schema
-    decorative, and nothing in the running system says so out loud.
+    Audit **C3**: RLS is inert when a service connects as a superuser or a
+    ``BYPASSRLS`` role, and nothing in the running system says so.
+
+    2026-09-29 (plan E8): ``role``/``is_superuser``/``bypasses_rls`` now
+    describe the TENANT engine's role (``get_engine()``, the only connection
+    tenant requests run on), probed with
+    :func:`app_shared.db.rls_guard.inspect_ordinary_role` -- which also
+    counts tables the role owns (an owner can switch FORCE off). They used to
+    describe whatever session the snapshot was collected on, which is the
+    BYPASSRLS auth/system session by design, so ``security.rls_inert`` fired
+    CRITICAL on every call while ``crawmatic_app`` was in fact confined.
+    The privileged session is reported separately (``system_*``) for what
+    it is.
+
+    ``available=False`` with an ``unavailable_reason`` means the tenant
+    probe RAN and failed -- unverified, which the rule treats as CRITICAL;
+    the bare default (no reason) means the section was not collected.
     """
 
     available: bool
@@ -669,12 +683,36 @@ class DatabaseRoleHealth:
     role: str | None = None
     is_superuser: bool | None = None
     bypasses_rls: bool | None = None
+    #: Public tables the tenant role owns (``None`` = not measured).
+    owned_public_tables: int | None = None
+    #: The session the snapshot itself was collected on (BYPASSRLS by design).
+    system_role: str | None = None
+    system_is_superuser: bool | None = None
+    system_bypasses_rls: bool | None = None
 
     @property
     def rls_effective(self) -> bool | None:
         if self.is_superuser is None or self.bypasses_rls is None:
             return None
-        return not (self.is_superuser or self.bypasses_rls)
+        return not (self.is_superuser or self.bypasses_rls or (self.owned_public_tables or 0) > 0)
+
+    @property
+    def system_role_status(self) -> str | None:
+        """``expected_privileged``, ``superuser`` or ``same_as_tenant``.
+
+        The privileged session is SUPPOSED to bypass RLS (it resolves
+        credentials pre-auth and runs fleet-wide sweeps). It is a problem
+        only if it is a superuser (far more than BYPASSRLS: DDL, roles,
+        COPY PROGRAM) or if it is the tenant role itself -- then the tenant
+        path is privileged too.
+        """
+        if self.system_role is None:
+            return None
+        if self.system_is_superuser:
+            return "superuser"
+        if self.role is not None and self.system_role == self.role:
+            return "same_as_tenant"
+        return "expected_privileged"
 
 
 @dataclass(frozen=True)
@@ -871,6 +909,7 @@ def collect_snapshot(
     redis: Any | None = None,
     scrapyd_status: dict[str, dict[str, Any] | None] | None = None,
     settings: Any | None = None,
+    tenant_bind: Any | None = None,
 ) -> OpsSnapshot:
     """Collect the full snapshot. Read-only; never raises.
 
@@ -891,6 +930,12 @@ def collect_snapshot(
             and probes each node before calling in.
         settings: optional ``Settings``-shaped object, used only for the
             breaker's configured ceiling.
+        tenant_bind: the ORDINARY (tenant) engine, or a zero-argument
+            callable returning it (``get_engine``, resolved inside the
+            section so a failure is reported, not raised). The RLS
+            section probes the role behind it (E8); ``session`` is BYPASSRLS
+            by design and says nothing about tenant isolation. Omitted, the
+            section reports the tenant role as unverified (CRITICAL).
     """
     now = now or datetime.now(UTC)
 
@@ -960,7 +1005,7 @@ def collect_snapshot(
             session,
         ),
         db_role=_section(
-            lambda: _collect_db_role(session),
+            lambda: _collect_db_role(session, tenant_bind=tenant_bind),
             lambda r: DatabaseRoleHealth(available=False, unavailable_reason=r),
             session,
         ),
@@ -1643,8 +1688,14 @@ def _collect_scrapyd(
     )
 
 
-def _collect_db_role(session: Any) -> DatabaseRoleHealth:
-    """Audit C3: is the connected role actually subject to RLS?"""
+def _collect_db_role(session: Any, tenant_bind: Any = None) -> DatabaseRoleHealth:
+    """Audit C3 / E8: is the role that serves TENANTS subject to RLS?
+
+    ``tenant_bind`` is the ordinary engine (``app_shared.database.get_engine``);
+    ``session`` is the (privileged) session the snapshot is collected on,
+    reported as ``system_*``. Without a tenant engine the answer is
+    "unverified", never "fine".
+    """
     from sqlalchemy import text
 
     row = session.execute(
@@ -1653,15 +1704,37 @@ def _collect_db_role(session: Any) -> DatabaseRoleHealth:
             "FROM pg_roles WHERE rolname = current_user"
         )
     ).first()
-    if row is None:
+    system = (
+        {}
+        if row is None
+        else {
+            "system_role": str(row[0]),
+            "system_is_superuser": bool(row[1]),
+            "system_bypasses_rls": bool(row[2]),
+        }
+    )
+    if tenant_bind is None:
         return DatabaseRoleHealth(
-            available=False, unavailable_reason="current_user not found in pg_roles"
+            available=False,
+            unavailable_reason=(
+                "no tenant engine supplied: the role that serves tenant requests "
+                "was not probed"
+            ),
+            **system,
         )
+    # A zero-argument callable (`get_engine` itself) is resolved HERE, inside
+    # the section, so an engine that cannot even be built (bad URL, settings
+    # that do not validate) becomes this section's `unavailable_reason` --
+    # an unverified tenant role -- instead of failing the whole snapshot.
+    bind = tenant_bind() if callable(tenant_bind) else tenant_bind
+    facts = inspect_ordinary_role(bind)
     return DatabaseRoleHealth(
         available=True,
-        role=str(row[0]),
-        is_superuser=bool(row[1]),
-        bypasses_rls=bool(row[2]),
+        role=facts.role_name,
+        is_superuser=facts.is_superuser,
+        bypasses_rls=facts.has_bypassrls,
+        owned_public_tables=facts.owned_public_tables,
+        **system,
     )
 
 

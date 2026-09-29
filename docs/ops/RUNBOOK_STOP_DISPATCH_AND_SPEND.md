@@ -532,13 +532,24 @@ Nothing is being scraped. Work outward:
 
 ## 8. RLS is inert {#rls-inert}
 
-**Fires from:** `security.rls_inert`.
+**Fires from:** `security.rls_inert` (CRITICAL) and
+`security.privileged_role_misconfigured` (HIGH).
 
-The connected role is a superuser or has `BYPASSRLS`, so every
+**Since 2026-09-29 (E8) the probe examines the role behind `DATABASE_URL` —
+the engine tenant requests run on — not the session `/ops/metrics` itself runs
+on.** That session is the BYPASSRLS auth/system role by design, and probing it
+made this alert fire on every call while `crawmatic_app` was in fact confined.
+`security.rls_inert` now means: the tenant role is a superuser, has
+`BYPASSRLS`, or owns public tables — or the probe of it could not run
+(`observed.unavailable_reason`). `security.privileged_role_misconfigured`
+means the BYPASSRLS session is a superuser or is the tenant role itself.
+`db_role.system_role_status` reports `expected_privileged` when all is well.
+
+The tenant role is a superuser or has `BYPASSRLS`, so every
 `FORCE ROW LEVEL SECURITY` policy in the schema provides **zero** isolation. This
 is audit **C3** and is a release gate, not an incident.
 
-Confirm (read-only):
+Confirm (read-only), connected with the service's `DATABASE_URL`:
 
 ```sql
 SELECT current_user, rolsuper, rolbypassrls
