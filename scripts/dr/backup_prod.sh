@@ -275,21 +275,24 @@ main_dump() {
   WORK=$(mktemp -d /tmp/dr-backup.XXXXXX); chmod 700 "$WORK"
   STAGE="$DR_SETS_DIR/.staging-$RUN_TS"; install -d -m 700 "$STAGE"
 
-  local entry name project service
-  for entry in "${DR_TARGETS[@]}"; do
-    IFS='|' read -r name project service <<<"$entry"
-    dr_log INFO "[$name] loading credentials via Railway bridge (names only)"
-    dr_load_pgenv "$project" "$service"
-    dr_dump_target "$name" "$STAGE" "$WORK"
-    dr_clear_pgenv
-  done
+  # Each target is dumped independently: a failure on one (e.g. its Railway
+  # token lost access) must not cost the other its backup. A set with at least
+  # one good target is still published — a partial backup beats none — but it
+  # names the missing targets in the manifest and the run still exits non-zero
+  # with a DR-ALERT line, so a partial set is never mistaken for a healthy one.
+  dr_dump_all_targets "$STAGE" "$WORK"
+  if (( ${#DR_FAILED_TARGETS[@]} == ${#DR_TARGETS[@]} )); then
+    dr_die "every target failed (${DR_FAILED_TARGETS[*]}) — no backup set written"
+  fi
 
   jq -n --arg id "$set_name" --arg created "$(dr_ts)" \
         --arg host "$(hostname)" --arg tool "scripts/dr/backup_prod.sh --mode dump" \
+        --argjson failed "$(printf '%s\n' "${DR_FAILED_TARGETS[@]}" | jq -R . | jq -s 'map(select(length > 0))')" \
         --slurpfile metas <(cat "$WORK"/*.meta.json) '
      {backup_set: $id, created_utc: $created, host: $host, tool: $tool,
       encryption: "gpg --symmetric --cipher-algo AES256 (key: host-local file, mode 0600)",
       private_network: false,
+      failed_targets: $failed,
       targets: ($metas | map({key: .name, value: .}) | from_entries)}' \
      > "$STAGE/manifest.json"
   chmod 600 "$STAGE/manifest.json"
@@ -322,6 +325,9 @@ main_dump() {
   dr_post_backup_report "$DR_REPORTS_DIR/backup-$set_name.json" || true
 
   dr_prune
+  if (( ${#DR_FAILED_TARGETS[@]} > 0 )); then
+    dr_die "=== backup run $set_name PARTIAL — failed target(s): ${DR_FAILED_TARGETS[*]} ($(dr_human "$(dr_dir_bytes "$DR_SETS_DIR/$set_name")") written for the rest) ==="
+  fi
   dr_log INFO "=== backup run $set_name OK ($(dr_human "$(dr_dir_bytes "$DR_SETS_DIR/$set_name")")) ==="
 }
 
