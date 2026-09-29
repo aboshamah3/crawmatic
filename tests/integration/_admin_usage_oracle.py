@@ -1,74 +1,18 @@
-"""Usage-export aggregation (PLAN §7.2) — all of it in SQL (risk P2).
+"""Frozen ORACLE: the usage-export query exactly as it was before E6 (2026-09-29).
 
-Shape of the answer, per PLAN §5.3: one row per
-`(workspace_id, product_id, cycle_ts)` describing one **product check
-cycle**, with the link counters the SaaS prices from and the
-success flag that decides whether a credit is consumed at all.
-
-Three facts drive the query, all verified against the live schema:
-
-1. `request_attempts` has `match_id`, not `product_id` — product
-   attribution comes from joining `competitor_product_matches`.
-2. A *link* is a match, not an attempt. Retries write several
-   `request_attempts` rows for one `match_id`, so the inner CTE folds
-   attempts per match with `bool_or` and the outer aggregate counts
-   folded rows. Without this a retried link would be billed twice.
-3. `check_successful` is read from `price_observations`, not from
-   attempt success: the Fairness law (PLAN §5.1.4) consumes a credit
-   only for a successful **price observation**.
-4. `request_attempts.origin` (Task 2.3) must be `'scrape'`. The domain-
-   strategy discovery probe ladder also writes `request_attempts` rows
-   now (`origin='discovery'`, with real `match_id`s), and that traffic
-   is internal COGS, not customer activity — it must never inflate a
-   customer's `links_total`/`protected_links_attempted`.
-
-`cycle_ts` is `date_trunc('hour', COALESCE(scrape_jobs.created_at,
-request_attempts.created_at))`. Hour truncation makes the export
-idempotent (re-exporting a window yields byte-identical rows) and is
-collision-free at every cadence the SaaS sells — the fastest is every
-6 hours (PLAN §5.2 `FREQUENCIES`), so two genuine cycles can never
-share a bucket, while retries of one cycle correctly collapse into it.
-
-Partition-awareness (risk P2): the only predicate on the partitioned
-`request_attempts`/`price_observations` is a bounded range on their
-partition keys (`created_at` / `scraped_at`), so Postgres prunes to the
-one or two monthly partitions the window touches. The window is capped
-at 31 days by `validate_window`.
-
-Deviation from the brief's reference implementation: neither of the two
-fallbacks the brief anticipated (`func.count().filter(...)` rejected;
-`.having()` on a tuple comparison compiling badly) actually triggers on
-this repo's SQLAlchemy 2.0.51 — both compile cleanly, so the query shape
-is unchanged from the brief.
-
-This is the most deliberately cross-workspace query in the repo: the
-export aggregates over every workspace in one statement, so the
-`per_link`/`per_check` CTEs' leading `select(...)` calls carry an
-explicit `# noqa: workspace-scope` marker even though the CI guard
-(`scripts/check_workspace_scoping.py`) would not flag them anyway — it
-only matches `select(Model)`, not `select(Model.column, ...)` — so the
-markers exist purely to make the intent explicit to a human reader, not
-to satisfy the guard's AST pattern.
-
-Every value that reaches this query — the window bounds, the cursor
-position, and the protected-method set — is passed as a **bound
-parameter**, never interpolated into SQL text. `.in_()` on the fixed
-`PROTECTED_ACCESS_METHODS` tuple compiles to an expanding bind param
-(`IN (__[POSTCOMPILE_access_method_1])`), which is correct and is what
-we want; the tests that need to see the two method names assert against
-a `literal_binds=True` compilation rather than asking this module to
-inline them. Production SQL is not shaped to make a string assertion
-convenient.
+`app.services.admin_usage.build_usage_query` was rewritten for speed (the
+OR-join on `network_operations` became a UNION ALL of two equi-joins bounded
+on the partition key, and the keyset cursor moved from HAVING into the scan).
+The SaaS importer derives exactly-once identity from this export's rows and
+cursor, so the rewrite must return the SAME rows in the SAME order for the
+SAME cursors. `test_admin_usage_equivalence.py` runs both against one seeded
+database and compares them. Do not "fix" or modernise this file: its whole
+value is that it is the old behaviour, verbatim.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import NamedTuple
+from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
@@ -78,165 +22,29 @@ from sqlalchemy import (
     distinct,
     func,
     literal,
+    or_,
     select,
     tuple_,
-    union_all,
 )
 
-from app_shared.costauth.service import FLEET_PROVIDER_DIRECT
-from app_shared.enums import AccessMethod, RequestOrigin
+from app.services.admin_usage import (
+    DIRECT_PROVIDER,
+    PROTECTED_ACCESS_METHODS,
+    PROXIED_TRANSPORTS,
+    UsageCursor,
+)
+from app_shared.enums import RequestOrigin
 from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJob
-from app_shared.models.network_operations import (
-    NetworkOperation,
-    NetworkOperationAllocation,
-    NetworkTransport,
-)
+from app_shared.models.network_operations import NetworkOperation, NetworkOperationAllocation
 from app_shared.models.observations import PriceObservation, RequestAttempt
-
-MAX_WINDOW_DAYS = 31
-DEFAULT_USAGE_LIMIT = 500
-MAX_USAGE_LIMIT = 1000
-
-#: Access methods that ride the paid residential proxy. Everything else
-#: (DIRECT_HTTP, DIRECT_HTTP_RETRY) is compute-only and near-free.
-PROTECTED_ACCESS_METHODS = (
-    AccessMethod.PROXY_HTTP.value,
-    AccessMethod.PLAYWRIGHT_PROXY.value,
-)
-
-#: `network_operations.transport` values that *can* be paid (Task B3).
-#:
-#: Task C6 (F17) demoted this tuple from a discriminator to a **shape**:
-#: it still separates the HTTP-shaped proxied count from the browser-
-#: shaped one, but it no longer decides whether an operation was paid at
-#: all. `BROWSER` was the bug — a browser navigation made straight from
-#: the fleet's own egress IP costs no proxy money, and counting it as
-#: `proxied_browser_attempted` billed a customer for a free fetch.
-PROXIED_TRANSPORTS = (
-    NetworkTransport.PROXY.value,
-    NetworkTransport.BROWSER.value,
-)
-
-#: E6 (2026-09-29): how far a ledger operation's `created_at` may sit from
-#: the export window and still be joined to an attempt inside it. The join
-#: used to have NO bound on `network_operations`' partition key, so every
-#: attempt probed every monthly partition. An operation is opened when its
-#: fetch starts and its attempt row carries the fetch's own `scraped_at`,
-#: so the two are minutes apart; a browser page's subresources follow
-#: their parent by seconds. Two days also covers a durable-buffer replay
-#: after an outage while still pruning to at most two monthly partitions.
-#: The equivalence suite (`tests/integration/test_admin_usage_equivalence.py`)
-#: pins that the bound changes no exported value.
-OPERATION_JOIN_GRACE = timedelta(days=2)
-
-#: `network_operations.provider` for fleet egress. Anything else is a
-#: provider identity — `"proxy"`/`"browser"` for a fleet-class scope, or
-#: the concrete `proxy_providers.id` the spider resolved.
-DIRECT_PROVIDER = FLEET_PROVIDER_DIRECT
-
-
-class InvalidUsageCursor(ValueError):
-    """The `cursor` query parameter was not a token we issued."""
-
-
-class UsageWindowTooLarge(ValueError):
-    """`until - since` exceeded `MAX_WINDOW_DAYS`."""
-
-
-class InvalidUsageWindow(ValueError):
-    """`since`/`until` are inverted or equal (`until <= since`).
-
-    Distinct from `UsageWindowTooLarge` (review finding I6b): an
-    inverted window is malformed, not "too large" -- conflating the two
-    made the router return the misleading `422 WINDOW_TOO_LARGE` for a
-    caller that simply swapped its query params.
-    """
-
-
-class UsageCursor(NamedTuple):
-    """Keyset position in the aggregate's natural sort order."""
-
-    cycle_ts: datetime
-    workspace_id: uuid.UUID
-    product_id: uuid.UUID
-
-
-def clamp_usage_limit(requested: int | None) -> int:
-    if requested is None:
-        return DEFAULT_USAGE_LIMIT
-    return max(1, min(int(requested), MAX_USAGE_LIMIT))
-
-
-def validate_window(since: datetime, until: datetime) -> None:
-    """Reject an inverted or over-long window (PLAN §7.2, risk P2).
-
-    Raises `InvalidUsageWindow` for `until <= since` (malformed) and
-    `UsageWindowTooLarge` for `until - since > MAX_WINDOW_DAYS` (the
-    real over-long case) -- two distinct exceptions so the router can
-    map them to two distinct, honest error codes (review finding I6b).
-    """
-    if until <= since:
-        raise InvalidUsageWindow("`until` must be after `since`.")
-    if until - since > timedelta(days=MAX_WINDOW_DAYS):
-        raise UsageWindowTooLarge(
-            f"The usage window may not exceed {MAX_WINDOW_DAYS} days."
-        )
-
-
-def normalize_window(since: datetime, until: datetime) -> tuple[datetime, datetime]:
-    """Treat a naive `since`/`until` as UTC (review finding I6c).
-
-    A naive `datetime` reaches Postgres as a bare `timestamp` and is
-    interpreted in the session TimeZone, silently shifting the window.
-    Every other timestamp boundary in this API is UTC; an absent
-    `tzinfo` here is treated the same way rather than trusting the
-    session's ambient TimeZone. Datetimes that already carry a tzinfo
-    are returned unchanged (same object, not a copy).
-    """
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
-    if until.tzinfo is None:
-        until = until.replace(tzinfo=timezone.utc)
-    return since, until
-
-
-def encode_usage_cursor(cursor: UsageCursor) -> str:
-    payload = json.dumps(
-        {
-            "c": cursor.cycle_ts.isoformat(),
-            "w": str(cursor.workspace_id),
-            "p": str(cursor.product_id),
-        },
-        separators=(",", ":"),
-    ).encode()
-    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
-
-
-def decode_usage_cursor(token: str) -> UsageCursor:
-    try:
-        padded = token + "=" * (-len(token) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode()))
-        return UsageCursor(
-            cycle_ts=datetime.fromisoformat(payload["c"]),
-            workspace_id=uuid.UUID(payload["w"]),
-            product_id=uuid.UUID(payload["p"]),
-        )
-    except (
-        KeyError,
-        TypeError,
-        ValueError,
-        binascii.Error,
-        UnicodeDecodeError,
-    ) as exc:
-        raise InvalidUsageCursor("Malformed cursor.") from exc
 
 
 def _cycle_ts_expr(attempt_created_at, job_created_at):
     return func.date_trunc("hour", func.coalesce(job_created_at, attempt_created_at))
 
 
-def build_usage_query(
+def build_usage_query_oracle(
     *,
     since: datetime,
     until: datetime,
@@ -363,29 +171,6 @@ def build_usage_query(
             # silently inflating a customer's `links_total`/
             # `protected_links_attempted`.
             RequestAttempt.origin == RequestOrigin.SCRAPE,
-            # E6: the keyset cursor, applied to the SCAN rather than as a
-            # HAVING after the whole window has been aggregated. Every
-            # output group is keyed on exactly (cycle_ts, workspace_id,
-            # product_id), so a group lies wholly after the cursor or not
-            # at all -- filtering its rows first returns the same groups,
-            # and the same row-level facts for them, as filtering the
-            # groups afterwards. Page N no longer costs N full aggregations.
-            *(
-                ()
-                if after is None
-                else (
-                    tuple_(
-                        attempt_cycle_ts,
-                        RequestAttempt.workspace_id,
-                        CompetitorProductMatch.product_id,
-                    )
-                    > tuple_(
-                        literal(after.cycle_ts),
-                        literal(after.workspace_id),
-                        literal(after.product_id),
-                    ),
-                )
-            ),
         )
         .cte("attempt_scan")
     )
@@ -427,67 +212,18 @@ def build_usage_query(
     #
     # `provider <> 'direct' AND proxy_provider_id IS NOT NULL` is the paid
     # predicate (F17). Transport no longer decides it.
-    #
-    # E6 (2026-09-29): that two-way join used to be ONE join on
-    # `network_request_id = X OR parent_operation_id = X`. An OR across two
-    # columns cannot use an index or a hash, so Postgres nested-looped every
-    # attempt against the whole unbounded ledger: a busy hour took 28.9 s
-    # in production. It is now a UNION ALL of two equi-joins, each bounded
-    # on the ledger's partition key. The two branches never produce the
-    # same (attempt, operation) pair -- an operation is never its own
-    # parent, and the `IS DISTINCT FROM` guard makes that explicit -- so
-    # the union is the same multiset of pairs the OR produced, and every
-    # aggregate below sees identical input.
-    op_bound = and_(
-        NetworkOperation.created_at >= since - OPERATION_JOIN_GRACE,
-        NetworkOperation.created_at < until + OPERATION_JOIN_GRACE,
-    )
-
-    def _op_branch(match_clause):  # noqa: ANN001, ANN202 - local builder
-        return (
-            select(  # noqa: workspace-scope
-                attempt_scan.c.workspace_id.label("workspace_id"),
-                attempt_scan.c.product_id.label("product_id"),
-                attempt_scan.c.cycle_ts.label("cycle_ts"),
-                attempt_scan.c.proxy_provider_id.label("proxy_provider_id"),
-                NetworkOperation.network_request_id.label("network_request_id"),
-                NetworkOperation.transport.label("transport"),
-                NetworkOperation.bytes_compressed.label("bytes_compressed"),
-                NetworkOperation.provider.label("provider"),
-            )
-            .select_from(attempt_scan)
-            .join(NetworkOperation, and_(match_clause, op_bound))
-        )
-
-    op_links = union_all(
-        _op_branch(
-            NetworkOperation.network_request_id == attempt_scan.c.network_operation_id
-        ),
-        _op_branch(
-            and_(
-                NetworkOperation.parent_operation_id
-                == attempt_scan.c.network_operation_id,
-                NetworkOperation.network_request_id.is_distinct_from(
-                    attempt_scan.c.network_operation_id
-                ),
-            )
-        ),
-    ).cte("op_links")
-
-    # `provider <> 'direct' AND proxy_provider_id IS NOT NULL` is the paid
-    # predicate (F17). Transport no longer decides it.
     is_proxied = and_(
-        op_links.c.provider != DIRECT_PROVIDER,
-        op_links.c.proxy_provider_id.is_not(None),
+        NetworkOperation.provider != DIRECT_PROVIDER,
+        attempt_scan.c.proxy_provider_id.is_not(None),
     )
     per_op = (
         select(  # noqa: workspace-scope
-            op_links.c.workspace_id.label("workspace_id"),
-            op_links.c.product_id.label("product_id"),
-            op_links.c.cycle_ts.label("cycle_ts"),
-            op_links.c.network_request_id.label("network_request_id"),
-            op_links.c.transport.label("transport"),
-            op_links.c.bytes_compressed.label("bytes_compressed"),
+            attempt_scan.c.workspace_id.label("workspace_id"),
+            attempt_scan.c.product_id.label("product_id"),
+            attempt_scan.c.cycle_ts.label("cycle_ts"),
+            NetworkOperation.network_request_id.label("network_request_id"),
+            NetworkOperation.transport.label("transport"),
+            NetworkOperation.bytes_compressed.label("bytes_compressed"),
             func.bool_or(is_proxied).label("proxied"),
             # The workspace's OWN share of this physical operation. At
             # most one allocation row exists per (operation, workspace)
@@ -497,23 +233,32 @@ def build_usage_query(
                 NetworkOperationAllocation.allocated_cost_micro_units
             ).label("allocated_cost_micro_units"),
         )
-        .select_from(op_links)
+        .select_from(attempt_scan)
+        .join(
+            NetworkOperation,
+            or_(
+                NetworkOperation.network_request_id
+                == attempt_scan.c.network_operation_id,
+                NetworkOperation.parent_operation_id
+                == attempt_scan.c.network_operation_id,
+            ),
+        )
         .outerjoin(
             NetworkOperationAllocation,
             and_(
                 NetworkOperationAllocation.operation_id
-                == op_links.c.network_request_id,
+                == NetworkOperation.network_request_id,
                 NetworkOperationAllocation.workspace_id
-                == op_links.c.workspace_id,
+                == attempt_scan.c.workspace_id,
             ),
         )
         .group_by(
-            op_links.c.workspace_id,
-            op_links.c.product_id,
-            op_links.c.cycle_ts,
-            op_links.c.network_request_id,
-            op_links.c.transport,
-            op_links.c.bytes_compressed,
+            attempt_scan.c.workspace_id,
+            attempt_scan.c.product_id,
+            attempt_scan.c.cycle_ts,
+            NetworkOperation.network_request_id,
+            NetworkOperation.transport,
+            NetworkOperation.bytes_compressed,
         )
         .cte("per_op")
     )
@@ -643,8 +388,18 @@ def build_usage_query(
         .group_by(per_link.c.workspace_id, per_link.c.product_id, per_link.c.cycle_ts)
     )
 
-    # E6: the keyset cursor is applied inside `attempt_scan` (see there);
-    # every output group is built only from rows already past it.
+    if after is not None:
+        stmt = stmt.having(
+            tuple_(
+                per_link.c.cycle_ts, per_link.c.workspace_id, per_link.c.product_id
+            )
+            > tuple_(
+                literal(after.cycle_ts),
+                literal(after.workspace_id),
+                literal(after.product_id),
+            )
+        )
+
     return stmt.order_by(
         per_link.c.cycle_ts, per_link.c.workspace_id, per_link.c.product_id
     ).limit(limit + 1)
