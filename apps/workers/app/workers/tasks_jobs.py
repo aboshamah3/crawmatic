@@ -267,10 +267,10 @@ def _node_placement(
     """The pass-scoped placement decision-maker for one dispatch pass (B6/F11).
 
     All the policy lives in :class:`~app_shared.jobs.node_load.NodePlacement`;
-    what this adds is the **lazy** probe client. A single-node pool never
-    reads a load at all (`NodePlacement`'s rule 2), so on today's
-    deployments the `ScrapydDispatchClient` below — and the Redis
-    connection it opens — is never constructed. `recover_stalled_batches`
+    what this adds is the **lazy** probe client, built on the first pool
+    that needs a load read. Since 2026-09-29 (E3.1) that is every pool,
+    single-node ones included, so `SCRAPYD_MAX_PENDING_PER_NODE` caps the
+    browser node's queue too. `recover_stalled_batches`
     passes its own long-lived prober in, so the sweep keeps one
     `daemonstatus.json` cache across every job it touches.
     """

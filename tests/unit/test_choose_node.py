@@ -203,20 +203,53 @@ def test_a_new_batch_with_no_intent_row_does_choose() -> None:
     assert chosen in _NODES
 
 
-def test_a_single_node_pool_short_circuits_to_select_node() -> None:
-    """`select_node` is kept for exactly this case — and probes nothing."""
+def test_a_single_node_pool_is_capped_like_any_other() -> None:
+    """2026-09-29 (plan E3.1). This used to pin the opposite: a single-node
+    pool short-circuited to `select_node` and was never probed, so
+    `SCRAPYD_MAX_PENDING_PER_NODE` did not apply to it -- and the browser
+    node, the only member of its pool, queued 2,725 batches behind one
+    wedged process. One node is still a pool with a capacity."""
     single = ["http://scrapers-browser-1:6800"]
-    placement = _placement(reader=_never_probed)
+    probed: list[list[str]] = []
+
+    def reader(nodes):
+        probed.append(list(nodes))
+        return {single[0]: NodeLoad(running=1, pending=_MAX_PENDING)}
+
+    placement = _placement(reader=reader)
+    assert (
+        placement.place(
+            domain="amazon.sa", nodes=single, intents=_RecordingIntents(None), identity=object()
+        )
+        is None
+    )
+    assert placement.deferred == 1
+    assert probed == [single]
+
+
+def test_a_single_node_pool_with_room_is_placed_on_its_node() -> None:
+    single = ["http://scrapers-browser-1:6800"]
+    placement = _placement(reader=lambda nodes: {single[0]: NodeLoad(running=1, pending=0)})
 
     assert (
         placement.place(
-            domain="amazon.sa",
-            nodes=single,
-            intents=_RecordingIntents(None),
-            identity=object(),
+            domain="amazon.sa", nodes=single, intents=_RecordingIntents(None), identity=object()
         )
         == single[0]
     )
+
+
+@pytest.mark.parametrize("recovery", [True, False])
+def test_a_silent_single_node_is_still_placed_on(recovery: bool) -> None:
+    """Only a node that ANSWERS "full" defers; with no alternative node,
+    silence is left to the POST to confirm (and its failure path)."""
+    single = ["http://scrapers-browser-1:6800"]
+    placement = NodePlacement(
+        max_pending=_MAX_PENDING,
+        load_reader=lambda nodes: {single[0]: UNREACHABLE},
+        unreachable_pool_fallback=recovery,
+    )
+    assert placement.place(domain="amazon.sa", nodes=single) == single[0]
 
 
 def test_a_saturated_pool_defers_the_batch_in_the_dispatch_path() -> None:
