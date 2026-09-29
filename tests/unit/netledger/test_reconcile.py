@@ -699,3 +699,65 @@ class TestProviderIdentityAndDailyTotals:
 
         assert report.passed is True, report.unexplained_operations
         assert len(report.settlements_written) == 5
+
+
+class TestWindowsAwaitingSettlement:
+    """2026-09-29 (plan E7.2): the cadence reconciled only YESTERDAY's
+    imports, so a window imported late (or whose ledger rows arrived late,
+    or that failed once) was never looked at again."""
+
+    def test_unsettled_windows_across_the_lookback_are_returned_settled_ones_not(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        from app_shared.netledger.reconcile import windows_awaiting_settlement
+
+        provider = f"dataimpulse-lookback-{uuid.uuid4().hex[:6]}"
+        day_old = datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+        day_new = datetime(2026, 7, 14, 0, 0, tzinfo=timezone.utc)
+        with session_scope() as session:
+            session.add(
+                _make_operation(
+                    provider=provider, domain="lb.example", bytes_compressed=1_000,
+                    closed_at=day_new + timedelta(hours=2), cost_micro_units=3,
+                )
+            )
+            session.commit()
+        settled = import_provider_usage(
+            _provider_source(provider=provider, host="lb.example", window_start=day_new,
+                             window_end=day_new + timedelta(days=1), row_bytes=[1_000]),
+            session_scope=session_scope,
+        )
+        assert reconcile_window(settled, session_scope=session_scope).settlements_written
+        unsettled = import_provider_usage(
+            _provider_source(provider=provider, host="nobody.example", window_start=day_old,
+                             window_end=day_old + timedelta(days=1), row_bytes=[5]),
+            session_scope=session_scope,
+        )
+        with session_scope() as session:
+            found = windows_awaiting_settlement(
+                session, since_date=day_old.date(), until_date=day_new.date(), provider=provider
+            )
+            outside = windows_awaiting_settlement(
+                session, since_date=day_new.date(), until_date=day_new.date(), provider=provider
+            )
+        assert [w.id for w in found] == [unsettled.id]
+        assert outside == []
+
+    def test_paid_operations_are_counted_by_day_for_the_import_missing_signal(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        from app_shared.netledger.reconcile import count_paid_operations
+
+        day = datetime(2026, 7, 20, 0, 0, tzinfo=timezone.utc)
+        with session_scope() as session:
+            before = count_paid_operations(session, since=day, until=day + timedelta(days=1))
+            for provider in ("0e80a9c2-969f-4e19-9bb4-fa3216856936", "direct", "browser"):
+                session.add(
+                    _make_operation(
+                        provider=provider, domain="p.example", bytes_compressed=1,
+                        closed_at=day + timedelta(hours=1), cost_micro_units=1,
+                    )
+                )
+            session.commit()
+            after = count_paid_operations(session, since=day, until=day + timedelta(days=1))
+        assert after - before == 1

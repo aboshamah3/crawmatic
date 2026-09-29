@@ -397,6 +397,9 @@ class Settings(BaseSettings):
     # offerable, counted from its first refusal, before it is FAILED with
     # the denial's code. Permanent denials (domain state) fail at once.
     SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS: int = 1800
+    # 2026-09-29 (E7): how far back the daily provider-usage reconciliation
+    # looks for imported windows that still have no settlement.
+    PROVIDER_RECONCILE_LOOKBACK_DAYS: int = 7
     # Hard ceiling on a single job's wall-clock runtime. Past it, every
     # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
     # `finalize_jobs` can close the job. 12h is far beyond any legitimate

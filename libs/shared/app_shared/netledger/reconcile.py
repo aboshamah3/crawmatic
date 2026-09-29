@@ -971,6 +971,90 @@ def windows_pending_reconciliation(
     inventing one. Adding a durable window-cost table is a documented
     follow-up, not built here.
     """
+    return _windows_where(
+        session, func.date(ProviderUsageRecord.window_start) == target_date, provider
+    )
+
+
+def windows_awaiting_settlement(
+    session: Session,
+    *,
+    since_date: date,
+    until_date: date,
+    provider: str | None = None,
+) -> list[ProviderUsageWindow]:
+    """Every imported window starting in ``[since_date, until_date]`` (UTC)
+    that no settlement has been written from yet.
+
+    2026-09-29 (plan E7.2). The cadence used to reconcile only yesterday's
+    imports, so a window imported a day late -- or whose ledger rows
+    arrived late, or that failed once -- was never examined again. A
+    settlement names its evidence in ``provider_usage_record_id``: one
+    record id (EXACT) or ``window:<window_id>`` (PRO_RATA_BYTES); a window
+    none of whose evidence is named anywhere is still owed a pass.
+    Re-running a window is idempotent (``_settlements_for_matched_groups``
+    skips a fact already recorded).
+    """
+    from sqlalchemy import String, and_, cast, exists, literal, or_
+
+    record = ProviderUsageRecord.__table__.alias("evidence")
+    settled = exists().where(
+        or_(
+            NetworkOperationSettlement.provider_usage_record_id
+            == literal("window:") + cast(ProviderUsageRecord.window_id, String),
+            NetworkOperationSettlement.provider_usage_record_id.in_(
+                select(cast(record.c.id, String))
+                .where(record.c.window_id == ProviderUsageRecord.window_id)
+                # Two levels deep: SQLAlchemy does not auto-correlate this
+                # far, and an uncorrelated `provider_usage_records` here
+                # would make ANY settlement count for EVERY window.
+                .correlate(ProviderUsageRecord)
+            ),
+        )
+    )
+    return _windows_where(
+        session,
+        and_(
+            func.date(ProviderUsageRecord.window_start) >= since_date,
+            func.date(ProviderUsageRecord.window_start) <= until_date,
+            ~settled,
+        ),
+        provider,
+    )
+
+
+#: Ledger ``provider`` values that are fleet egress, not a paid vendor
+#: (``app_shared.costauth.service.FLEET_PROVIDER_DIRECT``/``_BROWSER``;
+#: spelled here because costauth depends on this package, not vice versa).
+_UNPAID_LEDGER_PROVIDERS = ("direct", "browser")
+
+
+def count_paid_operations(session: Session, *, since: datetime, until: datetime) -> int:
+    """Closed operations in ``[since, until)`` that went through a paid provider.
+
+    2026-09-29 (plan E7.4): the "import missing" signal. Zero provider
+    windows is not an error by itself; zero windows WHILE the fleet paid a
+    provider for operations is exactly the state production sat in with
+    an empty ``provider_usage_records`` table and a permanent
+    ``reconciliation_missing`` CRITICAL that said nothing about why.
+    """
+    return int(
+        session.execute(
+            select(func.count())  # noqa: workspace-scope
+            .select_from(NetworkOperation)
+            .where(
+                NetworkOperation.closed_at.is_not(None),
+                NetworkOperation.closed_at >= since,
+                NetworkOperation.closed_at < until,
+                NetworkOperation.provider.not_in(_UNPAID_LEDGER_PROVIDERS),
+            )
+        ).scalar_one()
+    )
+
+
+def _windows_where(
+    session: Session, predicate: Any, provider: str | None
+) -> list[ProviderUsageWindow]:
     query = select(
         ProviderUsageRecord.window_id,
         ProviderUsageRecord.provider,
@@ -979,7 +1063,7 @@ def windows_pending_reconciliation(
         ProviderUsageRecord.window_end,
         ProviderUsageRecord.source_hash,
         ProviderUsageRecord.source_ref,
-    ).where(func.date(ProviderUsageRecord.window_start) == target_date)
+    ).where(predicate)
     if provider is not None:
         query = query.where(ProviderUsageRecord.provider == provider)
     distinct_rows = session.execute(query.distinct()).all()
