@@ -380,6 +380,12 @@ class Settings(BaseSettings):
     # that + a 300s grace is provably unowned: nothing can be racing the
     # revert, because the claimant's own lock has already expired.
     SCRAPE_STARTED_REAP_AFTER_SECONDS: int = 2100
+    # 2026-09-29 (E2.1): a STARTED target whose Scrapyd run the node reports
+    # finished (or no longer lists) is reverted on the next reaper tick
+    # instead of after the 2100 s horizon above. Claims younger than this
+    # are left out of that decision entirely (a guard against acting on a
+    # row written moments ago, not a wait for the run).
+    SCRAPE_ENDED_RUN_REAP_MIN_AGE_SECONDS: int = 120
     # Hard ceiling on a single job's wall-clock runtime. Past it, every
     # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
     # `finalize_jobs` can close the job. 12h is far beyond any legitimate

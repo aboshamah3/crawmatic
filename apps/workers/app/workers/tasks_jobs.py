@@ -71,6 +71,7 @@ from app_shared.jobs.dispatch_intents import (
 )
 from app_shared.jobs.reaper import (
     fail_targets_past_job_deadline,
+    revert_started_targets_of_ended_runs,
     revert_stale_started_targets,
 )
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
@@ -99,6 +100,7 @@ from app_shared.scrapyd import (
     ScrapydDispatchClient,
     build_dispatch_identity,
 )
+from app_shared.scrapyd.errors import ScrapydDispatchError
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     DISPATCH_RECONCILE_INTENTS,
@@ -2242,7 +2244,37 @@ def reap_stale_targets() -> None:
     settings = get_settings()
     now = datetime.now(timezone.utc)
 
+    # 2026-09-29 (E2.1): one `listjobs.json` per (node, project) per tick,
+    # and an unreachable node is `None` -- "no answer", which the ended-run
+    # pass treats as no verdict (its rows stay with the age-based pass).
+    lister = ScrapydDispatchClient(settings=settings)
+    listings: dict[tuple[str, str | None], dict[str, str] | None] = {}
+
+    def run_states(node_url: str, project: str | None) -> dict[str, str] | None:
+        key = (node_url, project)
+        if key not in listings:
+            try:
+                listings[key] = lister.list_job_states(node_url, project)
+            except ScrapydDispatchError as exc:
+                logger.warning(
+                    "maintenance_reap_stale_targets: listjobs unavailable node=%s "
+                    "project=%s (%s); leaving its STARTED targets to the age-based pass",
+                    node_url,
+                    project,
+                    exc,
+                )
+                listings[key] = None
+        return listings[key]
+
     with get_system_session() as session:
+        # First: runs the node says are over. Their targets are unowned now,
+        # not in 35 minutes (the watchdog-killed browser batch shape).
+        ended_reverted = revert_started_targets_of_ended_runs(
+            session,
+            now=now,
+            run_states=run_states,
+            min_started_age_seconds=settings.SCRAPE_ENDED_RUN_REAP_MIN_AGE_SECONDS,
+        )
         reverted = revert_stale_started_targets(
             session,
             now=now,
@@ -2256,7 +2288,8 @@ def reap_stale_targets() -> None:
         session.commit()
 
     logger.info(
-        "maintenance_reap_stale_targets reverted=%d deadline_failed=%d",
+        "maintenance_reap_stale_targets ended_run_reverted=%d reverted=%d deadline_failed=%d",
+        ended_reverted,
         reverted,
         deadline_failed,
     )
