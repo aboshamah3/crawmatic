@@ -461,3 +461,96 @@ def test_a_browser_claim_restarts_the_started_clock(session: Session) -> None:
     assert revert_stale_started_targets(
         session, now=real_now, older_than_seconds=REAP_AFTER
     ) == 0
+
+
+# --- terminal jobs hold no open targets (2026-09-29, plan E5) ----------
+
+
+@pytest.mark.parametrize(
+    "job_status",
+    [
+        ScrapeJobStatus.FAILED,
+        ScrapeJobStatus.PARTIAL_FAILED,
+        ScrapeJobStatus.COMPLETED,
+        ScrapeJobStatus.CANCELLED,
+    ],
+)
+def test_open_targets_of_a_terminal_job_are_closed(
+    session: Session, job_status: ScrapeJobStatus
+) -> None:
+    """Production had 16 DEFERRED targets under FAILED/PARTIAL_FAILED jobs
+    (07-10, 07-11, 08-03 -- the pre-e780782 last-writer-wins era). Re-
+    dispatch scans only non-terminal jobs, so nothing would ever touch them
+    again; they read as work in flight forever."""
+    from app_shared.jobs.reaper import close_open_targets_of_terminal_jobs
+
+    job = _make_job(session, started_seconds_ago=80 * 86_400, status=job_status)
+    deferred = _make_target(session, job, status=ScrapeTargetStatus.DEFERRED)
+    pending = _make_target(session, job, status=ScrapeTargetStatus.PENDING)
+    started = _make_target(
+        session, job, status=ScrapeTargetStatus.STARTED, started_seconds_ago=60
+    )
+    done = _make_target(session, job, status=ScrapeTargetStatus.COMPLETED)
+
+    assert close_open_targets_of_terminal_jobs(session, now=NOW) == 3
+
+    for target in (deferred, pending, started):
+        session.refresh(target)
+        assert target.status is ScrapeTargetStatus.FAILED
+        assert target.error_code is ScrapeErrorCode.JOB_ALREADY_TERMINAL
+        assert target.completed_at is not None
+    session.refresh(done)
+    assert done.status is ScrapeTargetStatus.COMPLETED
+    assert done.error_code is None
+    # Idempotent: the second run matches nothing.
+    assert close_open_targets_of_terminal_jobs(session, now=NOW) == 0
+
+
+def test_open_targets_of_a_live_job_are_untouched(session: Session) -> None:
+    from app_shared.jobs.reaper import close_open_targets_of_terminal_jobs
+
+    for status in (ScrapeJobStatus.RUNNING, ScrapeJobStatus.PENDING):
+        job = _make_job(session, started_seconds_ago=600, status=status)
+        target = _make_target(session, job, status=ScrapeTargetStatus.DEFERRED)
+        assert close_open_targets_of_terminal_jobs(session, now=NOW) == 0
+        session.refresh(target)
+        assert target.status is ScrapeTargetStatus.DEFERRED
+
+
+def test_the_invariant_holds_after_every_reaper_pass(session: Session) -> None:
+    """The invariant itself: after the reaper's passes, no terminal job
+    has a non-terminal target."""
+    from sqlalchemy import select
+
+    from app_shared.jobs.reaper import close_open_targets_of_terminal_jobs
+
+    live = _make_job(session, started_seconds_ago=600)
+    dead = _make_job(session, started_seconds_ago=600, status=ScrapeJobStatus.FAILED)
+    for job in (live, dead):
+        for status in (ScrapeTargetStatus.PENDING, ScrapeTargetStatus.DEFERRED):
+            _make_target(session, job, status=status)
+
+    close_open_targets_of_terminal_jobs(session, now=NOW)
+
+    violators = session.execute(
+        select(ScrapeJobTarget.id)
+        .join(ScrapeJob, ScrapeJob.id == ScrapeJobTarget.scrape_job_id)
+        .where(
+            ScrapeJob.status.in_(
+                [
+                    ScrapeJobStatus.COMPLETED,
+                    ScrapeJobStatus.FAILED,
+                    ScrapeJobStatus.PARTIAL_FAILED,
+                    ScrapeJobStatus.CANCELLED,
+                ]
+            ),
+            ScrapeJobTarget.status.in_(
+                [
+                    ScrapeTargetStatus.PENDING,
+                    ScrapeTargetStatus.STARTED,
+                    ScrapeTargetStatus.DEFERRED,
+                ]
+            ),
+        )
+    ).all()
+    assert violators == []

@@ -75,6 +75,7 @@ from app_shared.jobs.dispatch_intents import (
 )
 from app_shared.jobs.run_purge import purge_live_runs
 from app_shared.jobs.reaper import (
+    close_open_targets_of_terminal_jobs,
     fail_targets_past_job_deadline,
     revert_started_targets_of_ended_runs,
     revert_stale_started_targets,
@@ -2548,11 +2549,19 @@ def reap_stale_targets() -> None:
             now=now,
             max_runtime_seconds=settings.SCRAPE_JOB_MAX_RUNTIME_SECONDS,
         )
+        # E5 (2026-09-29): the invariant "a terminal job holds no open
+        # target". Nothing re-dispatches a terminal job, so an open target
+        # under one never moves again; its first run after deploy also
+        # repairs the 16 historical violators (not a migration: see the
+        # function's docstring on FORCE RLS).
+        terminal_closed = close_open_targets_of_terminal_jobs(session, now=now)
         session.commit()
 
     logger.info(
-        "maintenance_reap_stale_targets ended_run_reverted=%d reverted=%d deadline_failed=%d",
+        "maintenance_reap_stale_targets ended_run_reverted=%d reverted=%d "
+        "deadline_failed=%d terminal_job_targets_closed=%d",
         ended_reverted,
         reverted,
         deadline_failed,
+        terminal_closed,
     )

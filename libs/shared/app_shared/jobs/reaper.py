@@ -52,6 +52,7 @@ from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 
 __all__ = [
     "RunStateLookup",
+    "close_open_targets_of_terminal_jobs",
     "fail_targets_past_job_deadline",
     "revert_started_targets_of_ended_runs",
     "revert_stale_started_targets",
@@ -119,6 +120,59 @@ def revert_stale_started_targets(
             dispatched_at=None,
             dispatch_intent_id=None,
             locked_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount or 0)
+
+
+#: Terminal JOB statuses. A job in one of these is never re-dispatched
+#: (``redispatch_pending_jobs`` and ``dispatch_job`` scan non-terminal jobs
+#: only), so a non-terminal target under it can never move again.
+_TERMINAL_JOB_STATUSES = (
+    ScrapeJobStatus.COMPLETED,
+    ScrapeJobStatus.PARTIAL_FAILED,
+    ScrapeJobStatus.FAILED,
+    ScrapeJobStatus.CANCELLED,
+)
+
+
+def close_open_targets_of_terminal_jobs(session: Session, *, now: datetime) -> int:
+    """Fail every non-terminal target whose JOB is already terminal.
+
+    2026-09-29 (plan E5). The invariant "a terminal job holds no open
+    target" was broken in production by 16 DEFERRED rows under FAILED /
+    PARTIAL_FAILED jobs from 07-10, 07-11 and 08-03 -- the era before
+    ``mark_target`` refused to resurrect a finished target (e780782). No
+    sweep scans terminal jobs, so those rows count as in flight forever
+    (and feed every "oldest DEFERRED" gauge).
+
+    Deliberately NOT a migration: the table carries FORCE ROW LEVEL
+    SECURITY and migrations run as the NOBYPASSRLS ``crawmatic_migrate``
+    role with no ``app.workspace_id``, so a migration-time UPDATE matches
+    zero rows and reports success (see ``b6e5d1c94a72``'s docstring). This
+    runs on the BYPASSRLS system session with the other reaper passes, so
+    its first tick after deploy repairs the history and every later tick
+    keeps the invariant. Unbounded in time on purpose (the violators are
+    months old); cheap because non-terminal targets are few.
+
+    :returns: the number of targets closed.
+    """
+    terminal_jobs = (
+        select(ScrapeJob.id)  # noqa: workspace-scope
+        .where(ScrapeJob.status.in_(_TERMINAL_JOB_STATUSES))
+        .scalar_subquery()
+    )
+    result = session.execute(
+        update(ScrapeJobTarget)  # noqa: workspace-scope
+        .where(
+            ScrapeJobTarget.status.in_(_NON_TERMINAL_TARGET_STATUSES),
+            ScrapeJobTarget.scrape_job_id.in_(terminal_jobs),
+        )
+        .values(
+            status=ScrapeTargetStatus.FAILED,
+            error_code=ScrapeErrorCode.JOB_ALREADY_TERMINAL,
+            completed_at=now,
         )
         .execution_options(synchronize_session=False)
     )

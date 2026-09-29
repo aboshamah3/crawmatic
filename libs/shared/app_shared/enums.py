@@ -530,6 +530,14 @@ class ScrapeErrorCode(StrEnum):
     #: sat PENDING until the job deadline. Written with status SKIPPED: a
     #: catalog change, not a scraper failure.
     TARGET_UNRESOLVED = "TARGET_UNRESOLVED"
+    #: 2026-09-29 (plan E5). The target was still non-terminal although its
+    #: JOB was already terminal -- an impossible state that the pre-08-03
+    #: last-writer-wins ``mark_target`` could produce (a late DEFERRED
+    #: resurrecting a finished target). Nothing re-dispatches a terminal
+    #: job, so such a row read as "in flight" forever;
+    #: ``app_shared.jobs.reaper.close_open_targets_of_terminal_jobs`` closes
+    #: it. Asserts only that the job closed around it: no fetch outcome.
+    JOB_ALREADY_TERMINAL = "JOB_ALREADY_TERMINAL"
 
 
 class ScrapeScope(StrEnum):

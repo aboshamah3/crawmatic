@@ -72,6 +72,8 @@ def _install(*, reap_after=2100, max_runtime=43200):
     tasks_jobs.revert_stale_started_targets = revert
     tasks_jobs.fail_targets_past_job_deadline = fail
     tasks_jobs.revert_started_targets_of_ended_runs = ended
+    closed = MagicMock(name="close_open_targets_of_terminal_jobs", return_value=0)
+    tasks_jobs.close_open_targets_of_terminal_jobs = closed
     return session, revert, fail
 """
 
@@ -221,6 +223,31 @@ assert lookups["min_age"] == 120
 assert lookups["a1"] == {"j1": "finished"} and lookups["a2"] == lookups["a1"]
 assert lookups["dead"] is None
 assert calls == [("http://b:6800", "price_monitor_browser"), ("http://dead:6800", "price_monitor")], calls
+assert session.commit.call_count == 1
+print("OK")
+"""
+        )
+    )
+
+
+def test_the_terminal_job_invariant_pass_runs_last_with_the_same_now() -> None:
+    """2026-09-29 (E5): after the deadline pass (which makes a job's
+    targets terminal so finalize can close it), the invariant pass closes
+    any open target a TERMINAL job still holds -- same `now`, same commit."""
+    _assert_ok(
+        _run(
+            """
+session, revert, fail = _install()
+order = []
+fail.side_effect = lambda *a, **k: order.append("deadline") or 0
+closed = tasks_jobs.close_open_targets_of_terminal_jobs
+closed.side_effect = lambda *a, **k: order.append("terminal") or 16
+
+tasks_jobs.reap_stale_targets()
+
+assert order == ["deadline", "terminal"], order
+assert closed.call_args.args == (session,)
+assert closed.call_args.kwargs["now"] == fail.call_args.kwargs["now"]
 assert session.commit.call_count == 1
 print("OK")
 """
