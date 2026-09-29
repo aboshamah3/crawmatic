@@ -501,6 +501,35 @@ class ScrapeErrorCode(StrEnum):
     #: domain, the strategy or the URL.
     #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
     TARGET_DEADLINE_EXCEEDED = "TARGET_DEADLINE_EXCEEDED"
+    #: 2026-09-29 (plan E4). The dispatcher asked the cost-authorization
+    #: gate (``app_shared.costauth``) for this target's batch and was
+    #: refused -- one code per ``DenialReason``, spelled identically, so the
+    #: target says exactly WHY it was never fetched. A PERMANENT denial
+    #: (domain state) is written on the first refusal; a TRANSIENT one
+    #: (breaker, budgets, concurrency, entitlement evidence) only after
+    #: ``SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS`` of refusals. Before
+    #: this, every denial was retried silently until the 12 h job deadline
+    #: and the target said ``JOB_DEADLINE_EXCEEDED``. Like that code these
+    #: assert that no fetch happened, so nothing downstream may treat them
+    #: as evidence about the domain's pages.
+    #: No ``ALTER TYPE``: this column is an app-validated ``VARCHAR(32)``.
+    ENTITLEMENT_INACTIVE = "ENTITLEMENT_INACTIVE"
+    BREAKER_EVIDENCE_STALE = "BREAKER_EVIDENCE_STALE"
+    BREAKER_OPEN = "BREAKER_OPEN"
+    DOMAIN_QUARANTINED = "DOMAIN_QUARANTINED"
+    DOMAIN_NOT_CERTIFIED = "DOMAIN_NOT_CERTIFIED"
+    DOMAIN_ESCALATION_DENIED = "DOMAIN_ESCALATION_DENIED"
+    CONCURRENCY_CAP_EXCEEDED = "CONCURRENCY_CAP_EXCEEDED"
+    MONEY_BUDGET_EXCEEDED = "MONEY_BUDGET_EXCEEDED"
+    BYTE_BUDGET_EXCEEDED = "BYTE_BUDGET_EXCEEDED"
+    REQUEST_BUDGET_EXCEEDED = "REQUEST_BUDGET_EXCEEDED"
+    BROWSER_SECOND_BUDGET_EXCEEDED = "BROWSER_SECOND_BUDGET_EXCEEDED"
+    #: 2026-09-29 (plan E4). The target's match or its competitor no longer
+    #: resolves (deleted/archived -- a soft reference), so there is nothing
+    #: to fetch. It used to be skipped silently by every dispatch pass and
+    #: sat PENDING until the job deadline. Written with status SKIPPED: a
+    #: catalog change, not a scraper failure.
+    TARGET_UNRESOLVED = "TARGET_UNRESOLVED"
 
 
 class ScrapeScope(StrEnum):

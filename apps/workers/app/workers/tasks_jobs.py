@@ -37,11 +37,14 @@ from app.workers.celery_app import app
 from app.workers.tasks_dispatch import DispatchedBatch, stamp_targets_dispatched
 from app_shared.config import get_settings
 from app_shared.costauth import (
+    DENIAL_PERMANENCE,
     AuthorizationPurpose,
     AuthorizationRequest,
+    CostAuthorizationDenied,
     CostAuthorizationService,
+    DenialPermanence,
     FirstRungReservation,
-    authorize_or_none,
+    authorize_or_denial,
     escalation_reservation,
     first_rung_reservation,
     reservation_rung,
@@ -51,6 +54,7 @@ from app_shared.domains.lifecycle import unsupported_target_outcome
 from app_shared.domains.state_lookup import get_domain_state
 from app_shared.enums import (
     DispatchIntentState,
+    ScrapeErrorCode,
     ScrapeJobStatus,
     ScrapeProfileMode,
     ScrapeTargetStatus,
@@ -827,10 +831,26 @@ def _resolve_domains_and_modes(
     cursor_advanced = False
     for target in targets:
         match = matches.get(target.match_id)
-        if match is None:
-            continue
-        domain = domains.get(match.competitor_id)
-        if domain is None:
+        domain = None if match is None else domains.get(match.competitor_id)
+        if match is None or domain is None:
+            # 2026-09-29 (E4): the match or its competitor is gone (soft
+            # reference -- deleted or archived). Skipping it silently left
+            # the target PENDING, re-read by every pass, until the 12 h job
+            # deadline. There is nothing to fetch: close it, with a reason.
+            logger.info(
+                "tasks_jobs: unresolved target job=%s match=%s (%s missing) -> SKIPPED",
+                scrape_job_id,
+                target.match_id,
+                "match" if match is None else "competitor",
+            )
+            mark_target(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=target.scrape_job_id,
+                match_id=target.match_id,
+                status=ScrapeTargetStatus.SKIPPED,
+                error_code=ScrapeErrorCode.TARGET_UNRESOLVED,
+            )
             continue
         playbook = playbooks.get(domain)
         selected_method = current_methods.get(target.current_strategy_method_id)
@@ -988,6 +1008,99 @@ def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID
 
 @maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=SCRAPE_DISPATCH_JOB)
+def _denial_window_expired(
+    redis: Any,
+    *,
+    scrape_job_id: uuid.UUID,
+    match_ids: Sequence[Any],
+    now: datetime,
+    window_seconds: int,
+    ttl_seconds: int,
+) -> set[Any]:
+    """The match ids whose FIRST transient denial is older than the window.
+
+    2026-09-29 (plan E4). Anchored per target in Redis (``SET NX`` of the
+    first refusal's instant, expiring with the job's own deadline), not on
+    the target's ``created_at``: a nightly job legitimately reaches its later
+    batches hours after creation, and their first refusal must still get the
+    whole window. Any Redis failure answers "not expired" -- the fallback is
+    today's behaviour (retry), never a premature failure.
+    """
+    expired: set[Any] = set()
+    for match_id in match_ids:
+        key = f"dispatch-denied:{scrape_job_id}:{match_id}"
+        try:
+            redis.set(key, now.isoformat(), nx=True, ex=max(1, int(ttl_seconds)))
+            first = redis.get(key)
+        except Exception:  # noqa: BLE001 - see docstring: fail towards retrying
+            logger.warning("dispatch: denial window anchor unavailable key=%s", key, exc_info=True)
+            continue
+        if first is None:
+            continue
+        if isinstance(first, bytes):
+            first = first.decode()
+        try:
+            first_at = datetime.fromisoformat(str(first))
+        except ValueError:
+            continue
+        if (now - first_at).total_seconds() >= window_seconds:
+            expired.add(match_id)
+    return expired
+
+
+def _terminalize_denied_targets(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    batch_targets: Sequence[ScrapeJobTarget],
+    denial: CostAuthorizationDenied,
+    settings: Any,
+) -> int:
+    """Act on a cost-authorization refusal of one batch; return targets failed.
+
+    2026-09-29 (plan E4). A PERMANENT denial (domain state -- needs an
+    operator) fails every target of the batch now, with the denial's own
+    code. A TRANSIENT one leaves them offerable, exactly as before, until
+    their first refusal is ``SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS``
+    old, then fails them with its code. Before this every denial was
+    retried every 60 s until the 12 h job deadline, and the target then
+    said ``JOB_DEADLINE_EXCEEDED`` instead of why it was never fetched.
+    """
+    code = ScrapeErrorCode(denial.reason.value)
+    if DENIAL_PERMANENCE[denial.reason] is DenialPermanence.PERMANENT:
+        doomed = list(batch_targets)
+    else:
+        expired = _denial_window_expired(
+            get_redis_client(),
+            scrape_job_id=scrape_job_id,
+            match_ids=[t.match_id for t in batch_targets],
+            now=datetime.now(timezone.utc),
+            window_seconds=settings.SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS,
+            ttl_seconds=settings.SCRAPE_JOB_MAX_RUNTIME_SECONDS,
+        )
+        doomed = [t for t in batch_targets if t.match_id in expired]
+    for target in doomed:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=target.match_id,
+            status=ScrapeTargetStatus.FAILED,
+            error_code=code,
+        )
+    if doomed:
+        logger.warning(
+            "dispatch: %d target(s) FAILED %s (%s denial) scrape_job_id=%s workspace_id=%s",
+            len(doomed),
+            code.value,
+            DENIAL_PERMANENCE[denial.reason].value.lower(),
+            scrape_job_id,
+            workspace_id,
+        )
+    return len(doomed)
+
+
 def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
     """Expand `scrape_job_id`'s PENDING targets into domain/mode-grouped Scrapyd runs.
 
@@ -1222,7 +1335,7 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 if batch.mode == ScrapeProfileMode.BROWSER
                 else AuthorizationPurpose.REFRESH
             )
-            grant = authorize_or_none(
+            decision = authorize_or_denial(
                 costauth,
                 _batch_authorization_request(
                     batch,
@@ -1233,13 +1346,27 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 ),
                 site="tasks_jobs.dispatch_job",
             )
-            if grant is None:
-                # Denied: do NOT plan, do NOT POST and do NOT stamp. The
-                # targets stay PENDING/unstamped, so `redispatch_pending_jobs`
-                # will offer them again once whatever denied them
-                # (budget, breaker, entitlement, domain state) clears.
-                # A denial must never look like a dispatch.
+            if isinstance(decision, CostAuthorizationDenied):
+                # Denied: do NOT plan, do NOT POST and do NOT stamp. A denial
+                # must never look like a dispatch. What happens to the
+                # targets depends on WHY (E4): a permanent denial fails them
+                # now with its own code; a transient one leaves them
+                # PENDING/unstamped for `redispatch_pending_jobs` to offer
+                # again, until its retry window runs out.
+                _terminalize_denied_targets(
+                    session,
+                    workspace_id=workspace_uuid,
+                    scrape_job_id=job.id,
+                    batch_targets=[
+                        target
+                        for match_id in batch.match_ids
+                        for target in targets_by_match.get(match_id, ())
+                    ],
+                    denial=decision,
+                    settings=settings,
+                )
                 continue
+            grant = decision
             intent = intents.plan(
                 identity,
                 match_ids=batch.match_ids,
@@ -2209,7 +2336,7 @@ def recover_stalled_batches() -> None:
                     # generation (EPA B1), so its dedupe key differs from
                     # the original dispatch's — a retry gets its own grant
                     # rather than silently reusing the first one's.
-                    grant = authorize_or_none(
+                    decision = authorize_or_denial(
                         costauth,
                         _batch_authorization_request(
                             batch,
@@ -2220,12 +2347,26 @@ def recover_stalled_batches() -> None:
                         ),
                         site="tasks_jobs.recover_stalled_batches",
                     )
-                    if grant is None:
-                        # Denied: leave the targets stalled and unstamped.
-                        # A later sweep re-offers them once the denial
-                        # clears; re-POSTing unauthorized is the failure
-                        # mode this whole gate exists to remove.
+                    if isinstance(decision, CostAuthorizationDenied):
+                        # Denied: never re-POST unauthorized -- the failure
+                        # mode this whole gate exists to remove. As on the
+                        # primary path (E4), a permanent denial closes the
+                        # targets now with its code; a transient one leaves
+                        # them stalled for a later sweep until its window
+                        # runs out.
+                        batch_ids = set(batch.match_ids)
+                        _terminalize_denied_targets(
+                            session,
+                            workspace_id=workspace_id,
+                            scrape_job_id=job.id,
+                            batch_targets=[
+                                t for t in stalled_targets if t.match_id in batch_ids
+                            ],
+                            denial=decision,
+                            settings=settings,
+                        )
                         continue
+                    grant = decision
                     # EPA B2: the recovery re-plan records its node and
                     # mints its own deterministic `scrapyd_job_id` exactly
                     # as the primary path does, so a worker killed mid-POST

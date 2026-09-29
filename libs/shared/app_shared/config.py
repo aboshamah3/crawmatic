@@ -392,6 +392,11 @@ class Settings(BaseSettings):
     # for a few HTTP flushes to accumulate a full browser batch, short
     # against a multi-hour run.
     SCRAPE_HANDOFF_DISPATCH_DEBOUNCE_SECONDS: int = 30
+    # 2026-09-29 (E4): how long a TRANSIENT cost-authorization denial
+    # (breaker, budgets, concurrency, entitlement evidence) keeps a target
+    # offerable, counted from its first refusal, before it is FAILED with
+    # the denial's code. Permanent denials (domain state) fail at once.
+    SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS: int = 1800
     # Hard ceiling on a single job's wall-clock runtime. Past it, every
     # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
     # `finalize_jobs` can close the job. 12h is far beyond any legitimate
