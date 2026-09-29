@@ -602,3 +602,100 @@ class TestLiveReconciliation:
         # Window-level cost is not durably persisted (see the module
         # docstring) — reconstructed windows always carry None here.
         assert found[0].total_cost_micro_units is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29 (plan E7): provider identity, and host-less daily evidence
+# ---------------------------------------------------------------------------
+
+
+def _proxy_provider(session, *, name: str, base_url: str) -> uuid.UUID:  # type: ignore[no-untyped-def]
+    provider_id = uuid.uuid4()
+    session.execute(
+        sa.text(
+            "INSERT INTO proxy_providers (id, name, type, base_url, status, created_at, "
+            "updated_at) VALUES (:id, :n, 'RESIDENTIAL', :u, 'ACTIVE', now(), now())"
+        ),
+        {"id": provider_id, "n": name, "u": base_url},
+    )
+    session.commit()
+    return provider_id
+
+
+class TestProviderIdentityAndDailyTotals:
+    def test_a_vendor_window_matches_ledger_rows_keyed_by_the_provider_row_id(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Production: the ledger stores the proxy_providers row id
+        (`0e80a9c2-…`, 98,403 operations in 30 days) and the importer writes
+        the vendor name `"dataimpulse"` -- `reconcile_window` filtered
+        `provider == window.provider`, so the two could never meet."""
+        window_start = datetime(2026, 7, 2, 0, 0, tzinfo=timezone.utc)
+        window_end = window_start + timedelta(days=1)
+        with session_scope() as session:
+            row_id = _proxy_provider(
+                session,
+                name=f"dataimpulse-residential-{uuid.uuid4().hex[:6]}",
+                base_url="http://gw.dataimpulse.com:823",
+            )
+            for i in range(3):
+                session.add(
+                    _make_operation(
+                        provider=str(row_id), domain="identity.example",
+                        bytes_compressed=10_000,
+                        closed_at=window_start + timedelta(hours=i + 1),
+                        cost_micro_units=5,
+                    )
+                )
+            session.commit()
+
+        source = _provider_source(
+            provider="dataimpulse", host="identity.example",
+            window_start=window_start, window_end=window_end, row_bytes=[30_000],
+        )
+        window = import_provider_usage(source, session_scope=session_scope)
+        report = reconcile_window(window, session_scope=session_scope)
+
+        assert report.app_requests == 3
+        assert report.passed is True
+        assert len(report.settlements_written) == 3
+
+    def test_hostless_daily_totals_reconcile_against_the_whole_day(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The provider's documented usage API reports daily totals with no
+        host (`stats_with_history`: group_date, total_traffic,
+        requests_count). Grouping those by host put every provider byte in
+        a `None` bucket no operation can join, so a perfectly matching day
+        read as two unexplained gaps."""
+        provider = f"dataimpulse-daily-{uuid.uuid4().hex[:6]}"
+        window_start = datetime(2026, 7, 3, 0, 0, tzinfo=timezone.utc)
+        window_end = window_start + timedelta(days=1)
+        with session_scope() as session:
+            for host, n in (("a.example", 2), ("b.example", 3)):
+                for i in range(n):
+                    session.add(
+                        _make_operation(
+                            provider=provider, domain=host, bytes_compressed=10_000,
+                            closed_at=window_start + timedelta(hours=i + 1),
+                            cost_micro_units=7,
+                        )
+                    )
+            session.commit()
+        rows = [
+            ProviderUsageRow(
+                occurred_at=window_start, target_host=None, bytes_up=None,
+                bytes_down=None, total_bytes=50_400, request_count=5,
+                raw={"group_date": window_start.isoformat()},
+            )
+        ]
+        source = ProviderUsageSource(
+            provider=provider, window_start=window_start, window_end=window_end,
+            rows=rows, source_ref="test:daily", raw_bytes=f"{provider}:daily".encode(),
+            granularity=ProviderUsageGranularity.DAILY,
+        )
+        window = import_provider_usage(source, session_scope=session_scope)
+        report = reconcile_window(window, session_scope=session_scope)
+
+        assert report.passed is True, report.unexplained_operations
+        assert len(report.settlements_written) == 5

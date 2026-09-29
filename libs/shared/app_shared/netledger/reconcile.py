@@ -171,6 +171,7 @@ from app_shared.models.network_operations import (
     SettlementMethod,
     allocate_cost_largest_remainder,
 )
+from app_shared.models.access import ProxyProvider
 from app_shared.models.provider_usage import ProviderUsageGranularity, ProviderUsageRecord
 
 logger = logging.getLogger(__name__)
@@ -539,6 +540,31 @@ def _aggregate_rows(rows: Sequence[ProviderUsageRow]) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
+def ledger_provider_keys(session: Session, provider: str) -> list[str]:
+    """Every ``network_operations.provider`` value that means ``provider``.
+
+    2026-09-29 (plan E7.1). An import names the VENDOR (``"dataimpulse"``,
+    ``scripts/import_dataimpulse_usage.py``'s default), but the ledger
+    records the ``proxy_providers`` ROW id the spider resolved
+    (``scrape_core.netledger_middleware._provider_for`` -- in production
+    ``0e80a9c2-…`` = ``dataimpulse-residential``, 98,403 operations in 30
+    days). Filtering ``provider == window.provider`` could therefore never
+    match a single real operation. A provider row belongs to the vendor
+    when its name or gateway URL names it; the literal is kept too, for
+    ledgers (and tests) that record the vendor name directly.
+    """
+    vendor = provider.strip().lower()
+    keys = {provider}
+    if not vendor:
+        return sorted(keys)
+    for row_id, name, base_url in session.execute(
+        select(ProxyProvider.id, ProxyProvider.name, ProxyProvider.base_url)  # noqa: workspace-scope
+    ).all():
+        if vendor in (name or "").lower() or vendor in (base_url or "").lower():
+            keys.add(str(row_id))
+    return sorted(keys)
+
+
 def reconcile_window(
     window: ProviderUsageWindow,
     *,
@@ -582,7 +608,7 @@ def reconcile_window(
         lower = window.window_start - overlap_grace
         upper = window.window_end + overlap_grace
         op_query = select(NetworkOperation).where(
-            NetworkOperation.provider == window.provider,
+            NetworkOperation.provider.in_(ledger_provider_keys(session, window.provider)),
             NetworkOperation.closed_at.is_not(None),
             NetworkOperation.closed_at >= lower,
             NetworkOperation.closed_at <= upper,
@@ -639,8 +665,18 @@ def _build_report_and_settlements(
     for row in provider_rows:
         provider_by_host[row.target_host].append(row)
     ops_by_host: dict[str | None, list[NetworkOperation]] = defaultdict(list)
+    # 2026-09-29 (plan E7): host-less evidence. The provider's documented
+    # usage API reports DAILY TOTALS with no target host
+    # (`stats_with_history`: group_date / total_traffic / requests_count).
+    # Grouped by host, every provider byte landed in a `None` bucket no
+    # operation can join and a perfectly matching day read as two gaps.
+    # When NO provider row names a host, the whole window is one group:
+    # the claim being checked is "the day's bytes agree", which is exactly
+    # what that evidence can support -- and no more (settlements it writes
+    # are PRO_RATA_BYTES over the window, never per-host EXACT).
+    hostless = bool(provider_rows) and all(row.target_host is None for row in provider_rows)
     for op in operations:
-        ops_by_host[op.domain].append(op)
+        ops_by_host[None if hostless else op.domain].append(op)
 
     app_requests = len(operations)
     app_bytes = sum(_operation_bytes(op) for op in operations)
