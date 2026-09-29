@@ -29,14 +29,17 @@ MIGRATE_PW="loadtest-migrate-pw-$$"
 
 cleanup() {
   local exit_code=$?
+  # -v: postgres:18-alpine declares VOLUME for PGDATA, so a plain `rm -f`
+  # left one anonymous volume per run on the ops host (51 of them by
+  # 2026-09, ~5 GB). Same rule as scripts/dr/verify_restore.sh.
   echo "--- cleanup: removing ${CONTAINER_NAME} (by name) ---" >&2
-  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker rm -f -v "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   exit "$exit_code"
 }
 trap cleanup EXIT
 
 echo "--- starting scratch Postgres (${CONTAINER_NAME}) ---" >&2
-docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+docker rm -f -v "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 docker run -d --name "${CONTAINER_NAME}" \
   -e POSTGRES_USER="${PG_USER}" \
   -e POSTGRES_PASSWORD="${PG_PASSWORD}" \

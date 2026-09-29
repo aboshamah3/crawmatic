@@ -28,7 +28,7 @@ So the test now provisions everything it needs itself:
 
 ## Running it
 
-    docker run -d --name cm-rls-test \
+    docker run -d --rm --name cm-rls-test \
       -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \
       -e POSTGRES_DB=crawmatic -p 127.0.0.1:55444:5432 postgres:17.5-bookworm
 
@@ -87,7 +87,7 @@ No reachable admin/owner database URL for the RLS isolation test.
 Set RLS_TEST_DATABASE_URL (or MIGRATION_DATABASE_URL) to an owner-role
 URL for a THROWAWAY Postgres, e.g.:
 
-  docker run -d --name cm-rls-test \\
+  docker run -d --rm --name cm-rls-test \\
     -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \\
     -e POSTGRES_DB=crawmatic -p 127.0.0.1:55444:5432 postgres:17.5-bookworm
 

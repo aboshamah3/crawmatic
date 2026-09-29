@@ -26,7 +26,7 @@ SHIPPED task with its ordinary engine bound to that confined role.
 
 ## Running it
 
-    docker run -d --name cm-rls-test \\
+    docker run -d --rm --name cm-rls-test \\
       -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \\
       -e POSTGRES_DB=crawmatic -p 127.0.0.1:55444:5432 postgres:17.5-bookworm
 
