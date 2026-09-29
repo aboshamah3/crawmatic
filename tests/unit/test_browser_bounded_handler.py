@@ -268,3 +268,93 @@ def test_a_hung_handler_close_is_bounded() -> None:
     handler.playwright = None
 
     run(handler._close(), within=3)
+
+
+# ── E1.2: two context names cannot deadlock the context pool ────────────────
+#
+# The spider names a proxied target's context `proxy:<provider_id>` and an
+# unproxied one `default` (generic_browser_price_spider.py:704), while the
+# pool is capped at BROWSER_MAX_CONTEXTS=1. scrapy-playwright never closes a
+# context before shutdown, so the second name awaits `context_semaphore`
+# (handler.py:264) forever -- while holding `context_launch_lock` (321), which
+# every later request needs too. The whole spider stops.
+
+
+def _proxied(url: str = "https://shop.example/p/2", provider: str = "p1") -> Request:
+    return _request(
+        url,
+        playwright_context=f"proxy:{provider}",
+        playwright_context_kwargs={"proxy": {"server": "http://127.0.0.1:9"}},
+    )
+
+
+def test_a_second_context_name_reuses_the_single_slot_once_the_first_is_idle() -> None:
+    browser = FakeBrowser()
+    handler = build_handler(BoundedPlaywrightDownloadHandler, browser, DOWNLOAD_TIMEOUT=2)
+
+    async def scenario() -> list[Any]:
+        first = await handler._download_request(_request(), _Spider())
+        second = await handler._download_request(_proxied(), _Spider())
+        third = await handler._download_request(_proxied(provider="p2"), _Spider())
+        return [first, second, third]
+
+    responses = run(scenario(), within=5)
+
+    assert [b"ok" in r.body for r in responses] == [True, True, True]
+    # The idle contexts were closed to make room, never two open at once.
+    assert [ctx.closed for ctx in browser.contexts] == [True, True, False]
+    assert list(handler.context_wrappers) == ["proxy:p2"]
+
+
+def test_concurrent_requests_on_two_context_names_both_complete() -> None:
+    browser = FakeBrowser()
+    handler = build_handler(BoundedPlaywrightDownloadHandler, browser, DOWNLOAD_TIMEOUT=2)
+
+    async def scenario() -> list[Any]:
+        return await asyncio.gather(
+            handler._download_request(_request(), _Spider()),
+            handler._download_request(_proxied(), _Spider()),
+            handler._download_request(_request("https://shop.example/p/3"), _Spider()),
+        )
+
+    responses = run(scenario(), within=5)
+    assert all(b"ok" in r.body for r in responses)
+
+
+def test_the_stock_handler_deadlocks_on_the_second_context_name() -> None:
+    """Reproduces the latent deadlock on the unmodified handler."""
+    browser = FakeBrowser()
+    handler = build_handler(ScrapyPlaywrightDownloadHandler, browser)
+
+    async def scenario() -> None:
+        await handler._download_request(_request(), _Spider())
+        await handler._download_request(_proxied(), _Spider())
+
+    with pytest.raises(asyncio.TimeoutError):
+        run(scenario(), within=1)
+
+
+def test_a_context_with_a_page_in_flight_is_never_closed_under_it() -> None:
+    browser = FakeBrowser()
+    handler = build_handler(
+        BoundedPlaywrightDownloadHandler, browser, DOWNLOAD_TIMEOUT=2, PLAYWRIGHT_MAX_CONTEXTS=2
+    )
+
+    async def scenario() -> bool:
+        await handler._download_request(_request(), _Spider())
+        # Occupy `default` with a live page, then ask for two more names
+        # with only one slot free: the idle one may go, the busy one may not.
+        default = handler.context_wrappers["default"]
+        await default.semaphore.acquire()
+        page = await default.context.new_page()
+        await handler._download_request(_proxied(provider="p1"), _Spider())
+        await handler._download_request(_proxied(provider="p2"), _Spider())
+        return default.context.closed or page.is_closed()
+
+    assert run(scenario(), within=5) is False
+
+
+def test_the_default_context_pool_holds_a_default_and_a_proxied_context() -> None:
+    from app_shared.config import Settings as AppSettings
+
+    assert AppSettings.model_fields["BROWSER_MAX_CONTEXTS"].default >= 2

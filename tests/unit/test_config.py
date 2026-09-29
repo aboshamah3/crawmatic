@@ -126,7 +126,10 @@ def test_browser_scraping_knobs_default(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS == 30000
     assert settings.BROWSER_CONCURRENT_REQUESTS == 2
-    assert settings.BROWSER_MAX_CONTEXTS == 1
+    # Was 1 (data-model.md §4); raised to 3 on 2026-09-29 (E1) because one
+    # slot deadlocked the first batch mixing `default` and `proxy:<id>`
+    # contexts. See test_browser_bounded_handler.py.
+    assert settings.BROWSER_MAX_CONTEXTS == 3
 
 
 def test_browser_scraping_knobs_honor_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

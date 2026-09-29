@@ -31,6 +31,14 @@ What it changes
 * The inner coroutine is cancelled but NOT awaited: ``asyncio.wait_for``
   would wait for the cancellation to finish, and a coroutine stuck in a
   cleanup await would hold the handler exactly as before.
+* The context pool cannot deadlock. The spider names a proxied target's
+  context ``proxy:<provider_id>`` next to the unproxied ``default``, and the
+  pool is capped (``PLAYWRIGHT_MAX_CONTEXTS``). scrapy-playwright never
+  closes a context before shutdown, so a name beyond the cap awaited
+  ``context_semaphore`` (264) forever -- while holding ``context_launch_lock``
+  (321), which every later request needs as well. Here a request that needs
+  a slot first closes IDLE contexts (no page open, none being opened) until
+  one frees; a context with a page in flight is never closed under it.
 * ``_close`` (handler shutdown) is bounded by
   ``BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS``; past it the process moves on to
   exit and the out-of-reactor watchdog (``scrape_core.process_watchdog``)
@@ -54,6 +62,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HARD_MARGIN_SECONDS = 30.0
 DEFAULT_CLOSE_TIMEOUT_SECONDS = 30.0
 DEFAULT_PAGE_CLOSE_TIMEOUT_SECONDS = 10.0
+DEFAULT_IDLE_CONTEXT_POLL_SECONDS = 0.25
 
 
 class BrowserDownloadTimeoutError(Exception):
@@ -94,6 +103,9 @@ class BoundedPlaywrightDownloadHandler(ScrapyPlaywrightDownloadHandler):
             "BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS", DEFAULT_PAGE_CLOSE_TIMEOUT_SECONDS
         )
         self._download_timeout_seconds = settings.getfloat("DOWNLOAD_TIMEOUT", 180.0)
+        self._idle_context_poll_seconds = settings.getfloat(
+            "BROWSER_IDLE_CONTEXT_POLL_SECONDS", DEFAULT_IDLE_CONTEXT_POLL_SECONDS
+        )
         # Pages opened per in-flight request, keyed by id(request) and
         # popped in `finally`, so a timed-out request's page can be closed.
         # Not kept in request.meta: meta travels into items, logs and
@@ -176,6 +188,60 @@ class BoundedPlaywrightDownloadHandler(ScrapyPlaywrightDownloadHandler):
             "the process watchdog is the backstop",
             request.url,
         )
+
+    # ── the context pool ──────────────────────────────────────────────────
+    async def _create_browser_context(
+        self, name: str, context_kwargs: dict | None, spider: Spider | None = None
+    ) -> Any:
+        # Called with `context_launch_lock` held (by `_create_page`), so no
+        # other request can create a context meanwhile. Waiting here is
+        # still bounded: the whole download sits under `hard_timeout_for`.
+        semaphore = getattr(self, "context_semaphore", None)
+        if semaphore is not None:
+            while semaphore.locked():
+                if not await self._close_idle_contexts(keep=name):
+                    await asyncio.sleep(self._idle_context_poll_seconds)
+        # `Semaphore.acquire()` on an unlocked semaphore returns without
+        # yielding, so the slot freed above cannot be taken by anyone else
+        # before the parent's acquire.
+        return await super()._create_browser_context(name, context_kwargs, spider)
+
+    def _context_is_idle(self, wrapper: Any) -> bool:
+        # A page slot is taken (`wrapper.semaphore.acquire()`, handler.py
+        # 330) BEFORE `new_page()` and released only by the page's close
+        # event, so a full page semaphore means no page is open AND none is
+        # being opened. `context.pages` alone would miss the second case
+        # and close a context under a request about to use it.
+        return (
+            not wrapper.persistent
+            and not wrapper.context.pages
+            and wrapper.semaphore._value >= self.config.max_pages_per_context
+        )
+
+    async def _close_idle_contexts(self, *, keep: str) -> int:
+        closed = 0
+        for name, wrapper in list(self.context_wrappers.items()):
+            if name == keep or not self._context_is_idle(wrapper):
+                continue
+            logger.info(
+                "browser_context.close_idle name=%s -- freeing a pool slot for %s", name, keep
+            )
+            close = asyncio.ensure_future(wrapper.context.close())
+            done, _ = await asyncio.wait({close}, timeout=self._page_close_timeout_seconds)
+            if close not in done:
+                close.cancel()
+                close.add_done_callback(_drain)
+                continue
+            _drain(close)
+            # The context's "close" event (handler.py 755) pops the wrapper
+            # and releases the pool slot; make sure the slot is gone from
+            # the pool even if the event was not delivered.
+            if self.context_wrappers.get(name) is wrapper:
+                self.context_wrappers.pop(name, None)
+                if getattr(self, "context_semaphore", None) is not None:
+                    self.context_semaphore.release()
+            closed += 1
+        return closed
 
     # ── shutdown ──────────────────────────────────────────────────────────
     async def _close(self) -> None:

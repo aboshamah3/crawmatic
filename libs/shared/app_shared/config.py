@@ -856,7 +856,14 @@ class Settings(BaseSettings):
     # MATCH_LOCK_BROWSER_TTL_SECONDS, SCRAPE_FLUSH_*, SCRAPYD_BROWSER_URLS. ---
     SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS: int = 30000
     BROWSER_CONCURRENT_REQUESTS: int = 2
-    BROWSER_MAX_CONTEXTS: int = 1
+    # Size of the Playwright context pool: the spider uses one context per
+    # proxy provider (`proxy:<provider_id>`) next to the unproxied `default`,
+    # so this should be >= active providers + 1. It was 1, which deadlocked
+    # the first batch mixing a proxied and an unproxied target (2026-09-29,
+    # E1). `price_monitor_browser.handler` now closes idle contexts when the
+    # pool is full, so a smaller value serialises instead of wedging; the
+    # contexts share one Chromium, so the cost of a slot is small.
+    BROWSER_MAX_CONTEXTS: int = 3
     # Hard wall-clock cap on ONE browser spider process (Scrapy
     # CLOSESPIDER_TIMEOUT). The browser node runs max_proc=1, so a single
     # Playwright process that wedges (seen 2026-09-22 17:50Z for 25 h and
