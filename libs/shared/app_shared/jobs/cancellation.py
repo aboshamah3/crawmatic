@@ -115,8 +115,10 @@ from app_shared.ids import new_uuid7
 from app_shared.jobs.dispatch_intents import iter_dispatch_scrapyd_job_ids
 from app_shared.jobs.targets import mark_target
 from app_shared.maintenance.scoping import workspace_context
+from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.outbox.writer import write_outbox_message
+from app_shared.repository import scoped_select
 from app_shared.redis_client import get_redis_client
 from app_shared.task_names import CREATE_WEBHOOK_EVENT
 
@@ -435,7 +437,11 @@ def cancel_and_reconcile_job(
     # logged and swallowed so a Redis blip or an unreachable Scrapyd node
     # can never turn a successful, committed cancellation into an
     # exception the caller has to interpret.
-    _best_effort_scrapyd_cancel(job_uuid, scrapyd_job_ids)
+    _best_effort_scrapyd_cancel(
+        job_uuid,
+        scrapyd_job_ids,
+        locations=_run_locations(session, job_uuid) if scrapyd_job_ids else None,
+    )
     _delete_dispatch_guards(job_uuid)
     try:
         released = release_reservations_for_job(session, job_uuid)
@@ -687,8 +693,44 @@ def _record_cancellation_event(
 # ---------------------------------------------------------------------------
 
 
+def _run_locations(session: Session, job_uuid: uuid.UUID) -> dict[str, tuple[str, str | None]]:
+    """``{scrapyd_job_id: (node_url, project)}`` for this job's intents.
+
+    2026-09-29 (E3.3): each intent records the node it was POSTed to and
+    the project half of its ``node_class``, so a cancel can go exactly
+    there. Fails soft to ``{}`` (every run then keeps the old default), for
+    the same reason :func:`iter_known_scrapyd_job_ids` does.
+    """
+    try:
+        workspace_id = _job_workspace_id(session, job_uuid)
+        if workspace_id is None:
+            return {}
+        rows = (
+            session.execute(
+                scoped_select(DispatchIntent, workspace_id).where(
+                    DispatchIntent.scrape_job_id == job_uuid,
+                    DispatchIntent.node_url != "",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return {
+            str(row.scrapyd_job_id): (
+                row.node_url,
+                row.node_class.split(":", 1)[0] if row.node_class else None,
+            )
+            for row in rows
+        }
+    except Exception:  # noqa: BLE001 - cleanup must never fail a committed cancel
+        logger.warning("job_cancel.run_locations_failed scrape_job_id=%s", job_uuid, exc_info=True)
+        return {}
+
+
 def _best_effort_scrapyd_cancel(
-    job_uuid: uuid.UUID, scrapyd_job_ids: Sequence[str]
+    job_uuid: uuid.UUID,
+    scrapyd_job_ids: Sequence[str],
+    locations: dict[str, tuple[str, str | None]] | None = None,
 ) -> None:
     """Step 2: ask Scrapyd to stop runs we know about. Best effort, always.
 
@@ -705,9 +747,12 @@ def _best_effort_scrapyd_cancel(
 
     from app_shared.scrapyd.client import ScrapydDispatchClient  # local: keeps `requests` lazy
 
+    known = locations or {}
+    client = ScrapydDispatchClient()
     for scrapyd_job_id in scrapyd_job_ids:
+        node_url, project = known.get(str(scrapyd_job_id), (None, None))
         try:
-            ScrapydDispatchClient().cancel(scrapyd_job_id)
+            client.cancel(scrapyd_job_id, node_url=node_url, project=project)
         except Exception:  # noqa: BLE001 - cleanup must never fail a committed cancel
             logger.warning(
                 "job_cancel.scrapyd_cancel_failed scrape_job_id=%s scrapyd_job_id=%s",

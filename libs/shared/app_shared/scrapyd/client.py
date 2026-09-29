@@ -440,7 +440,13 @@ class ScrapydDispatchClient:
         )
         return jobid
 
-    def cancel(self, scrapyd_job_id: str, *, node_url: str | None = None) -> bool:
+    def cancel(
+        self,
+        scrapyd_job_id: str,
+        *,
+        node_url: str | None = None,
+        project: str | None = None,
+    ) -> bool:
         """Best-effort ``cancel.json`` for one Scrapyd job id.
 
         Called by :func:`app_shared.jobs.cancellation.cancel_and_reconcile_job`
@@ -463,12 +469,19 @@ class ScrapydDispatchClient:
         going and its results are refused by the fence. Recording the
         node on the intent (so this becomes exact) is B3's to decide,
         alongside the deterministic-jobid question above.
+
+        2026-09-29 (E3.3): the intent DOES record its node and the project
+        half of its ``node_class`` now, so callers that have them
+        (:mod:`app_shared.jobs.run_purge`, admin cancel) pass both, and
+        exactly that node is asked in exactly that project. The defaults
+        remain for callers that have only a jobid.
         """
         base = (node_url or self._settings.SCRAPYD_HTTP_URLS[0]).rstrip("/")
         auth = (self._settings.SCRAPYD_USERNAME, self._settings.SCRAPYD_PASSWORD)
         poster = self._session.post if self._session is not None else requests.post
         acknowledged = False
-        for project in _CANCELLABLE_PROJECTS:
+        projects = (project,) if project else _CANCELLABLE_PROJECTS
+        for project in projects:
             response = poster(
                 f"{base}/cancel.json",
                 data={"project": project, "job": str(scrapyd_job_id)},

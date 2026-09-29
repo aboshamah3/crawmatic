@@ -750,3 +750,56 @@ def test_cancel_unknown_job_raises_lookup_error() -> None:
     except LookupError:
         return
     raise AssertionError("cancelling an unresolvable job must raise LookupError")
+
+
+def test_admin_cancel_asks_the_node_and_project_each_run_was_posted_to(monkeypatch: Any) -> None:
+    """2026-09-29 (E3.3): cancel.json went to SCRAPYD_HTTP_URLS[0] for every
+    run, so a run on the browser node was never cancelled. When the intent
+    recorded where the run lives, that node and project are asked; a run
+    with no recorded location keeps the old default."""
+    import app_shared.jobs.cancellation as cancellation_mod
+    import app_shared.scrapyd.client as client_mod
+
+    calls: list[tuple[str, Any, Any]] = []
+
+    class _Client:
+        def cancel(self, jobid: str, *, node_url: Any = None, project: Any = None) -> bool:
+            calls.append((jobid, node_url, project))
+            return True
+
+    monkeypatch.setattr(client_mod, "ScrapydDispatchClient", lambda *a, **k: _Client())
+
+    cancellation_mod._best_effort_scrapyd_cancel(
+        uuid.uuid4(),
+        ["j1", "j2"],
+        locations={"j1": ("http://scrapers-browser:6800", "price_monitor_browser")},
+    )
+
+    assert calls == [
+        ("j1", "http://scrapers-browser:6800", "price_monitor_browser"),
+        ("j2", None, None),
+    ]
+
+
+def test_run_locations_reads_node_and_project_off_the_intents(monkeypatch: Any) -> None:
+    import app_shared.jobs.cancellation as cancellation_mod
+    from types import SimpleNamespace
+
+    job_uuid = uuid.uuid4()
+    rows = [
+        SimpleNamespace(
+            scrapyd_job_id="j1",
+            node_url="http://scrapers-browser:6800",
+            node_class="price_monitor_browser:generic_browser_price_spider",
+        )
+    ]
+
+    class _Session:
+        def execute(self, stmt: Any) -> Any:
+            assert "dispatch_intents" in str(stmt)
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+    monkeypatch.setattr(cancellation_mod, "_job_workspace_id", lambda s, j: uuid.uuid4())
+    assert cancellation_mod._run_locations(_Session(), job_uuid) == {
+        "j1": ("http://scrapers-browser:6800", "price_monitor_browser")
+    }

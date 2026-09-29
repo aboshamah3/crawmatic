@@ -188,3 +188,50 @@ print("OK")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "OK"
+
+
+def test_a_finalized_job_has_its_live_scrapyd_runs_purged_after_its_commit() -> None:
+    """2026-09-29 (plan E3.3): when a job finalizes -- normally, or after
+    the deadline sweep failed its leftovers -- its still-queued runs are
+    cancelled on the node that holds them. Only AFTER the finalize commit
+    (a rolled-back finalize must not have cancelled anything), only for
+    jobs that actually finalized, and a purge failure never fails the
+    sweep."""
+    result = _run(
+        _SETUP
+        + """
+purged = []
+
+def fake_purge(session, *, workspace_id, scrape_job_id, client):
+    purged.append(scrape_job_id)
+    events.append("purge:" + str(scrape_job_id))
+    if scrape_job_id == job_a.id:
+        raise RuntimeError("node exploded")
+
+tasks_jobs.purge_live_runs = fake_purge
+tasks_jobs.ScrapydDispatchClient = lambda **kw: object()
+
+# job_b still has a live target: it does not finalize, so it is not purged.
+live = ScrapeJobTarget(
+    workspace_id=ws_b,
+    scrape_job_id=job_b.id,
+    match_id=uuid.uuid4(),
+    status=ScrapeTargetStatus.PENDING,
+    created_at=datetime.now(timezone.utc),
+)
+live.id = uuid.uuid4()
+fake_session.seed(live)
+
+tasks_jobs.finalize_jobs()
+
+if purged != [job_a.id]:
+    print("PURGED:" + repr(purged))
+    sys.exit(1)
+if events.index("purge:" + str(job_a.id)) < events.index("commit"):
+    print("PURGE_BEFORE_COMMIT:" + repr(events))
+    sys.exit(1)
+print("OK")
+"""
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "OK"

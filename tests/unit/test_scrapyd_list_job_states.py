@@ -72,3 +72,29 @@ def test_list_jobs_is_still_the_set_of_known_ids() -> None:
 def test_no_useful_answer_raises_instead_of_meaning_no_runs(response: Any) -> None:
     with pytest.raises(ScrapydDispatchError):
         _client(_Session(response)).list_job_states("http://node:6800", "p")
+
+
+class _PostSession(_Session):
+    def __init__(self) -> None:
+        super().__init__(_Resp(200, {}))
+        self.posts: list[tuple[str, dict]] = []
+
+    def post(self, url: str, *, data: dict, auth: Any, timeout: float) -> _Resp:
+        self.posts.append((url, dict(data)))
+        return _Resp(200, {"status": "ok"})
+
+
+def test_cancel_goes_to_the_named_node_and_project_only() -> None:
+    """2026-09-29 (E3.3): `cancel.json` used to default to
+    SCRAPYD_HTTP_URLS[0] and try every project; a run on the browser node
+    was never reached."""
+    session = _PostSession()
+    assert _client(session).cancel(
+        "j1", node_url="http://scrapers-browser:6800", project="price_monitor_browser"
+    )
+    assert session.posts == [
+        (
+            "http://scrapers-browser:6800/cancel.json",
+            {"project": "price_monitor_browser", "job": "j1"},
+        )
+    ]

@@ -69,6 +69,7 @@ from app_shared.jobs.dispatch_intents import (
     reconcile_inflight_intents,
     receiver_holds_execution,
 )
+from app_shared.jobs.run_purge import purge_live_runs
 from app_shared.jobs.reaper import (
     fail_targets_past_job_deadline,
     revert_started_targets_of_ended_runs,
@@ -1549,6 +1550,7 @@ def finalize_jobs() -> None:
     """
     failures = 0
     first_failure: Exception | None = None
+    finalized: list[tuple[uuid.UUID, uuid.UUID]] = []
     with get_session() as session:
         for job_id, workspace_id in _scan_job_refs(_NON_TERMINAL_JOB_STATUSES):
             # ONE transaction per job (2026-09-23, mushtryati run 01a0cfd6).
@@ -1568,7 +1570,8 @@ def finalize_jobs() -> None:
             # other job has already had its own transaction committed.
             try:
                 set_workspace_context(session, workspace_id)
-                _finalize_one_job(session, job_id, workspace_id)
+                if _finalize_one_job(session, job_id, workspace_id):
+                    finalized.append((job_id, workspace_id))
                 session.commit()
             except Exception as exc:
                 session.rollback()
@@ -1580,21 +1583,57 @@ def finalize_jobs() -> None:
                     job_id,
                     workspace_id,
                 )
-        if first_failure is not None:
-            logger.error("finalize_jobs: %d job(s) failed this sweep; re-raising the first", failures)
-            raise first_failure
+    # 2026-09-29 (E3.3): after the finalize commits, not inside it -- a
+    # rolled-back finalize must not have cancelled anything.
+    _purge_finalized_job_runs(finalized)
+    if first_failure is not None:
+        logger.error("finalize_jobs: %d job(s) failed this sweep; re-raising the first", failures)
+        raise first_failure
 
 
-def _finalize_one_job(session: Session, job_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+def _purge_finalized_job_runs(finalized: list[tuple[uuid.UUID, uuid.UUID]]) -> None:
+    """Cancel the still-live Scrapyd runs of jobs this sweep finalized.
+
+    2026-09-29 (plan E3.3). A job that finished -- normally, or because the
+    deadline sweep failed its leftovers -- could still have hundreds of runs
+    queued on a node (2,725 on the browser node after one nightly deadline),
+    each of which would later spawn a spider only to find its targets
+    terminal. `purge_live_runs` cancels exactly the pending/running ones, on
+    the node and in the project each intent recorded. Best effort: a failure
+    is logged per job and never fails the sweep.
+    """
+    if not finalized:
+        return
+    client = ScrapydDispatchClient(settings=get_settings())
+    with get_system_session() as purge_session:
+        for job_id, workspace_id in finalized:
+            try:
+                purge_live_runs(
+                    purge_session,
+                    workspace_id=workspace_id,
+                    scrape_job_id=job_id,
+                    client=client,
+                )
+            except Exception:  # noqa: BLE001 - cleanup must never fail finalize
+                logger.warning(
+                    "finalize_jobs: run purge failed for job %s (workspace %s)",
+                    job_id,
+                    workspace_id,
+                    exc_info=True,
+                )
+
+
+def _finalize_one_job(session: Session, job_id: uuid.UUID, workspace_id: uuid.UUID) -> bool:
     """Refresh one job's counters and finalize it if every target is terminal.
 
     Runs inside the caller's transaction, whose `app.workspace_id` GUC the
     caller has already set for `workspace_id`; the caller commits or rolls
     back. Split out of `finalize_jobs` so each job gets its own transaction.
+    Returns True when the job was finalized in this call.
     """
     job = scoped_get(session, ScrapeJob, job_id, workspace_id)
     if job is None or job.status in _TERMINAL_JOB_STATUSES:
-        return
+        return False
 
     targets = list(
         session.execute(
@@ -1610,7 +1649,7 @@ def _finalize_one_job(session: Session, job_id: uuid.UUID, workspace_id: uuid.UU
 
     all_terminal = all(target.status in _TERMINAL_TARGET_STATUSES for target in targets)
     if not all_terminal:
-        return
+        return False
 
     job.status = resolve_finalized_status(
         counts.success, counts.failure, counts.skipped, counts.total
@@ -1676,6 +1715,7 @@ def _finalize_one_job(session: Session, job_id: uuid.UUID, workspace_id: uuid.UU
             now=job.completed_at,
             message_id=message_id,
         )
+    return True
 
 
 def _interleave_by_workspace(
