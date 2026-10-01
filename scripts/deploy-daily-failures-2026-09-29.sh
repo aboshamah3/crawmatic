@@ -38,9 +38,12 @@ BRANCH=fix/daily-failures-2026-09-29
 NEW_HEAD=f1c7e2a9b3d4
 API=${API:-https://api-production-7193.up.railway.app}
 NVM_BIN=${NVM_BIN:-/home/mahmoud/.nvm/versions/node/v24.18.0/bin}
-# The release-identity file earlier deploys baked into the upload tree (never
-# committed). Optional: without it /version reports the env identity.
-BAKED_SRC=${BAKED_SRC:-/tmp/claude-0/-srv-crawmatic/e1e509e9-d56c-4168-ac60-a609851c5b7d/scratchpad/ops/_baked_release.py.deploy-1f97664}
+# The release identity baked into the upload tree (never committed). It MUST be
+# generated for THIS release (`scripts/write_release_manifest.py --emit-identity`):
+# the first run on 2026-10-01 defaulted to the 1f97664 identity, whose
+# expected_db_migration (d8c14b7f6a92) made the new api's /ready fail closed
+# with MigrationHeadMismatch until the api was redeployed with this file.
+BAKED_SRC=${BAKED_SRC:-/srv/crawmatic/evidence/deploy-daily-failures-2026-09-29/_baked_release.py.deploy-d6fae66}
 BAKED_DST=$REPO/libs/shared/app_shared/_baked_release.py
 EVIDENCE=/srv/crawmatic/evidence/deploy-daily-failures-2026-09-29
 LOG=$EVIDENCE/DEPLOY-LOG.txt
@@ -148,8 +151,11 @@ code() { curl -s -o /dev/null -w '%{http_code}' -m 20 "$1"; }
 
 [[ "$(code "$API/health")" == "200" ]]; check "/health 200" $?
 [[ "$(code "$API/ready")" == "200" ]];  check "/ready 200" $?
-DBH=$(jv db_migration_head); CH=$(jv code_migration_head)
-[[ "$DBH" == "$NEW_HEAD" && "$CH" == "$NEW_HEAD" ]]; check "alembic head: db=$DBH code=$CH expected=$NEW_HEAD" $?
+# `code_migration_head` is always null on this api image (alembic is a dev-group
+# dependency, not in the image), so the code side is the BAKED identity's
+# `expected_db_migration` — the same value /ready compares against.
+DBH=$(jv db_migration_head); CH=$(jv expected_db_migration)
+[[ "$DBH" == "$NEW_HEAD" && "$CH" == "$NEW_HEAD" ]]; check "alembic head: db=$DBH baked-expected=$CH expected=$NEW_HEAD" $?
 
 # The service token never leaves this shell: read from the api service's own
 # variables (read-only), used as a header, unset afterwards.
