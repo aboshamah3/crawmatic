@@ -19,6 +19,8 @@
 #      registered partitioned table that exists (same set and lookahead as
 #      the daily job). Existing children are skipped.
 # Then it prints the seam probe the worker uses and the children per table.
+#   (The functions are re-owned by the parents' actual owner: prod never ran
+#   §8 ownership adoption. Refuses a superuser or mixed owners.)
 # Rollback: DROP FUNCTION crawmatic_create_partition(text,text,text,text),
 #           crawmatic_drop_partition(text); (the job falls back to direct DDL)
 # =============================================================================
@@ -47,6 +49,33 @@ psql "$PGURL" -v ON_ERROR_STOP=1 -X -q <<SQL
 BEGIN;
 SELECT current_user AS applying_as, rolsuper FROM pg_roles WHERE rolname = current_user;
 $SECTION9
+-- Prod never ran §8 (ownership adoption), so crawmatic_migrate does not own
+-- the parents and a crawmatic_migrate-owned definer fails "must be owner".
+-- Run the seam as the role that DOES own them; refuse a superuser owner or
+-- mixed owners (both mean the ownership model needs a real §8 run instead).
+DO \$\$
+DECLARE
+    owners text[];
+    is_super boolean;
+BEGIN
+    SELECT array_agg(DISTINCT pg_get_userbyid(c.relowner)) INTO owners
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind = 'p'
+       AND c.relname IN ('price_observations','request_attempts','price_alert_events',
+                         'webhook_events','network_operations');
+    RAISE NOTICE 'partitioned parents owned by %', owners;
+    IF array_length(owners, 1) <> 1 THEN
+        RAISE EXCEPTION 'parents have mixed owners %; run provision_db_roles.py --adopt-ownership instead', owners;
+    END IF;
+    SELECT rolsuper INTO is_super FROM pg_roles WHERE rolname = owners[1];
+    IF is_super THEN
+        RAISE EXCEPTION 'parents are owned by superuser %; refusing a superuser SECURITY DEFINER seam', owners[1];
+    END IF;
+    EXECUTE format('ALTER FUNCTION crawmatic_create_partition(text, text, text, text) OWNER TO %I', owners[1]);
+    EXECUTE format('ALTER FUNCTION crawmatic_drop_partition(text) OWNER TO %I', owners[1]);
+    RAISE NOTICE 'seam functions now owned by %', owners[1];
+END
+\$\$;
 DO \$\$
 DECLARE
     t text;
