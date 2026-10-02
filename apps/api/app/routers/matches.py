@@ -611,6 +611,59 @@ def _resolve_variant_maps(
     return by_external_id, by_sku, by_id
 
 
+def _reject_foreign_hosts(
+    session: Session,
+    workspace_id: uuid.UUID,
+    row_dicts: list[dict],
+    safe: list[dict],
+    rejected: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """E3 for bulk-upsert: drop rows whose URL host is not the competitor's domain.
+
+    Same rule as ``POST /v1/matches`` (`_assert_url_belongs_to_competitor`):
+    the host must be the competitor's canonical domain or a subdomain of it.
+    Offending rows are reported per row in ``rejected`` with code
+    ``MATCH_HOST_NOT_COMPETITOR`` (FR-013 reject-and-report: the rest of the
+    batch still lands). Competitors outside this workspace are left alone
+    here so the existing 404/403 reference checks still fire for them.
+    ``prepare_match_urls`` keeps ``safe`` in input order minus the
+    ``UNSAFE_URL`` rows, which is how each safe row's original index is
+    recovered.
+    """
+    if not safe:
+        return safe, []
+    unsafe_indices = {item["index"] for item in rejected}
+    safe_indices = [i for i in range(len(row_dicts)) if i not in unsafe_indices]
+    competitor_ids = {row["competitor_id"] for row in safe}
+    domains = {
+        row.id: row.domain
+        for row in session.execute(
+            select(Competitor.id, Competitor.domain).where(
+                Competitor.workspace_id == workspace_id,
+                Competitor.id.in_(competitor_ids),
+            )
+        ).all()
+    }
+    kept: list[dict] = []
+    host_rejected: list[dict] = []
+    for index, row in zip(safe_indices, safe, strict=True):
+        competitor_id = row["competitor_id"]
+        if competitor_id in domains and not url_host_belongs_to_domain(
+            row["competitor_url"], domains[competitor_id]
+        ):
+            host_rejected.append(
+                {
+                    "index": index,
+                    "code": "MATCH_HOST_NOT_COMPETITOR",
+                    "reason": "host_not_competitor_domain",
+                    "url": row["competitor_url"],
+                }
+            )
+            continue
+        kept.append(row)
+    return kept, host_rejected
+
+
 @router.post("/bulk-upsert", response_model=MatchBulkUpsertResult, status_code=200)
 def bulk_upsert_matches(
     payload: MatchBulkUpsertRequest,
@@ -636,6 +689,9 @@ def bulk_upsert_matches(
     row_dicts = [item.model_dump() for item in payload.matches]
 
     safe, rejected = prepare_match_urls(row_dicts)
+    safe, host_rejected = _reject_foreign_hosts(session, ws, row_dicts, safe, rejected)
+    if host_rejected:
+        rejected = sorted([*rejected, *host_rejected], key=lambda item: item["index"])
     deduped = list(dedup_last_wins(safe, match_conflict_key))
 
     external_ids, skus, variant_ids = variant_lookup_keys(deduped)

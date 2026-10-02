@@ -19,6 +19,7 @@ A match has exactly one unique key: `(workspace_id, product_variant_id, competit
 
 ## Router flow (`POST /v1/matches/bulk-upsert`)
 1. `prepare_match_urls(payload rows)` → `(safe, rejected)`.
+   - Then (security E3, 2026-10-02) every safe row whose `competitor_url` host is not the competitor's domain or a subdomain of it is dropped and reported in `rejected` as `{"index", "code": "MATCH_HOST_NOT_COMPETITOR", "reason": "host_not_competitor_domain", "url"}`; the rest of the batch still lands.
 2. `dedup_last_wins(safe, match_conflict_key)` (in-batch last-wins).
 3. Resolve variants: `variant_lookup_keys` → one scoped `IN(...)` select → `resolve_match_variants` (fills `product_variant_id` + `product_id`); `unresolved` → rejected/`422`.
 4. Consistency-check `competitor_id`s in-workspace (one scoped `IN(...)` select + `assert_refs_in_workspace`).

@@ -172,3 +172,101 @@ def test_match_on_foreign_host_is_422(client: TestClient, session: FakeOrmSessio
 def test_match_on_subdomain_is_201(client: TestClient, session: FakeOrmSession) -> None:
     variant, comp = _seed(session)
     assert _post(client, variant, comp, "https://m.amazon.sa/dp/1").status_code == 201
+
+
+# --- E3 on POST /v1/matches/bulk-upsert (P6 review finding 1) --------------
+
+
+class _BulkSession(_UniqueSession):
+    """Adds just enough of the set-based upsert for bulk-upsert to run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.upserted_rows: list[dict] = []
+
+    def execute(self, stmt):  # type: ignore[override]
+        from sqlalchemy.sql.dml import Insert
+
+        if isinstance(stmt, Insert):
+            from app_shared.models.competitors_matches import CompetitorProductMatch
+
+            rows = [
+                {col.key if hasattr(col, "key") else col: val for col, val in row.items()}
+                for row in stmt._multi_values[0]
+            ]
+            ids = []
+            for row in rows:
+                self.upserted_rows.append(row)
+                match = CompetitorProductMatch(id=uuid.uuid4(), **row)
+                self.add(match)
+                ids.append(match)
+            self.flush()
+            from types import SimpleNamespace
+
+            class _R:
+                def all(self_inner):
+                    return [SimpleNamespace(id=m.id) for m in ids]
+
+            return _R()
+        return super().execute(stmt)
+
+
+def _bulk(client: TestClient, variant: ProductVariant, comp: Competitor, urls: list[str]):
+    return client.post(
+        "/v1/matches/bulk-upsert",
+        json={
+            "matches": [
+                {"variant_external_id": variant.external_id, "competitor_id": str(comp.id), "competitor_url": url}
+                for url in urls
+            ]
+        },
+    )
+
+
+def test_bulk_upsert_rejects_foreign_host_and_keeps_subdomain() -> None:
+    session = _BulkSession()
+
+    def _dep() -> Iterator[tuple[FakeOrmSession, Principal]]:
+        yield session, Principal(
+            kind="api_key", id=uuid.uuid4(), role=None,
+            scopes=["matches:read", "matches:write"], workspace_id=WORKSPACE_ID,
+        )
+
+    app.dependency_overrides[get_current_principal] = _dep
+    variant, comp = _seed(session)
+    resp = _bulk(
+        TestClient(app), variant, comp,
+        ["https://noon.com/p/1", "https://m.amazon.sa/dp/2"],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["rejected"] == [
+        {
+            "index": 0,
+            "code": "MATCH_HOST_NOT_COMPETITOR",
+            "reason": "host_not_competitor_domain",
+            "url": "https://noon.com/p/1",
+        }
+    ]
+    assert body["upserted"] == 1
+    assert [row["competitor_url"] for row in session.upserted_rows] == ["https://m.amazon.sa/dp/2"]
+
+
+def test_bulk_upsert_all_foreign_writes_nothing() -> None:
+    session = _BulkSession()
+
+    def _dep() -> Iterator[tuple[FakeOrmSession, Principal]]:
+        yield session, Principal(
+            kind="api_key", id=uuid.uuid4(), role=None,
+            scopes=["matches:read", "matches:write"], workspace_id=WORKSPACE_ID,
+        )
+
+    app.dependency_overrides[get_current_principal] = _dep
+    variant, comp = _seed(session)
+    resp = _bulk(TestClient(app), variant, comp, ["https://evil.example/p", "https://amazon.sa.evil.example/x"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["upserted"] == 0
+    assert [r["index"] for r in body["rejected"]] == [0, 1]
+    assert {r["code"] for r in body["rejected"]} == {"MATCH_HOST_NOT_COMPETITOR"}
+    assert session.upserted_rows == []
