@@ -25,7 +25,9 @@ REPO=/srv/crawmatic/crawmatic
 BRANCH=feat/catalog-index-2026-10-02
 NEW_HEAD=a7c41e9d2b56
 API=${API:-https://api-production-7193.up.railway.app}
-NVM_BIN=${NVM_BIN:-/home/mahmoud/.nvm/versions/node/v24.18.0/bin}
+# mahmoud's own Node (the railway CLI lives there). Never inherit NVM_BIN: a
+# root shell exports root's nvm bin, which mahmoud cannot read (2026-10-02).
+NVM_BIN=${MAHMOUD_NODE_BIN:-/home/mahmoud/.nvm/versions/node/v24.18.0/bin}
 EVIDENCE=/srv/crawmatic/evidence/deploy-catalog-index-2026-10-02
 LOG=$EVIDENCE/DEPLOY-LOG.txt
 BAKED_SRC=${BAKED_SRC:-$EVIDENCE/_baked_release.py}
@@ -79,6 +81,7 @@ CUR_BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
 [[ "$CUR_BRANCH" == "$BRANCH" ]] || { echo "!! $REPO is on '$CUR_BRANCH', expected $BRANCH"; exit 1; }
 [[ -z "$(git -C "$REPO" status --porcelain)" ]] || { echo "!! $REPO tree is dirty"; git -C "$REPO" status --short | head; exit 1; }
 git -C "$REPO" merge-base --is-ancestor b68dab2 HEAD || { echo "!! HEAD does not contain b68dab2"; exit 1; }
+sudo -n -u mahmoud test -x "$NVM_BIN/railway" || { echo "!! railway CLI not found at $NVM_BIN (set MAHMOUD_NODE_BIN)"; exit 1; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 CODE_HEAD=$(cd "$REPO" && sudo -n -u mahmoud .venv/bin/python -m alembic heads 2>/dev/null | awk '{print $1}' | head -1)
 [[ "$CODE_HEAD" == "$NEW_HEAD" ]] || { echo "!! alembic head in tree is '$CODE_HEAD', expected $NEW_HEAD"; exit 1; }

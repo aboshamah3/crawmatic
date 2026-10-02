@@ -24,7 +24,9 @@ ENVNAME=production
 REPO=/srv/crawmatic/crawmatic
 NEW_HEAD=a7c41e9d2b56
 API=${API:-https://api-production-7193.up.railway.app}
-NVM_BIN=${NVM_BIN:-/home/mahmoud/.nvm/versions/node/v24.18.0/bin}
+# mahmoud's own Node (the railway CLI lives there). Never inherit NVM_BIN: a
+# root shell exports root's nvm bin, which mahmoud cannot read (2026-10-02).
+NVM_BIN=${MAHMOUD_NODE_BIN:-/home/mahmoud/.nvm/versions/node/v24.18.0/bin}
 MERGED=${MERGED:-/srv/crawmatic/outreach/leads/matching/full_crawl/merged}
 EVIDENCE=/srv/crawmatic/evidence/catalog-index-load-2026-10-02
 LOG=$EVIDENCE/LOAD-LOG.txt
@@ -46,6 +48,8 @@ grep -q "multibrand_evidence=" "$MERGED/pool_fit.csv" \
 DBH=$(curl -s -m 15 "$API/version" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("db_migration_head") or "")')
 [[ "$DBH" == "$NEW_HEAD" ]] || { echo "!! prod db head is '$DBH', expected $NEW_HEAD: deploy first"; exit 1; }
 [[ -s "$TOKEN_FILE" ]] || { echo "!! $TOKEN_FILE missing: deploy first"; exit 1; }
+
+sudo -n -u mahmoud test -x "$NVM_BIN/railway" || { echo "!! railway CLI not found at $NVM_BIN (set MAHMOUD_NODE_BIN)"; exit 1; }
 
 # ---- credentials (never echoed) ----------------------------------------------
 # shellcheck disable=SC1091
