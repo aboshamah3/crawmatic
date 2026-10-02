@@ -94,8 +94,19 @@ if [[ ! -s "$TOKEN_FILE" ]]; then
   ( umask 077; openssl rand -hex 32 > "$TOKEN_FILE" )
   echo "generated a new token in $TOKEN_FILE"
 fi
-rw variable set "INDEX_SERVICE_TOKEN=$(cat "$TOKEN_FILE")" -s api -e "$ENVNAME" -p "$PROJECT" --skip-deploys >/dev/null 2>&1 \
-  || { echo "!! could not set INDEX_SERVICE_TOKEN on api"; exit 1; }
+# The value goes in on stdin, never on a command line (`ps` would show it).
+# Railway's own output is shown on failure; it never contains the value.
+set_out=$(tr -d '\n' < "$TOKEN_FILE" \
+  | rw variable set INDEX_SERVICE_TOKEN --stdin -s api -e "$ENVNAME" -p "$PROJECT" --skip-deploys 2>&1)
+set_rc=$?
+if (( set_rc != 0 )); then
+  echo "!! could not set INDEX_SERVICE_TOKEN on api (railway exit $set_rc):"
+  sed 's/^/   railway: /' <<<"$set_out" | head -20
+  exit 1
+fi
+rw variable list -s api -e "$ENVNAME" -p "$PROJECT" --json 2>/dev/null \
+  | python3 -c 'import sys,json; sys.exit(0 if "INDEX_SERVICE_TOKEN" in json.load(sys.stdin) else 1)' \
+  || { echo "!! railway reported success but api has no INDEX_SERVICE_TOKEN"; exit 1; }
 echo "OK: INDEX_SERVICE_TOKEN set (value not shown)"
 
 # ---- 2. migrate --------------------------------------------------------------
