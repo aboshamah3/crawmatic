@@ -224,6 +224,56 @@ def _workspace_by_ref(session: Session, external_ref: str) -> Workspace | None:
     ).scalars().first()
 
 
+BOOTSTRAP_KEY_NAME_PREFIX = "saas-bootstrap:"
+
+
+class _AmbiguousLegacyRef(Exception):
+    pass
+
+
+def _legacy_workspace_for_ref(session: Session, external_ref: str) -> Workspace | None:
+    """A pre-E5 workspace (``external_ref IS NULL``) provisioned for this ref.
+
+    Until the owner backfill of ``workspaces.external_ref`` runs, every
+    workspace created before E5 has ``external_ref`` NULL, so a SaaS
+    re-provision of an existing project would miss `_workspace_by_ref` and
+    silently create a second workspace. The legacy identity is the bootstrap
+    key the old code minted in the same transaction as the workspace, named
+    ``saas-bootstrap:<raw external_ref>`` (exact, un-normalised, so
+    ``Store_1``/``store.1`` and boundary splits stay distinct; API key rows
+    are revoked, never deleted). The old ``name-ref`` slug is NOT used: it is
+    the ambiguous identity E5 removes.
+
+    Raises `_AmbiguousLegacyRef` when more than one legacy workspace carries
+    that key (an old rename-and-retry); the caller refuses rather than guess.
+    """
+    workspace_ids = {
+        key.workspace_id
+        for key in session.execute(  # noqa: workspace-scope
+            select(ApiKey).where(ApiKey.name == f"{BOOTSTRAP_KEY_NAME_PREFIX}{external_ref}")
+        ).scalars().all()
+    }
+    if not workspace_ids:
+        return None
+    candidates = [
+        ws
+        for ws in session.execute(  # noqa: workspace-scope
+            select(Workspace).where(Workspace.id.in_(workspace_ids))
+        ).scalars().all()
+        if ws.external_ref is None
+    ]
+    if len(candidates) > 1:
+        raise _AmbiguousLegacyRef(external_ref)
+    return candidates[0] if candidates else None
+
+
+def _duplicate_ref(external_ref: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"error": {"code": "DUPLICATE_EXTERNAL_REF", "message": message}},
+    )
+
+
 @router.post("/workspaces", response_model=WorkspaceProvisionResponse, status_code=201)
 def provision_workspace(
     payload: WorkspaceProvisionRequest,
@@ -239,9 +289,40 @@ def provision_workspace(
     is a workspace created (201) with a bootstrap key whose plaintext is
     returned exactly once (only its prefix and sha256 hash are persisted).
 
+    On a miss, a pre-E5 workspace (``external_ref IS NULL``) whose
+    bootstrap key is named for this exact ref is adopted: its
+    ``external_ref`` is stamped and it is returned (200, no new key), so a
+    SaaS re-provision before the owner backfill never forks a second
+    workspace. More than one such legacy workspace is a 409.
+
     The slug is display-only; collisions get `-2`, `-3`, ...
     """
     existing = _workspace_by_ref(session, payload.external_ref)
+    if existing is None:
+        try:
+            legacy = _legacy_workspace_for_ref(session, payload.external_ref)
+        except _AmbiguousLegacyRef as exc:
+            raise _duplicate_ref(
+                payload.external_ref,
+                "More than one pre-existing workspace was provisioned for external_ref "
+                f"{payload.external_ref!r}; an operator must backfill workspaces.external_ref.",
+            ) from exc
+        if legacy is not None:
+            # Adopt the legacy workspace: stamp its ref so later calls hit the
+            # unique lookup. A concurrent adopter/creator wins via the UNIQUE.
+            legacy.external_ref = payload.external_ref
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                legacy = _workspace_by_ref(session, payload.external_ref)
+                if legacy is None:
+                    raise _duplicate_ref(
+                        payload.external_ref,
+                        "Workspace provisioning conflicted for external_ref "
+                        f"{payload.external_ref!r}; retry.",
+                    ) from None
+            existing = legacy
     if existing is not None:
         response.status_code = 200
         return WorkspaceProvisionResponse(
@@ -285,7 +366,7 @@ def provision_workspace(
     session.add(
         ApiKey(
             workspace_id=workspace.id,
-            name=f"saas-bootstrap:{payload.external_ref}",
+            name=f"{BOOTSTRAP_KEY_NAME_PREFIX}{payload.external_ref}",
             key_prefix=key_prefix,
             key_hash=key_hash,
             scopes=BOOTSTRAP_SCOPES,

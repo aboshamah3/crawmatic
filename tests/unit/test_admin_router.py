@@ -417,3 +417,71 @@ def test_backfill_script_emits_guarded_updates():
     assert "external_ref IS NULL" in stmt and "'proj''1'" in stmt
     with pytest.raises(ValueError):
         mod.build_statements([[ws, "a"], [ws, "b"]])
+
+
+# --- legacy (pre-E5, external_ref IS NULL) adoption: P6 review finding 3 ----
+
+
+def _seed_legacy(session, ref, *, slug=None):
+    from app_shared.enums import ApiKeyStatus, WorkspaceStatus
+    from app_shared.models.identity import ApiKey, Workspace
+
+    ws = Workspace(
+        id=uuid.uuid4(), name="Acme", slug=slug or f"acme-{uuid.uuid4().hex[:6]}",
+        external_ref=None, status=WorkspaceStatus.ACTIVE,
+    )
+    session.seed(ws)
+    session.seed(
+        ApiKey(
+            id=uuid.uuid4(), workspace_id=ws.id, name=f"saas-bootstrap:{ref}",
+            key_prefix="ck_x", key_hash="h", scopes=[], status=ApiKeyStatus.REVOKED,
+        )
+    )
+    return ws
+
+
+def _provision_nocred(client, name, ref):
+    # No credential header: require_service_token is overridden, and with no
+    # identity the abuse limiter never counts the request (full-suite safe).
+    return client.post("/v1/admin/workspaces", json={"name": name, "external_ref": ref})
+
+
+def test_reprovision_adopts_legacy_workspace_without_new_key(client, session):
+    legacy = _seed_legacy(session, "proj_1", slug="acme-proj-1")
+    resp = _provision_nocred(client, "Acme Renamed", "proj_1")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["workspace_id"] == str(legacy.id)
+    assert resp.json()["api_key"] is None
+    assert legacy.external_ref == "proj_1"
+    assert [o for o in session.added if type(o).__name__ in ("Workspace", "ApiKey")] == []
+    # Second call now hits the unique external_ref lookup.
+    again = _provision_nocred(client, "Acme", "proj_1")
+    assert again.status_code == 200
+    assert again.json()["workspace_id"] == str(legacy.id)
+
+
+def test_legacy_adoption_is_exact_on_the_raw_ref(client, session):
+    # Same legacy slug spelling ("shop-store-1") but a different raw ref:
+    # must NOT adopt -- that is the punctuation collision E5 removes.
+    legacy = _seed_legacy(session, "Store_1", slug="shop-store-1")
+    resp = _provision_nocred(client, "Shop", "store.1")
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["workspace_id"] != str(legacy.id)
+    assert legacy.external_ref is None
+
+
+def test_already_adopted_workspace_is_not_readopted_for_its_key(client, session):
+    legacy = _seed_legacy(session, "proj_9")
+    legacy.external_ref = "proj_9_other"
+    resp = _provision_nocred(client, "Acme", "proj_9")
+    assert resp.status_code == 201
+    assert resp.json()["workspace_id"] != str(legacy.id)
+
+
+def test_ambiguous_legacy_ref_is_409_and_creates_nothing(client, session):
+    _seed_legacy(session, "proj_2")
+    _seed_legacy(session, "proj_2")
+    resp = _provision_nocred(client, "Acme", "proj_2")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "DUPLICATE_EXTERNAL_REF"
+    assert session.added == []
