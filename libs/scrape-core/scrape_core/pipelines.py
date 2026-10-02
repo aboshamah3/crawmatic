@@ -113,6 +113,7 @@ from app_shared.enums import (
     ScrapeTargetStatus,
     StockStatus,
 )
+from app_shared.domains import url_host_belongs_to_domain
 from app_shared.ids import new_uuid7
 from app_shared.jobs.cancellation import LATE_AFTER_CANCEL_REASON, cancelled_scrape_job_ids
 from app_shared.jobs.targets import mark_target, stamp_target_timestamps
@@ -123,6 +124,7 @@ from app_shared.models.observations import (
     PriceObservation,
     RequestAttempt,
 )
+from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.observations.evidence_store import store_dir_from_settings, store_evidence
 from app_shared.outbox import write_outbox_message
@@ -1174,7 +1176,33 @@ def _flush_batch(
                 target_row.current_strategy_method_id = item.next_strategy_method_id
                 target_row.strategy_attempt_ordinal = item.strategy_attempt_ordinal + 1
                 target_row.chain_token = item.chain_token or new_uuid7()
-                target_row.strategy_url_override = item.canonical_url
+                override_url = item.canonical_url
+                if override_url is not None:
+                    domain_row = session.execute(
+                        select(Competitor.domain)
+                        .join(
+                            CompetitorProductMatch,
+                            and_(
+                                CompetitorProductMatch.workspace_id == Competitor.workspace_id,
+                                CompetitorProductMatch.competitor_id == Competitor.id,
+                            ),
+                        )
+                        .where(
+                            CompetitorProductMatch.workspace_id == item.workspace_id,
+                            CompetitorProductMatch.id == item.match_id,
+                        )
+                    ).first()
+                    competitor_domain = domain_row.domain if domain_row is not None else None
+                    if not url_host_belongs_to_domain(override_url, competitor_domain):
+                        # E4: a strategy-repaired URL must stay on the competitor's host.
+                        log_event(
+                            logger,
+                            "strategy_url_override_skipped_foreign_host",
+                            match_id=str(item.match_id),
+                            scrape_job_id=str(item.scrape_job_id),
+                        )
+                        override_url = None
+                target_row.strategy_url_override = override_url
                 target_row.dispatched_at = None
                 write_outbox_message(
                     session,

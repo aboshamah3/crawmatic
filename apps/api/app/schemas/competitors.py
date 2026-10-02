@@ -17,13 +17,23 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
+from app_shared.domains import canonical_domain
 from app_shared.enums import CompetitorStatus, LegalStatus, RobotsPolicy
 
 # Reused, not rebuilt (contracts/api-competitors.md) — the DELETE
 # response shape is identical to the SPEC-04 catalog delete outcome.
 from app.schemas.catalog import DeleteOutcome  # noqa: F401 - re-exported for routers
+
+
+def _canonicalise(value):
+    if value is None:
+        return value
+    try:
+        return canonical_domain(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid competitor domain: {exc}") from exc
 
 
 class CompetitorCreate(BaseModel):
@@ -46,6 +56,11 @@ class CompetitorCreate(BaseModel):
     max_concurrent_requests: int | None = None
     max_requests_per_minute: int | None = None
 
+    @field_validator("domain")
+    @classmethod
+    def _canonical_domain(cls, value):
+        return _canonicalise(value)
+
 
 class CompetitorUpdate(BaseModel):
     """`PATCH /v1/competitors/{id}` — every field optional (partial update)."""
@@ -61,6 +76,11 @@ class CompetitorUpdate(BaseModel):
     default_access_policy_id: uuid.UUID | None = None
     max_concurrent_requests: int | None = None
     max_requests_per_minute: int | None = None
+
+    @field_validator("domain")
+    @classmethod
+    def _canonical_domain(cls, value):
+        return _canonicalise(value)
 
 
 class CompetitorResponse(BaseModel):

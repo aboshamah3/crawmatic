@@ -99,6 +99,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from app_shared.domains import canonical_domain
+
 logger = logging.getLogger("app_shared.scheduling.fair_queue")
 
 __all__ = [
@@ -159,12 +161,17 @@ def normalize_domain(domain: str | None) -> str:
     """
     if not domain:
         return WILDCARD_DOMAIN
-    value = str(domain).strip().lower().rstrip(".")
-    if not value:
-        return WILDCARD_DOMAIN
-    if value.startswith("www."):
-        value = value[4:]
-    return value or WILDCARD_DOMAIN
+    try:
+        return canonical_domain(str(domain))
+    except ValueError:
+        # Not a bare host (path, port, IP literal...). Keep the historical
+        # lenient spelling so the scheduler still gets a stable key.
+        value = str(domain).strip().lower().rstrip(".")
+        if not value:
+            return WILDCARD_DOMAIN
+        if value.startswith("www."):
+            value = value[4:]
+        return value or WILDCARD_DOMAIN
 
 
 @dataclass(frozen=True)

@@ -85,6 +85,7 @@ from app_shared.profiles.repository import assert_profile_assignable, profile_vi
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 from app_shared.url_pattern import derive_match_url_fields
+from app_shared.domains import url_host_belongs_to_domain
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
 from app.deps import Principal, require_scopes
@@ -124,6 +125,28 @@ def _unsafe_url(exc: UnsafeUrlError) -> HTTPException:
         status_code=422,
         detail={"error": {"code": "UNSAFE_URL", "message": str(exc), "reason": exc.reason.value}},
     )
+
+
+def _match_host_not_competitor(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"error": {"code": "MATCH_HOST_NOT_COMPETITOR", "message": message}},
+    )
+
+
+def _assert_url_belongs_to_competitor(
+    session: Session, workspace_id: uuid.UUID, competitor_id: uuid.UUID, url: str
+) -> None:
+    row = session.execute(
+        select(Competitor.domain).where(
+            Competitor.workspace_id == workspace_id, Competitor.id == competitor_id
+        )
+    ).first()
+    domain = row.domain if row is not None else None
+    if domain is None or not url_host_belongs_to_domain(url, domain):
+        raise _match_host_not_competitor(
+            "The match URL's host must be the competitor's domain or one of its subdomains."
+        )
 
 
 def _duplicate_match(message: str) -> HTTPException:
@@ -416,6 +439,7 @@ def create_match(
 
     variant = _resolve_variant(session, ws, payload)
     _resolve_competitor(session, ws, payload.competitor_id)
+    _assert_url_belongs_to_competitor(session, ws, payload.competitor_id, payload.competitor_url)
     _check_scrape_profile_assignable(session, ws, payload.scrape_profile_id)
     _check_protected_link_cap(
         session,
@@ -773,6 +797,9 @@ def update_match(
             validate_competitor_url(new_url)
         except UnsafeUrlError as exc:
             raise _unsafe_url(exc) from exc
+        _assert_url_belongs_to_competitor(
+            session, principal.workspace_id, match.competitor_id, new_url
+        )
         normalized_url, url_pattern, url_pattern_version = derive_match_url_fields(new_url)
         match.competitor_url = new_url
         match.normalized_competitor_url = normalized_url
