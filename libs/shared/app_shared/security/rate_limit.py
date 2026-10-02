@@ -43,20 +43,38 @@ def _incr_and_check(redis: object, key: str, *, max_attempts: int, window_second
     return count > max_attempts
 
 
-def _apply_progressive_backoff(redis: object, scope_key: str, *, window_seconds: int) -> None:
-    """Extend a per-scope lock TTL each time the scope is found over threshold.
+def _strike_key(scope_key: str) -> str:
+    return f"rl:login:strikes:{scope_key}"
 
-    Each violation doubles the previous lock TTL (starting at
-    ``window_seconds``), so repeated abuse is met with a growing lockout
-    rather than a fixed one.
+
+#: How long a scope's strike count is remembered, and the longest single
+#: lock it can earn. A day: long enough that a slow, patient attacker keeps
+#: meeting a doubled lock, short enough that a user who fat-fingered a
+#: password last week starts clean.
+_STRIKE_MEMORY_SECONDS = 86400
+
+
+def _apply_progressive_backoff(redis: object, scope_key: str, *, window_seconds: int) -> None:
+    """Lock ``scope_key``; each new lock is twice as long as the last one.
+
+    Strikes are counted in their own key (remembered for a day), so the
+    doubling survives the lock expiring -- the lock is enforced (attempts
+    while locked are refused without counting), so the old "double the
+    live lock's TTL on every over-threshold attempt" could never fire
+    again. Lock = ``window_seconds * 2**(strikes-1)``, capped at a day.
     """
-    lock_key = _lock_key(scope_key)
-    current_ttl = redis.ttl(lock_key)  # type: ignore[attr-defined]
-    if current_ttl is None or current_ttl < 0:
-        new_ttl = window_seconds
-    else:
-        new_ttl = current_ttl * 2
-    redis.set(lock_key, 1, ex=new_ttl)  # type: ignore[attr-defined]
+    strike_key = _strike_key(scope_key)
+    strikes = redis.incr(strike_key)  # type: ignore[attr-defined]
+    redis.expire(strike_key, _STRIKE_MEMORY_SECONDS)  # type: ignore[attr-defined]
+    exponent = max(int(strikes) - 1, 0)
+    new_ttl = min(window_seconds * (2 ** min(exponent, 20)), _STRIKE_MEMORY_SECONDS)
+    redis.set(_lock_key(scope_key), 1, ex=new_ttl)  # type: ignore[attr-defined]
+
+
+def _lock_ttl(redis: object, scope_key: str) -> int:
+    """Seconds left on ``scope_key``'s lock (0 when unlocked)."""
+    ttl = redis.ttl(_lock_key(scope_key))  # type: ignore[attr-defined]
+    return int(ttl) if ttl is not None and ttl > 0 else 0
 
 
 def check_and_increment_login(
@@ -78,6 +96,17 @@ def check_and_increment_login(
     try:
         account_key = _account_key(email)
         source_key = _source_key(source_ip)
+
+        # Security plan 2026-10-02 (E10): the progressive-backoff lock is
+        # ENFORCED. While either scope's lock is live the attempt is
+        # refused outright -- before any counter moves, so a locked scope
+        # cannot simply wait out the (shorter) counter window and get a
+        # fresh `max_attempts` while the doubled lock is still running.
+        lock_remaining = max(
+            _lock_ttl(redis, account_key), _lock_ttl(redis, source_key)
+        )
+        if lock_remaining > 0:
+            return RateLimitResult(allowed=False, retry_after_seconds=lock_remaining)
 
         account_over = _incr_and_check(
             redis, account_key, max_attempts=max_attempts, window_seconds=window_seconds

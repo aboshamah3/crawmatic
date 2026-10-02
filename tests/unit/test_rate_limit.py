@@ -106,3 +106,59 @@ def test_fail_safe_denies_on_redis_error() -> None:
         redis, email="a@example.com", source_ip="1.2.3.4", max_attempts=5, window_seconds=60
     )
     assert result.allowed is False
+
+
+# --- security plan 2026-10-02 E10: the lock is enforced ------------------
+
+
+def _attempt(redis, *, email="locked@example.com", ip="10.1.1.1"):
+    return check_and_increment_login(
+        redis, email=email, source_ip=ip, max_attempts=5, window_seconds=60
+    )
+
+
+def test_lockout_is_enforced_after_progressive_failures() -> None:
+    redis = _FakeRedis()
+    results = [_attempt(redis) for _ in range(6)]
+    assert [r.allowed for r in results] == [True] * 5 + [False]
+
+    # The counter window resets (as when its 60s TTL lapses) but the lock
+    # is still live: the attempt is refused and nothing is counted.
+    for key in [k for k in redis.counters if ":strikes:" not in k]:
+        del redis.counters[key]
+    before = dict(redis.counters)
+    locked = _attempt(redis)
+    assert locked.allowed is False
+    assert locked.retry_after_seconds == 60
+    assert redis.counters == before
+
+
+def test_lock_on_the_source_refuses_a_fresh_account() -> None:
+    redis = _FakeRedis()
+    for i in range(6):
+        _attempt(redis, email=f"spray{i}@example.com", ip="10.2.2.2")
+    redis.counters.clear()
+    assert _attempt(redis, email="brand-new@example.com", ip="10.2.2.2").allowed is False
+
+
+def test_each_new_lock_doubles() -> None:
+    redis = _FakeRedis()
+    for _ in range(6):
+        _attempt(redis)
+    first = max(ttl for _, ttl in redis.locks.values())
+    # Lock lapses, counter window lapses (the day-long strike memory does
+    # not), the scope trips again.
+    redis.locks.clear()
+    for key in [k for k in redis.counters if ":strikes:" not in k]:
+        del redis.counters[key]
+    for _ in range(6):
+        _attempt(redis)
+    second = max(ttl for _, ttl in redis.locks.values())
+    assert (first, second) == (60, 120)
+
+
+def test_unlocked_scope_is_not_affected_by_another_scopes_lock() -> None:
+    redis = _FakeRedis()
+    for _ in range(6):
+        _attempt(redis)
+    assert _attempt(redis, email="other@example.com", ip="10.9.9.9").allowed is True
