@@ -45,6 +45,8 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from requests.utils import select_proxy
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
@@ -239,6 +241,109 @@ _MAX_PROBE_REDIRECTS = 5
 _probe_resolver: Resolver = system_resolver
 
 
+def _host_header(host: str, port: int | None, scheme: str) -> str:
+    """`Host:` value for `host` (IPv6 bracketed, non-default port kept)."""
+    rendered = f"[{host}]" if ":" in host else host
+    default_port = 443 if scheme == "https" else 80
+    return rendered if port in (None, default_port) else f"{rendered}:{port}"
+
+
+class PinnedHTTPAdapter(HTTPAdapter):
+    """Send requests for `host` to the already-validated `ip` (audit E2).
+
+    `_probe_get` validates every hop with `validate_resolved_target`, but
+    a plain `requests.get(url)` would then resolve the hostname a SECOND
+    time inside urllib3 -- a DNS-rebinding host can answer the guard with
+    a public address and the connect with `127.0.0.1` /
+    `169.254.169.254`. This adapter closes that window:
+
+    * the urllib3 pool for `host` is opened against `ip` (no second
+      lookup -- an IP literal never hits the resolver);
+    * TLS keeps SNI (`server_hostname`) and certificate verification
+      (`assert_hostname`) on the original hostname, so `verify` is
+      never weakened and a cert for the IP is never accepted;
+    * the `Host:` header is set explicitly to the hostname (urllib3 would
+      otherwise derive it from the pool's host, i.e. the IP).
+
+    Requests for any other host, and proxied requests (the proxy performs
+    the connect, so there is nothing local to pin), fall through to the
+    stock `HTTPAdapter` behaviour.
+    """
+
+    def __init__(self, host: str, ip: str, **kwargs: Any) -> None:
+        self._pinned_host = host.lower()
+        self._pinned_ip = ip
+        super().__init__(**kwargs)
+
+    def _applies(self, request: requests.PreparedRequest, proxies: Any) -> bool:
+        host = (urlsplit(request.url or "").hostname or "").lower()
+        return host == self._pinned_host and not select_proxy(request.url, proxies or {})
+
+    def get_connection_with_tls_context(
+        self,
+        request: requests.PreparedRequest,
+        verify: Any,
+        proxies: Any = None,
+        cert: Any = None,
+    ) -> Any:
+        if not self._applies(request, proxies):
+            return super().get_connection_with_tls_context(
+                request, verify, proxies=proxies, cert=cert
+            )
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        host_params = {**host_params, "host": self._pinned_ip}
+        if host_params.get("scheme") == "https":
+            pool_kwargs = {
+                **pool_kwargs,
+                "server_hostname": self._pinned_host,
+                "assert_hostname": self._pinned_host,
+            }
+        return self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+
+    def add_headers(self, request: requests.PreparedRequest, **kwargs: Any) -> None:
+        super().add_headers(request, **kwargs)
+        if self._applies(request, kwargs.get("proxies")):
+            parts = urlsplit(request.url or "")
+            request.headers["Host"] = _host_header(
+                self._pinned_host, parts.port, (parts.scheme or "").lower()
+            )
+
+
+def _validated_ip(url: str) -> str:
+    """Run the fetch-time SSRF guard on `url`; return the IP it approved.
+
+    Wraps `_probe_resolver` so the address handed to the connection is
+    exactly an address `validate_resolved_target` checked -- one lookup,
+    no rebinding window. Raises `UnsafeUrlError` or `OSError` (callers
+    fail closed on both).
+    """
+    answers: list[str] = []
+
+    def capturing_resolver(name: str) -> list[str]:
+        resolved = list(_probe_resolver(name))
+        answers.extend(resolved)
+        return resolved
+
+    validate_resolved_target(url, resolver=capturing_resolver)
+    if not answers:
+        # Defensive: the guard always resolves (and refuses an empty
+        # answer); never connect to an address nobody checked.
+        raise OSError(f"no validated address for {urlsplit(url).hostname!r}")
+    return answers[0]
+
+
+def _pinned_get(url: str, ip: str, **kwargs: Any) -> requests.Response:
+    """One GET of `url` whose socket is pinned to the validated `ip`."""
+    host = urlsplit(url).hostname or ""
+    with requests.Session() as http:
+        adapter = PinnedHTTPAdapter(host, ip)
+        http.mount("http://", adapter)
+        http.mount("https://", adapter)
+        return http.get(url, **kwargs)
+
+
 def _probe_get(url: str, **kwargs: Any) -> "requests.Response | None":
     """One probe fetch with the SAME fetch-time SSRF guard the spiders use.
 
@@ -278,7 +383,7 @@ def _probe_get(url: str, **kwargs: Any) -> "requests.Response | None":
     current = url
     for _ in range(_MAX_PROBE_REDIRECTS + 1):
         try:
-            validate_resolved_target(current, resolver=_probe_resolver)
+            ip = _validated_ip(current)
         except UnsafeUrlError as exc:
             logger.warning(
                 "strategy_discovery: probe target refused by SSRF guard url=%s reason=%s",
@@ -295,8 +400,10 @@ def _probe_get(url: str, **kwargs: Any) -> "requests.Response | None":
             )
             return None
 
-        response = requests.get(
-            current, timeout=_PROBE_TIMEOUT_SECONDS, allow_redirects=False, **kwargs
+        # Connect to the IP the guard just approved, never re-resolve
+        # (audit E2): Host/SNI/cert verification stay on the hostname.
+        response = _pinned_get(
+            current, ip, timeout=_PROBE_TIMEOUT_SECONDS, allow_redirects=False, **kwargs
         )
         location = response.headers.get("location") if response.is_redirect else None
         if not location:
