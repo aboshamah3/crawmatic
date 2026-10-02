@@ -347,6 +347,17 @@ from app_shared.models.strategy_discovery_state import (
     StrategyDiscoveryState,
 )
 
+# The catalog index (2026-10-02): a fleet-wide copy of public storefront
+# listings used to propose competitor matches. Re-exported so
+# `Base.metadata` sees the three tables. Global (no `workspace_id`, no
+# RLS), the `domain_playbooks` class (deliberately NOT added to
+# `app_shared.repository.WORKSPACE_OWNED_MODELS`).
+from app_shared.models.catalog_index import (
+    CatalogIndexCode,
+    CatalogIndexLoad,
+    CatalogIndexProduct,
+)
+
 __all__ = [
     "Base",
     "metadata",
@@ -428,4 +439,7 @@ __all__ = [
     "StrategyDiscoveryState",
     "DISCOVERY_SCAN_STATE_KEY",
     "FleetDailyScorecard",
+    "CatalogIndexCode",
+    "CatalogIndexLoad",
+    "CatalogIndexProduct",
 ]
