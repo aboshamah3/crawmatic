@@ -15,6 +15,7 @@ configuration is parsed exactly once per process.
 
 from __future__ import annotations
 
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -181,7 +182,16 @@ class Settings(BaseSettings):
 
     # --- Auth / JWT (required — never silently defaulted, SPEC-03 FR-024) ---
     JWT_SECRET: str
+    # Restricted to the HMAC family {HS256, HS384, HS512} -- validated
+    # below, so a typo or `none` is a startup error, never a wider decode.
     JWT_ALGORITHM: str = "HS256"
+    # Security plan 2026-10-02 (E8): engine tokens now carry
+    # aud/iss="crawmatic-engine". Tokens issued before that deploy carry
+    # neither and are accepted ONLY until this instant (ISO-8601, UTC if
+    # no offset). Owner sets it to deploy time + ACCESS_TOKEN_TTL_SECONDS
+    # (15 min) and may unset it afterwards. Unset = NO grace: every
+    # aud-less token is refused immediately (users simply log in again).
+    JWT_LEGACY_AUD_GRACE_UNTIL: datetime | None = None
     ACCESS_TOKEN_TTL_SECONDS: int = 900
     REFRESH_TOKEN_TTL_SECONDS: int = 2592000
 
@@ -1275,6 +1285,16 @@ class Settings(BaseSettings):
     # navigations included, or a live fetch's slot is reclaimed while it
     # is still on the wire and the fleet quietly over-admits.
     FLEET_LEASE_TTL_SECONDS: int = 120
+
+    @field_validator("JWT_ALGORITHM")
+    @classmethod
+    def _validate_jwt_algorithm(cls, value: str) -> str:
+        allowed = ("HS256", "HS384", "HS512")
+        if value not in allowed:
+            raise ValueError(
+                f"JWT_ALGORITHM must be one of {', '.join(allowed)} (got {value!r})"
+            )
+        return value
 
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")
     @classmethod

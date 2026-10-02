@@ -175,6 +175,19 @@ def _weak_secret_findings(settings: Settings) -> list[str]:
                 '`python -c "import secrets; print(secrets.token_urlsafe(48))"`).'
             )
 
+    if settings.INDEX_SERVICE_TOKEN is not None:
+        if not settings.INDEX_SERVICE_TOKEN.strip():
+            findings.append(
+                "INDEX_SERVICE_TOKEN is set but blank — either unset it entirely "
+                "(index readers then need SAAS_SERVICE_TOKEN) or set a real generated token."
+            )
+        elif len(settings.INDEX_SERVICE_TOKEN.strip()) < _MIN_SECRET_LENGTH:
+            findings.append(
+                f"INDEX_SERVICE_TOKEN is only {len(settings.INDEX_SERVICE_TOKEN.strip())} bytes "
+                f"(minimum {_MIN_SECRET_LENGTH}; generate with "
+                '`python -c "import secrets; print(secrets.token_urlsafe(48))"`).'
+            )
+
     return findings
 
 

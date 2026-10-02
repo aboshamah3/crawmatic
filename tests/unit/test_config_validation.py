@@ -376,3 +376,50 @@ def test_the_fleet_cap_warning_never_fires_outside_production(
         assert_production_safe(settings=_settings(LOCAL_DEV_ENV))
 
     assert caplog.records == []
+
+
+# --- security plan 2026-10-02 E9: JWT algorithm + index token ------------
+
+
+def test_short_index_service_token_is_a_production_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    settings = _settings(SAFE_ENV, INDEX_SERVICE_TOKEN="short-index-token")
+
+    with pytest.raises(ProductionConfigError, match="INDEX_SERVICE_TOKEN"):
+        assert_production_safe(settings=settings)
+
+
+def test_blank_index_service_token_is_a_production_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    settings = _settings(SAFE_ENV, INDEX_SERVICE_TOKEN="   ")
+
+    with pytest.raises(ProductionConfigError, match="INDEX_SERVICE_TOKEN"):
+        assert_production_safe(settings=settings)
+
+
+def test_long_index_service_token_passes_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert_production_safe(settings=_settings(SAFE_ENV, INDEX_SERVICE_TOKEN="i" * 48))
+
+
+@pytest.mark.parametrize("algorithm", ["none", "RS256", "ES256", "hs256", ""])
+def test_bad_jwt_algorithm_is_a_startup_error(algorithm: str) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="JWT_ALGORITHM"):
+        _settings(SAFE_ENV, JWT_ALGORITHM=algorithm)
+
+
+@pytest.mark.parametrize("algorithm", ["HS256", "HS384", "HS512"])
+def test_hmac_jwt_algorithms_are_accepted(algorithm: str) -> None:
+    assert _settings(SAFE_ENV, JWT_ALGORITHM=algorithm).JWT_ALGORITHM == algorithm
+
+
+def test_jwt_legacy_aud_grace_until_defaults_to_no_grace() -> None:
+    assert _settings(SAFE_ENV).JWT_LEGACY_AUD_GRACE_UNTIL is None
+    parsed = _settings(SAFE_ENV, JWT_LEGACY_AUD_GRACE_UNTIL="2026-10-03T12:00:00+00:00")
+    assert parsed.JWT_LEGACY_AUD_GRACE_UNTIL is not None

@@ -199,7 +199,10 @@ def _authenticate_jwt(credential: str) -> Principal:
     settings = get_settings()
     try:
         claims = decode_access_token(
-            credential, secret=settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM
+            credential,
+            secret=settings.JWT_SECRET,
+            algorithm=settings.JWT_ALGORITHM,
+            legacy_aud_grace_until=getattr(settings, "JWT_LEGACY_AUD_GRACE_UNTIL", None),
         )
     except Exception as exc:
         raise auth_failed_exception() from exc

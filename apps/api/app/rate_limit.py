@@ -366,7 +366,10 @@ def _workspace_from_verified_jwt(credential: str, settings: object) -> str | Non
         from app_shared.security.jwt import decode_access_token
 
         claims = decode_access_token(
-            credential, secret=settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM
+            credential,
+            secret=settings.JWT_SECRET,
+            algorithm=settings.JWT_ALGORITHM,
+            legacy_aud_grace_until=getattr(settings, "JWT_LEGACY_AUD_GRACE_UNTIL", None),
         )
     except Exception:  # noqa: BLE001 - any decode failure just means "no claim"
         return None

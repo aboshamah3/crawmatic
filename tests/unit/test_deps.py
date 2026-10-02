@@ -79,7 +79,7 @@ def test_jwt_credential_routes_to_jwt_path_not_api_key_lookup(
     user_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
 
-    def _fake_decode(token, *, secret, algorithm):
+    def _fake_decode(token, *, secret, algorithm, **_kw):
         assert token == "a.jwt.token"
         return {
             "sub": str(user_id),
@@ -156,7 +156,7 @@ def test_non_bearer_authorization_header_is_401() -> None:
 
 
 def test_expired_jwt_is_401(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _raise_expired(token, *, secret, algorithm):
+    def _raise_expired(token, *, secret, algorithm, **_kw):
         raise Exception("simulated ExpiredSignatureError")
 
     monkeypatch.setattr(deps, "decode_access_token", _raise_expired)
@@ -176,7 +176,7 @@ def test_suspended_user_status_denies_with_401(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         deps,
         "decode_access_token",
-        lambda token, *, secret, algorithm: {
+        lambda token, *, secret, algorithm, **_kw: {
             "sub": str(user_id),
             "workspace_id": None,
             "role": "super_admin",
@@ -198,7 +198,7 @@ def test_suspended_workspace_status_denies_with_401(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         deps,
         "decode_access_token",
-        lambda token, *, secret, algorithm: {
+        lambda token, *, secret, algorithm, **_kw: {
             "sub": str(user_id),
             "workspace_id": str(workspace_id),
             "role": "workspace_admin",
@@ -223,7 +223,7 @@ def test_super_admin_without_x_workspace_id_is_rejected(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         deps,
         "decode_access_token",
-        lambda token, *, secret, algorithm: {
+        lambda token, *, secret, algorithm, **_kw: {
             "sub": str(user_id),
             "workspace_id": None,
             "role": "super_admin",
@@ -245,7 +245,7 @@ def test_super_admin_with_x_workspace_id_is_authorized(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         deps,
         "decode_access_token",
-        lambda token, *, secret, algorithm: {
+        lambda token, *, secret, algorithm, **_kw: {
             "sub": str(user_id),
             "workspace_id": None,
             "role": "super_admin",
@@ -275,7 +275,7 @@ def test_non_super_assuming_another_workspace_is_403(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         deps,
         "decode_access_token",
-        lambda token, *, secret, algorithm: {
+        lambda token, *, secret, algorithm, **_kw: {
             "sub": str(user_id),
             "workspace_id": str(own_workspace_id),
             "role": "workspace_admin",
@@ -300,7 +300,7 @@ def test_non_super_may_explicitly_assume_its_own_workspace(monkeypatch: pytest.M
     monkeypatch.setattr(
         deps,
         "decode_access_token",
-        lambda token, *, secret, algorithm: {
+        lambda token, *, secret, algorithm, **_kw: {
             "sub": str(user_id),
             "workspace_id": str(own_workspace_id),
             "role": "read_only",
@@ -349,3 +349,58 @@ def test_require_scopes_passes_when_all_scopes_are_granted() -> None:
     session = _FakeSession()
     result = check(principal_ctx=(session, principal))
     assert result == (session, principal)
+
+
+# --- security plan 2026-10-02 E8: real decode through the auth seam -------
+
+
+def _real_decode_settings(monkeypatch: pytest.MonkeyPatch) -> str:
+    from app_shared.security import jwt as engine_jwt
+
+    secret = "s" * 40
+
+    class _Settings(_FakeSettings):
+        JWT_SECRET = secret
+        JWT_LEGACY_AUD_GRACE_UNTIL = None
+
+    monkeypatch.setattr(deps, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(deps, "decode_access_token", engine_jwt.decode_access_token)
+    monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "active")
+    return secret
+
+
+def _assert_401(token: str) -> None:
+    gen = deps.get_current_principal(authorization=f"Bearer {token}", x_workspace_id=None)
+    with pytest.raises(HTTPException) as exc_info:
+        next(gen)
+    assert exc_info.value.status_code == 401
+
+
+def test_wrong_audience_token_is_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    import jwt as pyjwt
+
+    secret = _real_decode_settings(monkeypatch)
+    token = pyjwt.encode(
+        {"sub": str(uuid.uuid4()), "type": "access", "role": "super_admin",
+         "aud": "someone-else", "iss": "crawmatic-engine", "exp": int(time.time()) + 60},
+        secret,
+        algorithm="HS256",
+    )
+    _assert_401(token)
+
+
+def test_saas_shaped_token_signed_with_the_same_secret_is_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    import jwt as pyjwt
+
+    secret = _real_decode_settings(monkeypatch)
+    token = pyjwt.encode(
+        {"email": "owner@example.com", "exp": int(time.time()) + 60}, secret, algorithm="HS256"
+    )
+    _assert_401(token)
