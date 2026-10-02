@@ -250,7 +250,7 @@ def _legacy_workspace_for_ref(session: Session, external_ref: str) -> Workspace 
     workspace_ids = {
         key.workspace_id
         for key in session.execute(  # noqa: workspace-scope
-            select(ApiKey).where(ApiKey.name == f"{BOOTSTRAP_KEY_NAME_PREFIX}{external_ref}")
+            select(ApiKey).where(ApiKey.name == f"{BOOTSTRAP_KEY_NAME_PREFIX}{external_ref}")  # noqa: workspace-scope
         ).scalars().all()
     }
     if not workspace_ids:
