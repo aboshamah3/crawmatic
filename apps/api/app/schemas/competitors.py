@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, conint, field_validator
 
 from app_shared.domains import canonical_domain
 from app_shared.enums import CompetitorStatus, LegalStatus, RobotsPolicy
@@ -53,8 +53,8 @@ class CompetitorCreate(BaseModel):
     robots_policy: RobotsPolicy = RobotsPolicy.RESPECT
     default_scrape_profile_id: uuid.UUID | None = None
     default_access_policy_id: uuid.UUID | None = None
-    max_concurrent_requests: int | None = None
-    max_requests_per_minute: int | None = None
+    max_concurrent_requests: conint(ge=1, le=16) | None = None  # type: ignore[valid-type]
+    max_requests_per_minute: conint(ge=1, le=300) | None = None  # type: ignore[valid-type]
 
     @field_validator("domain")
     @classmethod
@@ -74,8 +74,8 @@ class CompetitorUpdate(BaseModel):
     robots_policy: RobotsPolicy | None = None
     default_scrape_profile_id: uuid.UUID | None = None
     default_access_policy_id: uuid.UUID | None = None
-    max_concurrent_requests: int | None = None
-    max_requests_per_minute: int | None = None
+    max_concurrent_requests: conint(ge=1, le=16) | None = None  # type: ignore[valid-type]
+    max_requests_per_minute: conint(ge=1, le=300) | None = None  # type: ignore[valid-type]
 
     @field_validator("domain")
     @classmethod

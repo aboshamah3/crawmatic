@@ -33,6 +33,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app_shared.enums import LegalStatus, RobotsPolicy
 from app_shared.catalog.consistency import CrossWorkspaceReference, MissingReference
 from app_shared.models.competitors_matches import Competitor
 from app_shared.models.domain_playbooks import DomainPlaybook
@@ -58,6 +59,29 @@ def _not_found(message: str) -> HTTPException:
     return HTTPException(
         status_code=404, detail={"error": {"code": "NOT_FOUND", "message": message}}
     )
+
+
+def _reject_self_approval(
+    robots_policy: RobotsPolicy | None, legal_status: LegalStatus | None
+) -> None:
+    """Tenants cannot self-approve the robots bypass or legal review (E7).
+
+    Only the operator surface (`/v1/admin/...`) may set these.
+    """
+    if (
+        robots_policy == RobotsPolicy.IGNORE_AFTER_APPROVAL
+        or legal_status == LegalStatus.APPROVED
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "OPERATOR_APPROVAL_REQUIRED",
+                    "message": "robots_policy=IGNORE_AFTER_APPROVAL and legal_status=APPROVED "
+                    "can only be set by an operator.",
+                }
+            },
+        )
 
 
 def _duplicate_domain(message: str) -> HTTPException:
@@ -124,6 +148,7 @@ def create_competitor(
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
 
+    _reject_self_approval(payload.robots_policy, payload.legal_status)
     _check_scrape_profile_assignable(
         session, principal.workspace_id, payload.default_scrape_profile_id
     )
@@ -243,6 +268,7 @@ def update_competitor(
         raise _not_found("Competitor not found.")
 
     updates = payload.model_dump(exclude_unset=True)
+    _reject_self_approval(updates.get("robots_policy"), updates.get("legal_status"))
     if "default_scrape_profile_id" in updates:
         _check_scrape_profile_assignable(
             session, principal.workspace_id, updates["default_scrape_profile_id"]

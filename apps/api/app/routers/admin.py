@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 from app_shared.database import get_auth_session
 from app_shared.enums import ApiKeyStatus, WorkspaceStatus
 from app_shared.jobs.reconciliation import reconcile_successful_failed_targets
+from app_shared.models.competitors_matches import Competitor
 from app_shared.models.identity import ApiKey, Workspace
 from app_shared.models.scrape_profiles import ScrapeProfile
 from app_shared.profiles.repository import clear_regex_quarantine
@@ -60,6 +61,8 @@ from app.schemas.admin import (
     AdminApiKeyListItem,
     AdminApiKeyListResponse,
     ApiKeyRevokeResponse,
+    CompetitorApprovalRequest,
+    CompetitorApprovalResponse,
     ProfileRegexUnquarantineResponse,
     ConnectorKeyCreateRequest,
     ConnectorKeyCreateResponse,
@@ -423,6 +426,39 @@ def archive_workspace(
     session.flush()
     return WorkspaceArchiveResponse(
         workspace_id=workspace.id, status=str(workspace.status)
+    )
+
+
+@router.patch(
+    "/workspaces/{workspace_id}/competitors/{competitor_id}/approval",
+    response_model=CompetitorApprovalResponse,
+)
+def set_competitor_approval(
+    workspace_id: uuid.UUID,
+    competitor_id: uuid.UUID,
+    payload: CompetitorApprovalRequest,
+    session: Session = Depends(get_admin_session),
+) -> CompetitorApprovalResponse:
+    """Operator-only: set `robots_policy` / `legal_status` (E7).
+
+    Tenant routes reject `IGNORE_AFTER_APPROVAL` / `APPROVED` with 403.
+    """
+    competitor = session.execute(
+        select(Competitor).where(  # noqa: workspace-scope
+            Competitor.id == competitor_id, Competitor.workspace_id == workspace_id
+        )
+    ).scalar_one_or_none()
+    if competitor is None:
+        raise _not_found("Competitor not found.")
+    if payload.robots_policy is not None:
+        competitor.robots_policy = payload.robots_policy
+    if payload.legal_status is not None:
+        competitor.legal_status = payload.legal_status
+    session.flush()
+    return CompetitorApprovalResponse(
+        competitor_id=competitor.id,
+        robots_policy=competitor.robots_policy,
+        legal_status=competitor.legal_status,
     )
 
 

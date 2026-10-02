@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app_shared.access.repository import assert_policy_assignable
+from app_shared.access.repository import GlobalPolicyNotAssignable, assert_policy_assignable
 from app_shared.catalog.consistency import (
     CrossWorkspaceReference,
     MissingReference,
@@ -106,6 +106,16 @@ def _check_policy_assignable(
         assert_policy_assignable(session, workspace_id, policy_id)
     except MissingReference as exc:
         raise _not_found("Access policy not found.") from exc
+    except GlobalPolicyNotAssignable as exc:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "OPERATOR_POLICY_REQUIRED",
+                    "message": "Global access policies can only be assigned by an operator.",
+                }
+            },
+        ) from exc
     except CrossWorkspaceReference as exc:
         raise _workspace_mismatch("Access policy belongs to a different workspace.") from exc
 
