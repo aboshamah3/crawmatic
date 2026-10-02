@@ -153,6 +153,7 @@ from app.routers import (
     alerts,
     api_keys,
     auth,
+    catalog_index,
     competitors,
     control_plane,
     cost_rollups,
@@ -226,6 +227,11 @@ app.include_router(admin.router)
 # Mounted after `admin.router` so the provisioning route a workspace is
 # created by is registered before the routes that address it.
 app.include_router(control_plane.router)
+# Catalog index (plan 2026-10-02): service-token routes under
+# /v1/admin/index. Read-only lookups accept the index token or the SaaS
+# token; the workspace-addressed routes accept the SaaS token only. See
+# `routers/catalog_index.py`'s module docstring.
+app.include_router(catalog_index.router)
 # EPA A2: also under /v1/admin, but on the TENANT auth seam (scope-gated,
 # RLS-scoped session) rather than `admin.router`'s cross-workspace service
 # token — see `routers/jobs_admin.py`'s module docstring. No path is served

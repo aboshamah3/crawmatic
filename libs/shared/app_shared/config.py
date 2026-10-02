@@ -193,6 +193,15 @@ class Settings(BaseSettings):
     # when unset, every admin request is refused (fail-closed).
     SAAS_SERVICE_TOKEN: str | None = None
 
+    # --- Catalog index service auth (plan 2026-10-02) ---
+    # Static bearer token for the READ-ONLY catalog index routes
+    # (`/v1/admin/index/lookup`, `/v1/admin/index/status`), so a caller
+    # that only needs lookups (the outreach service) never holds
+    # `SAAS_SERVICE_TOKEN`, which can provision workspaces. The SaaS
+    # token is accepted on those two routes as well. Unset: only the SaaS
+    # token works there.
+    INDEX_SERVICE_TOKEN: str | None = None
+
     # --- Status cache (SPEC-03 FR-022) ---
     STATUS_CACHE_TTL_SECONDS: int = 30
 
