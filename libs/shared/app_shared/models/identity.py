@@ -112,6 +112,11 @@ class RefreshToken(Base):
     expires_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
+    # Rotation family (security plan 2026-10-02, E10). NULL only on rows
+    # issued before the column existed; see ROTATE_REFRESH_TOKEN_SQL.
+    family_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
 
 
 class ApiKey(Base, WorkspaceScopedBase, TimestampMixin):

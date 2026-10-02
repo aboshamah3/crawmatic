@@ -30,6 +30,7 @@ on.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Request
@@ -47,6 +48,7 @@ from app_shared.security.rate_limit import check_and_increment_login
 from app_shared.security.tokens import (
     ROTATE_REFRESH_TOKEN_SQL,
     REVOKE_REFRESH_TOKEN_SQL,
+    REVOKE_REUSED_REFRESH_FAMILY_SQL,
     generate_refresh_token,
     hash_token,
 )
@@ -89,8 +91,12 @@ def _client_ip(request: Request) -> str:
     return client_ip(request)
 
 
-def _issue_pair(*, user: User) -> TokenPairResponse:
-    """Issue a fresh access+refresh pair for ``user`` and persist the refresh hash."""
+def _issue_pair(*, user: User, family_id: uuid.UUID | None = None) -> TokenPairResponse:
+    """Issue a fresh access+refresh pair for ``user`` and persist the refresh hash.
+
+    ``family_id`` is the rotation family the new refresh token joins: a
+    fresh one on login, the rotated token's family on refresh (E10).
+    """
     settings = get_settings()
     access_token = encode_access_token(
         user_id=user.id,
@@ -116,6 +122,7 @@ def _issue_pair(*, user: User) -> TokenPairResponse:
                 token_hash=refresh_hash,
                 expires_at=expires_at,
                 created_at=now,
+                family_id=family_id if family_id is not None else uuid.uuid4(),
             )
         )
         session.commit()
@@ -195,14 +202,22 @@ def refresh(payload: RefreshRequest) -> TokenPairResponse:
     # auth seam — the same carve-out the login lookup uses.
     with get_auth_session() as session:  # noqa: workspace-scope
         row = session.execute(
-            text(ROTATE_REFRESH_TOKEN_SQL), {"token_hash": presented_hash}
+            text(ROTATE_REFRESH_TOKEN_SQL),
+            {"token_hash": presented_hash, "new_family_id": uuid.uuid4()},
         ).mappings().first()
+        if row is None:
+            # Reuse detection (E10): a superseded token presented again
+            # revokes its whole family. Same transaction, same uniform 401.
+            session.execute(
+                text(REVOKE_REUSED_REFRESH_FAMILY_SQL), {"token_hash": presented_hash}
+            )
         session.commit()
 
     if row is None:
         raise auth_failed_exception()
 
     user_id = row["user_id"]
+    family_id = row.get("family_id")
 
     # The winning caller must resolve the associated user's current
     # role/workspace to mint the new pair. This user lookup is on an
@@ -216,7 +231,7 @@ def refresh(payload: RefreshRequest) -> TokenPairResponse:
     if user is None or user.status != UserStatus.ACTIVE:
         raise auth_failed_exception()
 
-    return _issue_pair(user=user)
+    return _issue_pair(user=user, family_id=family_id)
 
 
 @router.post("/logout", status_code=204)
