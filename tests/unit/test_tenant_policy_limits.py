@@ -16,6 +16,7 @@ from app_shared.enums import CompetitorStatus, LegalStatus, RobotsPolicy
 from app_shared.models.competitors_matches import Competitor
 
 from app.deps import Principal, get_current_principal
+from app import abuse_limit
 from app.main import app
 from app.routers import admin
 from app.service_auth import require_service_token
@@ -171,15 +172,20 @@ def test_tenant_safe_values_still_ok(client, session) -> None:
     assert resp.status_code == 200
 
 
-def test_admin_can_approve(session) -> None:
+def test_admin_can_approve(session, monkeypatch) -> None:
     comp = Competitor(id=uuid.uuid4(), workspace_id=WS, name="A", domain="amazon.sa")
     session.seed(comp)
     app.dependency_overrides[require_service_token] = lambda: None
     app.dependency_overrides[admin.get_admin_session] = lambda: session
+    # Reproduce the full-suite condition in isolation: once any earlier test
+    # has built Settings with a DATABASE_URL, AbuseLimitMiddleware is live and
+    # its counter DB is unreachable here (fail-closed 429). The request sends
+    # no credential (require_service_token is overridden), so the limiter has
+    # no identity to count and passes it through -- as test_admin_router does.
+    monkeypatch.setattr(abuse_limit, "_database_is_configured", lambda: True)
     resp = TestClient(app).patch(
         f"/v1/admin/workspaces/{WS}/competitors/{comp.id}/approval",
         json={"robots_policy": "IGNORE_AFTER_APPROVAL", "legal_status": "APPROVED"},
-        headers={"Authorization": f"Bearer test-service-{uuid.uuid4()}"},  # unique: avoids shared limiter bucket
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["robots_policy"] == RobotsPolicy.IGNORE_AFTER_APPROVAL
