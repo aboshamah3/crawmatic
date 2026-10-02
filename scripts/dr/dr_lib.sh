@@ -66,6 +66,14 @@ DR_MIN_FREE_BYTES="${DR_MIN_FREE_BYTES:-2147483648}"  # refuse to dump under 2 G
 DR_CKSUM_TABLES="${DR_CKSUM_TABLES:-3}"
 DR_CKSUM_MAX_ROWS="${DR_CKSUM_MAX_ROWS:-200000}"
 
+# Tables whose SCHEMA is dumped but whose DATA is not (plan 2026-10-02). The
+# catalog index is ~1.6 GB of public storefront listings that
+# scripts/load_catalog_index.py rebuilds from the ops host's crawl at any time:
+# dumping it would blow DR_MAX_BYTES on every set for data we never need to
+# restore. Both sides count these tables as 0 rows (`dr_build_count_sql`), so
+# verify_restore.sh's exact per-table count check still holds.
+DR_DATA_EXCLUDED_TABLES=(public.catalog_index_products public.catalog_index_codes)
+
 # ── Targets ────────────────────────────────────────────────────────────────
 # name|railway project id|railway service name|token variable
 #
@@ -307,6 +315,10 @@ dr_build_count_sql() {  # stdin = table list, stdout = SQL
     [[ -n "$t" ]] || continue
     schema="${t%%.*}"; name="${t#*.}"
     if (( first )); then first=0; else printf ' UNION ALL '; fi
+    if [[ " ${DR_DATA_EXCLUDED_TABLES[*]} " == *" $t "* ]]; then
+      printf "SELECT %s::text, '0'::text" "$(dr_sql_lit "$t")"
+      continue
+    fi
     printf "SELECT %s::text, count(*)::text FROM %s.%s" \
       "$(dr_sql_lit "$t")" "$(dr_sql_ident "$schema")" "$(dr_sql_ident "$name")"
   done
@@ -641,7 +653,9 @@ dr_dump_target() {  # $1 = name, $2 = stage dir, $3 = work dir
   local t0 t1
   t0=$(date -u +%s)
   set +e
-  "$PG_BIN/pg_dump" -Fc --snapshot="$snapshot" 2> "$wd/pg_dump.err" \
+  local exclude_data=() t_ex
+  for t_ex in "${DR_DATA_EXCLUDED_TABLES[@]}"; do exclude_data+=("--exclude-table-data=$t_ex"); done
+  "$PG_BIN/pg_dump" -Fc --snapshot="$snapshot" "${exclude_data[@]}" 2> "$wd/pg_dump.err" \
     | dr_pipe_count "$wd/bytes_exported" \
     | dr_gpg_encrypt_stdin "$out" 2> "$wd/gpg.err"
   local st=("${PIPESTATUS[@]}")
