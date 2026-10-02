@@ -101,6 +101,96 @@ def _candidate_fields(candidate: IndexCandidate) -> dict:
     }
 
 
+def _plan_accept(
+    session: Session,
+    workspace_id: uuid.UUID,
+    candidates: list[tuple[uuid.UUID, str, str | None]],
+) -> tuple[list[dict], list[RejectedCandidate], int]:
+    """Decide, row by row, what `accept_candidates` would record for
+    `(product_variant_id, url, title)` rows: `(rows to insert, rejected,
+    competitors created)`. Creates (and flushes) the competitor rows it
+    needs, so the candidates route runs it inside a rolled-back savepoint
+    as a dry run: a candidate this would reject is never offered, and so
+    never billed, again (2026-10-02 review: a PROTECTED_LINK_CAP_REACHED
+    row used to come back and be billed on every discovery pass)."""
+    rows = [
+        {
+            "index": index,
+            "product_variant_id": variant_id,
+            "competitor_url": url,
+            "external_title": title,
+        }
+        for index, (variant_id, url, title) in enumerate(candidates)
+    ]
+    safe, unsafe = prepare_match_urls(rows)
+    rejected = [RejectedCandidate(index=r["index"], code=r["code"], url=r["url"]) for r in unsafe]
+
+    def reject(row: dict, code: str) -> None:
+        rejected.append(RejectedCandidate(index=row["index"], code=code, url=row["competitor_url"]))
+
+    variant_products = dict(
+        session.execute(
+            select(ProductVariant.id, ProductVariant.product_id).where(
+                ProductVariant.workspace_id == workspace_id,
+                ProductVariant.id.in_({r["product_variant_id"] for r in safe}),
+            )
+        ).all()
+    )
+    # Keyed by bare host, so a competitor stored as `www.shop.com` is the
+    # same store as an index host `shop.com`.
+    competitors: dict[str, Competitor] = {}
+    for c in session.execute(scoped_select(Competitor, workspace_id)).scalars():
+        competitors.setdefault(host_of(c.domain), c)
+    competitors_created = 0
+    accepted: list[dict] = []
+    for row in safe:
+        product_id = variant_products.get(row["product_variant_id"])
+        if product_id is None:
+            reject(row, "UNRESOLVED_VARIANT")
+            continue
+        host = host_of(row["competitor_url"])
+        competitor = competitors.get(host)
+        if competitor is None:
+            if len(competitors) >= MAX_DOMAINS_PER_WORKSPACE:
+                reject(row, "DOMAIN_LIMIT_REACHED")
+                continue
+            competitor = Competitor(workspace_id=workspace_id, name=host, domain=host)
+            session.add(competitor)
+            session.flush()
+            competitors[host] = competitor
+            competitors_created += 1
+        elif competitor.status == CompetitorStatus.ARCHIVED:
+            reject(row, "COMPETITOR_ARCHIVED")
+            continue
+        accepted.append({**row, "product_id": product_id, "competitor_id": competitor.id})
+
+    # The per-product protected-link cap is a cost guard; reuse the bulk
+    # upsert's own check (one resolver, never a second classifier). Keep
+    # as many rows per product as fit, in order, and reject the rest: the
+    # dry run and the real accept then agree on any prefix of a page.
+    by_product: dict[uuid.UUID, list[dict]] = defaultdict(list)
+    for row in accepted:
+        by_product[row["product_id"]].append(row)
+    final: list[dict] = []
+    for product_rows in by_product.values():
+        try:
+            _bulk_protected_cap_check(session, workspace_id, product_rows)
+            final.extend(product_rows)
+            continue
+        except HTTPException:
+            pass
+        fitting: list[dict] = []
+        for row in product_rows:
+            try:
+                _bulk_protected_cap_check(session, workspace_id, [*fitting, row])
+            except HTTPException:
+                reject(row, "PROTECTED_LINK_CAP_REACHED")
+                continue
+            fitting.append(row)
+        final.extend(fitting)
+    return final, rejected, competitors_created
+
+
 def _require_workspace(session: Session, workspace_id: uuid.UUID) -> None:
     if session.get(Workspace, workspace_id) is None:
         raise HTTPException(
@@ -219,13 +309,13 @@ def workspace_candidates(
             )
         )
     }
-    competitor_status = dict(
-        session.execute(
-            select(Competitor.domain, Competitor.status).where(
-                Competitor.workspace_id == workspace_id
-            )
-        ).all()
-    )
+    # Keyed by bare host (as `_plan_accept`), so a competitor stored as
+    # `www.shop.com` is the same store as an index host `shop.com`.
+    competitor_status: dict[str, CompetitorStatus] = {}
+    for domain, status in session.execute(
+        select(Competitor.domain, Competitor.status).where(Competitor.workspace_id == workspace_id)
+    ).all():
+        competitor_status.setdefault(host_of(domain), status)
     known_hosts = set(competitor_status)
     # Stores the merchant removed never come back; asked of the lookup
     # itself, so they cannot use up a variant's `per_variant` slots.
@@ -293,6 +383,23 @@ def workspace_candidates(
             )
             kept += 1
 
+    # Dry-run the accept over this page and drop what it would reject
+    # (above all the per-product protected-link cap): the SaaS bills a
+    # candidate before it accepts it, so an unacceptable one must never
+    # be offered. The savepoint undoes the competitor rows it creates.
+    if out:
+        savepoint = session.begin_nested()
+        try:
+            _final, refused, _created = _plan_accept(
+                session,
+                workspace_id,
+                [(c.product_variant_id, c.url, c.title) for c in out],
+            )
+        finally:
+            savepoint.rollback()
+        refused_indexes = {r.index for r in refused}
+        out = [c for i, c in enumerate(out) if i not in refused_indexes]
+
     more = scanned < len(variants) or len(variants) == variant_limit
     return WorkspaceCandidatesResponse(
         generation=generation,
@@ -310,70 +417,11 @@ def accept_candidates(
     session: Session = Depends(get_catalog_index_session),
 ) -> AcceptCandidatesResponse:
     _require_workspace(session, workspace_id)
-    rows = [
-        {
-            "index": index,
-            "product_variant_id": item.product_variant_id,
-            "competitor_url": item.url,
-            "external_title": item.title,
-        }
-        for index, item in enumerate(payload.candidates)
-    ]
-    safe, unsafe = prepare_match_urls(rows)
-    rejected = [RejectedCandidate(index=r["index"], code=r["code"], url=r["url"]) for r in unsafe]
-
-    def reject(row: dict, code: str) -> None:
-        rejected.append(RejectedCandidate(index=row["index"], code=code, url=row["competitor_url"]))
-
-    variant_products = dict(
-        session.execute(
-            select(ProductVariant.id, ProductVariant.product_id).where(
-                ProductVariant.workspace_id == workspace_id,
-                ProductVariant.id.in_({r["product_variant_id"] for r in safe}),
-            )
-        ).all()
+    final, rejected, competitors_created = _plan_accept(
+        session,
+        workspace_id,
+        [(item.product_variant_id, item.url, item.title) for item in payload.candidates],
     )
-    competitors = {
-        c.domain: c for c in session.execute(scoped_select(Competitor, workspace_id)).scalars()
-    }
-    competitors_created = 0
-    accepted: list[dict] = []
-    for row in safe:
-        product_id = variant_products.get(row["product_variant_id"])
-        if product_id is None:
-            reject(row, "UNRESOLVED_VARIANT")
-            continue
-        host = host_of(row["competitor_url"])
-        competitor = competitors.get(host)
-        if competitor is None:
-            if len(competitors) >= MAX_DOMAINS_PER_WORKSPACE:
-                reject(row, "DOMAIN_LIMIT_REACHED")
-                continue
-            competitor = Competitor(workspace_id=workspace_id, name=host, domain=host)
-            session.add(competitor)
-            session.flush()
-            competitors[host] = competitor
-            competitors_created += 1
-        elif competitor.status == CompetitorStatus.ARCHIVED:
-            reject(row, "COMPETITOR_ARCHIVED")
-            continue
-        accepted.append({**row, "product_id": product_id, "competitor_id": competitor.id})
-
-    # The per-product protected-link cap is a cost guard; reuse the bulk
-    # upsert's own check (one resolver, never a second classifier) and
-    # turn its whole-batch 422 into a per-product rejection.
-    by_product: dict[uuid.UUID, list[dict]] = defaultdict(list)
-    for row in accepted:
-        by_product[row["product_id"]].append(row)
-    final: list[dict] = []
-    for product_rows in by_product.values():
-        try:
-            _bulk_protected_cap_check(session, workspace_id, product_rows)
-        except HTTPException:
-            for row in product_rows:
-                reject(row, "PROTECTED_LINK_CAP_REACHED")
-            continue
-        final.extend(product_rows)
 
     created = 0
     if final:

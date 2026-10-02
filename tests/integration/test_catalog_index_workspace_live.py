@@ -207,6 +207,56 @@ def test_bad_rows_are_rejected_one_by_one(world):
     assert body["created"] == 1
 
 
+def _competitor_hosts(world) -> set[str]:
+    with Session(world["owner"]) as session:
+        return set(session.execute(select(Competitor.domain).where(
+            Competitor.workspace_id == world["workspace"])).scalars())
+
+
+@pytest.fixture()
+def cap_of_one(monkeypatch):
+    """The protected-link cap with room for exactly one more link per
+    product: the real check, reduced to its decision."""
+    from fastapi import HTTPException
+
+    import app.routers.catalog_index as routes
+
+    def check(_session, _workspace_id, rows):
+        if len(rows) > 1:
+            raise HTTPException(status_code=422, detail={"error": {"code": "PROTECTED_LINK_CAP_REACHED"}})
+
+    monkeypatch.setattr(routes, "_bulk_protected_cap_check", check)
+
+
+def test_candidates_the_cap_would_reject_are_never_offered(world, cap_of_one):
+    # Review 2026-10-02: a row the accept refuses used to come back, and be
+    # billed, on every discovery pass. The candidates route now dry-runs it.
+    before = _competitor_hosts(world)
+    body = _candidates(world)
+    assert len(body["candidates"]) == 1
+    assert _competitor_hosts(world) == before        # the dry run left nothing behind
+
+
+def test_accept_keeps_what_fits_under_the_cap_and_rejects_the_rest(world, cap_of_one):
+    variant = str(world["variant"])
+    body = _accept(world, [
+        {"product_variant_id": variant, "url": "https://a.example/p/1"},
+        {"product_variant_id": variant, "url": "https://b.example/p/1"},
+    ])
+    assert body["created"] == 1
+    assert [(r["index"], r["code"]) for r in body["rejected"]] == [(1, "PROTECTED_LINK_CAP_REACHED")]
+
+
+def test_a_removed_competitor_stored_with_www_stays_removed(world):
+    with Session(world["owner"]) as session:
+        session.add(Competitor(workspace_id=world["workspace"], name="a.example",
+                               domain="www.a.example", status=CompetitorStatus.ARCHIVED))
+        session.commit()
+    assert "a.example" not in {c["domain"] for c in _candidates(world)["candidates"]}
+    body = _accept(world, [{"product_variant_id": str(world["variant"]), "url": "https://a.example/p/1"}])
+    assert [r["code"] for r in body["rejected"]] == ["COMPETITOR_ARCHIVED"] and body["created"] == 0
+
+
 def test_an_unknown_workspace_is_404(world):
     resp = world["client"].get(f"/v1/admin/index/workspaces/{uuid.uuid4()}/candidates")
     assert resp.status_code == 404
