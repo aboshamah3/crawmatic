@@ -179,9 +179,22 @@ def _clear_overrides() -> Iterator[None]:
     release_mod.reset_release_identity_cache()
 
 
+_INDEX_TOKEN = "v" * 48
+
+
+def _authorized_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Owner decision H1: the full /version payload needs the index bearer."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        version, "get_settings", lambda: SimpleNamespace(INDEX_SERVICE_TOKEN=_INDEX_TOKEN)
+    )
+    return TestClient(app, headers={"Authorization": f"Bearer {_INDEX_TOKEN}"})
+
+
 @pytest.fixture()
-def api_client() -> TestClient:
-    return TestClient(app)
+def api_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return _authorized_client(monkeypatch)
 
 
 @pytest.fixture()

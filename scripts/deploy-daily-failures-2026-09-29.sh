@@ -65,8 +65,26 @@ rw() {  # railway CLI as mahmoud (CLI on the nvm PATH), from the repo root, on t
   sudo -n -u mahmoud -H env RAILWAY_API_TOKEN="$RAILWAY_TOKEN_RAILWAY2" PATH="$NVM_BIN:$PATH" \
     bash -c 'cd "$1" && shift && railway "$@"' _ "$REPO" "$@"
 }
+# --- /version bearer (security plan 2026-10-02, owner decision H1) ---------
+# Once the hardened engine is live, anonymous GET /version answers only
+# {"status":"ok"}; git_sha / migration heads / manifest_id need the
+# INDEX_SERVICE_TOKEN bearer. The token comes from $INDEX_SERVICE_TOKEN or
+# the 0600 file $INDEX_TOKEN_FILE and reaches curl through a
+# process-substitution header file (-H @<(...)), never on any argv.
+INDEX_TOKEN_FILE=${INDEX_TOKEN_FILE:-/root/.crawmatic/index-service-token}
+_version_auth_header() {
+  local tok=${INDEX_SERVICE_TOKEN:-}
+  if [[ -z "$tok" && -r "$INDEX_TOKEN_FILE" ]]; then tok=$(tr -d '\r\n' < "$INDEX_TOKEN_FILE"); fi
+  if [[ -n "$tok" ]]; then printf 'Authorization: Bearer %s\n' "$tok"; fi
+  return 0
+}
+version_json() { curl -s -m 15 -H @<(_version_auth_header) "$API/version"; }
+version_field_is() { [[ "$(jv "$1")" == "$2" ]]; }  # version_field_is <field> <value>
+if [[ -z "${INDEX_SERVICE_TOKEN:-}" && ! -r "$INDEX_TOKEN_FILE" ]]; then
+  echo "WARN: no INDEX_SERVICE_TOKEN (env or $INDEX_TOKEN_FILE): a hardened api answers /version with {\"status\":\"ok\"} only, so SHA/head checks will read empty."
+fi
 jv() {  # jv <field> -> that field from GET /version ('' on failure)
-  curl -s -m 15 "$API/version" | python3 -c "import sys,json
+  version_json | python3 -c "import sys,json
 try: print(json.load(sys.stdin).get('$1') or '')
 except Exception: print('')"
 }
@@ -120,7 +138,7 @@ else
   step "1. migrate: e6a1c0d4f2b9 (3 indexes: ON ONLY + CONCURRENTLY per partition + ATTACH) and f1c7e2a9b3d4 (ADD COLUMN ... DEFAULT 0)"
   deploy migrate || exit 1
   wait_for "live migration head == $NEW_HEAD" 1500 \
-    bash -c "[[ \"\$(curl -s -m 15 $API/version | python3 -c 'import sys,json;print(json.load(sys.stdin).get(\"db_migration_head\"))')\" == \"$NEW_HEAD\" ]]" \
+    version_field_is db_migration_head "$NEW_HEAD" \
     || { echo "!! migrate did not reach $NEW_HEAD. Nothing else was deployed. Check: railway logs -s migrate -e $ENVNAME -p $PROJECT"; \
          echo "   An interrupted CONCURRENTLY build leaves an INVALID index; drop it by name (pg_index.indisvalid=false) and re-run."; exit 1; }
 fi
