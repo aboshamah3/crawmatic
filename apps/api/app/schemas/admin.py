@@ -32,7 +32,8 @@ class WorkspaceProvisionResponse(BaseModel):
     """The one and only time the bootstrap key is returned in plaintext."""
 
     workspace_id: uuid.UUID
-    api_key: str
+    #: None when the external_ref already had a workspace (idempotent replay).
+    api_key: str | None = None
     external_ref: str
 
 

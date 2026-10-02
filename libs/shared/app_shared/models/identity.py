@@ -58,6 +58,8 @@ class Workspace(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(Text(), nullable=False)
     slug: Mapped[str] = mapped_column(Text(), nullable=False, unique=True)
     status: Mapped[WorkspaceStatus] = enum_column(WorkspaceStatus, nullable=False)
+    # The SaaS project id: the provisioning idempotency key (security E5).
+    external_ref: Mapped[str | None] = mapped_column(Text(), nullable=True, unique=True)
     default_scrape_profile_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )

@@ -39,7 +39,7 @@ import logging
 from collections.abc import Iterator
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -191,51 +191,66 @@ def _not_found(message: str) -> HTTPException:
     )
 
 
-def _slugify(name: str, external_ref: str) -> str:
-    """A unique, stable slug: the readable name plus the SaaS ref.
+def _slugify(name: str) -> str:
+    """A DISPLAY-ONLY slug derived from the name.
 
-    `workspaces.slug` is UNIQUE; `external_ref` is unique per SaaS
-    project, so appending it makes collisions between two customers
-    named "Acme Store" impossible without a retry loop.
-
-    Truncate `base`, never `ref`: `f"{base}-{ref}"[:200]` used to
-    truncate from the END, which is where `external_ref` lives. Since
-    `name` (and therefore `base`) can itself be up to 200 chars, two
-    different refs on the same/similar long name collided into the
-    IDENTICAL slug -- `_slugify("A"*200, "ref-alpha") ==
-    _slugify("A"*200, "ref-beta")` -- so customer B's provisioning call
-    would 409 `DUPLICATE_EXTERNAL_REF` naming their own ref against a
-    workspace that actually belongs to customer A.
+    Identity is `workspaces.external_ref` (UNIQUE), never the slug: the old
+    `name-ref` slug let two different (name, ref) splits that join to the
+    same string (`a-b`+`c` vs `a`+`b-c`) collide. Slug uniqueness is
+    only a DB constraint; `_unique_slug` resolves collisions with `-2`, `-3`.
     """
     base = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-")
     base = "-".join(part for part in base.split("-") if part) or "workspace"
-    ref = "".join(ch.lower() if ch.isalnum() else "-" for ch in external_ref).strip("-")
-    base = base[: max(1, 200 - len(ref) - 1)]
-    return f"{base}-{ref}"
+    return base[:190]
+
+
+def _unique_slug(session: Session, name: str) -> str:
+    base = _slugify(name)
+    candidate, n = base, 1
+    while session.execute(  # noqa: workspace-scope
+        select(Workspace).where(Workspace.slug == candidate)
+    ).scalars().first() is not None:
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
+
+def _workspace_by_ref(session: Session, external_ref: str) -> Workspace | None:
+    return session.execute(  # noqa: workspace-scope
+        select(Workspace).where(Workspace.external_ref == external_ref)
+    ).scalars().first()
 
 
 @router.post("/workspaces", response_model=WorkspaceProvisionResponse, status_code=201)
 def provision_workspace(
     payload: WorkspaceProvisionRequest,
+    response: Response,
     session: Session = Depends(get_admin_session),
 ) -> WorkspaceProvisionResponse:
-    """`POST /v1/admin/workspaces` — create a workspace + bootstrap key.
+    """`POST /v1/admin/workspaces` — idempotent on a unique `external_ref`.
 
-    The plaintext key is returned exactly once and never stored; only
-    its prefix and sha256 hash are persisted (same contract as
-    `POST /v1/api-keys`).
+    The workspace is looked up by `external_ref` FIRST. If it exists the
+    existing workspace is returned with 200 and `api_key: null`: no second
+    bootstrap key is minted (the plaintext is unrecoverable by design, and
+    a retry must never widen the set of live keys). Only when it is absent
+    is a workspace created (201) with a bootstrap key whose plaintext is
+    returned exactly once (only its prefix and sha256 hash are persisted).
 
-    Re-provisioning an `external_ref` that already has a workspace is a
-    `409 DUPLICATE_EXTERNAL_REF`, not a 500. The SaaS retries this call
-    (network blip, job redelivery), and a retry must get a clear,
-    actionable answer instead of an opaque server error. It is
-    deliberately NOT idempotent-success: silently returning the existing
-    workspace would have to either mint a second bootstrap key or return
-    none, and both are worse than making the caller decide.
+    The slug is display-only; collisions get `-2`, `-3`, ...
     """
+    existing = _workspace_by_ref(session, payload.external_ref)
+    if existing is not None:
+        response.status_code = 200
+        return WorkspaceProvisionResponse(
+            workspace_id=existing.id,
+            api_key=None,
+            external_ref=payload.external_ref,
+        )
+
     workspace = Workspace(
         name=payload.name,
-        slug=_slugify(payload.name, payload.external_ref),
+        slug=_unique_slug(session, payload.name),
+        external_ref=payload.external_ref,
         status=WorkspaceStatus.ACTIVE,
     )
     session.add(workspace)
@@ -243,14 +258,21 @@ def provision_workspace(
         session.flush()
     except IntegrityError as exc:
         session.rollback()
+        # A concurrent provision of the same ref won the race: converge on it.
+        winner = _workspace_by_ref(session, payload.external_ref)
+        if winner is not None:
+            response.status_code = 200
+            return WorkspaceProvisionResponse(
+                workspace_id=winner.id, api_key=None, external_ref=payload.external_ref
+            )
         raise HTTPException(
             status_code=409,
             detail={
                 "error": {
                     "code": "DUPLICATE_EXTERNAL_REF",
                     "message": (
-                        "A workspace already exists for external_ref "
-                        f"{payload.external_ref!r}."
+                        "Workspace provisioning conflicted for external_ref "
+                        f"{payload.external_ref!r}; retry."
                     ),
                 }
             },
