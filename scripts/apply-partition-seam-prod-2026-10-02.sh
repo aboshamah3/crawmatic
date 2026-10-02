@@ -19,10 +19,10 @@
 #      registered partitioned table that exists (same set and lookahead as
 #      the daily job). Existing children are skipped.
 # Then it prints the seam probe the worker uses and the children per table.
-#   (The functions are re-owned by the parents' actual owner: prod never ran
-#   §8 ownership adoption. Refuses a superuser or mixed owners.)
-# Rollback: DROP FUNCTION crawmatic_create_partition(text,text,text,text),
-#           crawmatic_drop_partition(text); (the job falls back to direct DDL)
+#   (Prod never ran §8: parents are owned by a runtime role without CREATE on
+#   public. crawmatic_migrate is made a member of that owner and owns the seam.)
+# Rollback: REVOKE crawmatic_auth FROM crawmatic_migrate; DROP FUNCTION
+#           crawmatic_create_partition(text,text,text,text), crawmatic_drop_partition(text); (the job falls back to direct DDL)
 # =============================================================================
 set -euo pipefail
 
@@ -49,10 +49,13 @@ psql "$PGURL" -v ON_ERROR_STOP=1 -X -q <<SQL
 BEGIN;
 SELECT current_user AS applying_as, rolsuper FROM pg_roles WHERE rolname = current_user;
 $SECTION9
--- Prod never ran §8 (ownership adoption), so crawmatic_migrate does not own
--- the parents and a crawmatic_migrate-owned definer fails "must be owner".
--- Run the seam as the role that DOES own them; refuse a superuser owner or
--- mixed owners (both mean the ownership model needs a real §8 run instead).
+-- Prod never ran §8: the parents are owned by a runtime role (seen:
+-- crawmatic_auth) that has no CREATE on schema public, so neither direct DDL
+-- nor a seam owned by that role can create a child. Run the seam as
+-- crawmatic_migrate (the DDL role, which has CREATE) and make it a member of
+-- the owning role, which PostgreSQL accepts as ownership for PARTITION OF.
+-- No runtime role gains anything. Refuses a superuser owner, mixed owners,
+-- or a crawmatic_migrate without CREATE on public.
 DO \$\$
 DECLARE
     owners text[];
@@ -69,11 +72,18 @@ BEGIN
     END IF;
     SELECT rolsuper INTO is_super FROM pg_roles WHERE rolname = owners[1];
     IF is_super THEN
-        RAISE EXCEPTION 'parents are owned by superuser %; refusing a superuser SECURITY DEFINER seam', owners[1];
+        RAISE EXCEPTION 'parents are owned by superuser %; refusing', owners[1];
     END IF;
-    EXECUTE format('ALTER FUNCTION crawmatic_create_partition(text, text, text, text) OWNER TO %I', owners[1]);
-    EXECUTE format('ALTER FUNCTION crawmatic_drop_partition(text) OWNER TO %I', owners[1]);
-    RAISE NOTICE 'seam functions now owned by %', owners[1];
+    IF NOT has_schema_privilege('crawmatic_migrate', 'public', 'CREATE') THEN
+        RAISE EXCEPTION 'crawmatic_migrate has no CREATE on schema public; refusing';
+    END IF;
+    IF owners[1] <> 'crawmatic_migrate' THEN
+        EXECUTE format('GRANT %I TO crawmatic_migrate', owners[1]);
+        RAISE NOTICE 'crawmatic_migrate is now a member of %', owners[1];
+    END IF;
+    ALTER FUNCTION crawmatic_create_partition(text, text, text, text) OWNER TO crawmatic_migrate;
+    ALTER FUNCTION crawmatic_drop_partition(text) OWNER TO crawmatic_migrate;
+    RAISE NOTICE 'seam functions owned by crawmatic_migrate';
 END
 \$\$;
 DO \$\$
