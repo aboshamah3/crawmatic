@@ -94,6 +94,7 @@ def test_jwt_credential_routes_to_jwt_path_not_api_key_lookup(
     monkeypatch.setattr(deps, "decode_access_token", _fake_decode)
     monkeypatch.setattr(deps, "_lookup_api_key_candidates", _never_called)
     monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "workspace_admin")
     monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "active")
 
     gen = deps.get_current_principal(authorization="Bearer a.jwt.token", x_workspace_id=None)
@@ -206,6 +207,7 @@ def test_suspended_workspace_status_denies_with_401(monkeypatch: pytest.MonkeyPa
         },
     )
     monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "workspace_admin")
     monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "suspended")
 
     gen = deps.get_current_principal(authorization="Bearer a.jwt.token", x_workspace_id=None)
@@ -231,6 +233,7 @@ def test_super_admin_without_x_workspace_id_is_rejected(monkeypatch: pytest.Monk
         },
     )
     monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "super_admin")
 
     gen = deps.get_current_principal(authorization="Bearer a.jwt.token", x_workspace_id=None)
     with pytest.raises(HTTPException) as exc_info:
@@ -253,6 +256,7 @@ def test_super_admin_with_x_workspace_id_is_authorized(monkeypatch: pytest.Monke
         },
     )
     monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "super_admin")
     monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "active")
 
     gen = deps.get_current_principal(
@@ -283,6 +287,7 @@ def test_non_super_assuming_another_workspace_is_403(monkeypatch: pytest.MonkeyP
         },
     )
     monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "workspace_admin")
     monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "active")
 
     gen = deps.get_current_principal(
@@ -308,6 +313,7 @@ def test_non_super_may_explicitly_assume_its_own_workspace(monkeypatch: pytest.M
         },
     )
     monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "read_only")
     monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "active")
 
     gen = deps.get_current_principal(
@@ -404,3 +410,54 @@ def test_saas_shaped_token_signed_with_the_same_secret_is_401(
         {"email": "owner@example.com", "exp": int(time.time()) + 60}, secret, algorithm="HS256"
     )
     _assert_401(token)
+
+
+# --- security plan 2026-10-02 E10: role comes from the DB, not the claim --
+
+
+def test_demoted_admin_next_request_is_403(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The token still says super_admin; the user row now says read_only."""
+    user_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    monkeypatch.setattr(
+        deps,
+        "decode_access_token",
+        lambda token, *, secret, algorithm, **_kw: {
+            "sub": str(user_id),
+            "workspace_id": str(workspace_id),
+            "role": "super_admin",
+            "type": "access",
+        },
+    )
+    monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_workspace_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "read_only")
+
+    gen = deps.get_current_principal(authorization="Bearer a.jwt.token", x_workspace_id=None)
+    principal_ctx = next(gen)
+    assert principal_ctx[1].role == UserRole.READ_ONLY
+
+    check = deps.require_role(UserRole.SUPER_ADMIN)
+    with pytest.raises(HTTPException) as exc_info:
+        check(principal_ctx)
+    assert exc_info.value.status_code == 403
+
+
+def test_unreadable_db_role_is_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        deps,
+        "decode_access_token",
+        lambda token, *, secret, algorithm, **_kw: {
+            "sub": str(uuid.uuid4()),
+            "workspace_id": None,
+            "role": "super_admin",
+            "type": "access",
+        },
+    )
+    monkeypatch.setattr(deps, "get_user_status", lambda *a, **k: "active")
+    monkeypatch.setattr(deps, "get_user_role", lambda *a, **k: "unavailable")
+
+    gen = deps.get_current_principal(authorization="Bearer a.jwt.token", x_workspace_id=None)
+    with pytest.raises(HTTPException) as exc_info:
+        next(gen)
+    assert exc_info.value.status_code == 401

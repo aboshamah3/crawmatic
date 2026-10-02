@@ -53,7 +53,11 @@ from app_shared.security.api_keys import API_KEY_PREFIX, parse_prefix, verify_ap
 from app_shared.security.jwt import decode_access_token
 from app_shared.security.last_used import should_write_last_used
 from app_shared.security.scopes import has_scopes
-from app_shared.security.status_cache import get_user_status, get_workspace_status
+from app_shared.security.status_cache import (
+    get_user_role,
+    get_user_status,
+    get_workspace_status,
+)
 
 from app.errors import auth_failed_exception
 
@@ -215,12 +219,6 @@ def _authenticate_jwt(credential: str) -> Principal:
     except (KeyError, ValueError, TypeError) as exc:
         raise auth_failed_exception() from exc
 
-    role_claim = claims.get("role")
-    try:
-        role = UserRole(role_claim) if role_claim is not None else None
-    except ValueError as exc:
-        raise auth_failed_exception() from exc
-
     workspace_claim = claims.get("workspace_id")
     home_workspace_id = uuid.UUID(str(workspace_claim)) if workspace_claim else None
 
@@ -228,6 +226,16 @@ def _authenticate_jwt(credential: str) -> Principal:
     user_status = get_user_status(redis_client, get_auth_session, user_id)
     if user_status != ACTIVE_STATUS:
         raise auth_failed_exception()
+
+    # Security plan 2026-10-02 (E10): authorize on the role stored on the
+    # user row, re-read (cached for STATUS_CACHE_TTL_SECONDS, cleared by
+    # invalidate_user) -- never on the `role` claim minted into the token.
+    # A demoted admin's next request therefore carries the demoted role
+    # and fails the role gate (403). An unreadable/unknown role is a 401.
+    try:
+        role = UserRole(get_user_role(redis_client, get_auth_session, user_id))
+    except ValueError as exc:
+        raise auth_failed_exception() from exc
 
     if home_workspace_id is not None:
         ws_status = get_workspace_status(redis_client, get_auth_session, home_workspace_id)

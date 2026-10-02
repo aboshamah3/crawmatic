@@ -235,3 +235,41 @@ def test_invalidate_user_is_safe_on_redis_error() -> None:
 
 def test_invalidate_workspace_is_safe_on_redis_error() -> None:
     invalidate_workspace(_BrokenRedis(), uuid.uuid4())
+
+
+# --- security plan 2026-10-02 E10: cached DB role -------------------------
+
+
+def test_get_user_role_reads_the_db_row_role_and_caches_it() -> None:
+    from app_shared.enums import UserRole
+    from app_shared.security.status_cache import get_user_role
+
+    row = _FakeRow(status="active")
+    row.role = UserRole.READ_ONLY  # type: ignore[attr-defined]
+    redis = _FakeRedis()
+    user_id = uuid.uuid4()
+    factory = _session_factory_for(row=row)
+
+    assert get_user_role(redis, factory, user_id) == "read_only"
+    assert redis.store[f"role:user:{user_id}"] == "read_only"
+    assert get_user_role(redis, factory, user_id) == "read_only"
+    assert factory.session.execute_count == 1
+
+
+def test_get_user_role_missing_row_is_unavailable() -> None:
+    from app_shared.security.status_cache import get_user_role
+
+    assert get_user_role(_FakeRedis(), _session_factory_for(row=None), uuid.uuid4()) == (
+        STATUS_UNAVAILABLE
+    )
+
+
+def test_invalidate_user_also_clears_the_cached_role() -> None:
+    redis = _FakeRedis()
+    user_id = uuid.uuid4()
+    redis.store[f"status:user:{user_id}"] = "active"
+    redis.store[f"role:user:{user_id}"] = "super_admin"
+
+    invalidate_user(redis, user_id)
+
+    assert f"role:user:{user_id}" not in redis.store
