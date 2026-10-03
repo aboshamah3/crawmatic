@@ -154,10 +154,29 @@ job table, one queue depth.
   running spider is pure queue depth, and a queued batch holds a
   cost-authorization grant and a `claimed_at` phase clock open while it
   waits.
-* **`max_proc` stays 1 on the browser nodes** and 8 on the HTTP nodes
-  (`apps/scrapers/scrapyd.conf`). `SCRAPYD_MAX_PENDING_PER_NODE` bounds
-  the *queue*, not the concurrency; the two are independent knobs and B6
-  changes neither `scrapyd.conf`.
+* **`max_proc` is 1 on the browser nodes by default** and 8 on the HTTP
+  nodes (`apps/scrapers/scrapyd.conf`). `SCRAPYD_MAX_PENDING_PER_NODE`
+  bounds the *queue*, not the concurrency; the two are independent knobs.
+  Since 2026-09-29 the cap also applies to a single-node pool (the browser
+  pool), which it silently did not before.
+
+**Sizing `max_proc` on the browser node** (`SCRAPYD_MAX_PROC`, rendered
+into `apps/scrapers-browser/scrapyd.conf` at container start; default 1).
+Each running spider is one Scrapy process plus one Chromium with up to
+`BROWSER_CONCURRENT_REQUESTS` pages. Measure, do not guess:
+
+1. On the running node, during a busy browser batch, read the container's
+   peak memory (Railway metrics, or `cat /sys/fs/cgroup/memory.peak`) with
+   `max_proc = 1`. Call it `P1`. Idle memory (no spider running) is `P0`.
+2. Per-spider cost is `S = P1 - P0`. With container limit `L` and a 25 %
+   headroom for page-weight variance, `max_proc = floor((0.75 * L - P0) / S)`,
+   and never above what `WATCHDOG_MEMORY_LIMIT_MB` (the container memory
+   watchdog in `price_monitor_browser.scrapyd_app`) allows.
+3. Set `SCRAPYD_MAX_PROC` on the `scrapers-browser` service (this
+   redeploys it), then confirm `daemonstatus.json` shows `running` up to
+   the new value and memory stays under the watchdog limit for a full
+   nightly run. If the answer is 1 on the current instance, a larger
+   instance is the owner's call.
 
 **Adding a browser node** is therefore: deploy `scrapers-browser-<n+1>`
 from the same image and `scrapyd.conf`, then append its private

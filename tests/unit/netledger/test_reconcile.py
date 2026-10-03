@@ -602,3 +602,224 @@ class TestLiveReconciliation:
         # Window-level cost is not durably persisted (see the module
         # docstring) — reconstructed windows always carry None here.
         assert found[0].total_cost_micro_units is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29 (plan E7): provider identity, and host-less daily evidence
+# ---------------------------------------------------------------------------
+
+
+def _proxy_provider(session, *, name: str, base_url: str) -> uuid.UUID:  # type: ignore[no-untyped-def]
+    provider_id = uuid.uuid4()
+    session.execute(
+        sa.text(
+            "INSERT INTO proxy_providers (id, name, type, base_url, status, created_at, "
+            "updated_at) VALUES (:id, :n, 'RESIDENTIAL', :u, 'ACTIVE', now(), now())"
+        ),
+        {"id": provider_id, "n": name, "u": base_url},
+    )
+    session.commit()
+    return provider_id
+
+
+class TestProviderIdentityAndDailyTotals:
+    def test_a_vendor_window_matches_ledger_rows_keyed_by_the_provider_row_id(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Production: the ledger stores the proxy_providers row id
+        (`0e80a9c2-…`, 98,403 operations in 30 days) and the importer writes
+        the vendor name `"dataimpulse"` -- `reconcile_window` filtered
+        `provider == window.provider`, so the two could never meet."""
+        window_start = datetime(2026, 7, 2, 0, 0, tzinfo=timezone.utc)
+        window_end = window_start + timedelta(days=1)
+        with session_scope() as session:
+            row_id = _proxy_provider(
+                session,
+                name=f"dataimpulse-residential-{uuid.uuid4().hex[:6]}",
+                base_url="http://gw.dataimpulse.com:823",
+            )
+            for i in range(3):
+                session.add(
+                    _make_operation(
+                        provider=str(row_id), domain="identity.example",
+                        bytes_compressed=10_000,
+                        closed_at=window_start + timedelta(hours=i + 1),
+                        cost_micro_units=5,
+                    )
+                )
+            session.commit()
+
+        source = _provider_source(
+            provider="dataimpulse", host="identity.example",
+            window_start=window_start, window_end=window_end, row_bytes=[30_000],
+        )
+        window = import_provider_usage(source, session_scope=session_scope)
+        report = reconcile_window(window, session_scope=session_scope)
+
+        assert report.app_requests == 3
+        assert report.passed is True
+        assert len(report.settlements_written) == 3
+
+    def test_hostless_daily_totals_reconcile_against_the_whole_day(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The provider's documented usage API reports daily totals with no
+        host (`stats_with_history`: group_date, total_traffic,
+        requests_count). Grouping those by host put every provider byte in
+        a `None` bucket no operation can join, so a perfectly matching day
+        read as two unexplained gaps."""
+        provider = f"dataimpulse-daily-{uuid.uuid4().hex[:6]}"
+        window_start = datetime(2026, 7, 3, 0, 0, tzinfo=timezone.utc)
+        window_end = window_start + timedelta(days=1)
+        with session_scope() as session:
+            for host, n in (("a.example", 2), ("b.example", 3)):
+                for i in range(n):
+                    session.add(
+                        _make_operation(
+                            provider=provider, domain=host, bytes_compressed=10_000,
+                            closed_at=window_start + timedelta(hours=i + 1),
+                            cost_micro_units=7,
+                        )
+                    )
+            session.commit()
+        rows = [
+            ProviderUsageRow(
+                occurred_at=window_start, target_host=None, bytes_up=None,
+                bytes_down=None, total_bytes=50_400, request_count=5,
+                raw={"group_date": window_start.isoformat()},
+            )
+        ]
+        source = ProviderUsageSource(
+            provider=provider, window_start=window_start, window_end=window_end,
+            rows=rows, source_ref="test:daily", raw_bytes=f"{provider}:daily".encode(),
+            granularity=ProviderUsageGranularity.DAILY,
+        )
+        window = import_provider_usage(source, session_scope=session_scope)
+        report = reconcile_window(window, session_scope=session_scope)
+
+        assert report.passed is True, report.unexplained_operations
+        assert len(report.settlements_written) == 5
+
+
+class TestWindowsAwaitingSettlement:
+    """2026-09-29 (plan E7.2): the cadence reconciled only YESTERDAY's
+    imports, so a window imported late (or whose ledger rows arrived late,
+    or that failed once) was never looked at again."""
+
+    def test_unsettled_windows_across_the_lookback_are_returned_settled_ones_not(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        from app_shared.netledger.reconcile import windows_awaiting_settlement
+
+        provider = f"dataimpulse-lookback-{uuid.uuid4().hex[:6]}"
+        day_old = datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+        day_new = datetime(2026, 7, 14, 0, 0, tzinfo=timezone.utc)
+        with session_scope() as session:
+            session.add(
+                _make_operation(
+                    provider=provider, domain="lb.example", bytes_compressed=1_000,
+                    closed_at=day_new + timedelta(hours=2), cost_micro_units=3,
+                )
+            )
+            session.commit()
+        settled = import_provider_usage(
+            _provider_source(provider=provider, host="lb.example", window_start=day_new,
+                             window_end=day_new + timedelta(days=1), row_bytes=[1_000]),
+            session_scope=session_scope,
+        )
+        assert reconcile_window(settled, session_scope=session_scope).settlements_written
+        unsettled = import_provider_usage(
+            _provider_source(provider=provider, host="nobody.example", window_start=day_old,
+                             window_end=day_old + timedelta(days=1), row_bytes=[5]),
+            session_scope=session_scope,
+        )
+        with session_scope() as session:
+            found = windows_awaiting_settlement(
+                session, since_date=day_old.date(), until_date=day_new.date(), provider=provider
+            )
+            outside = windows_awaiting_settlement(
+                session, since_date=day_new.date(), until_date=day_new.date(), provider=provider
+            )
+        assert [w.id for w in found] == [unsettled.id]
+        assert outside == []
+
+    def test_paid_operations_are_counted_by_day_for_the_import_missing_signal(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        from app_shared.netledger.reconcile import count_paid_operations
+
+        day = datetime(2026, 7, 20, 0, 0, tzinfo=timezone.utc)
+        with session_scope() as session:
+            before = count_paid_operations(session, since=day, until=day + timedelta(days=1))
+            for provider in ("0e80a9c2-969f-4e19-9bb4-fa3216856936", "direct", "browser"):
+                session.add(
+                    _make_operation(
+                        provider=provider, domain="p.example", bytes_compressed=1,
+                        closed_at=day + timedelta(hours=1), cost_micro_units=1,
+                    )
+                )
+            session.commit()
+            after = count_paid_operations(session, since=day, until=day + timedelta(days=1))
+        assert after - before == 1
+
+
+class TestRerollAfterLateSettlement:
+    """2026-09-29 (plan E7.3): cost_rollup rolls a day once and advances its
+    watermark, and the day's settlements typically arrive AFTER that (the
+    provider export lands the next morning), so the rollup kept reporting
+    the day as unreconciled forever."""
+
+    def test_a_day_whose_settlements_postdate_its_rollup_is_rolled_again(
+        self, engine, session_scope
+    ) -> None:  # type: ignore[no-untyped-def]
+        from app_shared.models.network_cost_rollups import FleetNetworkCostRollup
+        from app_shared.netledger.rollups import (
+            days_with_late_settlements,
+            reroll_days_with_late_settlements,
+            run_cost_rollup,
+        )
+
+        provider = f"dataimpulse-reroll-{uuid.uuid4().hex[:6]}"
+        day_start = datetime(2026, 7, 25, 0, 0, tzinfo=timezone.utc)
+        host = f"reroll-{uuid.uuid4().hex[:6]}.example"
+        with session_scope() as session:
+            session.add(
+                _make_operation(
+                    provider=provider, domain=host, bytes_compressed=2_000,
+                    closed_at=day_start + timedelta(hours=3), cost_micro_units=40,
+                )
+            )
+            session.commit()
+            run_cost_rollup(session, target_date=day_start.date())
+            session.commit()
+            assert day_start.date() not in days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
+
+        window = import_provider_usage(
+            _provider_source(provider=provider, host=host, window_start=day_start,
+                             window_end=day_start + timedelta(days=1), row_bytes=[2_000]),
+            session_scope=session_scope,
+        )
+        assert reconcile_window(window, session_scope=session_scope).settlements_written
+
+        with session_scope() as session:
+            late = days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
+            assert day_start.date() in late
+            rerolled = reroll_days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )
+            session.commit()
+            assert day_start.date() in rerolled
+            bucket = session.execute(
+                select(FleetNetworkCostRollup).where(
+                    FleetNetworkCostRollup.rollup_date == day_start.date(),
+                    FleetNetworkCostRollup.domain == host,
+                )
+            ).scalar_one()
+            assert bucket.reconciled_cost_micro_units == 40
+            assert day_start.date() not in days_with_late_settlements(
+                session, since=day_start - timedelta(days=1), through_date=day_start.date()
+            )

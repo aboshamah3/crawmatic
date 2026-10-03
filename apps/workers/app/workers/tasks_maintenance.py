@@ -66,9 +66,16 @@ from app_shared.maintenance.rollups import (
 )
 from app_shared.maintenance.soft_refs import count_tolerated_dangling_refs
 from app_shared.messaging import enqueue
+from app_shared.netledger.provider_usage_clients import (
+    ProviderUsageFetchError,
+    configured_usage_clients,
+)
 from app_shared.netledger.reconcile import (
     ReconciliationPolicyError,
+    count_paid_operations,
+    import_provider_usage,
     reconcile_window,
+    windows_awaiting_settlement,
     windows_pending_reconciliation,
 )
 from app_shared.netledger.rollups import run_cost_rollup
@@ -594,6 +601,53 @@ def costauth_reservation_sweep() -> None:
     )
 
 
+def _fetch_provider_usage(now: datetime, lookback_days: int) -> None:
+    """E7 (2026-09-29): pull provider evidence before reconciling it.
+
+    Production had never imported a single provider usage row -- the only
+    importer was a manual script fed a hand-exported file -- so nothing
+    could ever reconcile. Every provider with a usage credential in the
+    environment (`configured_usage_clients`) is asked for the completed
+    days of the lookback, and each day is imported (content-addressed:
+    an unchanged day is a no-op). A provider failure is logged by name and
+    never stops reconciliation of whatever evidence already exists.
+    """
+    clients = configured_usage_clients(get_settings())
+    if not clients:
+        logger.warning(
+            "maintenance_reconcile_provider_usage_fetch_unconfigured -- "
+            "provider_usage_fetch_unconfigured: no provider usage API credential "
+            "(DATAIMPULSE_USAGE_API_LOGIN / DATAIMPULSE_USAGE_API_PASSWORD) in "
+            "the worker environment; nothing is fetched"
+        )
+        return
+    until_date = now.date()
+    since_date = until_date - timedelta(days=lookback_days)
+    for client in clients:
+        try:
+            sources = client.fetch(since=since_date, until=until_date, now=now)
+        except ProviderUsageFetchError as exc:
+            logger.error(
+                "maintenance_reconcile_provider_usage provider_usage_fetch_failed "
+                "provider=%s reason=%s",
+                client.provider,
+                exc,
+            )
+            continue
+        imported = 0
+        for source in sources:
+            import_provider_usage(source)
+            imported += 1
+        logger.info(
+            "maintenance_reconcile_provider_usage provider_usage_fetched provider=%s "
+            "days=%d since=%s until=%s",
+            client.provider,
+            imported,
+            since_date.isoformat(),
+            until_date.isoformat(),
+        )
+
+
 @maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=MAINTENANCE_RECONCILE_PROVIDER_USAGE)
 def reconcile_provider_usage(target_date: str | None = None, provider: str | None = None) -> None:
@@ -640,15 +694,47 @@ def reconcile_provider_usage(target_date: str | None = None, provider: str | Non
     it among ordinary INFO lines, the same EVENT_SYSTEM_SESSION_UNAVAILABLE
     lesson this module already learned once).
     """
-    if target_date is not None:
-        parsed_date = date.fromisoformat(target_date)
-    else:
-        parsed_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-
+    # 2026-09-29 (plan E7.2/E7.4). The cadence used to reconcile only
+    # YESTERDAY's imports: a window imported late, or whose ledger rows
+    # arrived late, or that failed once, was never examined again. It now
+    # takes every window still lacking a settlement over the lookback
+    # (idempotent to re-run). And when there is NO evidence at all while
+    # the fleet paid a provider -- production's state, with an empty
+    # provider_usage_records table -- it says so by name.
+    now = datetime.now(timezone.utc)
+    lookback_days = get_settings().PROVIDER_RECONCILE_LOOKBACK_DAYS
+    if target_date is None:
+        _fetch_provider_usage(now, lookback_days)
     with _system_session("reconcile_provider_usage") as session:
-        windows = windows_pending_reconciliation(
-            session, target_date=parsed_date, provider=provider
-        )
+        if target_date is not None:
+            parsed_date = date.fromisoformat(target_date)
+            windows = windows_pending_reconciliation(
+                session, target_date=parsed_date, provider=provider
+            )
+        else:
+            parsed_date = now.date()
+            since_date = parsed_date - timedelta(days=lookback_days)
+            windows = windows_awaiting_settlement(
+                session, since_date=since_date, until_date=parsed_date, provider=provider
+            )
+            if not windows:
+                paid = count_paid_operations(
+                    session,
+                    since=datetime.combine(since_date, datetime.min.time(), tzinfo=timezone.utc),
+                    until=now,
+                )
+                if paid:
+                    logger.warning(
+                        "maintenance_reconcile_provider_usage_import_missing "
+                        "paid_operations=%d lookback_days=%d -- no provider usage "
+                        "evidence has been imported for operations the fleet paid a "
+                        "provider for; every reported cost is an unchecked estimate "
+                        "until an import lands (fetched by this task when "
+                        "DATAIMPULSE_USAGE_API_LOGIN/PASSWORD are set; otherwise "
+                        "scripts/import_dataimpulse_usage.py)",
+                        paid,
+                        lookback_days,
+                    )
 
     windows_passed = 0
     windows_failed_open_gap = 0

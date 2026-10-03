@@ -35,7 +35,7 @@ the dispatcher.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -59,6 +59,7 @@ def write_outbox_message(
     dedup_key: str | None = None,
     now: datetime | None = None,
     message_id: uuid.UUID | None = None,
+    available_after_seconds: float = 0,
 ) -> uuid.UUID:
     """Record "publish ``task_name`` to ``queue``" in ``session``'s transaction.
 
@@ -85,6 +86,14 @@ def write_outbox_message(
             dispatcher stays generic — it publishes ``payload`` verbatim
             and knows nothing about any task's idempotency scheme.)
 
+        available_after_seconds: delay before the dispatcher may claim the
+            row (``available_at = now + delay``). With a ``dedup_key`` this
+            is a debounce: the first write of a window schedules the
+            message, and every later write while it is still PENDING is an
+            ON CONFLICT no-op that its one delivery covers (2026-09-29,
+            E3.2 -- one browser dispatch per job per window, not one per
+            handoff).
+
     Returns:
         The id this call assigned. Note it is returned even when the
         insert was a dedup no-op — callers treat the id as "the logical
@@ -107,7 +116,7 @@ def write_outbox_message(
         "dedup_key": dedup_key,
         "status": OutboxStatus.PENDING.value,
         "attempts": 0,
-        "available_at": moment,
+        "available_at": moment + timedelta(seconds=max(0.0, float(available_after_seconds))),
         "published_at": None,
         "last_error": None,
     }

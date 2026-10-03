@@ -356,6 +356,44 @@ class DenialReason(StrEnum):
     BROWSER_SECOND_BUDGET_EXCEEDED = "BROWSER_SECOND_BUDGET_EXCEEDED"
 
 
+class DenialPermanence(StrEnum):
+    """Whether a denial can clear during the life of one job (2026-09-29, E4)."""
+
+    #: Nothing the fleet does on its own will clear it before the job's
+    #: deadline -- it needs an operator (certify or un-quarantine the
+    #: domain). The dispatcher terminalizes the batch on the first refusal.
+    PERMANENT = "PERMANENT"
+    #: It clears by itself (breaker re-evaluation, budget window, a grant
+    #: released, fresh entitlement evidence). The dispatcher keeps the batch
+    #: offerable for ``SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS``.
+    TRANSIENT = "TRANSIENT"
+
+
+#: The explicit class of every :class:`DenialReason`. A reason added
+#: without an entry here fails ``tests/unit/test_costauth_denial_classes.py``
+#: -- there is deliberately no default.
+#:
+#: ``ENTITLEMENT_INACTIVE`` is TRANSIENT on purpose, although "inactive"
+#: sounds final: the gate collapses three different facts into it (no row,
+#: STALE evidence, non-ACTIVE state -- ``_check_entitlement``), and stale
+#: evidence clears as soon as the SaaS side next reports. Failing a
+#: paying customer's nightly job on a sync lag would be worse than retrying
+#: a genuinely inactive one for the bounded window.
+DENIAL_PERMANENCE: dict[DenialReason, DenialPermanence] = {
+    DenialReason.ENTITLEMENT_INACTIVE: DenialPermanence.TRANSIENT,
+    DenialReason.BREAKER_EVIDENCE_STALE: DenialPermanence.TRANSIENT,
+    DenialReason.BREAKER_OPEN: DenialPermanence.TRANSIENT,
+    DenialReason.DOMAIN_QUARANTINED: DenialPermanence.PERMANENT,
+    DenialReason.DOMAIN_NOT_CERTIFIED: DenialPermanence.PERMANENT,
+    DenialReason.DOMAIN_ESCALATION_DENIED: DenialPermanence.PERMANENT,
+    DenialReason.CONCURRENCY_CAP_EXCEEDED: DenialPermanence.TRANSIENT,
+    DenialReason.MONEY_BUDGET_EXCEEDED: DenialPermanence.TRANSIENT,
+    DenialReason.BYTE_BUDGET_EXCEEDED: DenialPermanence.TRANSIENT,
+    DenialReason.REQUEST_BUDGET_EXCEEDED: DenialPermanence.TRANSIENT,
+    DenialReason.BROWSER_SECOND_BUDGET_EXCEEDED: DenialPermanence.TRANSIENT,
+}
+
+
 class CostAuthorizationError(Exception):
     """Base class for this module's errors."""
 
@@ -1921,6 +1959,35 @@ def estimate_bytes(requests: int, *, per_request: int = DEFAULT_ESTIMATED_BYTES_
     return max(1, int(requests)) * int(per_request)
 
 
+def authorize_or_denial(
+    service: CostAuthorizationService, req: AuthorizationRequest, *, site: str
+) -> AuthorizationGrant | CostAuthorizationDenied:
+    """:func:`authorize_or_none`, but a denial comes back as the exception.
+
+    For call sites that must act on WHY they were refused (2026-09-29, E4:
+    ``dispatch_job`` terminalizes a permanently denied batch at once). The
+    denial is logged exactly as :func:`authorize_or_none` logs it.
+    """
+    try:
+        return service.authorize(req)
+    except CostAuthorizationDenied as denial:
+        _log_denial(denial, req, site)
+        return denial
+
+
+def _log_denial(denial: CostAuthorizationDenied, req: AuthorizationRequest, site: str) -> None:
+    logger.warning(
+        "cost_authorization.denied site=%s reason=%s workspace_id=%s domain=%s "
+        "purpose=%s detail=%s",
+        site,
+        denial.reason.value,
+        req.workspace_id,
+        req.domain,
+        req.purpose.value,
+        denial.detail,
+    )
+
+
 def authorize_or_none(
     service: CostAuthorizationService, req: AuthorizationRequest, *, site: str
 ) -> AuthorizationGrant | None:
@@ -1940,16 +2007,7 @@ def authorize_or_none(
     try:
         return service.authorize(req)
     except CostAuthorizationDenied as denial:
-        logger.warning(
-            "cost_authorization.denied site=%s reason=%s workspace_id=%s domain=%s "
-            "purpose=%s detail=%s",
-            site,
-            denial.reason.value,
-            req.workspace_id,
-            req.domain,
-            req.purpose.value,
-            denial.detail,
-        )
+        _log_denial(denial, req, site)
         return None
 
 

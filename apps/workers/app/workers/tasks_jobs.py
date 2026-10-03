@@ -37,11 +37,14 @@ from app.workers.celery_app import app
 from app.workers.tasks_dispatch import DispatchedBatch, stamp_targets_dispatched
 from app_shared.config import get_settings
 from app_shared.costauth import (
+    DENIAL_PERMANENCE,
     AuthorizationPurpose,
     AuthorizationRequest,
+    CostAuthorizationDenied,
     CostAuthorizationService,
+    DenialPermanence,
     FirstRungReservation,
-    authorize_or_none,
+    authorize_or_denial,
     escalation_reservation,
     first_rung_reservation,
     reservation_rung,
@@ -51,6 +54,7 @@ from app_shared.domains.lifecycle import unsupported_target_outcome
 from app_shared.domains.state_lookup import get_domain_state
 from app_shared.enums import (
     DispatchIntentState,
+    ScrapeErrorCode,
     ScrapeJobStatus,
     ScrapeProfileMode,
     ScrapeTargetStatus,
@@ -69,8 +73,11 @@ from app_shared.jobs.dispatch_intents import (
     reconcile_inflight_intents,
     receiver_holds_execution,
 )
+from app_shared.jobs.run_purge import purge_live_runs
 from app_shared.jobs.reaper import (
+    close_open_targets_of_terminal_jobs,
     fail_targets_past_job_deadline,
+    revert_started_targets_of_ended_runs,
     revert_stale_started_targets,
 )
 from app_shared.jobs.lifecycle import resolve_finalized_status, stall_window
@@ -82,6 +89,7 @@ from app_shared.messaging import enqueue
 from app_shared.maintenance.scoping import MaintenanceScope, maintenance_task
 from app_shared.models.competitors_matches import Competitor, CompetitorProductMatch
 from app_shared.netledger.recorder import canonical_url_hash
+from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.domain_playbooks import DomainPlaybook, DomainState
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
@@ -99,6 +107,7 @@ from app_shared.scrapyd import (
     ScrapydDispatchClient,
     build_dispatch_identity,
 )
+from app_shared.scrapyd.errors import ScrapydDispatchError
 from app_shared.task_names import (
     CREATE_WEBHOOK_EVENT,
     DISPATCH_RECONCILE_INTENTS,
@@ -264,10 +273,10 @@ def _node_placement(
     """The pass-scoped placement decision-maker for one dispatch pass (B6/F11).
 
     All the policy lives in :class:`~app_shared.jobs.node_load.NodePlacement`;
-    what this adds is the **lazy** probe client. A single-node pool never
-    reads a load at all (`NodePlacement`'s rule 2), so on today's
-    deployments the `ScrapydDispatchClient` below — and the Redis
-    connection it opens — is never constructed. `recover_stalled_batches`
+    what this adds is the **lazy** probe client, built on the first pool
+    that needs a load read. Since 2026-09-29 (E3.1) that is every pool,
+    single-node ones included, so `SCRAPYD_MAX_PENDING_PER_NODE` caps the
+    browser node's queue too. `recover_stalled_batches`
     passes its own long-lived prober in, so the sweep keeps one
     `daemonstatus.json` cache across every job it touches.
     """
@@ -823,10 +832,26 @@ def _resolve_domains_and_modes(
     cursor_advanced = False
     for target in targets:
         match = matches.get(target.match_id)
-        if match is None:
-            continue
-        domain = domains.get(match.competitor_id)
-        if domain is None:
+        domain = None if match is None else domains.get(match.competitor_id)
+        if match is None or domain is None:
+            # 2026-09-29 (E4): the match or its competitor is gone (soft
+            # reference -- deleted or archived). Skipping it silently left
+            # the target PENDING, re-read by every pass, until the 12 h job
+            # deadline. There is nothing to fetch: close it, with a reason.
+            logger.info(
+                "tasks_jobs: unresolved target job=%s match=%s (%s missing) -> SKIPPED",
+                scrape_job_id,
+                target.match_id,
+                "match" if match is None else "competitor",
+            )
+            mark_target(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=target.scrape_job_id,
+                match_id=target.match_id,
+                status=ScrapeTargetStatus.SKIPPED,
+                error_code=ScrapeErrorCode.TARGET_UNRESOLVED,
+            )
             continue
         playbook = playbooks.get(domain)
         selected_method = current_methods.get(target.current_strategy_method_id)
@@ -984,6 +1009,99 @@ def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID
 
 @maintenance_task(scope=MaintenanceScope.WORKSPACE)
 @app.task(name=SCRAPE_DISPATCH_JOB)
+def _denial_window_expired(
+    redis: Any,
+    *,
+    scrape_job_id: uuid.UUID,
+    match_ids: Sequence[Any],
+    now: datetime,
+    window_seconds: int,
+    ttl_seconds: int,
+) -> set[Any]:
+    """The match ids whose FIRST transient denial is older than the window.
+
+    2026-09-29 (plan E4). Anchored per target in Redis (``SET NX`` of the
+    first refusal's instant, expiring with the job's own deadline), not on
+    the target's ``created_at``: a nightly job legitimately reaches its later
+    batches hours after creation, and their first refusal must still get the
+    whole window. Any Redis failure answers "not expired" -- the fallback is
+    today's behaviour (retry), never a premature failure.
+    """
+    expired: set[Any] = set()
+    for match_id in match_ids:
+        key = f"dispatch-denied:{scrape_job_id}:{match_id}"
+        try:
+            redis.set(key, now.isoformat(), nx=True, ex=max(1, int(ttl_seconds)))
+            first = redis.get(key)
+        except Exception:  # noqa: BLE001 - see docstring: fail towards retrying
+            logger.warning("dispatch: denial window anchor unavailable key=%s", key, exc_info=True)
+            continue
+        if first is None:
+            continue
+        if isinstance(first, bytes):
+            first = first.decode()
+        try:
+            first_at = datetime.fromisoformat(str(first))
+        except ValueError:
+            continue
+        if (now - first_at).total_seconds() >= window_seconds:
+            expired.add(match_id)
+    return expired
+
+
+def _terminalize_denied_targets(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    batch_targets: Sequence[ScrapeJobTarget],
+    denial: CostAuthorizationDenied,
+    settings: Any,
+) -> int:
+    """Act on a cost-authorization refusal of one batch; return targets failed.
+
+    2026-09-29 (plan E4). A PERMANENT denial (domain state -- needs an
+    operator) fails every target of the batch now, with the denial's own
+    code. A TRANSIENT one leaves them offerable, exactly as before, until
+    their first refusal is ``SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS``
+    old, then fails them with its code. Before this every denial was
+    retried every 60 s until the 12 h job deadline, and the target then
+    said ``JOB_DEADLINE_EXCEEDED`` instead of why it was never fetched.
+    """
+    code = ScrapeErrorCode(denial.reason.value)
+    if DENIAL_PERMANENCE[denial.reason] is DenialPermanence.PERMANENT:
+        doomed = list(batch_targets)
+    else:
+        expired = _denial_window_expired(
+            get_redis_client(),
+            scrape_job_id=scrape_job_id,
+            match_ids=[t.match_id for t in batch_targets],
+            now=datetime.now(timezone.utc),
+            window_seconds=settings.SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS,
+            ttl_seconds=settings.SCRAPE_JOB_MAX_RUNTIME_SECONDS,
+        )
+        doomed = [t for t in batch_targets if t.match_id in expired]
+    for target in doomed:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=target.match_id,
+            status=ScrapeTargetStatus.FAILED,
+            error_code=code,
+        )
+    if doomed:
+        logger.warning(
+            "dispatch: %d target(s) FAILED %s (%s denial) scrape_job_id=%s workspace_id=%s",
+            len(doomed),
+            code.value,
+            DENIAL_PERMANENCE[denial.reason].value.lower(),
+            scrape_job_id,
+            workspace_id,
+        )
+    return len(doomed)
+
+
 def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
     """Expand `scrape_job_id`'s PENDING targets into domain/mode-grouped Scrapyd runs.
 
@@ -1218,7 +1336,7 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 if batch.mode == ScrapeProfileMode.BROWSER
                 else AuthorizationPurpose.REFRESH
             )
-            grant = authorize_or_none(
+            decision = authorize_or_denial(
                 costauth,
                 _batch_authorization_request(
                     batch,
@@ -1229,13 +1347,27 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 ),
                 site="tasks_jobs.dispatch_job",
             )
-            if grant is None:
-                # Denied: do NOT plan, do NOT POST and do NOT stamp. The
-                # targets stay PENDING/unstamped, so `redispatch_pending_jobs`
-                # will offer them again once whatever denied them
-                # (budget, breaker, entitlement, domain state) clears.
-                # A denial must never look like a dispatch.
+            if isinstance(decision, CostAuthorizationDenied):
+                # Denied: do NOT plan, do NOT POST and do NOT stamp. A denial
+                # must never look like a dispatch. What happens to the
+                # targets depends on WHY (E4): a permanent denial fails them
+                # now with its own code; a transient one leaves them
+                # PENDING/unstamped for `redispatch_pending_jobs` to offer
+                # again, until its retry window runs out.
+                _terminalize_denied_targets(
+                    session,
+                    workspace_id=workspace_uuid,
+                    scrape_job_id=job.id,
+                    batch_targets=[
+                        target
+                        for match_id in batch.match_ids
+                        for target in targets_by_match.get(match_id, ())
+                    ],
+                    denial=decision,
+                    settings=settings,
+                )
                 continue
+            grant = decision
             intent = intents.plan(
                 identity,
                 match_ids=batch.match_ids,
@@ -1270,6 +1402,15 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
         # step 3 below -- the POST must not be issued with a Postgres
         # backend pinned open behind it.
         session.commit()
+        # That commit also ended the transaction `set_workspace_context`
+        # above was LOCAL to. Under FORCE RLS the next transaction sees NO
+        # rows of this workspace until the GUC is set again -- and the
+        # per-batch target stamps below are ORM UPDATEs by primary key, so
+        # a missing context surfaces as SQLAlchemy's StaleDataError
+        # ("expected to update N rows; 0 were matched") at the first
+        # per-batch commit, every dispatch attempt, forever
+        # (prod 2026-09-22: workspace 01a020de, 26 attempts in 7 minutes).
+        set_workspace_context(session, workspace_uuid)
 
         # Steps 2-4 run per batch through a store that owns its own short
         # transactions, so `POSTED` is committed before the POST and
@@ -1420,11 +1561,17 @@ def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
                 # it is also what keeps the next POST from running with a
                 # transaction open.
                 session.commit()
+                # Same rule as after the plan commit: every commit drops the
+                # LOCAL workspace GUC, and the next batch's stamps are ORM
+                # UPDATEs on RLS-protected rows.
+                set_workspace_context(session, workspace_uuid)
         except Exception:
             # Grants reserved in step 1 for batches this pass never got to
             # are released rather than left to age out of their lease --
             # a task that raised on batch 3 must not hold batches 4..N's
             # budget until the reaper notices.
+            session.rollback()
+            set_workspace_context(session, workspace_uuid)
             for item in undispatched:
                 costauth.release(item.grant.authorization_id)
             session.commit()
@@ -1529,96 +1676,174 @@ def finalize_jobs() -> None:
     or not at all, and the outbox dispatcher publishes them with
     at-least-once delivery and bounded retries.
     """
+    failures = 0
+    first_failure: Exception | None = None
+    finalized: list[tuple[uuid.UUID, uuid.UUID]] = []
     with get_session() as session:
         for job_id, workspace_id in _scan_job_refs(_NON_TERMINAL_JOB_STATUSES):
-            set_workspace_context(session, workspace_id)
-
-            job = scoped_get(session, ScrapeJob, job_id, workspace_id)
-            if job is None or job.status in _TERMINAL_JOB_STATUSES:
-                continue
-
-            targets = list(
-                session.execute(
-                    scoped_select(ScrapeJobTarget, workspace_id).where(
-                        ScrapeJobTarget.scrape_job_id == job.id
-                    )
+            # ONE transaction per job (2026-09-23, mushtryati run 01a0cfd6).
+            # The sweep spans workspaces and `app.workspace_id` is a
+            # transaction-LOCAL GUC. With a single commit at the end, the
+            # first job's counter UPDATE stayed dirty in the session while
+            # the context was re-pointed at the NEXT workspace; the autoflush
+            # on that job's `scoped_get` then ran the UPDATE under the wrong
+            # RLS predicate, matched 0 rows, and `StaleDataError` killed the
+            # whole task -- every minute, for every tenant -- as soon as two
+            # workspaces had a non-terminal job at the same time. Committing
+            # per job means the context switch never sees dirty state, and
+            # one broken job can no longer stop every other job finalizing.
+            # The first failure is re-raised AFTER the sweep so the task run
+            # still reads as failed (audit H1: an outbox write that fails
+            # must abort that job's finalize AND stay visible), while every
+            # other job has already had its own transaction committed.
+            try:
+                set_workspace_context(session, workspace_id)
+                if _finalize_one_job(session, job_id, workspace_id):
+                    finalized.append((job_id, workspace_id))
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                failures += 1
+                if first_failure is None:
+                    first_failure = exc
+                logger.exception(
+                    "finalize_jobs: job %s (workspace %s) failed; continuing with the rest",
+                    job_id,
+                    workspace_id,
                 )
-                .scalars()
-                .all()
-            )
+    # 2026-09-29 (E3.3): after the finalize commits, not inside it -- a
+    # rolled-back finalize must not have cancelled anything.
+    _purge_finalized_job_runs(finalized)
+    if first_failure is not None:
+        logger.error("finalize_jobs: %d job(s) failed this sweep; re-raising the first", failures)
+        raise first_failure
 
-            counts = refresh_job_counters(session, job, workspace_id)
 
-            all_terminal = all(target.status in _TERMINAL_TARGET_STATUSES for target in targets)
-            if not all_terminal:
-                continue
+def _purge_finalized_job_runs(finalized: list[tuple[uuid.UUID, uuid.UUID]]) -> None:
+    """Cancel the still-live Scrapyd runs of jobs this sweep finalized.
 
-            job.status = resolve_finalized_status(
-                counts.success, counts.failure, counts.skipped, counts.total
-            )
-            job.completed_at = datetime.now(timezone.utc)
-
-            # Audit H1: this was a *pre-commit* `enqueue` — it fired the
-            # stats flush before the finalize it depends on had
-            # committed, so a rollback below left a flush racing (or
-            # preceding) a job that never finalized. Written to the
-            # outbox instead, it now commits atomically with the
-            # finalize and is published afterwards.
-            profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
-            if profile_ids:
-                write_outbox_message(
-                    session,
+    2026-09-29 (plan E3.3). A job that finished -- normally, or because the
+    deadline sweep failed its leftovers -- could still have hundreds of runs
+    queued on a node (2,725 on the browser node after one nightly deadline),
+    each of which would later spawn a spider only to find its targets
+    terminal. `purge_live_runs` cancels exactly the pending/running ones, on
+    the node and in the project each intent recorded. Best effort: a failure
+    is logged per job and never fails the sweep.
+    """
+    if not finalized:
+        return
+    client = ScrapydDispatchClient(settings=get_settings())
+    with get_system_session() as purge_session:
+        for job_id, workspace_id in finalized:
+            try:
+                purge_live_runs(
+                    purge_session,
                     workspace_id=workspace_id,
-                    task_name=STRATEGY_STATS_FLUSH,
-                    queue="maintenance",
-                    kwargs={
-                        "workspace_id": str(workspace_id),
-                        "profile_ids": [str(profile_id) for profile_id in profile_ids],
-                    },
-                    dedup_key=f"statsflush:{job.id}",
-                    now=job.completed_at,
+                    scrape_job_id=job_id,
+                    client=client,
+                )
+            except Exception:  # noqa: BLE001 - cleanup must never fail finalize
+                logger.warning(
+                    "finalize_jobs: run purge failed for job %s (workspace %s)",
+                    job_id,
+                    workspace_id,
+                    exc_info=True,
                 )
 
-            # SPEC-16 US3 (T034, contracts/events.md #2), reworked for
-            # audit H1: the job event was a post-commit fire-and-forget
-            # enqueue whose failure was swallowed, so a broker outage
-            # silently dropped the terminal-status event of a job that
-            # had genuinely finished. It is now an outbox row written in
-            # the same transaction as the finalize. `CANCELLED` (never
-            # produced by this path) and any non-terminal status still
-            # emit nothing (`build_job_event` returns `None`).
-            built = build_job_event(
-                scrape_job_id=job.id,
-                status=job.status,
-                success_count=counts.success,
-                failure_count=counts.failure,
-                skipped_count=counts.skipped,
-                total=counts.total,
+
+def _finalize_one_job(session: Session, job_id: uuid.UUID, workspace_id: uuid.UUID) -> bool:
+    """Refresh one job's counters and finalize it if every target is terminal.
+
+    Runs inside the caller's transaction, whose `app.workspace_id` GUC the
+    caller has already set for `workspace_id`; the caller commits or rolls
+    back. Split out of `finalize_jobs` so each job gets its own transaction.
+    Returns True when the job was finalized in this call.
+    """
+    job = scoped_get(session, ScrapeJob, job_id, workspace_id)
+    if job is None or job.status in _TERMINAL_JOB_STATUSES:
+        return False
+
+    targets = list(
+        session.execute(
+            scoped_select(ScrapeJobTarget, workspace_id).where(
+                ScrapeJobTarget.scrape_job_id == job.id
             )
-            if built is not None:
-                webhook_event_type, webhook_payload, dedup_key = built
-                # The message id doubles as the consumer's idempotency
-                # key -- see `create_webhook_event`.
-                message_id = new_uuid7()
-                write_outbox_message(
-                    session,
-                    workspace_id=workspace_id,
-                    task_name=CREATE_WEBHOOK_EVENT,
-                    queue="webhook_events",
-                    kwargs={
-                        "workspace_id": str(workspace_id),
-                        "event_type": webhook_event_type,
-                        "payload": webhook_payload,
-                        "dedup_key": dedup_key,
-                        "event_id": str(message_id),
-                        "occurred_at": job.completed_at.isoformat(),
-                    },
-                    dedup_key=dedup_key,
-                    now=job.completed_at,
-                    message_id=message_id,
-                )
+        )
+        .scalars()
+        .all()
+    )
 
-        session.commit()
+    counts = refresh_job_counters(session, job, workspace_id)
+
+    all_terminal = all(target.status in _TERMINAL_TARGET_STATUSES for target in targets)
+    if not all_terminal:
+        return False
+
+    job.status = resolve_finalized_status(
+        counts.success, counts.failure, counts.skipped, counts.total
+    )
+    job.completed_at = datetime.now(timezone.utc)
+
+    # Audit H1: this was a *pre-commit* `enqueue` — it fired the
+    # stats flush before the finalize it depends on had
+    # committed, so a rollback below left a flush racing (or
+    # preceding) a job that never finalized. Written to the
+    # outbox instead, it now commits atomically with the
+    # finalize and is published afterwards.
+    profile_ids = _strategy_profile_ids_for_targets(session, workspace_id, targets)
+    if profile_ids:
+        write_outbox_message(
+            session,
+            workspace_id=workspace_id,
+            task_name=STRATEGY_STATS_FLUSH,
+            queue="maintenance",
+            kwargs={
+                "workspace_id": str(workspace_id),
+                "profile_ids": [str(profile_id) for profile_id in profile_ids],
+            },
+            dedup_key=f"statsflush:{job.id}",
+            now=job.completed_at,
+        )
+
+    # SPEC-16 US3 (T034, contracts/events.md #2), reworked for
+    # audit H1: the job event was a post-commit fire-and-forget
+    # enqueue whose failure was swallowed, so a broker outage
+    # silently dropped the terminal-status event of a job that
+    # had genuinely finished. It is now an outbox row written in
+    # the same transaction as the finalize. `CANCELLED` (never
+    # produced by this path) and any non-terminal status still
+    # emit nothing (`build_job_event` returns `None`).
+    built = build_job_event(
+        scrape_job_id=job.id,
+        status=job.status,
+        success_count=counts.success,
+        failure_count=counts.failure,
+        skipped_count=counts.skipped,
+        total=counts.total,
+    )
+    if built is not None:
+        webhook_event_type, webhook_payload, dedup_key = built
+        # The message id doubles as the consumer's idempotency
+        # key -- see `create_webhook_event`.
+        message_id = new_uuid7()
+        write_outbox_message(
+            session,
+            workspace_id=workspace_id,
+            task_name=CREATE_WEBHOOK_EVENT,
+            queue="webhook_events",
+            kwargs={
+                "workspace_id": str(workspace_id),
+                "event_type": webhook_event_type,
+                "payload": webhook_payload,
+                "dedup_key": dedup_key,
+                "event_id": str(message_id),
+                "occurred_at": job.completed_at.isoformat(),
+            },
+            dedup_key=dedup_key,
+            now=job.completed_at,
+            message_id=message_id,
+        )
+    return True
 
 
 def _interleave_by_workspace(
@@ -1828,6 +2053,52 @@ def reconcile_dispatch_intents() -> None:
     )
 
 
+#: Scrapyd run states in which a dispatched batch is still waiting its
+#: turn or working: its targets are queued, not stalled.
+_LIVE_RUN_STATES = frozenset({"pending", "running"})
+
+
+def _own_run_states(
+    session: Any,
+    workspace_id: Any,
+    targets: list[ScrapeJobTarget],
+    lookup: Callable[[str, str | None], dict[str, str] | None],
+) -> dict[Any, str | None]:
+    """``target.id -> state of the Scrapyd run its dispatch intent names``.
+
+    2026-09-29 (plan E2.3). The state is ``pending``/``running``/
+    ``finished``, ``absent`` when the node answered without listing the run
+    (restarted or rolled history: the run is gone), or ``None`` when there
+    is no verdict -- no intent recorded, no node recorded, or the node did
+    not answer. One read of the intents for the whole list; the listing
+    itself is cached by ``lookup`` per (node, project) for the sweep.
+    """
+    intent_ids = {t.dispatch_intent_id for t in targets if t.dispatch_intent_id is not None}
+    if not intent_ids:
+        return {t.id: None for t in targets}
+    intents = {
+        intent.id: intent
+        for intent in session.execute(
+            scoped_select(DispatchIntent, workspace_id).where(DispatchIntent.id.in_(intent_ids))
+        )
+        .scalars()
+        .all()
+    }
+    states: dict[Any, str | None] = {}
+    for target in targets:
+        intent = intents.get(target.dispatch_intent_id)
+        if intent is None or not intent.node_url:
+            states[target.id] = None
+            continue
+        project = intent.node_class.split(":", 1)[0] if intent.node_class else None
+        listing = lookup(intent.node_url, project)
+        if listing is None:
+            states[target.id] = None
+            continue
+        states[target.id] = listing.get(str(intent.scrapyd_job_id), "absent")
+    return states
+
+
 @maintenance_task(scope=MaintenanceScope.FLEET)
 @app.task(name=SCRAPE_RECOVER_STALLED)
 def recover_stalled_batches() -> None:
@@ -1857,9 +2128,22 @@ def recover_stalled_batches() -> None:
     # One liveness probe per node per task invocation — N batches landing
     # on the same node must not become N `daemonstatus.json` round-trips.
     node_status_cache: dict = {}
+    # Same for `listjobs.json` per (node, project): the per-intent run state
+    # that replaced "node depth > 0 -> skip" (E2.3).
+    run_listing_cache: dict[tuple[str, str | None], dict[str, str] | None] = {}
 
     with get_session() as session:
         client = ScrapydDispatchClient(settings=settings)
+
+        def run_listing(node_url: str, project: str | None) -> dict[str, str] | None:
+            key = (node_url, project)
+            if key not in run_listing_cache:
+                try:
+                    run_listing_cache[key] = client.list_job_states(node_url, project)
+                except (ScrapydDispatchError, TypeError, ValueError, AttributeError):
+                    run_listing_cache[key] = None
+            return run_listing_cache[key]
+
         # EPA B6 (F11): one placement decision-maker for the WHOLE sweep,
         # not one per job. The pool is fleet-wide, so the batches this
         # sweep has already placed must count against the next job's
@@ -1895,6 +2179,24 @@ def recover_stalled_batches() -> None:
             )
             if not stalled_targets:
                 continue
+
+            # 2026-09-29 (E2.3): ask the node about each stalled target's OWN
+            # run. Still pending/running there -> it is queued, not stalled,
+            # whatever else the node is doing; finished/absent -> stalled,
+            # even on a node whose queue is deep. Only targets with no verdict
+            # (no intent recorded, node silent) fall back to the old
+            # node-depth heuristic below.
+            own_runs = _own_run_states(session, workspace_id, stalled_targets, run_listing)
+            stalled_targets = [
+                t for t in stalled_targets if own_runs.get(t.id) not in _LIVE_RUN_STATES
+            ]
+            if not stalled_targets:
+                continue
+            run_ended_match_ids = {
+                t.match_id
+                for t in stalled_targets
+                if own_runs.get(t.id) in ("finished", "absent")
+            }
 
             resolved_targets, _ = _resolve_domains_and_modes(
                 session,
@@ -2013,17 +2315,21 @@ def recover_stalled_batches() -> None:
                             job.id,
                         )
                         continue
-                    status_payload = node_status_cache.get(node_url, _UNPROBED)
-                    if status_payload is _UNPROBED:
-                        status_payload = client.daemon_status(node_url)
-                        node_status_cache[node_url] = status_payload
-                    depth = (
-                        None if status_payload is None else _queue_depth(status_payload)
-                    )
-                    if depth is not None and depth > 0:
-                        # Node alive and working its queue: these targets are
-                        # queued behind max_proc/rate limits, not stalled.
-                        continue
+                    # E2.3: a batch whose every target's own run is known to
+                    # have ended is stalled by direct evidence; node depth is
+                    # irrelevant to it (a wedged node's depth never drains).
+                    if not set(batch.match_ids) <= run_ended_match_ids:
+                        status_payload = node_status_cache.get(node_url, _UNPROBED)
+                        if status_payload is _UNPROBED:
+                            status_payload = client.daemon_status(node_url)
+                            node_status_cache[node_url] = status_payload
+                        depth = (
+                            None if status_payload is None else _queue_depth(status_payload)
+                        )
+                        if depth is not None and depth > 0:
+                            # No run evidence for these targets, node alive and
+                            # working its queue: assume queued, not stalled.
+                            continue
                     # Paid dispatch site 6 (RETRY): a stall re-POST is a
                     # SECOND physical fetch of work already paid for once,
                     # so it must clear the gate on its own account. Its
@@ -2031,7 +2337,7 @@ def recover_stalled_batches() -> None:
                     # generation (EPA B1), so its dedupe key differs from
                     # the original dispatch's — a retry gets its own grant
                     # rather than silently reusing the first one's.
-                    grant = authorize_or_none(
+                    decision = authorize_or_denial(
                         costauth,
                         _batch_authorization_request(
                             batch,
@@ -2042,12 +2348,26 @@ def recover_stalled_batches() -> None:
                         ),
                         site="tasks_jobs.recover_stalled_batches",
                     )
-                    if grant is None:
-                        # Denied: leave the targets stalled and unstamped.
-                        # A later sweep re-offers them once the denial
-                        # clears; re-POSTing unauthorized is the failure
-                        # mode this whole gate exists to remove.
+                    if isinstance(decision, CostAuthorizationDenied):
+                        # Denied: never re-POST unauthorized -- the failure
+                        # mode this whole gate exists to remove. As on the
+                        # primary path (E4), a permanent denial closes the
+                        # targets now with its code; a transient one leaves
+                        # them stalled for a later sweep until its window
+                        # runs out.
+                        batch_ids = set(batch.match_ids)
+                        _terminalize_denied_targets(
+                            session,
+                            workspace_id=workspace_id,
+                            scrape_job_id=job.id,
+                            batch_targets=[
+                                t for t in stalled_targets if t.match_id in batch_ids
+                            ],
+                            denial=decision,
+                            settings=settings,
+                        )
                         continue
+                    grant = decision
                     # EPA B2: the recovery re-plan records its node and
                     # mints its own deterministic `scrapyd_job_id` exactly
                     # as the primary path does, so a worker killed mid-POST
@@ -2188,7 +2508,37 @@ def reap_stale_targets() -> None:
     settings = get_settings()
     now = datetime.now(timezone.utc)
 
+    # 2026-09-29 (E2.1): one `listjobs.json` per (node, project) per tick,
+    # and an unreachable node is `None` -- "no answer", which the ended-run
+    # pass treats as no verdict (its rows stay with the age-based pass).
+    lister = ScrapydDispatchClient(settings=settings)
+    listings: dict[tuple[str, str | None], dict[str, str] | None] = {}
+
+    def run_states(node_url: str, project: str | None) -> dict[str, str] | None:
+        key = (node_url, project)
+        if key not in listings:
+            try:
+                listings[key] = lister.list_job_states(node_url, project)
+            except ScrapydDispatchError as exc:
+                logger.warning(
+                    "maintenance_reap_stale_targets: listjobs unavailable node=%s "
+                    "project=%s (%s); leaving its STARTED targets to the age-based pass",
+                    node_url,
+                    project,
+                    exc,
+                )
+                listings[key] = None
+        return listings[key]
+
     with get_system_session() as session:
+        # First: runs the node says are over. Their targets are unowned now,
+        # not in 35 minutes (the watchdog-killed browser batch shape).
+        ended_reverted = revert_started_targets_of_ended_runs(
+            session,
+            now=now,
+            run_states=run_states,
+            min_started_age_seconds=settings.SCRAPE_ENDED_RUN_REAP_MIN_AGE_SECONDS,
+        )
         reverted = revert_stale_started_targets(
             session,
             now=now,
@@ -2199,10 +2549,19 @@ def reap_stale_targets() -> None:
             now=now,
             max_runtime_seconds=settings.SCRAPE_JOB_MAX_RUNTIME_SECONDS,
         )
+        # E5 (2026-09-29): the invariant "a terminal job holds no open
+        # target". Nothing re-dispatches a terminal job, so an open target
+        # under one never moves again; its first run after deploy also
+        # repairs the 16 historical violators (not a migration: see the
+        # function's docstring on FORCE RLS).
+        terminal_closed = close_open_targets_of_terminal_jobs(session, now=now)
         session.commit()
 
     logger.info(
-        "maintenance_reap_stale_targets reverted=%d deadline_failed=%d",
+        "maintenance_reap_stale_targets ended_run_reverted=%d reverted=%d "
+        "deadline_failed=%d terminal_job_targets_closed=%d",
+        ended_reverted,
         reverted,
         deadline_failed,
+        terminal_closed,
     )

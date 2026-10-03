@@ -193,6 +193,15 @@ class Settings(BaseSettings):
     # when unset, every admin request is refused (fail-closed).
     SAAS_SERVICE_TOKEN: str | None = None
 
+    # --- Catalog index service auth (plan 2026-10-02) ---
+    # Static bearer token for the READ-ONLY catalog index routes
+    # (`/v1/admin/index/lookup`, `/v1/admin/index/status`), so a caller
+    # that only needs lookups (the outreach service) never holds
+    # `SAAS_SERVICE_TOKEN`, which can provision workspaces. The SaaS
+    # token is accepted on those two routes as well. Unset: only the SaaS
+    # token works there.
+    INDEX_SERVICE_TOKEN: str | None = None
+
     # --- Status cache (SPEC-03 FR-022) ---
     STATUS_CACHE_TTL_SECONDS: int = 30
 
@@ -380,6 +389,35 @@ class Settings(BaseSettings):
     # that + a 300s grace is provably unowned: nothing can be racing the
     # revert, because the claimant's own lock has already expired.
     SCRAPE_STARTED_REAP_AFTER_SECONDS: int = 2100
+    # 2026-09-29 (E2.1): a STARTED target whose Scrapyd run the node reports
+    # finished (or no longer lists) is reverted on the next reaper tick
+    # instead of after the 2100 s horizon above. Claims younger than this
+    # are left out of that decision entirely (a guard against acting on a
+    # row written moments ago, not a wait for the run).
+    SCRAPE_ENDED_RUN_REAP_MIN_AGE_SECONDS: int = 120
+    # 2026-09-29 (E3.2): a cross-mode handoff (HTTP -> browser) schedules the
+    # job's re-dispatch this many seconds out, and every further handoff of
+    # the same job inside the window joins that one dispatch. Long enough
+    # for a few HTTP flushes to accumulate a full browser batch, short
+    # against a multi-hour run.
+    SCRAPE_HANDOFF_DISPATCH_DEBOUNCE_SECONDS: int = 30
+    # 2026-09-29 (E4): how long a TRANSIENT cost-authorization denial
+    # (breaker, budgets, concurrency, entitlement evidence) keeps a target
+    # offerable, counted from its first refusal, before it is FAILED with
+    # the denial's code. Permanent denials (domain state) fail at once.
+    SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS: int = 1800
+    # 2026-09-29 (E7): how far back the daily provider-usage reconciliation
+    # looks for imported windows that still have no settlement.
+    PROVIDER_RECONCILE_LOOKBACK_DAYS: int = 7
+    # 2026-09-29 (E7): DataImpulse plan login/password for its documented
+    # gateway usage API (`GET https://gw.dataimpulse.com:777/api/
+    # stats_with_history`, HTTP basic). From the environment ONLY; unset
+    # means provider evidence is not fetched and cost reconciliation has
+    # nothing to reconcile against (owner gate). See
+    # app_shared.netledger.provider_usage_clients.
+    DATAIMPULSE_USAGE_API_LOGIN: str | None = None
+    DATAIMPULSE_USAGE_API_PASSWORD: str | None = None
+    DATAIMPULSE_USAGE_API_BASE_URL: str = "https://gw.dataimpulse.com:777"
     # Hard ceiling on a single job's wall-clock runtime. Past it, every
     # non-terminal target is failed `JOB_DEADLINE_EXCEEDED` so
     # `finalize_jobs` can close the job. 12h is far beyond any legitimate
@@ -760,6 +798,21 @@ class Settings(BaseSettings):
     STRATEGY_METHOD_BREAKER_FAILURE_RATE: float = 0.80
     STRATEGY_METHOD_BREAKER_COOLDOWN_SECONDS: int = 1800
     STRATEGY_METHOD_BREAKER_CANARY_INTERVAL_SECONDS: int = 600
+    # 2026-09-29 (E9.2): a rung whose share of BLOCKED answers in one
+    # stats-flush batch reaches this rate (with at least the minimum
+    # attempts in the batch) is quarantined like a broken rung: the ladder
+    # moves on, a canary keeps probing it. amazon.sa PROXY_HTTP measured
+    # 0.60-0.73 over 24 h and was bought for every target.
+    STRATEGY_METHOD_BLOCKED_RATE_THRESHOLD: float = 0.50
+    STRATEGY_METHOD_BLOCKED_MIN_ATTEMPTS: int = 20
+    # 2026-09-29 (E9.1): per-domain ops-alert thresholds, environment-
+    # tunable. Defaults are exactly the measured constants in
+    # app_shared.opsmetrics.rules.Thresholds -- tunable, not quieter.
+    OPS_DOMAIN_SUCCESS_RATE_HIGH: float = 0.70
+    OPS_DOMAIN_SUCCESS_RATE_WARNING: float = 0.90
+    OPS_DOMAIN_SUCCESS_MIN_ATTEMPTS: int = 50
+    OPS_WASTED_PAID_RATE_HIGH: float = 0.40
+    OPS_WASTED_PAID_MIN_ATTEMPTS: int = 200
     STRATEGY_DISCOVERY_MIN_SAMPLE: int = 3
     STRATEGY_DISCOVERY_MAX_SAMPLE: int = 10
     STRATEGY_STATS_FLUSH_INTERVAL_SECONDS: int = 60
@@ -856,7 +909,48 @@ class Settings(BaseSettings):
     # MATCH_LOCK_BROWSER_TTL_SECONDS, SCRAPE_FLUSH_*, SCRAPYD_BROWSER_URLS. ---
     SCRAPE_BROWSER_DEFAULT_TIMEOUT_MS: int = 30000
     BROWSER_CONCURRENT_REQUESTS: int = 2
-    BROWSER_MAX_CONTEXTS: int = 1
+    # Size of the Playwright context pool: the spider uses one context per
+    # proxy provider (`proxy:<provider_id>`) next to the unproxied `default`,
+    # so this should be >= active providers + 1. It was 1, which deadlocked
+    # the first batch mixing a proxied and an unproxied target (2026-09-29,
+    # E1). `price_monitor_browser.handler` now closes idle contexts when the
+    # pool is full, so a smaller value serialises instead of wedging; the
+    # contexts share one Chromium, so the cost of a slot is small.
+    BROWSER_MAX_CONTEXTS: int = 3
+    # Hard wall-clock cap on ONE browser spider process (Scrapy
+    # CLOSESPIDER_TIMEOUT). The browser node runs max_proc=1, so a single
+    # Playwright process that wedges (seen 2026-09-22 17:50Z for 25 h and
+    # again 2026-09-23 21:00Z) blocks every browser batch behind it, and the
+    # STARTED reaper cannot help: it keys off `started_at`, which a spider
+    # that never claimed its targets never wrote. Kept BELOW
+    # SCRAPE_STARTED_REAP_AFTER_SECONDS (2100) so a batch closed by this cap
+    # is over before the reaper hands its targets back to the dispatcher.
+    SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS: int = 1500
+    # Same cap for the HTTP project (CLOSESPIDER_TIMEOUT). Four noon batches
+    # wedged in four of the node's eight slots for >1 h on 2026-09-23 while
+    # everything behind them queued. Also below the 2100 s reaper horizon.
+    SCRAPE_SPIDER_MAX_RUNTIME_SECONDS: int = 1800
+    # CLOSESPIDER_TIMEOUT is graceful: the engine waits for in-flight
+    # downloads, so a spider wedged inside a download handler never closes.
+    # scrape-core's `extensions.hard_deadline` terminates the process this many
+    # seconds after the graceful deadline, freeing the Scrapyd slot.
+    SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS: int = 120
+    # scrapy-playwright ignores DOWNLOAD_TIMEOUT and awaits new_context,
+    # new_page, page.content and page.close with no bound, so one hung await
+    # wedged the browser node's only slot (2026-09-29, E1).
+    # `price_monitor_browser.handler` bounds every browser download by the
+    # request's own declared timeouts plus this margin (context/page
+    # creation, content and close carry no timeout of their own), and the
+    # handler's shutdown by the second knob.
+    # The out-of-reactor watchdog (scrape-core's `process_watchdog`, armed by
+    # both Scrapyd runners) kills a crawl's whole process group this many
+    # seconds AFTER max runtime + hard-kill grace -- i.e. only when the
+    # graceful close and the in-reactor hard deadline both failed to end it
+    # (blocked loop, pre-open hang, hung Playwright shutdown). Must keep the
+    # sum below SCRAPE_STARTED_REAP_AFTER_SECONDS; a unit test pins that.
+    SCRAPE_PROCESS_WATCHDOG_EXTRA_SECONDS: int = 120
+    BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS: int = 30
+    BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS: int = 30
     # EPA B5 (canary-gated): domains whose PROXIED browser legs fetch the
     # document and nothing else — every sub-resource is aborted before its
     # body crosses the paid proxy

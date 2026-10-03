@@ -11,9 +11,19 @@ set -eu
 : "${SCRAPYD_USERNAME:?SCRAPYD_USERNAME is required}"
 : "${SCRAPYD_PASSWORD:?SCRAPYD_PASSWORD is required}"
 
+# Scrapyd process concurrency for this node (2026-09-29, E3.4). Each running
+# spider is a whole Chromium, so this is a memory decision: size it from the
+# instance's measured memory (see docs/ops/CAPACITY.md, "Sizing max_proc on
+# the browser node"). Default 1 = the value baked here before it was a knob.
+SCRAPYD_MAX_PROC="${SCRAPYD_MAX_PROC:-1}"
+case "$SCRAPYD_MAX_PROC" in
+  ''|*[!0-9]*|0) echo "SCRAPYD_MAX_PROC must be a positive integer, got '$SCRAPYD_MAX_PROC'" >&2; exit 64 ;;
+esac
+
 sed \
   -e "s/__SCRAPYD_USERNAME__/${SCRAPYD_USERNAME}/g" \
   -e "s/__SCRAPYD_PASSWORD__/${SCRAPYD_PASSWORD}/g" \
+  -e "s/__SCRAPYD_MAX_PROC__/${SCRAPYD_MAX_PROC}/g" \
   scrapyd.conf > scrapyd.conf.rendered
 mv scrapyd.conf.rendered scrapyd.conf
 

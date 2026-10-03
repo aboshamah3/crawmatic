@@ -68,6 +68,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, date as date_type, datetime, timedelta
 from typing import Any
 
+from app_shared.db.rls_guard import inspect_ordinary_role
 from app_shared.opsmetrics import cost
 
 #: ``access_method`` values that cost money. Kept identical to
@@ -131,6 +132,10 @@ class RollupHealth:
     unrolled_observations: int = 0
 
 
+#: E7.4: how far back "was any provider evidence imported?" looks.
+PROVIDER_EVIDENCE_LOOKBACK_DAYS = 7
+
+
 @dataclass(frozen=True)
 class CostRollupHealth:
     """Fleet-wide cost-rollup health (EPA C6).
@@ -175,6 +180,11 @@ class CostRollupHealth:
     #: Age of the ledger's own freshness clock (a bare ``MAX``, not the
     #: rollup's).
     ledger_freshness_seconds: float | None = None
+    #: E7.4 (2026-09-29): distinct provider-usage windows imported in the
+    #: last ``PROVIDER_EVIDENCE_LOOKBACK_DAYS``. Separates "nothing was
+    #: ever imported" from "imported, but it matched nothing" -- two
+    #: failures with two different fixes. ``None`` = not measured.
+    provider_evidence_windows: int | None = None
 
     @property
     def _dominant_currency(self) -> str | None:
@@ -276,6 +286,29 @@ class QueueHealth:
 
 
 @dataclass(frozen=True)
+class LinkOutcomes:
+    """E9.1 (2026-09-29): FINAL outcome per target (link), per domain, 24h.
+
+    ``request_attempts`` counts tries, not links, and a target the job
+    deadline failed never wrote an attempt at all (the reaper fails it in
+    bulk) -- ~940 of them a night were invisible to every attempt-based
+    rule. This reads ``scrape_job_targets`` that reached a terminal state in
+    the window. ``failed`` includes ``deadline_failed``.
+    """
+
+    domain: str
+    completed: int
+    failed: int
+    skipped: int
+    deadline_failed: int
+
+    @property
+    def link_success_rate(self) -> float | None:
+        decided = self.completed + self.failed
+        return None if decided == 0 else self.completed / decided
+
+
+@dataclass(frozen=True)
 class DomainStats:
     """Per-domain fetch economics over one window.
 
@@ -304,6 +337,10 @@ class DomainStats:
     proxied: int
     failed_paid: int
     successful_prices: int = 0
+    #: E9.1 (2026-09-29): failed attempts by ``error_code`` over the same
+    #: window, so an alert says WHAT is failing (BLOCKED vs TIMEOUT vs
+    #: PRICE_NOT_FOUND need three different fixes), not only how much.
+    error_codes: dict[str, int] = field(default_factory=dict)
 
     @property
     def success_rate(self) -> float | None:
@@ -656,12 +693,25 @@ class ScrapydHealth:
 
 @dataclass(frozen=True)
 class DatabaseRoleHealth:
-    """Whether the connected role can actually be constrained by RLS.
+    """Whether the role that SERVES TENANTS is actually confined by RLS.
 
-    Audit **C3**: RLS is inert in production because every service
-    connects as a superuser that bypasses it. A superuser/``BYPASSRLS``
-    connection makes every workspace-isolation policy in the schema
-    decorative, and nothing in the running system says so out loud.
+    Audit **C3**: RLS is inert when a service connects as a superuser or a
+    ``BYPASSRLS`` role, and nothing in the running system says so.
+
+    2026-09-29 (plan E8): ``role``/``is_superuser``/``bypasses_rls`` now
+    describe the TENANT engine's role (``get_engine()``, the only connection
+    tenant requests run on), probed with
+    :func:`app_shared.db.rls_guard.inspect_ordinary_role` -- which also
+    counts tables the role owns (an owner can switch FORCE off). They used to
+    describe whatever session the snapshot was collected on, which is the
+    BYPASSRLS auth/system session by design, so ``security.rls_inert`` fired
+    CRITICAL on every call while ``crawmatic_app`` was in fact confined.
+    The privileged session is reported separately (``system_*``) for what
+    it is.
+
+    ``available=False`` with an ``unavailable_reason`` means the tenant
+    probe RAN and failed -- unverified, which the rule treats as CRITICAL;
+    the bare default (no reason) means the section was not collected.
     """
 
     available: bool
@@ -669,12 +719,36 @@ class DatabaseRoleHealth:
     role: str | None = None
     is_superuser: bool | None = None
     bypasses_rls: bool | None = None
+    #: Public tables the tenant role owns (``None`` = not measured).
+    owned_public_tables: int | None = None
+    #: The session the snapshot itself was collected on (BYPASSRLS by design).
+    system_role: str | None = None
+    system_is_superuser: bool | None = None
+    system_bypasses_rls: bool | None = None
 
     @property
     def rls_effective(self) -> bool | None:
         if self.is_superuser is None or self.bypasses_rls is None:
             return None
-        return not (self.is_superuser or self.bypasses_rls)
+        return not (self.is_superuser or self.bypasses_rls or (self.owned_public_tables or 0) > 0)
+
+    @property
+    def system_role_status(self) -> str | None:
+        """``expected_privileged``, ``superuser`` or ``same_as_tenant``.
+
+        The privileged session is SUPPOSED to bypass RLS (it resolves
+        credentials pre-auth and runs fleet-wide sweeps). It is a problem
+        only if it is a superuser (far more than BYPASSRLS: DDL, roles,
+        COPY PROGRAM) or if it is the tenant role itself -- then the tenant
+        path is privileged too.
+        """
+        if self.system_role is None:
+            return None
+        if self.system_is_superuser:
+            return "superuser"
+        if self.role is not None and self.system_role == self.role:
+            return "same_as_tenant"
+        return "expected_privileged"
 
 
 @dataclass(frozen=True)
@@ -699,6 +773,9 @@ class OpsSnapshot:
     discovery: tuple[DomainDiscovery, ...] = ()
     discovery_available: bool = True
     discovery_unavailable_reason: str | None = None
+    link_outcomes_24h: tuple[LinkOutcomes, ...] = ()
+    link_outcomes_available: bool = True
+    link_outcomes_unavailable_reason: str | None = None
     spend: SpendVelocity = field(default_factory=lambda: SpendVelocity(available=False))
     freshness: Freshness = field(default_factory=lambda: Freshness(available=False))
     optimizer: OptimizerChurn = field(
@@ -871,6 +948,7 @@ def collect_snapshot(
     redis: Any | None = None,
     scrapyd_status: dict[str, dict[str, Any] | None] | None = None,
     settings: Any | None = None,
+    tenant_bind: Any | None = None,
 ) -> OpsSnapshot:
     """Collect the full snapshot. Read-only; never raises.
 
@@ -891,12 +969,19 @@ def collect_snapshot(
             and probes each node before calling in.
         settings: optional ``Settings``-shaped object, used only for the
             breaker's configured ceiling.
+        tenant_bind: the ORDINARY (tenant) engine, or a zero-argument
+            callable returning it (``get_engine``, resolved inside the
+            section so a failure is reported, not raised). The RLS
+            section probes the role behind it (E8); ``session`` is BYPASSRLS
+            by design and says nothing about tenant isolation. Omitted, the
+            section reports the tenant role as unverified (CRITICAL).
     """
     now = now or datetime.now(UTC)
 
     partitions, part_ok, part_reason = _collect_partitions(session, now)
     domains_24h, domains_7d, dom_ok, dom_reason = _collect_domains(session, now)
     discovery, disc_ok, disc_reason = _collect_discovery(session, now)
+    links, links_ok, links_reason = _collect_link_outcomes(session, now)
 
     return OpsSnapshot(
         collected_at=now,
@@ -929,6 +1014,9 @@ def collect_snapshot(
             session,
         ),
         domains_24h=domains_24h,
+        link_outcomes_24h=links,
+        link_outcomes_available=links_ok,
+        link_outcomes_unavailable_reason=links_reason,
         domains_7d=domains_7d,
         domains_available=dom_ok,
         domains_unavailable_reason=dom_reason,
@@ -960,7 +1048,7 @@ def collect_snapshot(
             session,
         ),
         db_role=_section(
-            lambda: _collect_db_role(session),
+            lambda: _collect_db_role(session, tenant_bind=tenant_bind),
             lambda r: DatabaseRoleHealth(available=False, unavailable_reason=r),
             session,
         ),
@@ -1143,11 +1231,26 @@ def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
                     reconciled_by_currency.get(bucket.currency, 0)
                     + bucket.reconciled_cost_micro_units
                 )
-                reconciled_operation_count += bucket.operation_count
+            # E7.5: the exact per-bucket count, not the whole bucket's
+            # operation_count as soon as ONE of its operations settled.
+            reconciled_operation_count += int(bucket.reconciled_operation_count or 0)
 
     last_closed = session.execute(
         select(func.max(NetworkOperation.closed_at))
     ).scalar_one_or_none()
+
+    # E7.4: bounded (indexed-by-time window, distinct count only).
+    from app_shared.models.provider_usage import ProviderUsageRecord
+
+    provider_evidence_windows = int(
+        session.execute(
+            select(func.count(func.distinct(ProviderUsageRecord.window_id))).where(
+                ProviderUsageRecord.window_start
+                >= now - timedelta(days=PROVIDER_EVIDENCE_LOOKBACK_DAYS)
+            )
+        ).scalar_one()
+        or 0
+    )
 
     return CostRollupHealth(
         available=True,
@@ -1161,6 +1264,7 @@ def _collect_cost_rollups(session: Any, now: datetime) -> CostRollupHealth:
         reconciled_operation_count=reconciled_operation_count,
         total_operation_count=total_operation_count,
         ledger_freshness_seconds=_age(now, last_closed),
+        provider_evidence_windows=provider_evidence_windows,
     )
 
 
@@ -1318,6 +1422,69 @@ GROUP BY 1
 """
 
 
+#: E9.1: failed attempts per (domain, error_code) -- same partition-pruned
+#: window as ``_DOMAIN_AGG_SQL``.
+_DOMAIN_ERROR_CODES_SQL = f"""
+SELECT {_DOMAIN_SQL} AS domain, error_code, count(*) AS n
+FROM request_attempts
+WHERE created_at >= :since AND NOT success
+GROUP BY 1, 2
+"""
+
+#: E9.1: terminal targets per domain in the window, deadline failures split
+#: out. `scrape_job_targets` has no domain; attribution is match ->
+#: competitor, the same join `_SUCCESSFUL_PRICES_SQL` uses.
+_LINK_OUTCOMES_SQL = """
+SELECT c.domain AS domain,
+       count(*) FILTER (WHERE t.status = 'COMPLETED') AS completed,
+       count(*) FILTER (WHERE t.status = 'FAILED')    AS failed,
+       count(*) FILTER (WHERE t.status = 'SKIPPED')   AS skipped,
+       count(*) FILTER (WHERE t.status = 'FAILED'
+                          AND t.error_code = 'JOB_DEADLINE_EXCEEDED') AS deadline_failed
+FROM scrape_job_targets t
+JOIN competitor_product_matches cpm
+  ON cpm.workspace_id = t.workspace_id AND cpm.id = t.match_id
+JOIN competitors c
+  ON c.workspace_id = cpm.workspace_id AND c.id = cpm.competitor_id
+WHERE t.completed_at >= :since
+  AND t.status IN ('COMPLETED', 'FAILED', 'SKIPPED')
+GROUP BY 1
+ORDER BY count(*) DESC
+LIMIT :limit
+"""
+
+
+def _collect_link_outcomes(
+    session: Any, now: datetime, *, limit: int = 50
+) -> tuple[tuple[LinkOutcomes, ...], bool, str | None]:
+    from sqlalchemy import text
+
+    try:
+        rows = session.execute(
+            text(_LINK_OUTCOMES_SQL), {"since": now - timedelta(hours=24), "limit": limit}
+        ).all()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return (), False, f"{exc.__class__.__name__}: {exc}"[:300]
+    return (
+        tuple(
+            LinkOutcomes(
+                domain=r[0] or "(unknown)",
+                completed=int(r[1] or 0),
+                failed=int(r[2] or 0),
+                skipped=int(r[3] or 0),
+                deadline_failed=int(r[4] or 0),
+            )
+            for r in rows
+        ),
+        True,
+        None,
+    )
+
+
 def _collect_domains(
     session: Any, now: datetime, *, limit: int = 50
 ) -> tuple[tuple[DomainStats, ...], tuple[DomainStats, ...], bool, str | None]:
@@ -1341,6 +1508,13 @@ def _collect_domains(
             (r[0] or "(unparsed)"): int(r[1])
             for r in session.execute(text(_SUCCESSFUL_PRICES_SQL), {"since": since}).all()
         }
+        # E9.1: same window, failures by code (a third bounded pass; merged
+        # by domain name like the prices above).
+        codes_by_domain: dict[str, dict[str, int]] = {}
+        for domain, code, n in session.execute(
+            text(_DOMAIN_ERROR_CODES_SQL), {"since": since}
+        ).all():
+            codes_by_domain.setdefault(domain or "(unparsed)", {})[code or "UNKNOWN"] = int(n)
         return tuple(
             DomainStats(
                 domain=r[0] or "(unparsed)",
@@ -1350,6 +1524,7 @@ def _collect_domains(
                 proxied=int(r[4]),
                 failed_paid=int(r[5]),
                 successful_prices=successful_by_domain.get(r[0] or "(unparsed)", 0),
+                error_codes=codes_by_domain.get(r[0] or "(unparsed)", {}),
             )
             for r in rows
         )
@@ -1643,8 +1818,14 @@ def _collect_scrapyd(
     )
 
 
-def _collect_db_role(session: Any) -> DatabaseRoleHealth:
-    """Audit C3: is the connected role actually subject to RLS?"""
+def _collect_db_role(session: Any, tenant_bind: Any = None) -> DatabaseRoleHealth:
+    """Audit C3 / E8: is the role that serves TENANTS subject to RLS?
+
+    ``tenant_bind`` is the ordinary engine (``app_shared.database.get_engine``);
+    ``session`` is the (privileged) session the snapshot is collected on,
+    reported as ``system_*``. Without a tenant engine the answer is
+    "unverified", never "fine".
+    """
     from sqlalchemy import text
 
     row = session.execute(
@@ -1653,15 +1834,37 @@ def _collect_db_role(session: Any) -> DatabaseRoleHealth:
             "FROM pg_roles WHERE rolname = current_user"
         )
     ).first()
-    if row is None:
+    system = (
+        {}
+        if row is None
+        else {
+            "system_role": str(row[0]),
+            "system_is_superuser": bool(row[1]),
+            "system_bypasses_rls": bool(row[2]),
+        }
+    )
+    if tenant_bind is None:
         return DatabaseRoleHealth(
-            available=False, unavailable_reason="current_user not found in pg_roles"
+            available=False,
+            unavailable_reason=(
+                "no tenant engine supplied: the role that serves tenant requests "
+                "was not probed"
+            ),
+            **system,
         )
+    # A zero-argument callable (`get_engine` itself) is resolved HERE, inside
+    # the section, so an engine that cannot even be built (bad URL, settings
+    # that do not validate) becomes this section's `unavailable_reason` --
+    # an unverified tenant role -- instead of failing the whole snapshot.
+    bind = tenant_bind() if callable(tenant_bind) else tenant_bind
+    facts = inspect_ordinary_role(bind)
     return DatabaseRoleHealth(
         available=True,
-        role=str(row[0]),
-        is_superuser=bool(row[1]),
-        bypasses_rls=bool(row[2]),
+        role=facts.role_name,
+        is_superuser=facts.is_superuser,
+        bypasses_rls=facts.has_bypassrls,
+        owned_public_tables=facts.owned_public_tables,
+        **system,
     )
 
 
@@ -1671,6 +1874,7 @@ __all__ = [
     "DatabaseRoleHealth",
     "DomainDiscovery",
     "DomainStats",
+    "LinkOutcomes",
     "Freshness",
     "OpsSnapshot",
     "OptimizerChurn",

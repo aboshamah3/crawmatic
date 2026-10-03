@@ -110,11 +110,17 @@ DEFAULT_REQUEST_HEADERS = {
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
-# scrapy-playwright download handlers (browser-driven scraping).
+# scrapy-playwright download handlers (browser-driven scraping), through
+# the bounded subclass: the stock handler ignores DOWNLOAD_TIMEOUT and has
+# unbounded awaits, so one hung page.content()/page.close() held this
+# node's only slot until the 12 h job deadline (2026-09-29, E1). See
+# `price_monitor_browser.handler`.
 DOWNLOAD_HANDLERS = {
-    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+    "http": "price_monitor_browser.handler.BoundedPlaywrightDownloadHandler",
+    "https": "price_monitor_browser.handler.BoundedPlaywrightDownloadHandler",
 }
+BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS = _settings.BROWSER_DOWNLOAD_HARD_MARGIN_SECONDS
+BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS = _settings.BROWSER_HANDLER_CLOSE_TIMEOUT_SECONDS
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
 
 # Per-navigation-hop resolved-IP SSRF guard (T030/T031, Constitution §VI
@@ -205,6 +211,20 @@ PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = _settings.SCRAPE_BROWSER_DEFAULT_TIMEOUT
 DOWNLOAD_MAXSIZE = _settings.SCRAPE_DOWNLOAD_MAXSIZE_BYTES
 DOWNLOAD_WARNSIZE = _settings.SCRAPE_DOWNLOAD_WARNSIZE_BYTES
 DOWNLOAD_TIMEOUT = _settings.SCRAPE_DOWNLOAD_TIMEOUT_SECONDS
+# Hard cap on the whole spider process (Scrapy's built-in CloseSpider
+# extension, reason `closespider_timeout`). Without it a wedged Playwright
+# process holds the browser node's single slot forever -- 2026-09-22 one
+# did for 25 h and every amazon browser escalation queued behind it. See
+# `SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS` for why it sits below the
+# STARTED reaper horizon.
+CLOSESPIDER_TIMEOUT = _settings.SCRAPE_BROWSER_SPIDER_MAX_RUNTIME_SECONDS
+# CLOSESPIDER_TIMEOUT is graceful and waits for in-flight navigations; a
+# wedged Playwright process never finishes them. The hard deadline below
+# terminates the process `HARD_DEADLINE_GRACE_SECONDS` after that.
+HARD_DEADLINE_GRACE_SECONDS = _settings.SCRAPE_SPIDER_HARD_KILL_GRACE_SECONDS
+EXTENSIONS = {
+    "scrape_core.extensions.hard_deadline.HardDeadlineExtension": 0,
+}
 
 # Batched-flush thresholds (contracts/persistence-pipeline.md, parity with
 # price_monitor/settings.py) -- read from `Settings`/config, never

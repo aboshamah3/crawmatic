@@ -71,7 +71,7 @@ misprovisioned role would make every assertion below vacuous.
 It never touches `.env` DSNs: the only URL it accepts is an explicit
 throwaway one.
 
-    docker run -d --name cm-b8-pg \\
+    docker run -d --rm --name cm-b8-pg \\
       -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \\
       -e POSTGRES_DB=crawmatic -p 127.0.0.1:55488:5432 postgres:18-alpine
 
@@ -122,7 +122,7 @@ No reachable owner/admin database URL for the tenant-isolation suite.
 Set TENANT_ISOLATION_TEST_DATABASE_URL (or RLS_TEST_DATABASE_URL /
 MIGRATION_DATABASE_URL) to an owner-role URL for a THROWAWAY Postgres:
 
-  docker run -d --name cm-b8-pg \\
+  docker run -d --rm --name cm-b8-pg \\
     -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \\
     -e POSTGRES_DB=crawmatic -p 127.0.0.1:55488:5432 postgres:18-alpine
 

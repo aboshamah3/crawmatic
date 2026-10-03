@@ -120,3 +120,55 @@ def test_override_statement_timeout_sets_local_config():
     assert "set_config" in sql
     assert "statement_timeout" in sql
     assert params["timeout_ms"] == "300000"
+
+
+# --- E6 (2026-09-29): the privileged engines are bounded too -------------
+#
+# The auth (crawmatic_auth, BYPASSRLS) and system engines had NO statement
+# timeout. `/v1/admin/usage` runs on the auth session; when it took 28.9 s
+# the SaaS client (5 s) gave up but the statement kept running to the end,
+# and a pathological window could have held a connection indefinitely.
+# They get their own knob, DB_PRIVILEGED_STATEMENT_TIMEOUT_MS (default
+# 120 s): these engines also serve the worker's fleet-wide sweeps, which
+# the API-tight 15 s default would break.
+
+
+def _capture_privileged_engine(monkeypatch, getter_name: str, **env: str):
+    for key, value in {**_REQUIRED_ENV, **env}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(
+        "AUTH_DATABASE_URL", "postgresql+psycopg://crawmatic_auth:x@postgres:5432/crawmatic"
+    )
+    from app_shared.config import get_settings
+
+    get_settings.cache_clear()
+    module = importlib.reload(database_mod)
+    captured: dict[str, object] = {}
+    real_create_engine = module.create_engine
+
+    def _spy(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_create_engine(*args, **kwargs)
+
+    monkeypatch.setattr(module, "create_engine", _spy)
+    try:
+        getattr(module, getter_name)()
+    finally:
+        module.dispose_engine()
+        get_settings.cache_clear()
+        importlib.reload(database_mod)
+    return captured["kwargs"]
+
+
+def test_auth_engine_has_a_statement_timeout(monkeypatch):
+    monkeypatch.delenv("DB_PRIVILEGED_STATEMENT_TIMEOUT_MS", raising=False)
+    kwargs = _capture_privileged_engine(monkeypatch, "get_auth_engine")
+    assert kwargs["connect_args"]["options"] == "-c statement_timeout=120000"
+    assert kwargs["connect_args"]["prepare_threshold"] is None
+
+
+def test_system_engine_has_a_statement_timeout(monkeypatch):
+    kwargs = _capture_privileged_engine(
+        monkeypatch, "get_system_engine", DB_PRIVILEGED_STATEMENT_TIMEOUT_MS="90000"
+    )
+    assert kwargs["connect_args"]["options"] == "-c statement_timeout=90000"

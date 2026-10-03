@@ -39,15 +39,32 @@ Neither statement writes ``updated_at`` — ``scrape_job_targets`` carries
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app_shared.enums import ScrapeErrorCode, ScrapeJobStatus, ScrapeTargetStatus
+from app_shared.models.dispatch import DispatchIntent
 from app_shared.models.jobs import ScrapeJob, ScrapeJobTarget
 
-__all__ = ["fail_targets_past_job_deadline", "revert_stale_started_targets"]
+__all__ = [
+    "RunStateLookup",
+    "close_open_targets_of_terminal_jobs",
+    "fail_targets_past_job_deadline",
+    "revert_started_targets_of_ended_runs",
+    "revert_stale_started_targets",
+]
+
+#: ``(node_url, project) -> {scrapyd_job_id: "pending"|"running"|"finished"}``
+#: for everything the node lists, or ``None`` when the node could not be
+#: asked. ``None`` is "no answer", never "no runs".
+RunStateLookup = Callable[[str, str | None], Mapping[str, str] | None]
+
+#: Run states that mean a live process may still own the row.
+_LIVE_RUN_STATES = frozenset({"pending", "running"})
 
 #: Non-terminal target statuses the deadline sweep must close out. The
 #: terminal set (COMPLETED/FAILED/SKIPPED/CANCELLED) is real history and
@@ -96,6 +113,147 @@ def revert_stale_started_targets(
             ScrapeJobTarget.status == ScrapeTargetStatus.STARTED,
             ScrapeJobTarget.started_at.is_not(None),
             ScrapeJobTarget.started_at < cutoff,
+        )
+        .values(
+            status=ScrapeTargetStatus.PENDING,
+            started_at=None,
+            dispatched_at=None,
+            dispatch_intent_id=None,
+            locked_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount or 0)
+
+
+#: Terminal JOB statuses. A job in one of these is never re-dispatched
+#: (``redispatch_pending_jobs`` and ``dispatch_job`` scan non-terminal jobs
+#: only), so a non-terminal target under it can never move again.
+_TERMINAL_JOB_STATUSES = (
+    ScrapeJobStatus.COMPLETED,
+    ScrapeJobStatus.PARTIAL_FAILED,
+    ScrapeJobStatus.FAILED,
+    ScrapeJobStatus.CANCELLED,
+)
+
+
+def close_open_targets_of_terminal_jobs(session: Session, *, now: datetime) -> int:
+    """Fail every non-terminal target whose JOB is already terminal.
+
+    2026-09-29 (plan E5). The invariant "a terminal job holds no open
+    target" was broken in production by 16 DEFERRED rows under FAILED /
+    PARTIAL_FAILED jobs from 07-10, 07-11 and 08-03 -- the era before
+    ``mark_target`` refused to resurrect a finished target (e780782). No
+    sweep scans terminal jobs, so those rows count as in flight forever
+    (and feed every "oldest DEFERRED" gauge).
+
+    Deliberately NOT a migration: the table carries FORCE ROW LEVEL
+    SECURITY and migrations run as the NOBYPASSRLS ``crawmatic_migrate``
+    role with no ``app.workspace_id``, so a migration-time UPDATE matches
+    zero rows and reports success (see ``b6e5d1c94a72``'s docstring). This
+    runs on the BYPASSRLS system session with the other reaper passes, so
+    its first tick after deploy repairs the history and every later tick
+    keeps the invariant. Unbounded in time on purpose (the violators are
+    months old); cheap because non-terminal targets are few.
+
+    :returns: the number of targets closed.
+    """
+    terminal_jobs = (
+        select(ScrapeJob.id)  # noqa: workspace-scope
+        .where(ScrapeJob.status.in_(_TERMINAL_JOB_STATUSES))
+        .scalar_subquery()
+    )
+    result = session.execute(
+        update(ScrapeJobTarget)  # noqa: workspace-scope
+        .where(
+            ScrapeJobTarget.status.in_(_NON_TERMINAL_TARGET_STATUSES),
+            ScrapeJobTarget.scrape_job_id.in_(terminal_jobs),
+        )
+        .values(
+            status=ScrapeTargetStatus.FAILED,
+            error_code=ScrapeErrorCode.JOB_ALREADY_TERMINAL,
+            completed_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount or 0)
+
+
+def revert_started_targets_of_ended_runs(
+    session: Session,
+    *,
+    now: datetime,
+    run_states: RunStateLookup,
+    min_started_age_seconds: int,
+) -> int:
+    """Return STARTED targets whose Scrapyd run has ended to PENDING, at once.
+
+    2026-09-29 (plan E2.1). :func:`revert_stale_started_targets` is
+    age-based: it waits out the longest a LIVE claimant could hold a row,
+    because it has no other evidence. But every STARTED row names the
+    dispatch intent that claimed it, and that intent names the node and the
+    ``scrapyd_job_id`` of its run. When the node says that run is finished
+    -- the process watchdog killed it, it crashed, the container was
+    replaced -- nobody owns the row any more and waiting 35 minutes buys
+    nothing.
+
+    A run the node answers WITHOUT listing counts as ended too: a STARTED
+    row proves the run existed (only a running spider claims), so its
+    absence from an answering node means the node restarted (Scrapyd's
+    job storage is in memory) or rolled its ``finished_to_keep`` history.
+    A node that cannot be asked (``run_states`` returns ``None``) is no
+    verdict: its rows are left to the age-based reaper.
+
+    ``min_started_age_seconds`` keeps a claim written moments ago out of
+    the decision entirely; the UPDATE re-checks ``status = STARTED``, so a
+    spider that wrote its terminal status between the read and the write
+    keeps it. Stamps are cleared exactly as the age-based reaper clears
+    them, for the same reasons.
+
+    :returns: the number of targets reverted.
+    """
+    cutoff = now - timedelta(seconds=min_started_age_seconds)
+    rows = session.execute(
+        select(  # noqa: workspace-scope
+            ScrapeJobTarget.id,
+            DispatchIntent.node_url,
+            DispatchIntent.node_class,
+            DispatchIntent.scrapyd_job_id,
+        )
+        .join(
+            DispatchIntent,
+            (DispatchIntent.id == ScrapeJobTarget.dispatch_intent_id)
+            & (DispatchIntent.workspace_id == ScrapeJobTarget.workspace_id),
+        )
+        .where(
+            ScrapeJobTarget.status == ScrapeTargetStatus.STARTED,
+            ScrapeJobTarget.started_at.is_not(None),
+            ScrapeJobTarget.started_at < cutoff,
+            DispatchIntent.node_url != "",
+        )
+    ).all()
+
+    by_node: dict[tuple[str, str | None], list[tuple[object, str]]] = defaultdict(list)
+    for target_id, node_url, node_class, scrapyd_job_id in rows:
+        project = node_class.split(":", 1)[0] if node_class else None
+        by_node[(node_url, project)].append((target_id, str(scrapyd_job_id)))
+
+    ended: list[object] = []
+    for (node_url, project), items in by_node.items():
+        states = run_states(node_url, project)
+        if states is None:
+            continue
+        ended.extend(
+            target_id for target_id, job_id in items if states.get(job_id) not in _LIVE_RUN_STATES
+        )
+    if not ended:
+        return 0
+
+    result = session.execute(
+        update(ScrapeJobTarget)  # noqa: workspace-scope
+        .where(
+            ScrapeJobTarget.id.in_(ended),
+            ScrapeJobTarget.status == ScrapeTargetStatus.STARTED,
         )
         .values(
             status=ScrapeTargetStatus.PENDING,

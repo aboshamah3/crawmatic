@@ -468,7 +468,10 @@ def test_a_lower_evidence_version_is_ignored_as_stale(client, session, workspace
     assert row.evidence_version == "5"
 
 
-def test_an_equal_evidence_version_is_ignored_as_stale(client, session, workspace_id):
+def test_an_equal_evidence_version_with_the_same_as_of_is_ignored_as_stale(
+    client, session, workspace_id
+):
+    """An out-of-order redelivery of the same refresh changes nothing."""
     client.put(
         f"{_base(workspace_id)}/entitlement",
         json=_entitlement_body(evidence_version=5),
@@ -481,6 +484,46 @@ def test_an_equal_evidence_version_is_ignored_as_stale(client, session, workspac
     )
     assert resp.status_code == 200
     assert resp.json() == {"ignored": "stale_evidence"}
+    older = client.put(
+        f"{_base(workspace_id)}/entitlement",
+        json=_entitlement_body(
+            evidence_version=5, as_of=(_NOW - timedelta(hours=1)).isoformat()
+        ),
+        headers=SERVICE_HEADERS,
+    )
+    assert older.status_code == 200
+    assert older.json() == {"ignored": "stale_evidence"}
+
+
+def test_an_equal_evidence_version_with_a_newer_as_of_refreshes_the_evidence(
+    client, session, workspace_id
+):
+    """Regression for the 2026-09-23 production outage.
+
+    The SaaS reconciler refreshes evidence that is about to expire by
+    re-sending the SAME desired-state version with ``as_of = now``. Until
+    this fix the engine ignored that as stale, so every tenant whose plan
+    never changed hit ``ENTITLEMENT_INACTIVE`` exactly one max-evidence-age
+    after its last version bump (Mushtryati: 24 h after go-live). A newer
+    ``as_of`` at the same version must be applied — it advances
+    ``observed_at`` and nothing else.
+    """
+    client.put(
+        f"{_base(workspace_id)}/entitlement",
+        json=_entitlement_body(evidence_version=5),
+        headers=SERVICE_HEADERS,
+    )
+    later = _NOW + timedelta(hours=23)
+    resp = client.put(
+        f"{_base(workspace_id)}/entitlement",
+        json=_entitlement_body(evidence_version=5, as_of=later.isoformat()),
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 204
+    (row,) = [o for o in session.added if isinstance(o, WorkspaceEntitlement)]
+    assert row.observed_at == later
+    assert row.evidence_version == "5"
+    assert row.plan_code == "starter"
 
 
 def test_saas_evidence_outranks_a_seeded_placeholder(client, session, workspace_id):

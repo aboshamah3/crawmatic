@@ -210,6 +210,7 @@ def _make_current_price(
     scraped_at: datetime | None = None,
     stock_status: StockStatus | None = StockStatus.IN_STOCK,
     success: bool = True,
+    old_price: Decimal | None = None,
 ) -> MatchCurrentPrice:
     now = datetime.now(timezone.utc)
     current = MatchCurrentPrice(
@@ -219,6 +220,7 @@ def _make_current_price(
         product_variant_id=match.product_variant_id,
         competitor_id=match.competitor_id,
         price=price,
+        old_price=old_price,
         currency="SAR",
         stock_status=stock_status,
         comparable=True,
@@ -747,3 +749,161 @@ def test_bulk_price_comparison_route_declares_alerts_read_scope() -> None:
 def test_competitor_prices_route_declares_alerts_read_scope() -> None:
     route = _route("/v1/variants/{variant_id}/competitor-prices", "GET")
     assert _required_scopes(route) == ("alerts:read",)
+
+
+# --- GET /v1/variants/competitor-prices (bulk) -------------------------------
+
+
+def test_bulk_competitor_prices_returns_every_match_in_workspace(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    variant_a, variant_b = _make_variant(), _make_variant()
+    competitor = _make_competitor(name="Competitor One")
+    match_a = _make_match(variant_id=variant_a.id, competitor=competitor, url="https://c1.example/a")
+    match_b = _make_match(variant_id=variant_b.id, competitor=competitor, url="https://c1.example/b")
+    session.seed(
+        variant_a, variant_b, competitor, match_a, match_b,
+        _make_current_price(match=match_a, price=Decimal("10")),
+        _make_current_price(match=match_b, price=Decimal("20")),
+    )
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    resp = client.get("/v1/variants/competitor-prices", params={"limit": 200})
+
+    assert resp.status_code == 200, resp.json()
+    body = resp.json()
+    assert {i["product_variant_id"] for i in body["items"]} == {str(variant_a.id), str(variant_b.id)}
+    assert body["next_cursor"] is None
+
+
+def test_bulk_competitor_prices_carries_old_price_and_match_status(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    variant = _make_variant()
+    competitor = _make_competitor(name="Competitor One")
+    match = _make_match(variant_id=variant.id, competitor=competitor, url="https://c1.example/p")
+    session.seed(
+        variant, competitor, match,
+        _make_current_price(match=match, price=Decimal("99.0000"), old_price=Decimal("120.0000")),
+    )
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    item = client.get("/v1/variants/competitor-prices").json()["items"][0]
+
+    assert item["old_price"] == "120.0000" and item["price"] == "99.0000"
+    assert item["match_status"] == "ACTIVE"
+    assert item["url"] == "https://c1.example/p"
+
+
+def test_bulk_competitor_prices_is_workspace_scoped(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    mine_variant = _make_variant()
+    theirs_variant = _make_variant(workspace_id=OTHER_WORKSPACE_ID)
+    mine_comp = _make_competitor(name="Mine")
+    theirs_comp = _make_competitor(name="Theirs", workspace_id=OTHER_WORKSPACE_ID)
+    mine = _make_match(variant_id=mine_variant.id, competitor=mine_comp, url="https://m.example/p")
+    theirs = _make_match(
+        variant_id=theirs_variant.id, competitor=theirs_comp, url="https://t.example/p",
+        workspace_id=OTHER_WORKSPACE_ID,
+    )
+    session.seed(mine_variant, theirs_variant, mine_comp, theirs_comp, mine, theirs)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    items = client.get("/v1/variants/competitor-prices").json()["items"]
+
+    assert [i["match_id"] for i in items] == [str(mine.id)]
+
+
+def test_bulk_competitor_prices_paginates(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    variant = _make_variant()
+    base = datetime.now(timezone.utc)
+    seeded: list[CompetitorProductMatch] = []
+    session.seed(variant)
+    for i in range(5):
+        competitor = _make_competitor(name=f"Competitor {i}")
+        match = _make_match(
+            variant_id=variant.id, competitor=competitor, url=f"https://c{i}.example/p",
+            created_at=base + timedelta(seconds=i),
+        )
+        session.seed(competitor, match)
+        seeded.append(match)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    first = client.get("/v1/variants/competitor-prices", params={"limit": 2}).json()
+    assert [i["match_id"] for i in first["items"]] == [str(m.id) for m in seeded[:2]]
+    assert first["next_cursor"]
+
+    second = client.get(
+        "/v1/variants/competitor-prices", params={"limit": 2, "cursor": first["next_cursor"]}
+    ).json()
+    assert [i["match_id"] for i in second["items"]] == [str(m.id) for m in seeded[2:4]]
+
+
+def test_bulk_competitor_prices_malformed_cursor_is_422(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    resp = client.get("/v1/variants/competitor-prices", params={"cursor": "not-a-cursor"})
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
+
+
+def test_bulk_competitor_prices_missing_scope_is_403(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["variants:read"]
+    )
+
+    assert client.get("/v1/variants/competitor-prices").status_code == 403
+
+
+def test_bulk_competitor_prices_is_not_swallowed_by_variant_id_route(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read", "variants:read"]
+    )
+
+    resp = client.get("/v1/variants/competitor-prices")
+
+    assert resp.status_code == 200, resp.json()
+    assert "items" in resp.json()
+    paths = [route.path for route in _iter_api_routes()]
+    assert paths.index("/v1/variants/competitor-prices") < paths.index("/v1/variants/{variant_id}")
+
+
+def test_per_variant_route_now_carries_old_price(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    variant = _make_variant()
+    competitor = _make_competitor(name="Competitor One")
+    match = _make_match(variant_id=variant.id, competitor=competitor, url="https://c1.example/p")
+    session.seed(
+        variant, competitor, match,
+        _make_current_price(match=match, price=Decimal("99.0000"), old_price=Decimal("120.0000")),
+    )
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+
+    item = client.get(f"/v1/variants/{variant.id}/competitor-prices").json()["items"][0]
+
+    assert item["old_price"] == "120.0000"
+    assert item["product_variant_id"] == str(variant.id)
+    assert item["match_status"] == "ACTIVE"

@@ -368,7 +368,7 @@ BEGIN
             -- crawmatic_app gets no privileges on this table (see grants_expected.yaml)
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'domain_rules', 'network_operations'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'catalog_index_codes', 'catalog_index_loads', 'catalog_index_products', 'domain_rules', 'network_operations'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_app but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -421,7 +421,7 @@ BEGIN
             EXECUTE format('GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE %I TO crawmatic_auth', child.ident);
         END LOOP;
     END LOOP;
-    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'api_keys', 'domain_rules', 'proxy_providers', 'users', 'webhook_endpoints'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['alembic_version', 'api_keys', 'catalog_index_codes', 'catalog_index_loads', 'catalog_index_products', 'domain_rules', 'proxy_providers', 'users', 'webhook_endpoints'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_auth but it does not exist in this database -- skipping', tbl;
             CONTINUE;
@@ -470,7 +470,7 @@ BEGIN
     END LOOP;
 
     -- ---- crawmatic_scraper ----
-    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_daily_scorecard', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_resource_summaries', 'network_operation_settlements', 'network_operations_pre_partition', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'rollup_completion', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
+    FOREACH tbl IN ARRAY ARRAY['_smoke_foundation', 'access_policies', 'alembic_version', 'api_abuse_limit_counters', 'api_keys', 'catalog_index_codes', 'catalog_index_loads', 'catalog_index_products', 'competitors', 'control_plane_rules', 'cost_budgets', 'cost_reservations', 'dispatch_intents', 'domain_access_rules', 'domain_lifecycle_audit', 'domain_playbooks', 'domain_strategy_methods', 'fleet_cost_budgets', 'fleet_daily_scorecard', 'fleet_network_cost_rollups', 'maintenance_cadences', 'match_audit_classifications', 'match_competitor_identifiers', 'match_current_prices', 'network_cost_rollups', 'network_operation_allocations', 'network_operation_resource_summaries', 'network_operation_settlements', 'network_operations_pre_partition', 'outbox_messages', 'price_alert_events', 'product_group_items', 'product_groups', 'product_variants', 'products', 'provider_usage_records', 'proxy_circuit_breakers', 'proxy_providers', 'refresh_rule_occurrences', 'refresh_rules', 'refresh_tokens', 'rollup_completion', 'rollup_watermarks', 'scrape_jobs', 'scrape_profile_revisions', 'strategy_attempt_stats', 'strategy_discovery_runs', 'strategy_discovery_state', 'strategy_method_switches', 'users', 'variant_alert_states', 'variant_price_daily_rollups', 'variant_price_states', 'webhook_endpoints', 'webhook_events', 'workspace_entitlements', 'workspaces'] LOOP
         IF to_regclass('public.' || tbl) IS NULL THEN
             RAISE WARNING 'grants_expected.yaml names table % for crawmatic_scraper but it does not exist in this database -- skipping', tbl;
             CONTINUE;

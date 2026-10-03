@@ -1289,3 +1289,112 @@ def test_a_failed_recovery_post_returns_the_hold_immediately() -> None:
     a 900s lease — and `release` is CAS-idempotent, so a Celery retry
     cannot double-credit the budget."""
     _run_reaper_check(_STALL_RELEASES_ON_POST_FAILURE_CHECK)
+
+
+# --- 2026-09-29 (plan E2.3): the batch's OWN run decides, not node depth ---
+#
+# "Node depth > 0 -> skip" was permanently disabled by a wedged node: the
+# browser node showed pending=2725 running=1 for hours, so no stalled batch
+# was ever re-offered and every job ran to its 12 h deadline. When the
+# stalled targets' dispatch intent names a run, `listjobs.json` on the node
+# the intent recorded says whether THAT run is still queued/running (skip:
+# it is waiting its turn) or finished/gone (stalled: re-dispatch), whatever
+# else the node is busy with. Targets with no recorded run keep the depth
+# heuristic.
+_PER_INTENT_PRELUDE = _REAPER_PRELUDE + """
+from app_shared.enums import DispatchIntentState, ScrapeProfileMode
+from app_shared.models.dispatch import DispatchIntent
+
+# The node is busy (pending > 0), exactly the state that used to veto
+# every recovery -- but under SCRAPYD_MAX_PENDING_PER_NODE, so placement
+# itself still accepts it (a node over the cap is deferred by placement,
+# which is the backpressure rule, not the stall rule under test here).
+daemon["payload"] = {"status": "ok", "pending": 2, "running": 1, "finished": 3}
+listings = []
+run_state = {"value": "finished"}
+
+
+def fake_get(url, *, auth=None, timeout=None, params=None):
+    if url.endswith("/listjobs.json"):
+        listings.append((url, dict(params or {})))
+        bucket = run_state["value"]
+        payload = {"status": "ok", "pending": [], "running": [], "finished": []}
+        if bucket is not None:
+            payload[bucket].append({"id": str(intent.scrapyd_job_id)})
+        return FakeResponse(200, payload)
+    probes.append(url)
+    return FakeResponse(200, daemon["payload"])
+
+
+job = new_job(7200)
+target = new_target(job, 7200)
+intent = DispatchIntent(
+    workspace_id=workspace_id,
+    scrape_job_id=job.id,
+    planning_generation=0,
+    strategy_method="PLAYWRIGHT_DIRECT",
+    domain="shop.example.com",
+    mode=ScrapeProfileMode.HTTP,
+    node_class="price_monitor:generic_price_spider",
+    match_ids_digest="d",
+    match_ids=[str(target.match_id)],
+    identity_key="k-" + str(uuid.uuid4()),
+    identity_payload="{}",
+    node_url="http://scraper-a:6800",
+    scrapyd_job_id=uuid.uuid4(),
+    state=DispatchIntentState.CONFIRMED,
+    cancellation_generation_at_creation=0,
+)
+intent.id = uuid.uuid4()
+fake_session.seed(intent)
+target.dispatch_intent_id = intent.id
+"""
+
+_OWN_RUN_FINISHED_CHECK = _PER_INTENT_PRELUDE + """
+run_state["value"] = "finished"
+tasks_jobs.recover_stalled_batches()
+
+if not listings or listings[0][0] != "http://scraper-a:6800/listjobs.json":
+    fail("OWN_RUN_WAS_NOT_LOOKED_UP_ON_ITS_NODE:" + repr(listings))
+if listings[0][1].get("project") != "price_monitor":
+    fail("WRONG_PROJECT:" + repr(listings))
+if len(calls) != 1:
+    fail("FINISHED_RUN_ON_A_BUSY_NODE_WAS_NOT_RECOVERED_GOT:" + str(len(calls)))
+print("OK")
+sys.exit(0)
+"""
+
+_OWN_RUN_GONE_CHECK = _PER_INTENT_PRELUDE + """
+run_state["value"] = None
+tasks_jobs.recover_stalled_batches()
+
+if len(calls) != 1:
+    fail("RUN_THE_NODE_NO_LONGER_LISTS_WAS_NOT_RECOVERED_GOT:" + str(len(calls)))
+print("OK")
+sys.exit(0)
+"""
+
+_OWN_RUN_QUEUED_CHECK = _PER_INTENT_PRELUDE + """
+# The node is idle as far as depth goes, but THIS batch's run is still
+# queued there: re-POSTing would run it twice.
+daemon["payload"] = {"status": "ok", "pending": 0, "running": 0, "finished": 3}
+run_state["value"] = "pending"
+tasks_jobs.recover_stalled_batches()
+
+if calls:
+    fail("QUEUED_RUN_WAS_RE_POSTED:" + str(len(calls)))
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_a_finished_run_on_a_busy_node_is_recovered() -> None:
+    _run_reaper_check(_OWN_RUN_FINISHED_CHECK)
+
+
+def test_a_run_the_node_no_longer_lists_is_recovered() -> None:
+    _run_reaper_check(_OWN_RUN_GONE_CHECK)
+
+
+def test_a_still_queued_run_is_not_re_posted_even_on_an_idle_node() -> None:
+    _run_reaper_check(_OWN_RUN_QUEUED_CHECK)

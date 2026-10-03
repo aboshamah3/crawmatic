@@ -66,11 +66,27 @@ DR_MIN_FREE_BYTES="${DR_MIN_FREE_BYTES:-2147483648}"  # refuse to dump under 2 G
 DR_CKSUM_TABLES="${DR_CKSUM_TABLES:-3}"
 DR_CKSUM_MAX_ROWS="${DR_CKSUM_MAX_ROWS:-200000}"
 
+# Tables whose SCHEMA is dumped but whose DATA is not (plan 2026-10-02). The
+# catalog index is ~1.6 GB of public storefront listings that
+# scripts/load_catalog_index.py rebuilds from the ops host's crawl at any time:
+# dumping it would blow DR_MAX_BYTES on every set for data we never need to
+# restore. Both sides count these tables as 0 rows (`dr_build_count_sql`), so
+# verify_restore.sh's exact per-table count check still holds.
+DR_DATA_EXCLUDED_TABLES=(public.catalog_index_products public.catalog_index_codes)
+
 # ── Targets ────────────────────────────────────────────────────────────────
-# name|railway project id|railway service name
+# name|railway project id|railway service name|token variable
+#
+# The token variable is PER TARGET because the two projects do not live on the
+# same Railway account: the SaaS project moved to the rw003 account on
+# 2026-09-23 while the engine stayed on railway2. With one hardcoded token the
+# SaaS lookup answered "Unauthorized" from that day on, and because the error
+# was sent to /dev/null and aborted the whole run, no backup set of EITHER
+# database was written for six days. The variable is resolved from
+# $DR_RAILWAY_ACCOUNTS at load time; moving a project again is a one-field edit.
 DR_TARGETS=(
-  "engine|69dc4bda-0d97-4290-a82f-822ed97d3fb8|postgres"
-  "saas|91debd0f-1dc4-4b7f-aa74-b9874ac27071|Postgres"
+  "engine|69dc4bda-0d97-4290-a82f-822ed97d3fb8|postgres|RAILWAY_TOKEN_RAILWAY2"
+  "saas|91debd0f-1dc4-4b7f-aa74-b9874ac27071|Postgres|RAILWAY_TOKEN_RW003"
 )
 
 # Session settings applied to EVERY session that produces or verifies a
@@ -144,18 +160,32 @@ dr_gpg_decrypt_stdout() { # $1 = input path
 # Reads the service's variables and exports PG* ONLY. `railway variables --kv`
 # prints values, so its output is never echoed: it is captured into a shell
 # variable, parsed, and the variable is unset.
-dr_load_pgenv() {  # $1 = project id, $2 = service
-  local project="$1" service="$2" vars
+#
+# The CLI's stderr, by contrast, carries no values (only messages such as
+# "Unauthorized" or "Project not found"), and it is the ONLY evidence of why a
+# lookup failed — it used to go to /dev/null, which turned a moved project into
+# six silent days without backups. It is captured to a private temp file,
+# scrubbed (PG* values, DSNs and the token itself), and put on the alert line.
+dr_load_pgenv() {  # $1 = project id, $2 = service, $3 = token variable name
+  local project="$1" service="$2" token_var="${3:-}" vars token errf err
+  [[ "$token_var" =~ ^[A-Z][A-Z0-9_]*$ ]] \
+    || dr_die "no valid token variable name for project=$project service=$service (DR_TARGETS field 4)"
   # shellcheck disable=SC1090
   source "$DR_RAILWAY_ACCOUNTS" >/dev/null 2>&1 \
     || dr_die "cannot source $DR_RAILWAY_ACCOUNTS"
-  [[ -n "${RAILWAY_TOKEN_RAILWAY2:-}" ]] \
-    || dr_die "RAILWAY_TOKEN_RAILWAY2 not exported by $DR_RAILWAY_ACCOUNTS"
+  token="${!token_var:-}"
+  [[ -n "$token" ]] \
+    || dr_die "$token_var not exported by $DR_RAILWAY_ACCOUNTS"
 
-  vars=$(RAILWAY_API_TOKEN="$RAILWAY_TOKEN_RAILWAY2" \
+  errf=$(mktemp "${TMPDIR:-/tmp}/dr-railway-err.XXXXXX"); chmod 600 "$errf"
+  if ! vars=$(RAILWAY_API_TOKEN="$token" \
          railway variables --service "$service" --project "$project" \
-                 --environment "$DR_RAILWAY_ENV" --kv 2>/dev/null) \
-    || dr_die "railway variables failed for project=$project service=$service"
+                 --environment "$DR_RAILWAY_ENV" --kv 2>"$errf"); then
+    err=$(head -c 400 "$errf" | sed "s|${token//|/\\|}|[REDACTED:$token_var]|g" | dr_scrub | tr '\n' ' ')
+    rm -f "$errf"; token=""; vars=""
+    dr_die "railway variables failed for project=$project service=$service token=$token_var: ${err:-<no stderr>}"
+  fi
+  rm -f "$errf"; token=""
 
   get() { grep -m1 -E "^$1=" <<<"$vars" | cut -d= -f2-; }
   PGUSER=$(get PGUSER);       export PGUSER
@@ -168,6 +198,42 @@ dr_load_pgenv() {  # $1 = project id, $2 = service
 
   [[ -n "$PGUSER" && -n "$PGPASSWORD" && -n "$PGDATABASE" && -n "$PGHOST" && -n "$PGPORT" ]] \
     || dr_die "incomplete PG* set for project=$project service=$service (names only: PGUSER/PGPASSWORD/PGDATABASE/RAILWAY_TCP_PROXY_DOMAIN/RAILWAY_TCP_PROXY_PORT)"
+}
+
+# Dump every target in DR_TARGETS, each in its own subshell, so ONE target
+# failing (a moved project, an expired token, a proxy blip) never costs the
+# other target its backup. Before this, `dr_die` inside the loop exited the
+# whole run: a broken SaaS credential meant no ENGINE backup either.
+#
+# The subshell runs with `set -e` in a plain statement position (NOT under
+# `||` or `if`, where bash silently disables errexit for everything inside),
+# so every check inside dr_dump_target keeps failing the target the way it
+# always did. A failed target's partial ciphertext is removed so the set never
+# carries a file that the manifest does not describe.
+#
+# Sets DR_FAILED_TARGETS (array of names). Returns 0 even when some failed;
+# the caller decides what a partial set means.
+dr_dump_all_targets() {  # $1 = stage dir, $2 = work dir
+  local stage="$1" work="$2" entry name project service token_var rc
+  DR_FAILED_TARGETS=()
+  for entry in "${DR_TARGETS[@]}"; do
+    IFS='|' read -r name project service token_var <<<"$entry"
+    dr_log INFO "[$name] loading credentials via Railway bridge ($token_var; names only)"
+    set +e
+    (
+      set -e
+      dr_load_pgenv "$project" "$service" "$token_var"
+      dr_dump_target "$name" "$stage" "$work"
+    )
+    rc=$?
+    set -e
+    dr_clear_pgenv
+    if (( rc != 0 )); then
+      rm -f "$stage/$name.dump.gpg" "$work/$name.meta.json"
+      DR_FAILED_TARGETS+=("$name")
+      dr_alert "[$name] target FAILED (exit $rc) — continuing with the remaining targets"
+    fi
+  done
 }
 
 dr_clear_pgenv() {
@@ -249,6 +315,10 @@ dr_build_count_sql() {  # stdin = table list, stdout = SQL
     [[ -n "$t" ]] || continue
     schema="${t%%.*}"; name="${t#*.}"
     if (( first )); then first=0; else printf ' UNION ALL '; fi
+    if [[ " ${DR_DATA_EXCLUDED_TABLES[*]} " == *" $t "* ]]; then
+      printf "SELECT %s::text, '0'::text" "$(dr_sql_lit "$t")"
+      continue
+    fi
     printf "SELECT %s::text, count(*)::text FROM %s.%s" \
       "$(dr_sql_lit "$t")" "$(dr_sql_ident "$schema")" "$(dr_sql_ident "$name")"
   done
@@ -583,7 +653,9 @@ dr_dump_target() {  # $1 = name, $2 = stage dir, $3 = work dir
   local t0 t1
   t0=$(date -u +%s)
   set +e
-  "$PG_BIN/pg_dump" -Fc --snapshot="$snapshot" 2> "$wd/pg_dump.err" \
+  local exclude_data=() t_ex
+  for t_ex in "${DR_DATA_EXCLUDED_TABLES[@]}"; do exclude_data+=("--exclude-table-data=$t_ex"); done
+  "$PG_BIN/pg_dump" -Fc --snapshot="$snapshot" "${exclude_data[@]}" 2> "$wd/pg_dump.err" \
     | dr_pipe_count "$wd/bytes_exported" \
     | dr_gpg_encrypt_stdin "$out" 2> "$wd/gpg.err"
   local st=("${PIPESTATUS[@]}")

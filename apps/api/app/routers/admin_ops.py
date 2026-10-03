@@ -47,6 +47,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from app_shared.database import get_engine
 from app_shared.maintenance.scorecard import (
     BACKUP_REPORT_SCHEMA,
     read_scorecard_range,
@@ -83,6 +84,8 @@ def active_alerts(session: Session = Depends(_get_ops_session)) -> JSONResponse:
         redis=redis_client,
         settings=settings,
         scrapyd_status=_get_scrapyd_status(settings, redis_client),
+        # E8: the tenant role, not this BYPASSRLS session (see ops_metrics).
+        tenant_bind=get_engine,
     )
     alerts = evaluate(snapshot)
     worst = worst_severity(alerts)

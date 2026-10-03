@@ -158,6 +158,10 @@ TOP_N_COST_ROLLUP_BUCKETS = 20  # TODO(config): promote to Settings
 #: will catch up in one invocation, oldest first — mirrors
 #: `app_shared.maintenance.rollups`' `ROLLUP_BACKFILL_MAX_DAYS` shape.
 COST_ROLLUP_BACKFILL_MAX_DAYS = 7  # TODO(config): promote to Settings
+#: E7.3 (2026-09-29): how far back the cadence looks for settlements that
+#: arrived after their day was rolled. Matches the provider-reconciliation
+#: lookback, so a window reconciled late is always re-rolled.
+COST_ROLLUP_REROLL_LOOKBACK_DAYS = 8
 #: First-use watermark seed lag (see `seed_watermark`'s docstring for why
 #: not the epoch): the cursor is born at `latest_complete_day - LAG`, so
 #: the very first run does one day, not a walk to 1970.
@@ -253,6 +257,9 @@ class CostBucketRow:
     estimated_cost_micro_units: int
     #: ``None`` iff not one operation in the bucket has a settlement yet.
     reconciled_cost_micro_units: int | None
+    #: E7.5 (2026-09-29): how many of ``operation_count`` actually have a
+    #: settlement folded into ``reconciled_cost_micro_units``.
+    reconciled_operation_count: int = 0
 
 
 def latest_settlements_by_operation(
@@ -283,6 +290,7 @@ class _MutableBucket:
     estimated_cost_micro_units: int = 0
     reconciled_cost_micro_units: int = 0
     has_reconciled: bool = False
+    reconciled_operation_count: int = 0
 
 
 def _collapse_to_top_n(
@@ -310,6 +318,7 @@ def _collapse_to_top_n(
         if bucket.has_reconciled:
             other.has_reconciled = True
             other.reconciled_cost_micro_units += bucket.reconciled_cost_micro_units
+            other.reconciled_operation_count += bucket.reconciled_operation_count
 
     for currency, other in other_by_currency.items():
         key = (
@@ -327,6 +336,7 @@ def _collapse_to_top_n(
             if other.has_reconciled:
                 existing.has_reconciled = True
                 existing.reconciled_cost_micro_units += other.reconciled_cost_micro_units
+                existing.reconciled_operation_count += other.reconciled_operation_count
     return kept
 
 
@@ -354,6 +364,7 @@ def aggregate_fleet_cost_buckets(
         if settlement is not None and settlement.currency == op.currency:
             bucket.has_reconciled = True
             bucket.reconciled_cost_micro_units += settlement.reconciled_cost_micro_units
+            bucket.reconciled_operation_count += 1
 
     bounded = _collapse_to_top_n(buckets, top_n=top_n)
     return tuple(
@@ -368,6 +379,7 @@ def aggregate_fleet_cost_buckets(
             reconciled_cost_micro_units=(
                 b.reconciled_cost_micro_units if b.has_reconciled else None
             ),
+            reconciled_operation_count=b.reconciled_operation_count,
         )
         for (domain, method, profile_version, currency), b in sorted(bounded.items())
     )
@@ -411,6 +423,7 @@ def aggregate_tenant_cost_buckets(
             share = (alloc.fraction_ppb * settlement.reconciled_cost_micro_units) // FRACTION_SCALE
             bucket.has_reconciled = True
             bucket.reconciled_cost_micro_units += share
+            bucket.reconciled_operation_count += 1
 
     out: list[CostBucketRow] = []
     for workspace_id, ws_buckets in per_workspace.items():
@@ -555,6 +568,7 @@ def _upsert_fleet_buckets(session: Session, target_date: date_type, buckets: Seq
             operation_count=bucket.operation_count,
             estimated_cost_micro_units=bucket.estimated_cost_micro_units,
             reconciled_cost_micro_units=bucket.reconciled_cost_micro_units,
+            reconciled_operation_count=bucket.reconciled_operation_count,
             currency=bucket.currency,
         )
         stmt = stmt.on_conflict_do_update(
@@ -565,6 +579,7 @@ def _upsert_fleet_buckets(session: Session, target_date: date_type, buckets: Seq
                 "operation_count": stmt.excluded.operation_count,
                 "estimated_cost_micro_units": stmt.excluded.estimated_cost_micro_units,
                 "reconciled_cost_micro_units": stmt.excluded.reconciled_cost_micro_units,
+                "reconciled_operation_count": stmt.excluded.reconciled_operation_count,
                 "updated_at": func.now(),
             },
         )
@@ -608,6 +623,69 @@ def _upsert_tenant_buckets(session: Session, target_date: date_type, buckets: Se
     return written
 
 
+def days_with_late_settlements(
+    session: Session, *, since: datetime, through_date: date_type
+) -> list[date_type]:
+    """UTC days up to ``through_date`` holding an operation whose settlement
+    was written AFTER that day's fleet rollup rows were last computed.
+
+    2026-09-29 (plan E7.3). The cadence rolls each day once and advances
+    the watermark, but a day's settlements arrive when its provider
+    evidence does -- typically the next morning or later -- so the rollup
+    kept reporting the day as unreconciled forever. Bounded by ``since``
+    on both the settlement and the operation, so it reads recent rows only.
+    A day that was never rolled at all is not "late": the watermark
+    catch-up owns it.
+    """
+    rows = session.execute(  # noqa: workspace-scope - fleet-owned ledger
+        text(
+            """
+            SELECT DISTINCT d.day
+            FROM (
+                SELECT (no.closed_at AT TIME ZONE 'UTC')::date AS day, s.created_at
+                FROM network_operation_settlements s
+                JOIN network_operations no ON no.network_request_id = s.operation_id
+                WHERE s.created_at >= :since
+                  AND no.closed_at >= :since
+                  AND no.closed_at IS NOT NULL
+            ) d
+            JOIN LATERAL (
+                SELECT max(f.updated_at) AS rolled_at
+                FROM fleet_network_cost_rollups f
+                WHERE f.rollup_date = d.day
+            ) r ON true
+            WHERE d.day <= :through
+              AND r.rolled_at IS NOT NULL
+              AND d.created_at > r.rolled_at
+            ORDER BY d.day
+            """
+        ).bindparams(since=since, through=through_date)
+    ).all()
+    return [row[0] for row in rows]
+
+
+def reroll_days_with_late_settlements(
+    session: Session,
+    *,
+    since: datetime,
+    through_date: date_type,
+    top_n: int = TOP_N_COST_ROLLUP_BUCKETS,
+    max_days: int = COST_ROLLUP_BACKFILL_MAX_DAYS,
+) -> list[date_type]:
+    """Re-run the (idempotent) upsert for every day
+    :func:`days_with_late_settlements` names, oldest first, bounded. Never
+    moves the watermark; the caller commits."""
+    days = days_with_late_settlements(session, since=since, through_date=through_date)[:max_days]
+    for day in days:
+        _run_one_day(session, day, top_n=top_n)
+    if days:
+        logger.info(
+            "network_cost_rollup_rerolled_late_settlements days=%s",
+            ",".join(d.isoformat() for d in days),
+        )
+    return days
+
+
 @dataclass
 class CostRollupReport:
     """Structured summary of one :func:`run_cost_rollup` call — logged by
@@ -619,6 +697,8 @@ class CostRollupReport:
     tenant_rows_upserted: int = 0
     watermark_advanced: bool = False
     watermark_store_available: bool = False
+    #: E7.3: already-rolled days re-rolled because settlements arrived later.
+    days_rerolled: list[date_type] = field(default_factory=list)
 
 
 def _run_one_day(session: Session, target_date: date_type, *, top_n: int) -> tuple[int, int]:
@@ -723,4 +803,14 @@ def run_cost_rollup(
         processed += 1
         day += timedelta(days=1)
 
+    # E7.3: days already rolled whose settlements arrived afterwards.
+    rerolled = reroll_days_with_late_settlements(
+        session,
+        since=now - timedelta(days=COST_ROLLUP_REROLL_LOOKBACK_DAYS),
+        through_date=min(day - timedelta(days=1), latest_complete_day),
+        top_n=top_n,
+    )
+    if rerolled and commit:
+        session.commit()
+    report.days_rerolled = rerolled
     return report

@@ -78,9 +78,9 @@ from sqlalchemy import (
     distinct,
     func,
     literal,
-    or_,
     select,
     tuple_,
+    union_all,
 )
 
 from app_shared.costauth.service import FLEET_PROVIDER_DIRECT
@@ -117,6 +117,18 @@ PROXIED_TRANSPORTS = (
     NetworkTransport.PROXY.value,
     NetworkTransport.BROWSER.value,
 )
+
+#: E6 (2026-09-29): how far a ledger operation's `created_at` may sit from
+#: the export window and still be joined to an attempt inside it. The join
+#: used to have NO bound on `network_operations`' partition key, so every
+#: attempt probed every monthly partition. An operation is opened when its
+#: fetch starts and its attempt row carries the fetch's own `scraped_at`,
+#: so the two are minutes apart; a browser page's subresources follow
+#: their parent by seconds. Two days also covers a durable-buffer replay
+#: after an outage while still pruning to at most two monthly partitions.
+#: The equivalence suite (`tests/integration/test_admin_usage_equivalence.py`)
+#: pins that the bound changes no exported value.
+OPERATION_JOIN_GRACE = timedelta(days=2)
 
 #: `network_operations.provider` for fleet egress. Anything else is a
 #: provider identity — `"proxy"`/`"browser"` for a fleet-class scope, or
@@ -351,6 +363,29 @@ def build_usage_query(
             # silently inflating a customer's `links_total`/
             # `protected_links_attempted`.
             RequestAttempt.origin == RequestOrigin.SCRAPE,
+            # E6: the keyset cursor, applied to the SCAN rather than as a
+            # HAVING after the whole window has been aggregated. Every
+            # output group is keyed on exactly (cycle_ts, workspace_id,
+            # product_id), so a group lies wholly after the cursor or not
+            # at all -- filtering its rows first returns the same groups,
+            # and the same row-level facts for them, as filtering the
+            # groups afterwards. Page N no longer costs N full aggregations.
+            *(
+                ()
+                if after is None
+                else (
+                    tuple_(
+                        attempt_cycle_ts,
+                        RequestAttempt.workspace_id,
+                        CompetitorProductMatch.product_id,
+                    )
+                    > tuple_(
+                        literal(after.cycle_ts),
+                        literal(after.workspace_id),
+                        literal(after.product_id),
+                    ),
+                )
+            ),
         )
         .cte("attempt_scan")
     )
@@ -392,18 +427,67 @@ def build_usage_query(
     #
     # `provider <> 'direct' AND proxy_provider_id IS NOT NULL` is the paid
     # predicate (F17). Transport no longer decides it.
+    #
+    # E6 (2026-09-29): that two-way join used to be ONE join on
+    # `network_request_id = X OR parent_operation_id = X`. An OR across two
+    # columns cannot use an index or a hash, so Postgres nested-looped every
+    # attempt against the whole unbounded ledger: a busy hour took 28.9 s
+    # in production. It is now a UNION ALL of two equi-joins, each bounded
+    # on the ledger's partition key. The two branches never produce the
+    # same (attempt, operation) pair -- an operation is never its own
+    # parent, and the `IS DISTINCT FROM` guard makes that explicit -- so
+    # the union is the same multiset of pairs the OR produced, and every
+    # aggregate below sees identical input.
+    op_bound = and_(
+        NetworkOperation.created_at >= since - OPERATION_JOIN_GRACE,
+        NetworkOperation.created_at < until + OPERATION_JOIN_GRACE,
+    )
+
+    def _op_branch(match_clause):  # noqa: ANN001, ANN202 - local builder
+        return (
+            select(  # noqa: workspace-scope
+                attempt_scan.c.workspace_id.label("workspace_id"),
+                attempt_scan.c.product_id.label("product_id"),
+                attempt_scan.c.cycle_ts.label("cycle_ts"),
+                attempt_scan.c.proxy_provider_id.label("proxy_provider_id"),
+                NetworkOperation.network_request_id.label("network_request_id"),
+                NetworkOperation.transport.label("transport"),
+                NetworkOperation.bytes_compressed.label("bytes_compressed"),
+                NetworkOperation.provider.label("provider"),
+            )
+            .select_from(attempt_scan)
+            .join(NetworkOperation, and_(match_clause, op_bound))
+        )
+
+    op_links = union_all(
+        _op_branch(
+            NetworkOperation.network_request_id == attempt_scan.c.network_operation_id
+        ),
+        _op_branch(
+            and_(
+                NetworkOperation.parent_operation_id
+                == attempt_scan.c.network_operation_id,
+                NetworkOperation.network_request_id.is_distinct_from(
+                    attempt_scan.c.network_operation_id
+                ),
+            )
+        ),
+    ).cte("op_links")
+
+    # `provider <> 'direct' AND proxy_provider_id IS NOT NULL` is the paid
+    # predicate (F17). Transport no longer decides it.
     is_proxied = and_(
-        NetworkOperation.provider != DIRECT_PROVIDER,
-        attempt_scan.c.proxy_provider_id.is_not(None),
+        op_links.c.provider != DIRECT_PROVIDER,
+        op_links.c.proxy_provider_id.is_not(None),
     )
     per_op = (
         select(  # noqa: workspace-scope
-            attempt_scan.c.workspace_id.label("workspace_id"),
-            attempt_scan.c.product_id.label("product_id"),
-            attempt_scan.c.cycle_ts.label("cycle_ts"),
-            NetworkOperation.network_request_id.label("network_request_id"),
-            NetworkOperation.transport.label("transport"),
-            NetworkOperation.bytes_compressed.label("bytes_compressed"),
+            op_links.c.workspace_id.label("workspace_id"),
+            op_links.c.product_id.label("product_id"),
+            op_links.c.cycle_ts.label("cycle_ts"),
+            op_links.c.network_request_id.label("network_request_id"),
+            op_links.c.transport.label("transport"),
+            op_links.c.bytes_compressed.label("bytes_compressed"),
             func.bool_or(is_proxied).label("proxied"),
             # The workspace's OWN share of this physical operation. At
             # most one allocation row exists per (operation, workspace)
@@ -413,32 +497,23 @@ def build_usage_query(
                 NetworkOperationAllocation.allocated_cost_micro_units
             ).label("allocated_cost_micro_units"),
         )
-        .select_from(attempt_scan)
-        .join(
-            NetworkOperation,
-            or_(
-                NetworkOperation.network_request_id
-                == attempt_scan.c.network_operation_id,
-                NetworkOperation.parent_operation_id
-                == attempt_scan.c.network_operation_id,
-            ),
-        )
+        .select_from(op_links)
         .outerjoin(
             NetworkOperationAllocation,
             and_(
                 NetworkOperationAllocation.operation_id
-                == NetworkOperation.network_request_id,
+                == op_links.c.network_request_id,
                 NetworkOperationAllocation.workspace_id
-                == attempt_scan.c.workspace_id,
+                == op_links.c.workspace_id,
             ),
         )
         .group_by(
-            attempt_scan.c.workspace_id,
-            attempt_scan.c.product_id,
-            attempt_scan.c.cycle_ts,
-            NetworkOperation.network_request_id,
-            NetworkOperation.transport,
-            NetworkOperation.bytes_compressed,
+            op_links.c.workspace_id,
+            op_links.c.product_id,
+            op_links.c.cycle_ts,
+            op_links.c.network_request_id,
+            op_links.c.transport,
+            op_links.c.bytes_compressed,
         )
         .cte("per_op")
     )
@@ -568,18 +643,8 @@ def build_usage_query(
         .group_by(per_link.c.workspace_id, per_link.c.product_id, per_link.c.cycle_ts)
     )
 
-    if after is not None:
-        stmt = stmt.having(
-            tuple_(
-                per_link.c.cycle_ts, per_link.c.workspace_id, per_link.c.product_id
-            )
-            > tuple_(
-                literal(after.cycle_ts),
-                literal(after.workspace_id),
-                literal(after.product_id),
-            )
-        )
-
+    # E6: the keyset cursor is applied inside `attempt_scan` (see there);
+    # every output group is built only from rows already past it.
     return stmt.order_by(
         per_link.c.cycle_ts, per_link.c.workspace_id, per_link.c.product_id
     ).limit(limit + 1)

@@ -277,3 +277,24 @@ class TestDateHelpers:
         start, end = cost_rollup_day_bounds(date(2026, 8, 25))
         assert start == datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)
         assert end == datetime(2026, 8, 26, 0, 0, tzinfo=timezone.utc)
+
+
+class TestExactReconciledOperationCount:
+    """2026-09-29 (plan E7.5): the ops snapshot counted EVERY operation of a
+    bucket as reconciled as soon as ONE of them had a settlement
+    (`snapshot.py` summed `operation_count` over buckets with any
+    reconciled cost), overstating coverage. The rollup now carries the
+    exact count."""
+
+    def test_the_bucket_counts_only_settled_operations(self) -> None:
+        ops = [_op(estimated_cost_micro_units=10) for _ in range(5)]
+        settlements = [RawSettlementRow(ops[0].network_request_id, 1, 9, "USD")]
+        (bucket,) = aggregate_fleet_cost_buckets(ops, settlements)
+        assert bucket.operation_count == 5
+        assert bucket.reconciled_operation_count == 1
+
+    def test_the_count_survives_top_n_collapsing(self) -> None:
+        ops = [_op(domain=f"d{i}.example", estimated_cost_micro_units=1) for i in range(4)]
+        settlements = [RawSettlementRow(op.network_request_id, 1, 1, "USD") for op in ops[2:]]
+        buckets = aggregate_fleet_cost_buckets(ops, settlements, top_n=1)
+        assert sum(b.reconciled_operation_count for b in buckets) == 2

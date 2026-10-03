@@ -36,7 +36,7 @@ bound to that confined role and its system engine bound to the BYPASSRLS
 
 ## Running it
 
-    docker run -d --name cm-rls-test \\
+    docker run -d --rm --name cm-rls-test \\
       -e POSTGRES_USER=crawmatic_owner -e POSTGRES_PASSWORD=ownerpw \\
       -e POSTGRES_DB=crawmatic -p 127.0.0.1:55446:5432 postgres:16
 

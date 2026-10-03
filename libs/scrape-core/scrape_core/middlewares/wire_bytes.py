@@ -137,5 +137,20 @@ class WireBytesMiddleware:
     """
 
     def process_response(self, request: Any, response: Any, spider: Any) -> Any:
-        response.meta[META_WIRE_BYTES] = compute_wire_bytes(response)
+        # Stamp onto ``request.meta``, NOT ``response.meta``. Inside the
+        # downloader-middleware chain the response is not yet tied to its
+        # request: Scrapy's HTTP11 handler builds it via
+        # ``scrapy.utils._download_handlers.make_response`` with no
+        # ``request=``, and the engine only assigns ``response.request``
+        # AFTER every ``process_response`` has run
+        # (``ExecutionEngine._download``, Scrapy 2.16). ``Response.meta``
+        # on an untied response raises ``AttributeError("Response.meta not
+        # available, this response is not tied to any request")`` — which
+        # failed EVERY non-impersonated fetch in production on 2026-09-23
+        # (3,049 targets, all ten direct-HTTP domains; amazon/noon survived
+        # only because ``ImpersonatingDownloadHandler`` passes
+        # ``request=`` itself). ``response.meta`` is a live view onto
+        # ``request.meta`` once tied, so the ledger reads the same value
+        # either way.
+        request.meta[META_WIRE_BYTES] = compute_wire_bytes(response)
         return response

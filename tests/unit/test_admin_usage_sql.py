@@ -321,8 +321,11 @@ def test_proxied_is_the_provider_dimension_not_the_transport() -> None:
     sql = _sql_with_values(
         build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
     )
-    assert "network_operations.provider != 'direct'" in sql
-    assert "attempt_scan.proxy_provider_id IS NOT NULL" in sql
+    # E6: the predicate reads the ledger through the `op_links` union
+    # (same columns, same rows as the old OR-join -- pinned by the
+    # integration equivalence suite).
+    assert "op_links.provider != 'direct'" in sql
+    assert "op_links.proxy_provider_id IS NOT NULL" in sql
     # The old discriminator: an IN-list over the two transports used as
     # the *paid* test. Transport survives only as the HTTP/browser split
     # inside the already-proxied set (`per_op.proxied AND ... = 'PROXY'`).
@@ -363,12 +366,13 @@ def test_cost_is_allocated_through_cost_allocations_not_summed_per_attempt() -> 
         build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10)
     )
     assert "network_operation_allocations" in sql
+    # E6: joined off the `op_links` union rather than the raw ledger.
     assert (
         "network_operation_allocations.operation_id = "
-        "network_operations.network_request_id" in sql
+        "op_links.network_request_id" in sql
     )
     assert (
-        "network_operation_allocations.workspace_id = attempt_scan.workspace_id"
+        "network_operation_allocations.workspace_id = op_links.workspace_id"
         in sql
     )
     assert "allocated_cost_micro_units" in sql
@@ -398,6 +402,40 @@ def test_query_still_reads_the_partitioned_table_exactly_once() -> None:
     is a property of `FROM request_attempts` appearing once."""
     sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
     assert sql.count("FROM request_attempts") == 1, sql
-    # `per_link` and `per_op` both read the scan -- twice from the CTE,
-    # once from the table. That is the point of hoisting the scan out.
-    assert sql.count("FROM attempt_scan") == 2, sql
+    # `per_link` and the two `op_links` branches (E6: the OR-join became a
+    # UNION ALL of two equi-joins) read the scan -- three times from the
+    # CTE, once from the table. That is the point of hoisting the scan out.
+    # (Counted at line start: the child branch's `IS DISTINCT FROM
+    # attempt_scan.network_operation_id` guard also contains the phrase.)
+    assert sql.count("\nFROM attempt_scan") == 3, sql
+
+
+# --- E6 (2026-09-29): the shape that makes the export fast ---------------
+
+
+def test_the_ledger_is_never_or_joined() -> None:
+    """`network_request_id = X OR parent_operation_id = X` cannot use an
+    index or a hash join; it made one busy hour take 28.9 s. The two
+    lookups are separate equi-joins in a UNION ALL."""
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
+    assert " OR network_operations" not in sql
+    assert "UNION ALL" in sql
+    assert sql.count("JOIN network_operations ON") == 2
+
+
+def test_both_ledger_joins_are_bounded_on_its_partition_key() -> None:
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=None, limit=10))
+    assert sql.count("network_operations.created_at >=") == 2
+    assert sql.count("network_operations.created_at <") == 2
+
+
+def test_the_cursor_filters_the_scan_not_the_aggregate() -> None:
+    after = UsageCursor(
+        cycle_ts=datetime(2026, 8, 3, 14, tzinfo=timezone.utc),
+        workspace_id=uuid.uuid4(),
+        product_id=uuid.uuid4(),
+    )
+    sql = _sql(build_usage_query(since=SINCE, until=UNTIL, after=after, limit=10))
+    assert "HAVING" not in sql
+    scan = sql.split("per_link AS")[0]
+    assert "request_attempts.workspace_id, competitor_product_matches.product_id) >" in scan

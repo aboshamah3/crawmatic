@@ -41,7 +41,7 @@ uv run python tests/load/scenario_noisy_tenant.py
 
 The scratch Postgres container is created **by name**
 (`epa_w55ga_b_scratch_pg`) and removed **by name** at the end of
-`run_load_suite.sh` (`docker rm -f epa_w55ga_b_scratch_pg`), whether the
+`run_load_suite.sh` (`docker rm -f -v epa_w55ga_b_scratch_pg`), whether the
 suite passes or fails (`trap ... EXIT`). No bulk container/volume prune is
 ever run by this harness. `b3_matrix` (the engine CI `dispatch-integrity`
 job's own scratch-DB usage) is untouched — this harness uses its own,

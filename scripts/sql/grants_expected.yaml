@@ -78,6 +78,12 @@ crawmatic_app:
   - INSERT
   - SELECT
   - UPDATE
+  catalog_index_codes:
+  - SELECT
+  catalog_index_loads:
+  - SELECT
+  catalog_index_products:
+  - SELECT
   competitor_product_matches:
   - DELETE
   - INSERT
@@ -352,6 +358,12 @@ crawmatic_auth:
   - SELECT
   - UPDATE
   api_keys:
+  - SELECT
+  catalog_index_codes:
+  - SELECT
+  catalog_index_loads:
+  - SELECT
+  catalog_index_products:
   - SELECT
   competitor_product_matches:
   - DELETE
@@ -631,6 +643,9 @@ crawmatic_scraper:
   alembic_version: []
   api_abuse_limit_counters: []
   api_keys: []
+  catalog_index_codes: []
+  catalog_index_loads: []
+  catalog_index_products: []
   competitor_product_matches:
   - SELECT
   competitors: []

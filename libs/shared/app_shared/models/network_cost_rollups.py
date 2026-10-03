@@ -110,7 +110,7 @@ import uuid
 from datetime import date as date_type
 from datetime import datetime
 
-from sqlalchemy import BigInteger, CheckConstraint, Date, ForeignKeyConstraint, Index, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, Date, ForeignKeyConstraint, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app_shared.models.base import Base, TimestampMixin, TZDateTime, WorkspaceScopedBase
@@ -187,6 +187,13 @@ class FleetNetworkCostRollup(Base, TimestampMixin):
     #: falsely claim "reconciled to zero cost".
     reconciled_cost_micro_units: Mapped[int | None] = mapped_column(
         BigInteger(), nullable=True
+    )
+    #: E7.5 (2026-09-29, migration f1c7e2a9b3d4): how many of
+    #: ``operation_count`` have a settlement folded in -- the EXACT
+    #: reconciliation coverage. Summing ``operation_count`` over buckets
+    #: with any reconciled cost overstated it.
+    reconciled_operation_count: Mapped[int] = mapped_column(
+        BigInteger(), nullable=False, default=0, server_default=text("0")
     )
     currency: Mapped[str] = mapped_column(String(length=3), nullable=False)
 

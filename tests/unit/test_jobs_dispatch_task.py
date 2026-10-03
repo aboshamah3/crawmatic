@@ -1046,3 +1046,118 @@ def test_dispatch_job_forwards_the_grants_decision_facts() -> None:
     decided, so an auditor can reconstruct a spend decision from C1's
     ledger without joining back to `cost_reservations`."""
     _run_f2(_DISPATCH_FORWARDS_DECISION_FACTS_CHECK)
+
+
+# --- 2026-09-29 (plan E4): a denied dispatch fails fast, with its reason ---
+#
+# A denial used to leave the batch's targets untouched whatever the reason,
+# and `redispatch_pending_jobs` re-offered them every 60 s until the 12 h
+# job deadline -- the daily canary (one target on an uncertified domain)
+# failed that way every day, with JOB_DEADLINE_EXCEEDED instead of the real
+# reason. A PERMANENT denial now terminalizes the batch's targets at once
+# with the denial's own code; a TRANSIENT one keeps them offerable for
+# SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS, then fails them with its
+# code. The window is anchored per target in Redis (first denial seen).
+_E4_PRELUDE = _F2_FIXTURES + """
+from _costauth_test_stub import AlwaysGrantCostAuthorizationService
+from app_shared.enums import ScrapeErrorCode
+
+tasks_jobs.get_redis_client = lambda: fake_redis
+
+
+def deny_with(reason):
+    class _Deny(AlwaysGrantCostAuthorizationService):
+        deny_reason = reason
+    stub_cost_authorization(tasks_jobs, _Deny)
+"""
+
+_PERMANENT_DENIAL_CHECK = _E4_PRELUDE + """
+deny_with("DOMAIN_NOT_CERTIFIED")
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+if calls:
+    print("DENIED_BATCH_WAS_POSTED")
+    sys.exit(1)
+for t in (t1, t3):
+    if t.status != ScrapeTargetStatus.FAILED or t.error_code != ScrapeErrorCode.DOMAIN_NOT_CERTIFIED:
+        print("NOT_FAILED_FAST:" + repr((t.status, t.error_code)))
+        sys.exit(1)
+    if t.completed_at is None:
+        print("NO_COMPLETED_AT")
+        sys.exit(1)
+# The stamped PENDING target (t2) was not part of this pass; untouched.
+if t2.status != ScrapeTargetStatus.PENDING:
+    print("T2_TOUCHED:" + repr(t2.status))
+    sys.exit(1)
+print("OK")
+sys.exit(0)
+"""
+
+_TRANSIENT_DENIAL_INSIDE_WINDOW_CHECK = _E4_PRELUDE + """
+deny_with("BREAKER_OPEN")
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+if t1.status != ScrapeTargetStatus.PENDING or t3.status != ScrapeTargetStatus.DEFERRED:
+    print("TRANSIENT_DENIAL_TERMINALIZED_TOO_EARLY:" + repr((t1.status, t3.status)))
+    sys.exit(1)
+print("OK")
+sys.exit(0)
+"""
+
+_TRANSIENT_DENIAL_PAST_WINDOW_CHECK = _E4_PRELUDE + """
+deny_with("BREAKER_OPEN")
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+# Age every first-denial anchor past the window.
+long_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+for key in list(fake_redis.store):
+    if key.startswith("dispatch-denied:"):
+        fake_redis.store[key] = long_ago
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+for t in (t1, t3):
+    if t.status != ScrapeTargetStatus.FAILED or t.error_code != ScrapeErrorCode.BREAKER_OPEN:
+        print("NOT_FAILED_AFTER_WINDOW:" + repr((t.status, t.error_code)))
+        sys.exit(1)
+print("OK")
+sys.exit(0)
+"""
+
+_UNRESOLVED_MATCH_CHECK = _E4_PRELUDE + """
+orphan = ScrapeJobTarget(
+    workspace_id=workspace_id,
+    scrape_job_id=job_id,
+    match_id=uuid.uuid4(),   # no such match: deleted/archived
+    status=ScrapeTargetStatus.PENDING,
+    created_at=now,
+    dispatched_at=None,
+)
+orphan.id = uuid.uuid4()
+fake_session.seed(orphan)
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+if orphan.status != ScrapeTargetStatus.SKIPPED or orphan.error_code != ScrapeErrorCode.TARGET_UNRESOLVED:
+    print("UNRESOLVED_TARGET_LEFT_OPEN:" + repr((orphan.status, orphan.error_code)))
+    sys.exit(1)
+if not calls:
+    print("RESOLVABLE_TARGETS_WERE_NOT_DISPATCHED")
+    sys.exit(1)
+print("OK")
+sys.exit(0)
+"""
+
+
+def test_a_permanent_denial_fails_the_batch_at_once_with_its_code() -> None:
+    _run_f2(_PERMANENT_DENIAL_CHECK)
+
+
+def test_a_transient_denial_keeps_the_batch_offerable_inside_its_window() -> None:
+    _run_f2(_TRANSIENT_DENIAL_INSIDE_WINDOW_CHECK)
+
+
+def test_a_transient_denial_past_its_window_fails_with_its_code() -> None:
+    _run_f2(_TRANSIENT_DENIAL_PAST_WINDOW_CHECK)
+
+
+def test_an_unresolvable_target_is_terminalized_not_left_pending() -> None:
+    _run_f2(_UNRESOLVED_MATCH_CHECK)

@@ -44,7 +44,7 @@ gets muted — which is how you end up back at silent failures.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Callable
 
@@ -234,6 +234,43 @@ class Thresholds:
 
 
 DEFAULT_THRESHOLDS = Thresholds()
+
+#: E9.1 (2026-09-29): the per-domain thresholds are environment-tunable
+#: (``OPS_*`` settings, defaults = the measured constants above). Tunable is
+#: not quieter: the defaults are unchanged and the alert text reports the
+#: threshold it was judged against.
+_SETTINGS_TO_THRESHOLD = {
+    "OPS_DOMAIN_SUCCESS_RATE_HIGH": "domain_success_rate_high",
+    "OPS_DOMAIN_SUCCESS_RATE_WARNING": "domain_success_rate_warning",
+    "OPS_DOMAIN_SUCCESS_MIN_ATTEMPTS": "domain_success_min_attempts",
+    "OPS_WASTED_PAID_RATE_HIGH": "wasted_paid_rate_high",
+    "OPS_WASTED_PAID_MIN_ATTEMPTS": "wasted_paid_min_attempts",
+}
+
+
+def thresholds_from_settings(settings: Any) -> Thresholds:
+    """``DEFAULT_THRESHOLDS`` with every ``OPS_*`` value the settings carry."""
+    overrides = {
+        field_name: getattr(settings, setting)
+        for setting, field_name in _SETTINGS_TO_THRESHOLD.items()
+        if getattr(settings, setting, None) is not None
+    }
+    return replace(DEFAULT_THRESHOLDS, **overrides) if overrides else DEFAULT_THRESHOLDS
+
+
+def _configured_thresholds() -> Thresholds:
+    try:
+        from app_shared.config import get_settings
+
+        return thresholds_from_settings(get_settings())
+    except Exception:  # noqa: BLE001 - an unconfigurable process still alerts, on defaults
+        return DEFAULT_THRESHOLDS
+
+
+def _top_error_codes(codes: dict[str, int], n: int = 6) -> dict[str, int]:
+    """Most frequent failure codes first (E9.1) -- the part of a domain
+    alert that says which fix it needs."""
+    return dict(sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))[:n])
 
 
 # --------------------------------------------------------------------------
@@ -567,18 +604,44 @@ def _r_cost_rollup(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
         )
     else:
         if c.total_operation_count > 0 and c.reconciled_operation_count == 0:
-            out.append(
-                _alert(
-                    "cost_rollup.reconciliation_missing",
-                    Severity.CRITICAL,
-                    Category.COST,
-                    f"No reconciled cost for any of {c.total_operation_count} "
-                    f"operation(s) rolled up on {c.latest_rollup_date} -- every "
-                    "reported dollar is an unchecked estimate.",
-                    _J_COST_ROLLUP,
-                    observed={"total_operation_count": c.total_operation_count},
+            # E7.4 (2026-09-29): two different failures, two fixes. With no
+            # provider evidence imported at all, nothing downstream could
+            # ever reconcile (fix: the import). With evidence imported but
+            # nothing matched, the matching is broken (fix: reconciliation).
+            # Both remain CRITICAL: either way every dollar is unchecked.
+            if c.provider_evidence_windows == 0:
+                out.append(
+                    _alert(
+                        "cost_rollup.provider_evidence_missing",
+                        Severity.CRITICAL,
+                        Category.COST,
+                        f"No provider usage evidence has been imported, so none of "
+                        f"{c.total_operation_count} operation(s) rolled up on "
+                        f"{c.latest_rollup_date} can be reconciled -- every reported "
+                        "dollar is an unchecked estimate.",
+                        _J_COST_ROLLUP,
+                        observed={
+                            "total_operation_count": c.total_operation_count,
+                            "provider_evidence_windows": 0,
+                        },
+                    )
                 )
-            )
+            else:
+                out.append(
+                    _alert(
+                        "cost_rollup.reconciliation_missing",
+                        Severity.CRITICAL,
+                        Category.COST,
+                        f"No reconciled cost for any of {c.total_operation_count} "
+                        f"operation(s) rolled up on {c.latest_rollup_date} -- every "
+                        "reported dollar is an unchecked estimate.",
+                        _J_COST_ROLLUP,
+                        observed={
+                            "total_operation_count": c.total_operation_count,
+                            "provider_evidence_windows": c.provider_evidence_windows,
+                        },
+                    )
+                )
         variance = c.estimated_vs_reconciled_variance_pct
         if variance is not None and variance > t.cost_rollup_variance_critical_pct:
             out.append(
@@ -851,6 +914,7 @@ def _r_wasted_spend(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
                         "proxied": d.proxied,
                         "wasted_usd": cost.usd(d.failed_paid),
                         "threshold": t.wasted_paid_rate_high,
+                        "error_codes": _top_error_codes(d.error_codes),
                     },
                     runbook="#stop-proxy-spend-now",
                 )
@@ -1173,11 +1237,41 @@ def _r_domain_success(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
                     "success_rate": round(rate, 4),
                     "attempts": d.attempts,
                     "threshold": threshold,
+                    "error_codes": _top_error_codes(d.error_codes),
                 },
                 runbook="#per-domain-success-drop",
             )
         )
     return out
+
+
+_J_DEADLINE = (
+    "E9.1 (2026-09-29): targets the job deadline fails write no request "
+    "attempt, so every attempt-based rule is blind to them -- and they were "
+    "the night's largest failure (~940 a night: amazon.sa 629, noon.com 297). "
+    "A link that was never tried is a failure the customer sees."
+)
+
+
+def _r_deadline_failed_targets(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
+    by_domain = {
+        lo.domain: lo.deadline_failed for lo in snapshot.link_outcomes_24h if lo.deadline_failed
+    }
+    if not by_domain:
+        return []
+    total = sum(by_domain.values())
+    return [
+        _alert(
+            "jobs.deadline_failed_targets",
+            Severity.HIGH,
+            Category.RELIABILITY,
+            f"{total} target(s) were failed by the job deadline in 24h without "
+            "ever being fetched.",
+            _J_DEADLINE,
+            observed={"deadline_failed": total, "by_domain": by_domain},
+            runbook="#per-domain-success-drop",
+        )
+    ]
 
 
 _J_QUEUE = (
@@ -1571,15 +1665,48 @@ def _r_optimizer(snapshot: OpsSnapshot, t: Thresholds) -> list[Alert]:
 
 
 def _r_rls(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
+    """E8 (2026-09-29): about the TENANT role, and never silent on no verdict.
+
+    ``db_role`` describes the role behind the ordinary (tenant) engine, not
+    the BYPASSRLS session the snapshot was collected on -- that was the
+    permanent false CRITICAL. A tenant probe that ran and failed is
+    CRITICAL too: isolation that cannot be verified is not verified. The
+    privileged session has its own rule, ``_r_privileged_role``.
+    """
     d = snapshot.db_role
-    if d.available and d.rls_effective is False:
-        return [
+    alerts: list[Alert] = []
+    if not d.available and d.unavailable_reason:
+        alerts.append(
             _alert(
                 "security.rls_inert",
                 Severity.CRITICAL,
                 Category.SECURITY,
-                f"This service connects as {d.role!r}, which is "
-                f"{'superuser' if d.is_superuser else 'BYPASSRLS'} — every "
+                "The role that serves tenant requests could not be probed, so "
+                "workspace isolation is unverified.",
+                "Audit C3 / E8: RLS is only as good as the role it applies to. "
+                "A probe that cannot run gives no evidence the tenant role is "
+                "confined, and 'no evidence' must not read as 'fine'.",
+                observed={"unavailable_reason": d.unavailable_reason},
+                runbook="#rls-inert",
+            )
+        )
+    if d.available and d.rls_effective is False:
+        reasons = [
+            label
+            for label, flag in (
+                ("superuser", d.is_superuser),
+                ("BYPASSRLS", d.bypasses_rls),
+                (f"owner of {d.owned_public_tables} public table(s)", (d.owned_public_tables or 0) > 0),
+            )
+            if flag
+        ]
+        alerts.append(
+            _alert(
+                "security.rls_inert",
+                Severity.CRITICAL,
+                Category.SECURITY,
+                f"Tenant requests run as {d.role!r}, which is "
+                f"{' and '.join(reasons)} — every "
                 "workspace-isolation policy in the schema is inert.",
                 "Audit C3: RLS protection depends on unverified, manually "
                 "created roles, and production was found connecting as a "
@@ -1590,11 +1717,41 @@ def _r_rls(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
                     "role": d.role,
                     "is_superuser": d.is_superuser,
                     "bypasses_rls": d.bypasses_rls,
+                    "owned_public_tables": d.owned_public_tables,
                 },
                 runbook="#rls-inert",
             )
-        ]
-    return []
+        )
+    return alerts
+
+
+def _r_privileged_role(snapshot: OpsSnapshot, _t: Thresholds) -> list[Alert]:
+    """E8: the BYPASSRLS session is fine as such; alert only on the two
+    configurations that are not (see ``DatabaseRoleHealth.system_role_status``)."""
+    d = snapshot.db_role
+    alerts: list[Alert] = []
+    status = d.system_role_status
+    if status in ("superuser", "same_as_tenant"):
+        alerts.append(
+            _alert(
+                "security.privileged_role_misconfigured",
+                Severity.HIGH,
+                Category.SECURITY,
+                f"The privileged (BYPASSRLS) session connects as {d.system_role!r}, "
+                + (
+                    "a SUPERUSER."
+                    if status == "superuser"
+                    else "the same role that serves tenant requests."
+                ),
+                "E8: the auth/system session is meant to bypass RLS -- for "
+                "credential lookup and fleet sweeps -- but not as a superuser "
+                "(DDL, role changes, server-side COPY) and never as the tenant "
+                "role, which would make every tenant request privileged.",
+                observed={"role": d.system_role, "status": status},
+                runbook="#rls-inert",
+            )
+        )
+    return alerts
 
 
 # --------------------------------------------------------------------------
@@ -1898,6 +2055,13 @@ RULES: tuple[Rule, ...] = (
         _J_SUCCESS,
         _r_domain_success,
     ),
+    Rule(
+        "jobs.deadline_failed_targets",
+        Category.RELIABILITY,
+        "Targets failed by the job deadline without a fetch",
+        "E9.1 (2026-09-29).",
+        _r_deadline_failed_targets,
+    ),
     Rule("queue.*", Category.RELIABILITY, "Queue depth and age", _J_QUEUE, _r_queue),
     Rule(
         "freshness.*",
@@ -1925,9 +2089,16 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "security.rls_inert",
         Category.SECURITY,
-        "RLS effectiveness of the connected role",
-        "Audit C3.",
+        "RLS effectiveness of the role that serves tenants",
+        "Audit C3; E8 (2026-09-29): probes the tenant engine, not the session.",
         _r_rls,
+    ),
+    Rule(
+        "security.privileged_role_misconfigured",
+        Category.SECURITY,
+        "The BYPASSRLS session is a superuser or the tenant role",
+        "E8 (2026-09-29).",
+        _r_privileged_role,
     ),
     # --- EPA B9 (F22) — inert until a later task wires the named
     # attribute onto a real OpsSnapshot; see the section comment above.
@@ -2009,7 +2180,7 @@ def evaluate(
     because one rule has a bug is the failure mode this whole module
     exists to prevent.
     """
-    t = thresholds or DEFAULT_THRESHOLDS
+    t = thresholds or _configured_thresholds()
     alerts: list[Alert] = []
     for rule in RULES:
         try:

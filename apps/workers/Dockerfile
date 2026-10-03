@@ -32,4 +32,9 @@ USER app
 # commands it renders. `docker-compose.yml`'s healthcheck
 # (`celery ... inspect ping`) still round-trips through the broker to
 # BOTH pools unchanged.
-CMD ["/app/start.sh"]
+# The build context is the repo root (`COPY . .` above, and
+# docker-compose.yml's `context: .`), so the script lands under
+# /app/apps/workers/, not /app/. The first production deploy of this
+# CMD (2026-09-14) failed at CREATE_CONTAINER with "The executable
+# `/app/start.sh` could not be found" — keep the path in sync with COPY.
+CMD ["/app/apps/workers/start.sh"]

@@ -37,6 +37,15 @@ RUN uv sync --locked --package scrapers-browser --no-dev
 # Playwright's Chromium + required OS-level libraries, baked at build.
 RUN playwright install --with-deps chromium
 
+# A real init as PID 1 (2026-09-29, E1.3). The crawl watchdog kills a wedged
+# crawl's whole process group, and Chromium forks helpers that can outlive
+# their parent; without an init nothing reaps them and they pile up as
+# zombies in a long-lived container. `-g` forwards stop signals to the
+# child's process group.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 # READY F01 build gate: prove IN THIS IMAGE that Chromium cannot egress
 # past `scrape_core.browser.egress_guard` — redirect-to-loopback, a
 # privately-resolving sub-resource, service workers, popups, and a proxied
@@ -53,7 +62,15 @@ RUN playwright install --with-deps chromium
 # The sync above is `--no-dev`, so pytest is absent: pull the dev group in
 # for the gate and strip it again in the SAME layer, so the shipped image
 # still carries no test dependencies.
+# `pytest` lives in the ROOT workspace's `[dependency-groups] dev`, and
+# `uv sync --package <member>` does not pull the root's groups in on its
+# own: the 2026-09-14 production build died here with
+# `.venv/bin/pytest: not found`. The pinned uv 0.7.13 resolves `--group`
+# against the member package (which has no groups: "Group `dev` is not
+# defined"), so install pytest into the venv directly for the gate; the
+# final `--no-dev` sync below makes the environment exact again and drops it.
 RUN uv sync --locked --package scrapers-browser \
+    && uv pip install --python .venv/bin/python "pytest>=8.3,<9" \
     && .venv/bin/pytest tests/integration/test_browser_egress_guard_image.py \
         -m browser -q -p no:cacheprovider \
     && uv sync --locked --package scrapers-browser --no-dev
@@ -99,5 +116,5 @@ USER app
 
 EXPOSE 6800
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "./docker-entrypoint.sh"]
 CMD ["scrapyd"]

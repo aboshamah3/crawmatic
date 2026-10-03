@@ -84,7 +84,14 @@ def test_get_auth_engine_builds_engine_from_auth_database_url(
     assert captured["url"] == _FakeSettings.AUTH_DATABASE_URL
     assert captured["kwargs"] == {
         "pool_pre_ping": True,
-        "connect_args": {"prepare_threshold": None},
+        "connect_args": {
+            "prepare_threshold": None,
+            # E6 (2026-09-29): the auth engine is bounded too; see
+            # test_db_statement_timeout.py for the knob.
+            "options": (
+                f"-c statement_timeout={database.DB_PRIVILEGED_STATEMENT_TIMEOUT_MS}"
+            ),
+        },
     }
 
     monkeypatch.setattr(database, "_auth_engine", None, raising=False)

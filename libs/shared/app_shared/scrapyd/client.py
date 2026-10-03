@@ -440,7 +440,13 @@ class ScrapydDispatchClient:
         )
         return jobid
 
-    def cancel(self, scrapyd_job_id: str, *, node_url: str | None = None) -> bool:
+    def cancel(
+        self,
+        scrapyd_job_id: str,
+        *,
+        node_url: str | None = None,
+        project: str | None = None,
+    ) -> bool:
         """Best-effort ``cancel.json`` for one Scrapyd job id.
 
         Called by :func:`app_shared.jobs.cancellation.cancel_and_reconcile_job`
@@ -463,12 +469,19 @@ class ScrapydDispatchClient:
         going and its results are refused by the fence. Recording the
         node on the intent (so this becomes exact) is B3's to decide,
         alongside the deterministic-jobid question above.
+
+        2026-09-29 (E3.3): the intent DOES record its node and the project
+        half of its ``node_class`` now, so callers that have them
+        (:mod:`app_shared.jobs.run_purge`, admin cancel) pass both, and
+        exactly that node is asked in exactly that project. The defaults
+        remain for callers that have only a jobid.
         """
         base = (node_url or self._settings.SCRAPYD_HTTP_URLS[0]).rstrip("/")
         auth = (self._settings.SCRAPYD_USERNAME, self._settings.SCRAPYD_PASSWORD)
         poster = self._session.post if self._session is not None else requests.post
         acknowledged = False
-        for project in _CANCELLABLE_PROJECTS:
+        projects = (project,) if project else _CANCELLABLE_PROJECTS
+        for project in projects:
             response = poster(
                 f"{base}/cancel.json",
                 data={"project": project, "job": str(scrapyd_job_id)},
@@ -661,6 +674,10 @@ class ScrapydDispatchClient:
         return payload if isinstance(payload, dict) else None
 
     def list_jobs(self, node_url: str, project: str | None = None) -> set[str]:
+        """Every job id ``node_url`` knows -- see :meth:`list_job_states`."""
+        return set(self.list_job_states(node_url, project))
+
+    def list_job_states(self, node_url: str, project: str | None = None) -> dict[str, str]:
         """Every job id ``node_url`` knows — pending, running and finished.
 
         The read half of EPA B2's step 5. ``reconcile_inflight_intents``
@@ -677,6 +694,12 @@ class ScrapydDispatchClient:
         re-POST on the strength of a network failure. Contrast
         :meth:`daemon_status`, which deliberately returns ``None`` rather
         than raising: there, "node dead" IS the answer the caller wants.
+
+        Returns ``{job_id: "pending" | "running" | "finished"}`` -- the
+        bucket matters to the ended-run reaper and to stall recovery
+        (2026-09-29, E2): a run that is pending or running may still own
+        its targets; a finished one owns nothing. ``list_jobs`` is the
+        key set of this answer.
 
         Bounded knowledge, deliberately not hidden: both deployed nodes
         run ``MemoryJobStorage`` with ``finished_to_keep = 100``, so a run
@@ -730,11 +753,13 @@ class ScrapydDispatchClient:
                 f"listjobs.json on {base} returned {type(payload).__name__}, not an object"
             )
 
-        known: set[str] = set()
+        # Buckets read oldest-state first, so an id a racing listing shows
+        # twice (moved pending -> running mid-response) keeps the later one.
+        known: dict[str, str] = {}
         for bucket in ("pending", "running", "finished"):
             for entry in payload.get(bucket) or ():
                 if isinstance(entry, dict) and entry.get("id") is not None:
-                    known.add(str(entry["id"]))
+                    known[str(entry["id"])] = bucket
         return known
 
     def _post_schedule(

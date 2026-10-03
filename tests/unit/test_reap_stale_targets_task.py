@@ -61,14 +61,19 @@ def _install(*, reap_after=2100, max_runtime=43200):
     settings = MagicMock(
         SCRAPE_STARTED_REAP_AFTER_SECONDS=reap_after,
         SCRAPE_JOB_MAX_RUNTIME_SECONDS=max_runtime,
+        SCRAPE_ENDED_RUN_REAP_MIN_AGE_SECONDS=120,
     )
     revert = MagicMock(name="revert_stale_started_targets", return_value=3)
     fail = MagicMock(name="fail_targets_past_job_deadline", return_value=5)
+    ended = MagicMock(name="revert_started_targets_of_ended_runs", return_value=7)
 
     tasks_jobs.get_system_session = _fake_system_session
     tasks_jobs.get_settings = lambda: settings
     tasks_jobs.revert_stale_started_targets = revert
     tasks_jobs.fail_targets_past_job_deadline = fail
+    tasks_jobs.revert_started_targets_of_ended_runs = ended
+    closed = MagicMock(name="close_open_targets_of_terminal_jobs", return_value=0)
+    tasks_jobs.close_open_targets_of_terminal_jobs = closed
     return session, revert, fail
 """
 
@@ -165,6 +170,85 @@ def test_task_is_registered_under_its_name_and_declares_a_fleet_scope() -> None:
             """
 assert tasks_jobs.reap_stale_targets.name == SCRAPE_REAP_STALE_TARGETS
 assert maintenance_scope_of(tasks_jobs.reap_stale_targets) is MaintenanceScope.FLEET
+print("OK")
+"""
+        )
+    )
+
+
+def test_the_ended_run_pass_runs_first_and_asks_each_node_once() -> None:
+    """2026-09-29 (E2.1): STARTED targets whose Scrapyd run the node reports
+    finished (or no longer lists) go back at once, BEFORE the age-based
+    pass, sharing its `now`. The lookup asks each (node, project) once per
+    tick and turns an unreachable node into `None` -- "no answer", never
+    "no runs"."""
+    _assert_ok(
+        _run(
+            """
+from app_shared.scrapyd.errors import ScrapydDispatchError
+
+session, revert, fail = _install()
+order = []
+revert.side_effect = lambda *a, **k: order.append("age") or 0
+lookups = {}
+
+def fake_ended(session_, *, now, run_states, min_started_age_seconds):
+    order.append("ended")
+    lookups["now"] = now
+    lookups["min_age"] = min_started_age_seconds
+    lookups["a1"] = run_states("http://b:6800", "price_monitor_browser")
+    lookups["a2"] = run_states("http://b:6800", "price_monitor_browser")
+    lookups["dead"] = run_states("http://dead:6800", "price_monitor")
+    return 2
+
+calls = []
+
+class FakeClient:
+    def __init__(self, settings):
+        pass
+    def list_job_states(self, node_url, project=None):
+        calls.append((node_url, project))
+        if "dead" in node_url:
+            raise ScrapydDispatchError("unreachable")
+        return {"j1": "finished"}
+
+tasks_jobs.revert_started_targets_of_ended_runs = fake_ended
+tasks_jobs.ScrapydDispatchClient = FakeClient
+
+tasks_jobs.reap_stale_targets()
+
+assert order == ["ended", "age"], order
+assert lookups["now"] == revert.call_args.kwargs["now"]
+assert lookups["min_age"] == 120
+assert lookups["a1"] == {"j1": "finished"} and lookups["a2"] == lookups["a1"]
+assert lookups["dead"] is None
+assert calls == [("http://b:6800", "price_monitor_browser"), ("http://dead:6800", "price_monitor")], calls
+assert session.commit.call_count == 1
+print("OK")
+"""
+        )
+    )
+
+
+def test_the_terminal_job_invariant_pass_runs_last_with_the_same_now() -> None:
+    """2026-09-29 (E5): after the deadline pass (which makes a job's
+    targets terminal so finalize can close it), the invariant pass closes
+    any open target a TERMINAL job still holds -- same `now`, same commit."""
+    _assert_ok(
+        _run(
+            """
+session, revert, fail = _install()
+order = []
+fail.side_effect = lambda *a, **k: order.append("deadline") or 0
+closed = tasks_jobs.close_open_targets_of_terminal_jobs
+closed.side_effect = lambda *a, **k: order.append("terminal") or 16
+
+tasks_jobs.reap_stale_targets()
+
+assert order == ["deadline", "terminal"], order
+assert closed.call_args.args == (session,)
+assert closed.call_args.kwargs["now"] == fail.call_args.kwargs["now"]
+assert session.commit.call_count == 1
 print("OK")
 """
         )

@@ -213,12 +213,18 @@ class NodePlacement:
        `reconcile_inflight_intents` asks exactly ONE node whether the run
        exists, so a retry that moved the batch would be a run nobody can
        find and a re-POST nobody can suppress.
-    2. **A single-node pool short-circuits to
-       :func:`~app_shared.jobs.nodes.select_node`.** There is nothing to
-       choose and a probe cannot change the answer, so it is not paid for
-       — which is also every deployment's situation today
-       (`docs/ops/CAPACITY.md`).
-    3. **Otherwise `choose_node`**, which may answer ``None``: every node
+    2. **Every pool is probed and capped, a single-node pool included**
+       (2026-09-29, E3.1). It used to short-circuit to
+       :func:`~app_shared.jobs.nodes.select_node` unprobed ("nothing to
+       choose"), which silently exempted it from `max_pending` -- and the
+       browser pool IS a single node: it queued 2,725 batches behind one
+       wedged process. There is nothing to choose, but there is still
+       "not now" -- when the node ANSWERS that it is full. A single node
+       that does not answer at all is placed on anyway (both paths), as
+       before: with no alternative node, deferring on silence only delays
+       the POST that would tell us the same thing, and the POST-failure
+       path already releases the grant and leaves the targets offerable.
+    3. **`choose_node`**, which may answer ``None``: every node
        unreachable or at `max_pending`. ``None`` means DEFER — the caller
        must not authorize, POST or stamp.
     """
@@ -274,8 +280,6 @@ class NodePlacement:
             already = intents.planned_node_url(identity)
             if already:
                 return str(already)
-        if len(nodes) == 1:
-            return select_node(domain, nodes)
         key = tuple(nodes)
         loads = self._loads.get(key)
         if loads is None:
@@ -285,9 +289,8 @@ class NodePlacement:
             domain, list(nodes), loads=loads, max_pending=self._max_pending
         )
         if node_url is None:
-            if self._unreachable_pool_fallback and not any(
-                load.reachable for load in loads.values()
-            ):
+            nobody_answered = not any(load.reachable for load in loads.values())
+            if nobody_answered and (self._unreachable_pool_fallback or len(nodes) == 1):
                 return select_node(domain, list(nodes))
             self.deferred += 1
             return None

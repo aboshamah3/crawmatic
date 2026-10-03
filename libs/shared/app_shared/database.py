@@ -76,6 +76,15 @@ DB_STATEMENT_TIMEOUT_MS = int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "15000")
 DB_POOL_ACQUIRE_TIMEOUT_SECONDS = float(
     os.environ.get("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "15")
 )
+#: E6 (2026-09-29): the statement ceiling for the two BYPASSRLS engines
+#: (auth, system), which had none. Separate from DB_STATEMENT_TIMEOUT_MS
+#: because the same engines serve the worker's fleet-wide sweeps, which the
+#: API-tight 15 s default would break; 120 s matches the worker figure the
+#: module docstring gives. `/v1/admin/usage` runs on the auth session: when
+#: it took 28.9 s the SaaS client gave up at 5 s and the statement ran on.
+DB_PRIVILEGED_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("DB_PRIVILEGED_STATEMENT_TIMEOUT_MS", "120000")
+)
 
 _engine: Engine | None = None
 _sessionmaker: sessionmaker[Session] | None = None
@@ -262,6 +271,8 @@ def get_auth_engine() -> Engine:
                 # engine (see module docstring): disable server-side
                 # prepared statements.
                 "prepare_threshold": None,
+                # E6: bounded like every other engine (see the constant).
+                "options": f"-c statement_timeout={DB_PRIVILEGED_STATEMENT_TIMEOUT_MS}",
             },
         )
     return _auth_engine
@@ -366,6 +377,8 @@ def get_system_engine() -> Engine:
                 # main engine (see module docstring): disable server-side
                 # prepared statements.
                 "prepare_threshold": None,
+                # E6: bounded like every other engine (see the constant).
+                "options": f"-c statement_timeout={DB_PRIVILEGED_STATEMENT_TIMEOUT_MS}",
             },
         )
     return _system_engine
