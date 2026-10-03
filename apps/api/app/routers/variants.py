@@ -191,6 +191,114 @@ def list_price_comparisons(
     )
 
 
+def _stitch_competitor_prices(
+    session, ws: uuid.UUID, matches: list[CompetitorProductMatch]
+) -> list[CompetitorPriceResponse]:
+    """Join one page of matches to their current prices and competitor names.
+
+    Shared by the per-variant and the bulk `competitor-prices` routes.
+    Two bounded `id IN (...)` lookups (current prices by match, competitors
+    by id) keep the stitch in Python — the page is already capped at
+    `limit + 1` by the keyset query.
+    """
+    if not matches:
+        return []
+    prices_by_match_id = {
+        row.match_id: row
+        for row in session.execute(
+            scoped_select(MatchCurrentPrice, ws).where(
+                MatchCurrentPrice.match_id.in_([m.id for m in matches])
+            )
+        )
+        .scalars()
+        .all()
+    }
+    names_by_competitor_id = {
+        row.id: row.name
+        for row in session.execute(
+            scoped_select(Competitor, ws).where(
+                Competitor.id.in_({m.competitor_id for m in matches})
+            )
+        )
+        .scalars()
+        .all()
+    }
+
+    items: list[CompetitorPriceResponse] = []
+    for match in matches:
+        current = prices_by_match_id.get(match.id)
+        items.append(
+            CompetitorPriceResponse(
+                match_id=match.id,
+                competitor_id=match.competitor_id,
+                # Direct indexing, not `.get(..., "")`: `competitor_id` is a
+                # real FK (fk_cpm_workspace_competitor_competitors) within
+                # this workspace, so a miss is impossible — and if it ever
+                # happened it must fail loudly rather than serve a blank
+                # competitor name.
+                competitor_name=names_by_competitor_id[match.competitor_id],
+                url=match.competitor_url,
+                price=current.price if current is not None else None,
+                old_price=current.old_price if current is not None else None,
+                currency=current.currency if current is not None else None,
+                scraped_at=current.scraped_at if current is not None else None,
+                health_status=match.health_status,
+                # 2026-08-09 (problem 4): the availability/outcome pair the
+                # plugin needs to tell "unavailable on the competitor's
+                # site" apart from "we have no price for this yet" — both
+                # None when there is no current-price row at all.
+                stock_status=current.stock_status if current is not None else None,
+                success=current.success if current is not None else None,
+                product_variant_id=match.product_variant_id,
+                match_status=str(getattr(match.status, "value", match.status)),
+            )
+        )
+    return items
+
+
+# NOTE: static route, registered BEFORE `/{variant_id}` (see the
+# `/price-comparison` note above). Guarded by
+# `test_bulk_competitor_prices_is_not_swallowed_by_variant_id_route`.
+@router.get("/competitor-prices", response_model=CompetitorPriceListResponse)
+def list_all_competitor_prices(
+    limit: int | None = None,
+    cursor: str | None = None,
+    principal_ctx: tuple = Depends(require_scopes("alerts:read")),
+) -> CompetitorPriceListResponse:
+    """`GET /v1/variants/competitor-prices` — every match's latest price.
+
+    The bulk counterpart of `GET /v1/variants/{variant_id}/competitor-prices`:
+    one item per `competitor_product_matches` row in the workspace (each
+    carries `product_variant_id` so the client can group), keyset-paginated
+    over `(created_at, id)` — a client snapshots the whole table in
+    `ceil(n / limit)` calls instead of one per variant. Scope `alerts:read`.
+    """
+    session, principal = principal_ctx
+    assert isinstance(principal, Principal)
+    ws = principal.workspace_id
+
+    page_limit = clamp_limit(limit)
+    stmt = scoped_select(CompetitorProductMatch, ws)
+    if cursor is not None:
+        try:
+            after = decode_cursor(cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "INVALID_CURSOR", "message": str(exc)}},
+            ) from exc
+        stmt = stmt.where(keyset_predicate(CompetitorProductMatch, after))
+    stmt = stmt.order_by(CompetitorProductMatch.created_at, CompetitorProductMatch.id).limit(
+        page_limit + 1
+    )
+
+    envelope = paginate(session.execute(stmt).scalars().all(), page_limit)
+    return CompetitorPriceListResponse(
+        items=_stitch_competitor_prices(session, ws, envelope["items"]),
+        next_cursor=envelope["next_cursor"],
+    )
+
+
 @router.get("/{variant_id}", response_model=VariantResponse)
 def get_variant(
     variant_id: uuid.UUID,
@@ -319,54 +427,10 @@ def list_competitor_prices(
     if not matches:
         return CompetitorPriceListResponse(items=[], next_cursor=envelope["next_cursor"])
 
-    prices_by_match_id = {
-        row.match_id: row
-        for row in session.execute(
-            scoped_select(MatchCurrentPrice, ws).where(
-                MatchCurrentPrice.match_id.in_([m.id for m in matches])
-            )
-        )
-        .scalars()
-        .all()
-    }
-    names_by_competitor_id = {
-        row.id: row.name
-        for row in session.execute(
-            scoped_select(Competitor, ws).where(
-                Competitor.id.in_({m.competitor_id for m in matches})
-            )
-        )
-        .scalars()
-        .all()
-    }
-
-    items: list[CompetitorPriceResponse] = []
-    for match in matches:
-        current = prices_by_match_id.get(match.id)
-        items.append(
-            CompetitorPriceResponse(
-                match_id=match.id,
-                competitor_id=match.competitor_id,
-                # Direct indexing, not `.get(..., "")`: `competitor_id` is a
-                # real FK (fk_cpm_workspace_competitor_competitors) within
-                # this workspace, so a miss is impossible — and if it ever
-                # happened it must fail loudly rather than serve a blank
-                # competitor name.
-                competitor_name=names_by_competitor_id[match.competitor_id],
-                url=match.competitor_url,
-                price=current.price if current is not None else None,
-                currency=current.currency if current is not None else None,
-                scraped_at=current.scraped_at if current is not None else None,
-                health_status=match.health_status,
-                # 2026-08-09 (problem 4): the availability/outcome pair the
-                # plugin needs to tell "unavailable on the competitor's
-                # site" apart from "we have no price for this yet" — both
-                # None when there is no current-price row at all.
-                stock_status=current.stock_status if current is not None else None,
-                success=current.success if current is not None else None,
-            )
-        )
-    return CompetitorPriceListResponse(items=items, next_cursor=envelope["next_cursor"])
+    return CompetitorPriceListResponse(
+        items=_stitch_competitor_prices(session, ws, matches),
+        next_cursor=envelope["next_cursor"],
+    )
 
 
 #: Per-variant rescrape cooldown window. A second rescrape of the same

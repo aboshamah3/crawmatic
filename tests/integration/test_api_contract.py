@@ -273,6 +273,7 @@ def test_alerts_read_is_the_gate_on_the_price_comparison_surface() -> None:
     assert Scope.ALERTS_READ.value == "alerts:read"
     for path in (
         "/v1/variants/price-comparison",
+        "/v1/variants/competitor-prices",
         "/v1/variants/{variant_id}/price-comparison",
         "/v1/variants/{variant_id}/competitor-prices",
     ):
