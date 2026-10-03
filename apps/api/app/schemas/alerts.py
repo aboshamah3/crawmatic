@@ -102,6 +102,15 @@ class CompetitorPriceResponse(BaseModel):
     # (never scraped), which stays distinguishable from a scraped failure.
     stock_status: StockStatus | None = None
     success: bool | None = None
+    # 2026-10-03 (products UX plan, Phase 1): additive. `old_price` is the
+    # competitor's pre-discount price (None when not on promotion or never
+    # scraped); `product_variant_id` + `match_status` let the bulk route
+    # `GET /v1/variants/competitor-prices` be grouped client-side by variant
+    # without a per-variant call. `match_status` is the `MatchStatus` value
+    # (ACTIVE / PAUSED / FAILED / ARCHIVED), distinct from `health_status`.
+    old_price: Decimal | None = None
+    product_variant_id: uuid.UUID | None = None
+    match_status: str | None = None
 
 
 class CompetitorPriceListResponse(BaseModel):
