@@ -1007,8 +1007,6 @@ def _scan_job_refs(statuses: frozenset[ScrapeJobStatus]) -> list[tuple[uuid.UUID
         return list(session.execute(stmt).all())
 
 
-@maintenance_task(scope=MaintenanceScope.WORKSPACE)
-@app.task(name=SCRAPE_DISPATCH_JOB)
 def _denial_window_expired(
     redis: Any,
     *,
@@ -1102,6 +1100,8 @@ def _terminalize_denied_targets(
     return len(doomed)
 
 
+@maintenance_task(scope=MaintenanceScope.WORKSPACE)
+@app.task(name=SCRAPE_DISPATCH_JOB)
 def dispatch_job(scrape_job_id: str, workspace_id: str) -> None:
     """Expand `scrape_job_id`'s PENDING targets into domain/mode-grouped Scrapyd runs.
 
