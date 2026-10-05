@@ -1123,6 +1123,44 @@ print("OK")
 sys.exit(0)
 """
 
+# 2026-10-05: a BREAKER denial's window must outlast the breaker's own
+# auto-close cooldown (3600 s + evaluator cadence). With the flat 1800 s
+# window every breaker-denied target was failed BREAKER_OPEN half an hour
+# before the breaker could possibly reopen (2026-10-04: 835 targets).
+_AGE_ANCHORS = """
+aged = (datetime.now(timezone.utc) - timedelta(seconds=2000)).isoformat()
+for key in list(fake_redis.store):
+    if key.startswith("dispatch-denied:"):
+        fake_redis.store[key] = aged
+"""
+
+_BREAKER_DENIAL_OUTLASTS_THE_COOLDOWN_CHECK = _E4_PRELUDE + """
+deny_with("BREAKER_OPEN")
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+""" + _AGE_ANCHORS + """
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+if t1.status != ScrapeTargetStatus.PENDING or t3.status != ScrapeTargetStatus.DEFERRED:
+    print("BREAKER_DENIAL_FAILED_BEFORE_THE_BREAKER_COULD_REOPEN:" + repr((t1.status, t3.status)))
+    sys.exit(1)
+print("OK")
+sys.exit(0)
+"""
+
+_OTHER_TRANSIENT_DENIAL_KEEPS_ITS_WINDOW_CHECK = _E4_PRELUDE + """
+deny_with("CONCURRENCY_CAP_EXCEEDED")
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+""" + _AGE_ANCHORS + """
+tasks_jobs.dispatch_job(str(job_id), str(workspace_id))
+
+for t in (t1, t3):
+    if t.status != ScrapeTargetStatus.FAILED or t.error_code != ScrapeErrorCode.CONCURRENCY_CAP_EXCEEDED:
+        print("NON_BREAKER_WINDOW_CHANGED:" + repr((t.status, t.error_code)))
+        sys.exit(1)
+print("OK")
+sys.exit(0)
+"""
+
 _UNRESOLVED_MATCH_CHECK = _E4_PRELUDE + """
 orphan = ScrapeJobTarget(
     workspace_id=workspace_id,
@@ -1161,3 +1199,11 @@ def test_a_transient_denial_past_its_window_fails_with_its_code() -> None:
 
 def test_an_unresolvable_target_is_terminalized_not_left_pending() -> None:
     _run_f2(_UNRESOLVED_MATCH_CHECK)
+
+
+def test_a_breaker_denial_outlasts_the_breakers_auto_close_cooldown() -> None:
+    _run_f2(_BREAKER_DENIAL_OUTLASTS_THE_COOLDOWN_CHECK)
+
+
+def test_a_non_breaker_transient_denial_keeps_the_configured_window() -> None:
+    _run_f2(_OTHER_TRANSIENT_DENIAL_KEEPS_ITS_WINDOW_CHECK)

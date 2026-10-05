@@ -43,6 +43,7 @@ from app_shared.costauth import (
     CostAuthorizationDenied,
     CostAuthorizationService,
     DenialPermanence,
+    DenialReason,
     FirstRungReservation,
     authorize_or_denial,
     escalation_reservation,
@@ -1047,6 +1048,36 @@ def _denial_window_expired(
     return expired
 
 
+#: Denials that clear when the spend breaker recovers -- their retry window
+#: has to reach past the breaker's own auto-close cooldown.
+_BREAKER_DENIAL_REASONS = frozenset(
+    {DenialReason.BREAKER_OPEN, DenialReason.BREAKER_EVIDENCE_STALE}
+)
+
+
+def _denial_retry_window_seconds(reason: DenialReason, settings: Any) -> int:
+    """How long a TRANSIENT denial of ``reason`` keeps its targets offerable.
+
+    ``SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS`` for every reason, except
+    the breaker's: an OPEN breaker cannot auto-close before
+    ``PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS`` and is only re-evaluated
+    every ``PROXY_BREAKER_EVAL_INTERVAL_SECONDS``, so a shorter window
+    fails the targets before their denial can possibly clear. That is what
+    the flat 1800 s window did against the 3600 s cooldown on 2026-10-04:
+    835 targets FAILED ``BREAKER_OPEN`` half an hour before the breaker
+    reopened (2026-10-05). With auto-close disabled the breaker is
+    operator-only and the configured window stands.
+    """
+    window = int(settings.SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS)
+    if reason not in _BREAKER_DENIAL_REASONS:
+        return window
+    auto_close = int(getattr(settings, "PROXY_BREAKER_AUTO_CLOSE_AFTER_SECONDS", 0) or 0)
+    if auto_close <= 0:
+        return window
+    eval_interval = int(getattr(settings, "PROXY_BREAKER_EVAL_INTERVAL_SECONDS", 0) or 0)
+    return max(window, auto_close + 2 * eval_interval)
+
+
 def _terminalize_denied_targets(
     session: Session,
     *,
@@ -1075,7 +1106,7 @@ def _terminalize_denied_targets(
             scrape_job_id=scrape_job_id,
             match_ids=[t.match_id for t in batch_targets],
             now=datetime.now(timezone.utc),
-            window_seconds=settings.SCRAPE_DISPATCH_DENIAL_RETRY_WINDOW_SECONDS,
+            window_seconds=_denial_retry_window_seconds(denial.reason, settings),
             ttl_seconds=settings.SCRAPE_JOB_MAX_RUNTIME_SECONDS,
         )
         doomed = [t for t in batch_targets if t.match_id in expired]
