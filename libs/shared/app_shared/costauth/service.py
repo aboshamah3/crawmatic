@@ -39,10 +39,14 @@ fundamental first:
    ``evaluated_at`` older than the configured maximum evidence age denies
    with ``BREAKER_EVIDENCE_STALE``; an OPEN breaker denies with
    ``BREAKER_OPEN``. **Fail-closed**: absent evidence is not permission.
-   The breaker is consulted for every transport, DIRECT included — its
-   freshness is evidence that the fleet's cost brake is running at all,
-   and a fleet whose brake has stopped reporting has no business starting
-   new work of any kind.
+   Freshness is checked for every transport, DIRECT included — it is
+   evidence that the fleet's cost brake is running at all, and a fleet
+   whose brake has stopped reporting has no business starting new work of
+   any kind. An OPEN breaker, however, denies only transports that can
+   spend proxy money (everything but the ``DIRECT`` rung, unknown
+   transports included): the breaker measures proxied requests and stops
+   proxy spend, and denying free direct sites with it (2026-10-04, 835
+   targets of a false trip) only widened the outage.
 3. **Domain state**, via C2 (:func:`app_shared.domains.state_lookup.
    get_domain_state` + :func:`~app_shared.domains.state_lookup.
    authorization_rules_for_state`). See "Reconciling C2's nested rules
@@ -821,7 +825,7 @@ class CostAuthorizationService:
                     return grant
 
             entitlement_version = self._check_entitlement(session, workspace_id, now)
-            breaker_decision = self._check_breaker(session, now)
+            breaker_decision = self._check_breaker(session, now, req.transport)
             self._check_domain(session, req)
 
             # 7. Lock the budget rows. FLEET first, then TENANT — always,
@@ -1255,14 +1259,21 @@ class CostAuthorizationService:
             )
         return row.evidence_version
 
-    def _check_breaker(self, session: Session, now: datetime) -> str:
-        """Deny on a missing/stale/OPEN breaker. Returns the recorded verdict.
+    def _check_breaker(self, session: Session, now: datetime, transport: object) -> str:
+        """Deny on missing/stale evidence, or an OPEN breaker for paid work.
+
+        Returns the recorded verdict.
 
         Fail-closed by the run's binding ruling: no row and stale evidence
-        both DENY. The breaker's evaluator re-runs on its own lease far
-        more often than the max evidence age, so a stale row means the
-        evaluator has stopped — the exact condition under which "we have
-        no idea what we are spending" is the honest answer.
+        both DENY, whatever the transport. The breaker's evaluator re-runs
+        on its own lease far more often than the max evidence age, so a
+        stale row means the evaluator has stopped — the exact condition
+        under which "we have no idea what we are spending" is the honest
+        answer.
+
+        An OPEN breaker denies every transport except the ``DIRECT`` rung
+        (see the module docstring). A transport this build cannot classify
+        counts as paid.
         """
         row = session.execute(
             select(ProxyCircuitBreaker).where(
@@ -1282,7 +1293,7 @@ class CostAuthorizationService:
                 f"breaker evidence is {int(age)}s old "
                 f"(max {self._breaker_max_evidence_age_seconds}s)",
             )
-        if row.state is not ProxyBreakerState.CLOSED:
+        if row.state is not ProxyBreakerState.CLOSED and not _is_direct_rung(transport):
             raise CostAuthorizationDenied(
                 DenialReason.BREAKER_OPEN,
                 f"breaker is {row.state.value}"
@@ -2117,6 +2128,14 @@ def _normalized_rung(transport: object) -> str:
             f"{sorted(_RUNG_FOR_ACCESS_METHOD)}"
         )
     return name
+
+
+def _is_direct_rung(transport: object) -> bool:
+    """True only for a transport that bills as the free ``DIRECT`` rung."""
+    try:
+        return _normalized_rung(transport) == "DIRECT"
+    except ValueError:
+        return False
 
 
 def reservation_rung(transport: object) -> str:
