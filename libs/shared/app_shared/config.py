@@ -139,6 +139,13 @@ class Settings(BaseSettings):
     #: Minimum samples before a velocity window is trusted (a 3-request
     #: hour must not extrapolate into a trip).
     PROXY_BREAKER_VELOCITY_MIN_SAMPLE: int = 200
+    #: How long each velocity window's rate is held in the month-end
+    #: forecast before it falls back to the trailing week's average
+    #: (2026-10-05): 1h -> one day, 24h -> one week, the nightly and weekly
+    #: refresh cycles. Holding one hour for the rest of the month tripped
+    #: the breaker on a normal nightly burst (2026-10-04 21:21Z).
+    PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS: int = 86_400
+    PROXY_BREAKER_VELOCITY_24H_HORIZON_SECONDS: int = 604_800
     #: Max proxied requests per DISTINCT url in the trailing 24h. The
     #: 2026-08-10 measurement was amazon 2,716 fetches / 1,097 urls =
     #: 2.48, so 8 is comfortably above healthy retry behaviour and well

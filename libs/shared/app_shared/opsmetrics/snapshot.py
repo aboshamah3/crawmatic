@@ -477,11 +477,12 @@ class SpendVelocity:
     can measure itself) and converted with
     :data:`app_shared.opsmetrics.cost.USD_PER_PROXIED_REQUEST`.
 
-    ``forecast_month_end_*`` extrapolates the trailing window's rate over
-    the remaining seconds in the calendar month and adds month-to-date --
-    the same arithmetic ``access/breaker._velocity_forecast`` trips on,
-    reproduced here so the dashboard and the breaker never disagree
-    about what "on course to blow the budget" means.
+    ``forecast_month_end_*`` is ``access.breaker.velocity_forecast`` --
+    the very function the breaker trips on, not a copy of it -- so the
+    dashboard and the breaker never disagree about what "on course to
+    blow the budget" means: month-to-date + the window's rate held for its
+    horizon (1h -> a day, 24h -> a week) + the trailing week's average
+    for the rest of the month (2026-10-05).
     """
 
     available: bool
@@ -491,6 +492,8 @@ class SpendVelocity:
     proxied_prev_1h: int = 0
     proxied_24h: int = 0
     proxied_prev_24h: int = 0
+    #: Trailing-7d proxied requests: the forecast's baseline rate.
+    proxied_7d: int = 0
     attempts_month_to_date: int = 0
     seconds_remaining_in_month: float = 0.0
     #: The circuit breaker's configured monthly ceiling
@@ -505,6 +508,10 @@ class SpendVelocity:
     #: enforced figure was 35%.
     provider_budget_limit: int | None = None
     providers_without_budget: int = 0
+    #: The breaker's configured horizons (``PROXY_BREAKER_VELOCITY_*_
+    #: HORIZON_SECONDS``); the defaults equal the settings' defaults.
+    velocity_1h_horizon_seconds: float = 86_400.0
+    velocity_24h_horizon_seconds: float = 7 * 86_400.0
 
     @property
     def pct_of_provider_budget(self) -> float | None:
@@ -528,15 +535,23 @@ class SpendVelocity:
 
     @property
     def forecast_month_end_1h(self) -> float:
-        return self._forecast(self.proxied_1h, 3600.0)
+        return self._forecast(self.proxied_1h, 3600.0, self.velocity_1h_horizon_seconds)
 
     @property
     def forecast_month_end_24h(self) -> float:
-        return self._forecast(self.proxied_24h, 86400.0)
+        return self._forecast(self.proxied_24h, 86400.0, self.velocity_24h_horizon_seconds)
 
-    def _forecast(self, count: int, window_seconds: float) -> float:
-        rate = count / window_seconds
-        return self.proxied_month_to_date + rate * self.seconds_remaining_in_month
+    def _forecast(self, count: int, window_seconds: float, horizon_seconds: float) -> float:
+        from app_shared.access.breaker import velocity_forecast
+
+        return velocity_forecast(
+            count,
+            window_seconds,
+            month_to_date=self.proxied_month_to_date,
+            remaining_seconds=self.seconds_remaining_in_month,
+            horizon_seconds=horizon_seconds,
+            baseline_count=max(self.proxied_7d, self.proxied_24h),
+        )
 
     @property
     def acceleration_1h(self) -> float | None:
@@ -1592,8 +1607,16 @@ def _collect_spend(session: Any, now: datetime, settings: Any | None) -> SpendVe
     h2, h48 = now - timedelta(hours=2), now - timedelta(hours=48)
 
     ceiling = None
+    horizons: dict[str, float] = {}
     if settings is not None:
         ceiling = getattr(settings, "PROXY_BREAKER_MONTHLY_PROXIED_REQUESTS", None)
+        for field_name, setting_name in (
+            ("velocity_1h_horizon_seconds", "PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS"),
+            ("velocity_24h_horizon_seconds", "PROXY_BREAKER_VELOCITY_24H_HORIZON_SECONDS"),
+        ):
+            value = getattr(settings, setting_name, None)
+            if value is not None:
+                horizons[field_name] = float(value)
 
     # The ledger's real cap. Best-effort: an older/newer schema must not
     # blind the whole spend section over a nice-to-have.
@@ -1624,11 +1647,13 @@ def _collect_spend(session: Any, now: datetime, settings: Any | None) -> SpendVe
         proxied_prev_24h=count(
             paid, RequestAttempt.created_at >= h48, RequestAttempt.created_at < h24
         ),
+        proxied_7d=count(paid, RequestAttempt.created_at >= now - timedelta(days=7)),
         attempts_month_to_date=count(RequestAttempt.created_at >= month_start),
         seconds_remaining_in_month=seconds_remaining_in_month(now),
         ceiling_proxied_requests=ceiling,
         provider_budget_limit=provider_limit,
         providers_without_budget=providers_without_budget,
+        **horizons,
     )
 
 

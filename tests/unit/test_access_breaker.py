@@ -86,15 +86,74 @@ def test_monthly_ceiling_none_disables_that_condition() -> None:
 # --- trip conditions 2/3: velocity ------------------------------------------
 
 
-def test_trips_on_1h_velocity_extrapolated_to_month_end() -> None:
-    """500/h for the ~16 days left is ~192k, far over 100k x 1.5."""
+def test_trips_on_1h_velocity_that_would_breach_within_a_day() -> None:
+    """7,000/h held for one day is 168k on top of 5k -- over 100k x 1.5."""
     verdict = evaluate_thresholds(
-        _observation(proxied_requests_month=5_000, proxied_requests_1h=500),
+        _observation(proxied_requests_month=5_000, proxied_requests_1h=7_000),
         _thresholds(),
     )
     assert verdict.tripped is True
     assert verdict.reason is ProxyBreakerTrip.VELOCITY_1H
     assert "1h velocity" in (verdict.detail or "")
+
+
+def test_one_hour_burst_is_not_extrapolated_over_the_whole_month() -> None:
+    """The 2026-10-04 21:21Z false trip, replayed.
+
+    A nightly refresh sends its proxied requests in a burst. The old rule
+    projected that one hour over the ~27 days left in the month (700/h ->
+    ~455k) against 250k x 1.5 and tripped; real month-to-date spend was
+    4,632 requests (~$0.59). The burst is now held for one day (the
+    workload's cycle) and the rest of the month runs at the trailing
+    week's average.
+    """
+    now = datetime(2026, 10, 4, 21, 21, 33, tzinfo=UTC)
+    verdict = evaluate_thresholds(
+        BreakerObservation(
+            now=now,
+            month_started_at=datetime(2026, 10, 1, tzinfo=UTC),
+            proxied_requests_month=4_400,
+            proxied_requests_1h=700,
+            proxied_requests_24h=1_900,
+            proxied_requests_7d=9_000,
+            proxied_requests_24h_for_ratio=1_900,
+            distinct_urls_24h=1_830,
+        ),
+        _thresholds(monthly_proxied_requests=250_000),
+    )
+    assert verdict.tripped is False
+
+
+def test_a_sustained_runaway_still_trips_on_the_24h_window() -> None:
+    """A loop at ~3,500 proxied/h for ten hours, on top of a normal week."""
+    now = datetime(2026, 10, 4, 21, 0, 0, tzinfo=UTC)
+    verdict = evaluate_thresholds(
+        BreakerObservation(
+            now=now,
+            month_started_at=datetime(2026, 10, 1, tzinfo=UTC),
+            proxied_requests_month=4_400 + 35_000,
+            proxied_requests_1h=3_500,
+            proxied_requests_24h=2_000 + 35_000,
+            proxied_requests_7d=9_000 + 35_000,
+        ),
+        _thresholds(monthly_proxied_requests=250_000),
+    )
+    assert verdict.tripped is True
+    assert verdict.reason is ProxyBreakerTrip.VELOCITY_24H
+
+
+def test_an_inconsistent_week_count_cannot_hide_the_last_day() -> None:
+    """The baseline never reads below the 24h window it contains."""
+    verdict = evaluate_thresholds(
+        _observation(
+            proxied_requests_month=5_000,
+            proxied_requests_24h=20_000,
+            proxied_requests_7d=0,
+        ),
+        _thresholds(),
+    )
+    assert verdict.tripped is True
+    assert verdict.reason is ProxyBreakerTrip.VELOCITY_24H
 
 
 def test_trips_on_24h_velocity_when_1h_is_quiet() -> None:
@@ -382,10 +441,11 @@ class _EvalSession:
         month: int = 0,
         hour: int = 0,
         day: tuple[int, int] = (0, 0),
+        week: int = 0,
         discovery: tuple[str, int] | None = None,
     ) -> None:
         self.row = row
-        self.scalars = [month, hour]
+        self.scalars = [month, hour, week]
         self.day_counts = day
         self.firsts = [("breaker-row",) if claimed else None, discovery]
         self.added: list[object] = []

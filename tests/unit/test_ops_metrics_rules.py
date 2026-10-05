@@ -474,6 +474,8 @@ class TestCostAlarms:
                 proxied_month_to_date=20_900,
                 proxied_24h=20_000,
                 proxied_prev_24h=20_000,
+                # Steady state: the week ran at the same daily rate.
+                proxied_7d=140_000,
                 proxied_1h=0,
                 proxied_prev_1h=0,
                 seconds_remaining_in_month=16 * 86_400.0,
@@ -485,6 +487,28 @@ class TestCostAlarms:
         assert alerts[0].observed["month_to_date"] == 20_900
         assert alerts[0].observed["forecast_proxied"] > 250_000
 
+    def test_a_nightly_burst_alone_does_not_forecast_a_breach(self) -> None:
+        """The 2026-10-04 shape: one busy hour, an ordinary week. The
+        forecast is the breaker's own (``velocity_forecast``), so the
+        dashboard does not cry wolf where the breaker no longer trips."""
+        snap = healthy_snapshot(
+            spend=SpendVelocity(
+                available=True,
+                proxied_month_to_date=4_400,
+                proxied_1h=700,
+                proxied_24h=1_900,
+                proxied_7d=9_000,
+                seconds_remaining_in_month=27.1 * 86_400.0,
+                ceiling_proxied_requests=250_000,
+                provider_budget_limit=60_000,
+            )
+        )
+        assert snap.spend.forecast_month_end_1h < 60_000
+        assert snap.spend.forecast_month_end_24h < 60_000
+        # Nearing the provider cap may still WARN; it must not page.
+        alerts = by_id(evaluate(snap), "cost.month_end_forecast")
+        assert all(alert.severity is not Severity.CRITICAL for alert in alerts)
+
     def test_forecast_uses_whichever_ceiling_binds_first(self) -> None:
         """Production had a breaker ceiling of 250,000 and an enforced
         provider ledger cap of 60,000. Forecasting against the larger
@@ -495,6 +519,7 @@ class TestCostAlarms:
                 proxied_month_to_date=20_900,
                 proxied_24h=3_000,
                 proxied_prev_24h=3_000,
+                proxied_7d=21_000,
                 seconds_remaining_in_month=16 * 86_400.0,
                 ceiling_proxied_requests=250_000,
                 provider_budget_limit=60_000,
@@ -502,7 +527,8 @@ class TestCostAlarms:
         )
         assert snap.spend.effective_ceiling == 60_000
         alerts = by_id(evaluate(snap), "cost.month_end_forecast")
-        # 20,900 + 3,000*16 = 68,900 > 60,000 but far under 250,000.
+        # 20,900 + 3,000/day for 16 days = 68,900 > 60,000 but far under
+        # 250,000 (a steady week: the 7-day horizon and the baseline agree).
         assert alerts and alerts[0].severity is Severity.CRITICAL
         assert alerts[0].observed["ceiling"] == 60_000
 

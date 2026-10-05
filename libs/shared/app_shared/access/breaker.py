@@ -39,7 +39,7 @@ disagrees with a buggy caller.
 | Condition | Signal |
 |---|---|
 | `MONTHLY_SPEND` | month-to-date proxied requests vs absolute ceiling |
-| `VELOCITY_1H` / `VELOCITY_24H` | trailing rate extrapolated to month end |
+| `VELOCITY_1H` / `VELOCITY_24H` | trailing rate held for a bounded horizon, then the trailing week's average, to month end |
 | `REQUESTS_PER_URL` | proxied requests / DISTINCT url (runaway-loop shape) |
 | `DISCOVERY_RUNS_PER_DOMAIN` | discovery runs per domain per day |
 
@@ -113,7 +113,9 @@ __all__ = [
     "paid_requests_allowed",
     "reset_gate_cache",
     "thresholds_from_settings",
+    "BASELINE_WINDOW_SECONDS",
     "trip_breaker",
+    "velocity_forecast",
 ]
 
 #: Structured-log events (contracts/observability.md JSON convention).
@@ -138,6 +140,14 @@ class BreakerThresholds:
     monthly_proxied_requests: int | None = None
     velocity_factor: float = 1.5
     velocity_min_sample: int = 200
+    #: How long each velocity window's rate is assumed to persist before
+    #: the forecast falls back to the trailing week's average (2026-10-05).
+    #: One hour is held for one day and one day for one week -- the
+    #: workload's own cycles (nightly and weekly refreshes). Holding a
+    #: one-hour window for the whole rest of the month is what tripped
+    #: the breaker on a normal nightly burst.
+    velocity_1h_horizon_seconds: float = 86_400.0
+    velocity_24h_horizon_seconds: float = 7 * 86_400.0
     max_requests_per_url: float | None = None
     requests_per_url_min_sample: int = 500
     max_discovery_runs_per_domain_per_day: int | None = None
@@ -156,9 +166,12 @@ class BreakerObservation:
     month_started_at: datetime
     #: Month-to-date PROXIED request count.
     proxied_requests_month: int = 0
-    #: Trailing-1h / trailing-24h proxied request counts.
+    #: Trailing-1h / trailing-24h / trailing-7d proxied request counts.
+    #: The 7d count is the baseline the velocity forecast falls back to
+    #: once a window's horizon is spent.
     proxied_requests_1h: int = 0
     proxied_requests_24h: int = 0
+    proxied_requests_7d: int = 0
     #: Trailing-24h proxied requests and the DISTINCT urls behind them.
     proxied_requests_24h_for_ratio: int = 0
     distinct_urls_24h: int = 0
@@ -174,6 +187,7 @@ class BreakerObservation:
             "proxied_requests_month": self.proxied_requests_month,
             "proxied_requests_1h": self.proxied_requests_1h,
             "proxied_requests_24h": self.proxied_requests_24h,
+            "proxied_requests_7d": self.proxied_requests_7d,
             "proxied_requests_24h_for_ratio": self.proxied_requests_24h_for_ratio,
             "distinct_urls_24h": self.distinct_urls_24h,
             "max_discovery_runs_domain": self.max_discovery_runs_domain,
@@ -211,14 +225,50 @@ def _seconds_remaining_in_month(now: datetime) -> float:
     return max(0.0, (month_end - now).total_seconds())
 
 
-def _velocity_forecast(
-    observed_count: int, window_seconds: float, now: datetime, month_to_date: int
+#: The trailing window the velocity forecast's baseline rate is read from.
+BASELINE_WINDOW_SECONDS = 7 * 86_400.0
+
+
+def velocity_forecast(
+    observed_count: int,
+    window_seconds: float,
+    *,
+    month_to_date: int,
+    remaining_seconds: float,
+    horizon_seconds: float,
+    baseline_count: int,
 ) -> float:
-    """Month-end forecast = month-to-date + (rate x seconds remaining)."""
+    """Month-end forecast for one velocity window.
+
+    ``month_to_date`` + the window's rate held for ``horizon_seconds`` +
+    the trailing week's average rate for whatever remains of the month.
+    The breaker trips on it and the ops dashboard
+    (``app_shared.opsmetrics.snapshot.SpendVelocity``) reports it, so the
+    two can never disagree about what "on course to blow the budget" means.
+
+    Before 2026-10-05 the window's rate was held for ALL of the remaining
+    month. This engine's traffic is batch-shaped -- a nightly refresh
+    sends its proxied requests within an hour or two -- so on 2026-10-04
+    a normal ~700-request hour, projected over 27 days, "forecast" ~455k
+    against a 375k ceiling and the breaker stopped every job while real
+    spend was 4.6k requests. A rate is only evidence about the period the
+    workload repeats on; past that the honest estimate is the measured
+    average. A runaway still trips: it raises its own window AND, hour by
+    hour, the baseline -- and the absolute monthly ceiling stays the hard
+    stop regardless of any forecast.
+
+    ``baseline_count`` is clamped to at least ``observed_count``: a week
+    always contains its own last day and hour, so an observation whose
+    week reads lower (a racing aggregate, a hand-built one) can never
+    make the forecast smaller than the window alone implies.
+    """
     if window_seconds <= 0:
         return float(month_to_date)
-    rate_per_second = observed_count / window_seconds
-    return month_to_date + rate_per_second * _seconds_remaining_in_month(now)
+    remaining = max(0.0, remaining_seconds)
+    rate = observed_count / window_seconds
+    baseline_rate = max(baseline_count, observed_count) / BASELINE_WINDOW_SECONDS
+    held = min(horizon_seconds, remaining)
+    return month_to_date + rate * held + baseline_rate * (remaining - held)
 
 
 def evaluate_thresholds(
@@ -250,19 +300,33 @@ def evaluate_thresholds(
     # 2/3. Velocity: extrapolate the trailing window to month end.
     if limit is not None:
         forecast_ceiling = limit * thresholds.velocity_factor
-        for reason, count, window_seconds, label in (
-            (ProxyBreakerTrip.VELOCITY_1H, observation.proxied_requests_1h, 3600.0, "1h"),
+        for reason, count, window_seconds, horizon_seconds, label in (
+            (
+                ProxyBreakerTrip.VELOCITY_1H,
+                observation.proxied_requests_1h,
+                3600.0,
+                thresholds.velocity_1h_horizon_seconds,
+                "1h",
+            ),
             (
                 ProxyBreakerTrip.VELOCITY_24H,
                 observation.proxied_requests_24h,
                 86400.0,
+                thresholds.velocity_24h_horizon_seconds,
                 "24h",
             ),
         ):
             if count < thresholds.velocity_min_sample:
                 continue
-            forecast = _velocity_forecast(
-                count, window_seconds, observation.now, observation.proxied_requests_month
+            forecast = velocity_forecast(
+                count,
+                window_seconds,
+                month_to_date=observation.proxied_requests_month,
+                remaining_seconds=_seconds_remaining_in_month(observation.now),
+                horizon_seconds=horizon_seconds,
+                baseline_count=max(
+                    observation.proxied_requests_7d, observation.proxied_requests_24h
+                ),
             )
             if forecast > forecast_ceiling:
                 return BreakerVerdict(
@@ -320,6 +384,8 @@ def thresholds_from_settings(settings: Any) -> BreakerThresholds:
         monthly_proxied_requests=settings.PROXY_BREAKER_MONTHLY_PROXIED_REQUESTS,
         velocity_factor=settings.PROXY_BREAKER_VELOCITY_FACTOR,
         velocity_min_sample=settings.PROXY_BREAKER_VELOCITY_MIN_SAMPLE,
+        velocity_1h_horizon_seconds=settings.PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS,
+        velocity_24h_horizon_seconds=settings.PROXY_BREAKER_VELOCITY_24H_HORIZON_SECONDS,
         max_requests_per_url=settings.PROXY_BREAKER_MAX_REQUESTS_PER_URL,
         requests_per_url_min_sample=settings.PROXY_BREAKER_REQUESTS_PER_URL_MIN_SAMPLE,
         max_discovery_runs_per_domain_per_day=(
@@ -358,6 +424,7 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
     )
     since_1h = now - timedelta(hours=1)
     since_24h = now - timedelta(hours=24)
+    since_7d = now - timedelta(days=7)
 
     paid_methods = [AccessMethod.PROXY_HTTP, AccessMethod.PLAYWRIGHT_PROXY]
     paid = RequestAttempt.access_method.in_(paid_methods)
@@ -382,6 +449,14 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
         .where(paid, RequestAttempt.created_at >= since_24h)
     ).one()
 
+    # The velocity forecast's baseline (see `_velocity_forecast`). Bounded
+    # by the same partition-pruned created_at index as the other counts.
+    count_7d = session.execute(
+        select(func.count())
+        .select_from(RequestAttempt)
+        .where(paid, RequestAttempt.created_at >= since_7d)
+    ).scalar_one()
+
     discovery_row = session.execute(
         select(
             StrategyDiscoveryRun.domain,
@@ -399,6 +474,7 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
         proxied_requests_month=int(month_count or 0),
         proxied_requests_1h=int(count_1h or 0),
         proxied_requests_24h=int(count_24h or 0),
+        proxied_requests_7d=int(count_7d or 0),
         proxied_requests_24h_for_ratio=int(count_24h or 0),
         distinct_urls_24h=int(distinct_urls_24h or 0),
         max_discovery_runs_domain=discovery_row[0] if discovery_row else None,
