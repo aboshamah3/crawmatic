@@ -251,7 +251,60 @@ def test_open_breaker_denies_paid_work_even_with_healthy_redis(
 
     decision = _prepare_dispatch(_target(_policy(AccessStrategy.PROXY_FIRST)), 1, {}, {})
 
+    # 2026-10-05: BREAKER_OPEN, not LIMIT_REACHED. The breaker clears on
+    # its own, so the spiders defer on this code instead of failing the
+    # target (`TRANSIENT_DISPATCH_SKIP_CODES`).
+    assert decision.skip_error_code is ScrapeErrorCode.BREAKER_OPEN
+    assert decision.skip_error_code in targets_mod.TRANSIENT_DISPATCH_SKIP_CODES
+
+
+def test_a_degraded_ledger_still_reports_limit_reached(
+    outage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the breaker's denial changed code; a fail-closed ledger outage
+    keeps its pre-existing outcome."""
+    _set_fail_open(monkeypatch, False)
+
+    decision = _prepare_dispatch(_target(_policy(AccessStrategy.PROXY_FIRST)), 1, {}, {})
+
     assert decision.skip_error_code is ScrapeErrorCode.LIMIT_REACHED
+    assert decision.skip_error_code not in targets_mod.TRANSIENT_DISPATCH_SKIP_CODES
+
+
+def test_attempt_one_defers_a_breaker_denied_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The spider hands a breaker-denied target back DEFERRED with the
+    breaker's code at once -- no in-line wait, no terminal row."""
+    import asyncio
+
+    from scrape_core.targets import AdmissionContext, _DispatchDecision
+
+    deferred: list[tuple[str, ScrapeErrorCode]] = []
+
+    async def _fake_await_in_thread(fn: object, *args: object, **kwargs: object) -> object:
+        return _DispatchDecision(
+            plan=None, proxy=None, skip_error_code=ScrapeErrorCode.BREAKER_OPEN
+        )
+
+    async def _fake_defer(
+        ctx: object, target: object, *, event: str, error_code: ScrapeErrorCode
+    ) -> None:
+        deferred.append((event, error_code))
+
+    monkeypatch.setattr(targets_mod, "await_in_thread", _fake_await_in_thread)
+    monkeypatch.setattr(targets_mod, "defer_rate_limited_target", _fake_defer)
+    monkeypatch.setattr("app_shared.config.get_settings", lambda: object())
+    ctx = AdmissionContext(
+        workspace_id=uuid.uuid4(), scrape_job_id=uuid.uuid4(), requeue_state_by_match_id={}
+    )
+
+    decision = asyncio.run(
+        targets_mod.prepare_dispatch_with_backoff(
+            ctx, _target(_policy(AccessStrategy.PROXY_FIRST)), 1, {}, {}
+        )
+    )
+
+    assert decision is None
+    assert deferred == [("proxy_breaker.defer", ScrapeErrorCode.BREAKER_OPEN)]
 
 
 def test_open_breaker_does_not_stop_direct_work(

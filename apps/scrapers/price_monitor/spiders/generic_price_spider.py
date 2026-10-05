@@ -114,7 +114,6 @@ from scrape_core.adapters import (
     get_adapter,
 )
 from scrape_core.errors import (
-    RATE_LIMITED,
     classify_exception,
     classify_http_status,
 )
@@ -147,6 +146,7 @@ from scrape_core.targets import (
     load_targets,
     overflow_to_dispatch,
     prepare_dispatch_with_backoff,
+    TRANSIENT_DISPATCH_SKIP_CODES,
     redispatch_job,
     resolve_request_timeout_seconds,
     sticky_proxy_username,
@@ -1030,7 +1030,8 @@ class GenericPriceSpider(scrapy.Spider):
         # Backing off in-line here is deliberately NOT done -- this errback
         # may still hold the match lock, whose TTL is shorter than the
         # requeue wait cap.
-        defer = decision.skip_error_code is RATE_LIMITED
+        # 2026-10-05: the spend breaker's refusal is transient too.
+        defer = decision.skip_error_code in TRANSIENT_DISPATCH_SKIP_CODES
         for result in self._results_with_siblings(
             target,
             failure.request.url,

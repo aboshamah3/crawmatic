@@ -167,6 +167,7 @@ __all__ = [
     "acquire_fetch_permission",
     "defer_rate_limited_target",
     "prepare_dispatch_with_backoff",
+    "TRANSIENT_DISPATCH_SKIP_CODES",
     "redispatch_job",
     "overflow_to_dispatch",
     "dispatch_admission",
@@ -574,6 +575,7 @@ def _mark_target_rate_limited_failed(
     workspace_id: uuid.UUID,
     scrape_job_id: uuid.UUID,
     match_id: uuid.UUID,
+    error_code: ScrapeErrorCode = ScrapeErrorCode.RATE_LIMITED,
 ) -> None:
     """Terminal counterpart of :func:`_mark_target_deferred_rate_limited`
     for a target whose defer budget is spent (2026-08-03,
@@ -587,7 +589,7 @@ def _mark_target_rate_limited_failed(
             scrape_job_id=scrape_job_id,
             match_id=match_id,
             status=ScrapeTargetStatus.FAILED,
-            error_code=ScrapeErrorCode.RATE_LIMITED,
+            error_code=error_code,
         )
 
 
@@ -1473,6 +1475,17 @@ class _DispatchDecision:
     retry_after_seconds: int = 0
 
 
+#: Skip codes for a next attempt that was decided but refused by a gate
+#: that clears by itself: a rate ceiling/cooldown, or the spend breaker
+#: (which auto-closes). A target refused this way is handed back DEFERRED,
+#: never failed -- the attempt-1 path through
+#: :func:`prepare_dispatch_with_backoff`, the retry path through the
+#: result's ``defer_target``. Every other skip code is terminal.
+TRANSIENT_DISPATCH_SKIP_CODES: frozenset[ScrapeErrorCode] = frozenset(
+    {ScrapeErrorCode.RATE_LIMITED, ScrapeErrorCode.BREAKER_OPEN}
+)
+
+
 def _settings() -> Any:
     """The process ``Settings`` (lazy import, matching this module's
     existing local-import convention for config access)."""
@@ -1661,6 +1674,12 @@ def _prepare_dispatch(
     # in-flight is affected -- this runs before any request is built.
     if plan.use_proxy:
         deny_paid_reason: str | None = None
+        # 2026-10-05: the breaker's denial clears by itself (auto-close),
+        # so it is reported as BREAKER_OPEN -- a TRANSIENT_DISPATCH_SKIP_CODE
+        # the spiders defer on -- rather than the terminal LIMIT_REACHED
+        # that failed 175 noon targets during one false trip. A degraded
+        # ledger keeps LIMIT_REACHED.
+        deny_code = ScrapeErrorCode.LIMIT_REACHED
 
         if ledger_degraded and not _settings().PROXY_LEDGER_FAIL_OPEN:
             deny_paid_reason = "cost ledger unavailable (Redis)"
@@ -1668,6 +1687,7 @@ def _prepare_dispatch(
             breaker_ok, breaker_reason = _breaker_allows_paid_work()
             if not breaker_ok:
                 deny_paid_reason = breaker_reason or "spend circuit breaker open"
+                deny_code = ScrapeErrorCode.BREAKER_OPEN
 
         if deny_paid_reason is not None:
             breaker_log_denied(
@@ -1679,7 +1699,7 @@ def _prepare_dispatch(
                 return _DispatchDecision(
                     plan=None,
                     proxy=None,
-                    skip_error_code=ScrapeErrorCode.LIMIT_REACHED,
+                    skip_error_code=deny_code,
                     attempted_method=intended_method,
                 )
 
@@ -2077,6 +2097,7 @@ async def defer_rate_limited_target(
             ctx.workspace_id,
             scrape_job_id,
             target.match_id,
+            error_code,
         )
         log_event(
             logger,
@@ -2140,6 +2161,18 @@ async def prepare_dispatch_with_backoff(
         decision = await await_in_thread(
             _prepare_dispatch, target, attempt_number, visible_providers, provider_rows
         )
+        if decision.skip_error_code is ScrapeErrorCode.BREAKER_OPEN:
+            # Recovery is the breaker's auto-close (an hour, not seconds),
+            # so waiting in-line would only pin this Scrapyd slot: hand the
+            # target straight back. The dispatcher re-offers it and the
+            # cost gate holds it until the breaker closes (2026-10-05).
+            await defer_rate_limited_target(
+                ctx,
+                target,
+                event="proxy_breaker.defer",
+                error_code=ScrapeErrorCode.BREAKER_OPEN,
+            )
+            return None
         if decision.skip_error_code is not ScrapeErrorCode.RATE_LIMITED:
             return decision
 
