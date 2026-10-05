@@ -274,11 +274,14 @@ class TestDerivedSignals:
             proxied_month_to_date=20_900,
             proxied_24h=12_141,
             proxied_prev_24h=4_279,
+            proxied_7d=40_000,
             seconds_remaining_in_month=16 * 86_400.0,
             ceiling_proxied_requests=250_000,
         )
-        # 20,900 + (12,141/day * 16 days)
-        assert s.forecast_month_end_24h == pytest.approx(215_156, abs=1)
+        # `velocity_forecast` (2026-10-05): the 24h rate held for its
+        # 7-day horizon, the trailing week's average for the other 9 days:
+        # 20,900 + 12,141/day * 7 + 40,000/7 per day * 9
+        assert s.forecast_month_end_24h == pytest.approx(157_316, abs=1)
         assert s.acceleration_24h == pytest.approx(2.84, abs=0.01)
         assert s.pct_of_ceiling == pytest.approx(0.0836, abs=0.001)
         assert s.usd_month_to_date == pytest.approx(2.644, abs=0.01)
