@@ -148,6 +148,7 @@ from scrape_core.targets import (
     prepare_dispatch_with_backoff,
     TRANSIENT_DISPATCH_SKIP_CODES,
     redispatch_job,
+    skip_unresolved_target,
     resolve_request_timeout_seconds,
     sticky_proxy_username,
     next_strategy_method,
@@ -401,9 +402,11 @@ class GenericPriceSpider(scrapy.Spider):
                         proxy_country=(decision.attempted_proxy.country if decision.attempted_proxy else None),
                     ):
                         yield result
-                # else: NONE_RESOLVED access policy -- skip silently, see
-                # `_DispatchDecision` docstring. (Siblings resolved the
-                # same chain -- same silent skip, exactly as standalone.)
+                else:
+                    # NONE_RESOLVED access policy: no result row (see
+                    # `_DispatchDecision`), but the claimed target and its
+                    # siblings (same chain) are closed SKIPPED.
+                    await skip_unresolved_target(self._admission_context(), target)
                 continue
             result = await self._dispatch(target, 1, decision.plan, decision.proxy)
             if result is None:

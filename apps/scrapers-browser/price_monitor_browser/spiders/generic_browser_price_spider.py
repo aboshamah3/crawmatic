@@ -93,6 +93,7 @@ from scrape_core.targets import (
     dispatch_admission,
     load_targets,
     prepare_dispatch_with_backoff,
+    skip_unresolved_target,
     sticky_proxy_username,
     next_strategy_method,
 )
@@ -454,8 +455,10 @@ class GenericBrowserPriceSpider(scrapy.Spider):
                             decision.attempted_proxy.country if decision.attempted_proxy else None
                         ),
                     )
-                # else: NONE_RESOLVED access policy -- skip silently, see
-                # `_DispatchDecision` docstring (exactly as HTTP).
+                else:
+                    # NONE_RESOLVED access policy: no result row, but the
+                    # claimed target is closed SKIPPED (exactly as HTTP).
+                    await skip_unresolved_target(self._admission_context(), target)
                 continue
 
             # Browser-direct and browser-proxy are distinct audited methods.

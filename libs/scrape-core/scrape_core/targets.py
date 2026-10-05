@@ -169,6 +169,7 @@ __all__ = [
     "prepare_dispatch_with_backoff",
     "TRANSIENT_DISPATCH_SKIP_CODES",
     "redispatch_job",
+    "skip_unresolved_target",
     "overflow_to_dispatch",
     "dispatch_admission",
     "sticky_proxy_username",
@@ -591,6 +592,32 @@ def _mark_target_rate_limited_failed(
             status=ScrapeTargetStatus.FAILED,
             error_code=error_code,
         )
+
+
+def _mark_targets_unresolved_skipped(
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    match_ids: list[uuid.UUID],
+) -> None:
+    """Finalize claimed targets whose access policy never resolved as
+    ``SKIPPED`` + ``TARGET_UNRESOLVED`` -- **Blocking** (DB round trip), so
+    only ever called inside :func:`scrape_core.db.run_in_thread`.
+
+    Same guard as :func:`_finalize_refused_targets`: the batch is already
+    ``STARTED`` by this run's own pickup, and a terminal target keeps the
+    outcome it earned. Single ``mark_target`` writer, one transaction.
+    """
+    with workspace_txn(workspace_id) as session:
+        for match_id in match_ids:
+            mark_target(
+                session,
+                workspace_id=workspace_id,
+                scrape_job_id=scrape_job_id,
+                match_id=match_id,
+                status=ScrapeTargetStatus.SKIPPED,
+                error_code=ScrapeErrorCode.TARGET_UNRESOLVED,
+                only_if_status=REFUSAL_FINALIZABLE_TARGET_STATUSES,
+            )
 
 
 # --- match_ids arg parsing (contracts/spider-args.md) -----------------------
@@ -2127,6 +2154,33 @@ async def defer_rate_limited_target(
         workspace_id=ctx.workspace_id,
         scrape_job_id=scrape_job_id,
         match_id=target.match_id,
+    )
+
+
+async def skip_unresolved_target(ctx: AdmissionContext, target: SpiderTarget) -> None:
+    """Close a ``NONE_RESOLVED`` target (and its dedup siblings, which
+    resolved the same chain) as ``SKIPPED`` + ``TARGET_UNRESOLVED``.
+
+    No ``ScrapeResult`` (the resolution contract: "skipped, not scraped"),
+    but never a silent drop either (2026-10-05 fix 7): the pickup already
+    claimed the row ``STARTED``, so leaving it untouched let the ended-run
+    reaper and the dispatcher re-send it every ~15 minutes until the job
+    deadline.
+    """
+    scrape_job_id = ctx.scrape_job_id
+    if scrape_job_id is None:
+        return
+    match_ids = [target.match_id, *(s.match_id for s in target.sibling_targets)]
+    await await_in_thread(
+        _mark_targets_unresolved_skipped, ctx.workspace_id, scrape_job_id, match_ids
+    )
+    log_event(
+        logger,
+        "dispatch.policy_unresolved",
+        workspace_id=ctx.workspace_id,
+        scrape_job_id=scrape_job_id,
+        match_id=target.match_id,
+        siblings=len(match_ids) - 1,
     )
 
 
