@@ -37,6 +37,7 @@ __all__ = [
     "Counts",
     "PHASE_TIMESTAMP_COLUMNS",
     "PICKUP_ELIGIBLE_TARGET_STATUSES",
+    "REFUSAL_FINALIZABLE_TARGET_STATUSES",
     "aggregate_counts",
     "mark_target",
     "mark_targets_started",
@@ -52,6 +53,22 @@ __all__ = [
 PICKUP_ELIGIBLE_TARGET_STATUSES: tuple[ScrapeTargetStatus, ...] = (
     ScrapeTargetStatus.PENDING,
     ScrapeTargetStatus.DEFERRED,
+)
+
+#: 2026-10-05. The statuses a budget/deadline REFUSAL made by the spider's
+#: own load may finalize: every non-terminal one, ``STARTED`` included.
+#: ``load_targets`` claims the batch (-> ``STARTED``) BEFORE it asks the
+#: attempt ladder about each target, so by the time a refusal is written
+#: the row it refuses is already ``STARTED`` -- by this very load. Guarding
+#: the refusal with :data:`PICKUP_ELIGIBLE_TARGET_STATUSES` made that write
+#: a silent no-op: the refused target was dropped from the run, stayed
+#: ``STARTED``, was reverted by the ended-run reaper, re-sent, and looped
+#: until the 12 h job deadline (noon, 2026-10-03: 314 targets, 109 empty
+#: runs). Terminal statuses stay excluded, so a refusal still never
+#: overwrites an outcome a target already earned.
+REFUSAL_FINALIZABLE_TARGET_STATUSES: tuple[ScrapeTargetStatus, ...] = (
+    *PICKUP_ELIGIBLE_TARGET_STATUSES,
+    ScrapeTargetStatus.STARTED,
 )
 
 #: EPA A5. The per-phase lifecycle timestamp columns

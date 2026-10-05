@@ -88,7 +88,7 @@ from app_shared.enums import (
     VariantStrategy,
 )
 from app_shared.jobs.targets import (
-    PICKUP_ELIGIBLE_TARGET_STATUSES,
+    REFUSAL_FINALIZABLE_TARGET_STATUSES,
     mark_target,
     mark_targets_started,
 )
@@ -481,6 +481,61 @@ def resolve_request_timeout_seconds(target: SpiderTarget) -> float | None:
     if policy_timeout_ms:
         return float(policy_timeout_ms) / 1000.0
     return None
+
+
+def _persist_load_selection(job_target: Any, selection: Any) -> None:
+    """Record a method ``load_targets`` selected on the target's durable cursor.
+
+    The ladder CHARGES a physical attempt the moment it returns a
+    selection. The dispatcher persists its selections on the job target
+    (``current_strategy_method_id`` / ``strategy_attempt_ordinal`` /
+    ``chain_token``), so a re-pickup reuses the cursor and charges
+    nothing. ``load_targets`` -- which selects only when the dispatcher
+    left no cursor -- did not, so every re-pickup of the same target (a
+    run capped by ``CLOSESPIDER_TIMEOUT``, a node redeploy, an ended-run
+    revert) selected and charged AGAIN without a fetch, and the target
+    reached ``ATTEMPT_BUDGET_EXHAUSTED`` having never been tried
+    (2026-10-05). Same three fields, same semantics as the dispatcher.
+    A load with no job (no ``scrape_job_targets`` row) has nothing to keep.
+    """
+    if job_target is None:
+        return
+    from app_shared.ids import new_uuid7
+
+    job_target.current_strategy_method_id = selection.method.id
+    job_target.strategy_attempt_ordinal = selection.attempt_ordinal
+    job_target.chain_token = job_target.chain_token or new_uuid7()
+
+
+def _finalize_refused_targets(
+    session: Any,
+    *,
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    refusals_by_match: dict[uuid.UUID, ScrapeErrorCode],
+) -> None:
+    """Fail every target the attempt ladder refused, with the refusal's code.
+
+    Runs inside ``load_targets``' transaction, AFTER the pickup has claimed
+    the batch -- so a refused row is normally ``STARTED`` by this very load,
+    and the guard is :data:`REFUSAL_FINALIZABLE_TARGET_STATUSES` (every
+    non-terminal status), not the pickup set. With the pickup set the write
+    matched nothing (2026-10-05): the refused target was dropped from the
+    run yet left ``STARTED``, and the ended-run reaper and the dispatcher
+    re-sent it every ~15 minutes until the job deadline. ``mark_target``
+    stays the single writer, and a terminal target still keeps the outcome
+    it earned.
+    """
+    for refused_match_id, refusal_code in refusals_by_match.items():
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=refused_match_id,
+            status=ScrapeTargetStatus.FAILED,
+            error_code=refusal_code,
+            only_if_status=REFUSAL_FINALIZABLE_TARGET_STATUSES,
+        )
 
 
 def _mark_target_deferred_rate_limited(
@@ -1127,6 +1182,7 @@ def load_targets(
                     selected_method = selection.method if selection is not None else None
                     if selection is not None:
                         strategy_version_by_match[match.id] = selection.strategy_version
+                        _persist_load_selection(job_target, selection)
                 strategy_method_by_match[match.id] = selected_method
                 strategy_methods_by_match[match.id] = tuple(method_list)
 
@@ -1186,21 +1242,14 @@ def load_targets(
 
         # EPA C4: finalize every target the ladder refused on budget or
         # deadline grounds, in ONE bounded pass, before any target is
-        # built. `mark_target` is the single writer of these transitions
-        # and its `only_if_status` guard means an already-terminal target
-        # keeps the outcome it earned -- a refusal is a reason not to
-        # START work, never a reason to overwrite a finished result.
-        for refused_match_id, refusal_code in refusals_by_match.items():
-            if scrape_job_id is None:
-                continue
-            mark_target(
+        # built. See `_finalize_refused_targets` for why the guard must
+        # include STARTED.
+        if scrape_job_id is not None:
+            _finalize_refused_targets(
                 session,
                 workspace_id=workspace_id,
                 scrape_job_id=scrape_job_id,
-                match_id=refused_match_id,
-                status=ScrapeTargetStatus.FAILED,
-                error_code=refusal_code,
-                only_if_status=PICKUP_ELIGIBLE_TARGET_STATUSES,
+                refusals_by_match=refusals_by_match,
             )
 
         targets: list[SpiderTarget] = []
