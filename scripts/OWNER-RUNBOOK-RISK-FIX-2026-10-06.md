@@ -68,3 +68,39 @@ Rollback: redeploy each service's previous Railway deployment (dashboard: Deploy
 previous -> Redeploy). The three migrations downgrade cleanly but `b3d9e5a17c42`'s domain
 rewrite is not undone by downgrade; restore from the DR backup taken in step 3 if the schema
 must go back. See `docs/DEPLOY-ROLLBACK.md`.
+
+## Task 7: breaker and dispatch economics (E4, P5, A9 engine lows)
+
+Code only, no migration (the new trip reason `HOURLY_CEILING` fits the existing
+`proxy_circuit_breakers.trip_reason` VARCHAR(32)). Ships with the next engine deploy of
+`workers`, `scheduler`, `scrapers` and `scrapers-browser` (the breaker, dispatcher and spider
+all changed). No env var is required; every new setting has a code default:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PROXY_BREAKER_HOURLY_CEILING` | unset (None) | Fixed trailing-1h proxied-request ceiling. Unset = measured: max(FLOOR, P95_FACTOR x the trailing week's p95 hourly count). |
+| `PROXY_BREAKER_HOURLY_CEILING_FLOOR` | `3000` | Floor of the measured ceiling. Set to empty/None (with no fixed ceiling) to disable the hourly-ceiling trip. |
+| `PROXY_BREAKER_HOURLY_CEILING_P95_FACTOR` | `3.0` | Multiplier on the week's p95 hour. |
+| `SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS` | `60` | Debounce of the one outbox `dispatch_job` per job (`dedup_key=breaker-defer:<job>`) that BREAKER_OPEN defers now schedule. |
+
+Changed meaning of an existing setting: `PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS` (86400) is
+now the CAP on the 1h horizon; the horizon itself is the day's measured busy hours
+(24h count / 1h count, clamped 1-24).
+
+Behaviour to expect after deploy:
+- A trip with reason `HOURLY_CEILING` means the trailing hour exceeded the ceiling printed in
+  `proxy_circuit_breakers.detail`; the row's `observed` JSON now carries
+  `proxied_requests_7d_p95_hourly`. Auto-close works as before.
+- If the fleet grows abruptly (e.g. 5+ new Mushtryati-sized tenants in one nightly window
+  before a week of history exists), the measured ceiling can trip on the first big night.
+  Raise `PROXY_BREAKER_HOURLY_CEILING_FLOOR` (or set a fixed `PROXY_BREAKER_HOURLY_CEILING`)
+  before onboarding such a batch.
+- An OPEN breaker no longer refuses PLAYWRIGHT_DIRECT batches at the dispatcher.
+- BREAKER_OPEN defers no longer burn `SCRAPE_MAX_DEFER_CYCLES`; they are bounded by the per-target
+  and job deadlines instead.
+
+Verify (read-only, after the next nightly run): `proxy_circuit_breakers.observed` contains
+`proxied_requests_7d_p95_hourly`; during any trip, `outbox_messages` holds at most one PENDING
+`breaker-defer:<job>` row per job.
+
+Rollback: redeploy the previous engine deployment; no schema change to undo.
