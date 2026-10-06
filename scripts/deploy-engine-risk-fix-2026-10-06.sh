@@ -18,9 +18,14 @@
 #   2  DR backup (rollback target)
 #   3  JWT_LEGACY_AUD_GRACE_UNTIL (offered; now + one access TTL + build buffer)
 #   4  migrate service (alembic b3d9e5a17c42 -> c4e8f2a6b913 -> d7a1f3c5e902 -> e2b8d4f6a1c3; upgrade only)
-#   5  api -> worker -> scheduler -> scrapers -> scrapers-browser (from the clean checkout)
+#   5  api -> worker -> scheduler -> scrapers -> scrapers-browser (from the clean checkout);
+#      after scrapers: Scrapyd egg re-register (every scrapers deploy wipes the egg)
 #   6  external_ref backfill steps (printed; owner-run SQL after the SaaS export)
 #   7  post-deploy checks with the owner's test workspace key
+#
+# Refuses a real run between 19:00 and 23:59 UTC (nightly refresh window) unless ALLOW_NIGHTLY=1.
+# BEFORE the deploy set PROXY_BREAKER_HOURLY_CEILING_FLOOR on worker, scrapers, scrapers-browser, api
+# (runbook "Release procedure" step 2); this script does not set it.
 #
 # Secrets NEVER appear on argv or in output. The Railway token goes through a 0600 env
 # file (shredded on exit); INDEX_SERVICE_TOKEN / workspace key / dry-run DSN are read from
@@ -48,7 +53,17 @@
 set -euo pipefail
 
 DRY=0
-for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; -h|--help) sed -n 2,47p "$0"; exit 0 ;; *) echo "unknown arg: $a"; exit 2 ;; esac; done
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; -h|--help) sed -n 2,52p "$0"; exit 0 ;; *) echo "unknown arg: $a"; exit 2 ;; esac; done
+
+# Nightly-window guard: the nightly refresh runs 19:00-23:59 UTC and a deploy restarts worker/scrapers
+# mid-run. Dry runs mutate nothing and are exempt.
+if (( ! DRY )) && [[ "${ALLOW_NIGHTLY:-0}" != "1" ]]; then
+  utc_hour=$((10#$(date -u +%H)))
+  if (( utc_hour >= 19 )); then
+    echo "!! refusing to deploy at $(date -u +%H:%M)Z: 19:00-23:59 UTC is the nightly refresh run and a deploy would restart its workers. Wait until 00:00Z or set ALLOW_NIGHTLY=1."
+    exit 1
+  fi
+fi
 
 PROJECT=69dc4bda-0d97-4290-a82f-822ed97d3fb8     # Crawmatic engine (railway2)
 ENVNAME=production
@@ -71,7 +86,7 @@ mkdir -p "$EVIDENCE"
 exec > >(tee -a "$LOG") 2>&1
 ts() { date -u +%FT%TZ; }
 step() { echo; echo "----- $(ts)  $*"; }
-echo "=== engine security deploy start $(ts) dry_run=$DRY (log: $LOG)"
+echo "=== engine risk-fix 2026-10-06 deploy start $(ts) dry_run=$DRY (log: $LOG)"
 
 # shellcheck disable=SC1091
 source /root/.railway/accounts.sh
@@ -123,7 +138,7 @@ SHA=$(git -C "$REPO" rev-parse "${DEPLOY_SHA:-$BRANCH}")
 git -C "$REPO" merge-base --is-ancestor "$BASE_SHA" "$SHA" || { echo "!! $SHA does not descend from base $BASE_SHA"; exit 1; }
 echo "will deploy commit $SHA ($(git -C "$REPO" log -1 --format=%s "$SHA"))"
 git -C "$REPO" log --oneline "$BASE_SHA..$SHA" | head -40
-CLEAN=$(mktemp -d /tmp/engine-security-deploy.XXXXXX); rmdir "$CLEAN"
+CLEAN=$(mktemp -d /tmp/engine-riskfix-deploy.XXXXXX); rmdir "$CLEAN"
 git -C "$REPO" worktree add --detach "$CLEAN" "$SHA" >/dev/null
 chown -R mahmoud:mahmoud "$CLEAN"
 echo "clean checkout: $CLEAN (removed on exit; the live run worktree is never uploaded)"
@@ -228,10 +243,10 @@ if (( DRY )); then
   echo "[dry-run] build_release_manifest.py --emit-identity -> $CLEAN/libs/shared/app_shared/_baked_release.py"
 else
   ( cd "$CLEAN" && sudo -n -u mahmoud /srv/crawmatic/crawmatic/.venv/bin/python scripts/build_release_manifest.py \
-      --out /tmp/engine-sec-manifest.json --emit-identity /tmp/engine-sec-identity.json >/dev/null )
+      --out /tmp/engine-riskfix-manifest.json --emit-identity /tmp/engine-riskfix-identity.json >/dev/null )
   python3 - "$CLEAN/libs/shared/app_shared/_baked_release.py" "$SHA" <<'PY'
 import json, pprint, sys
-ident = json.load(open("/tmp/engine-sec-identity.json"))
+ident = json.load(open("/tmp/engine-riskfix-identity.json"))
 assert ident["expected_db_migration"], "identity has no expected_db_migration"
 open(sys.argv[1], "w").write('"""GENERATED AT DEPLOY TIME. DO NOT COMMIT. Release identity for %s."""\n\nRELEASE_IDENTITY: dict = %s\n' % (sys.argv[2][:7], pprint.pformat(ident, sort_dicts=True)))
 print("baked identity written; expected_db_migration =", ident["expected_db_migration"])
@@ -261,6 +276,19 @@ else
     || { echo "!! migrate did not reach $NEW_HEAD. Nothing else was deployed."; exit 1; }
 fi
 
+EGG_REGISTERED=0
+register_egg() {   # every scrapers deploy wipes the Scrapyd egg; HTTP scraping stalls until it is back
+  step "5b. re-register the Scrapyd egg on scrapers"
+  if (( DRY )); then echo "[dry-run] railway ssh -s scrapers -e $ENVNAME -p $PROJECT -- python /app/apps/scrapers/register_egg.py"; EGG_REGISTERED=1; return 0; fi
+  # the new container may need a moment before ssh works
+  local i
+  for i in 1 2 3 4; do
+    if rw ssh -s scrapers -e "$ENVNAME" -p "$PROJECT" -- python /app/apps/scrapers/register_egg.py; then EGG_REGISTERED=1; echo "OK: egg re-registered"; return 0; fi
+    echo "egg register attempt $i failed; retrying in 20s"; sleep 20
+  done
+  return 1
+}
+
 # ---- 5. services ------------------------------------------------------------------------
 for svc in ${ONLY_SERVICES:-api worker scheduler scrapers scrapers-browser}; do
   if [[ "$svc" == "api" ]]; then rw variable set "GIT_SHA=$SHA" -s api -e "$ENVNAME" -p "$PROJECT" --skip-deploys >/dev/null 2>&1 || echo "note: GIT_SHA not set"; fi
@@ -268,6 +296,7 @@ for svc in ${ONLY_SERVICES:-api worker scheduler scrapers scrapers-browser}; do
   if [[ "$svc" == "api" ]]; then
     wait_for "api /ready" 900 api_ready || { echo "!! api not ready"; exit 1; }
   fi
+  if [[ "$svc" == "scrapers" ]]; then register_egg || echo "!! egg re-register FAILED; see MANDATORY NEXT STEP at the end of this run"; fi
 done
 
 # ---- 6. external_ref backfill (owner steps; printed, not run) ----------------------------
@@ -296,11 +325,21 @@ if (( DRY )); then
   echo "[dry-run] checks: /ready 200; db head == $NEW_HEAD; /version without token has no git_sha; /version with token has git_sha=$SHA;"
   echo "[dry-run]   foreign-host POST /v1/matches -> 422; robots-respecting fixture scrape (TEST_MATCH_ID) succeeds; queue age re-check command"
 else
-  [[ "$(code "$API/ready")" == "200" ]]; check "/ready 200" $?
-  [[ "$(jv db_migration_head)" == "$NEW_HEAD" ]]; check "db head is $NEW_HEAD" $?
-  anon=$(curl -s -m 15 "$API/version"); ! grep -qE 'git_sha|migration|manifest' <<<"$anon"; check "/version without a token carries no SHA/heads/manifest (H1)" $?
-  [[ "$(jv git_sha)" == "$SHA"* || "$SHA" == "$(jv git_sha)"* ]]; check "/version with the index bearer reports git_sha $SHA" $?
-  [[ "$(code "$API/health/scraping")" == "401" || "$(code "$API/health/scraping")" == "403" ]]; check "/health/scraping refuses an anonymous caller" $?
+  # `check_if "<label>" <command...>`: runs the test in an `if`, so a failing test records FAIL and the
+  # script goes on (a bare `[[ ... ]]; check ... $?` would exit under `set -e` with no FAIL line).
+  check_if() { local label=$1; shift; if "$@"; then check "$label" 0; else check "$label" 1; fi; }
+  eq() { [[ "$1" == "$2" ]]; }
+  check_if "/ready 200" eq "$(code "$API/ready")" 200
+  check_if "db head is $NEW_HEAD" eq "$(jv db_migration_head)" "$NEW_HEAD"
+  anon=$(curl -s -m 15 "$API/version" || true)
+  if ! grep -qE 'git_sha|migration|manifest' <<<"$anon"; then check "/version without a token carries no SHA/heads/manifest (H1)" 0; else check "/version without a token carries no SHA/heads/manifest (H1)" 1; fi
+  live_sha=$(jv git_sha)
+  if [[ -n "$live_sha" && ( "$live_sha" == "$SHA"* || "$SHA" == "$live_sha"* ) ]]; then check "/version with the index bearer reports git_sha $SHA" 0; else check "/version with the index bearer reports git_sha $SHA (got '${live_sha:-none}')" 1; fi
+  hs=$(code "$API/health/scraping")
+  if [[ "$hs" == "401" || "$hs" == "403" ]]; then check "/health/scraping refuses an anonymous caller" 0; else check "/health/scraping refuses an anonymous caller (got $hs)" 1; fi
+  if [[ " ${ONLY_SERVICES:-api worker scheduler scrapers scrapers-browser} " == *" scrapers "* ]]; then
+    check_if "Scrapyd egg re-registered after the scrapers deploy" eq "$EGG_REGISTERED" 1
+  fi
 
   if [[ -z "$(ws_key)" ]]; then
     skip "workspace-key checks: no key in $WS_KEY_FILE (0600, the owner's TEST workspace key)"
@@ -308,7 +347,7 @@ else
     if [[ -n "${TEST_COMPETITOR_ID:-}" && -n "${TEST_VARIANT_ID:-}" ]]; then
       body=$(printf '{"product_variant_id":"%s","competitor_id":"%s","competitor_url":"https://not-the-competitor.invalid.example.net/p/1"}' "$TEST_VARIANT_ID" "$TEST_COMPETITOR_ID")
       st=$(code -X POST -H @<(bearer_header ws_key) -H 'Content-Type: application/json' -d "$body" "$API/v1/matches")
-      [[ "$st" == "422" ]]; check "foreign-host match is refused with 422 (got $st)" $?
+      if [[ "$st" == "422" ]]; then check "foreign-host match is refused with 422 (got $st)" 0; else check "foreign-host match is refused with 422 (got $st)" 1; fi
     else skip "foreign-host check: set TEST_COMPETITOR_ID and TEST_VARIANT_ID (test workspace)"; fi
 
     if [[ -n "${TEST_MATCH_ID:-}" ]]; then
@@ -324,8 +363,9 @@ try: print(json.load(sys.stdin).get("status",""))
 except Exception: print("")')
           case "$final" in SUCCEEDED|COMPLETED|succeeded|completed|FAILED|failed|PARTIAL|partial) break ;; esac; sleep 15
         done
-        [[ "$final" == "SUCCEEDED" || "$final" == "COMPLETED" || "$final" == "succeeded" || "$final" == "completed" ]]
-        check "robots-respecting fixture scrape finished (status=$final)" $?
+        if [[ "$final" == "SUCCEEDED" || "$final" == "COMPLETED" || "$final" == "succeeded" || "$final" == "completed" ]]; then
+          check "robots-respecting fixture scrape finished (status=$final)" 0
+        else check "robots-respecting fixture scrape finished (status=$final)" 1; fi
       fi
     else skip "fixture scrape: set TEST_MATCH_ID (a match on a robots-respecting fixture competitor)"; fi
   fi
@@ -335,4 +375,10 @@ echo "Scheduler/queue check (run ~15 min after the deploy; oldest pending target
 echo "  curl -s -H @<(printf 'Authorization: Bearer %s\\n' \"\$(tr -d '\\r\\n' < $INDEX_TOKEN_FILE)\") $API/health/scraping | python3 -m json.tool"
 echo "  (field oldest_pending_target_age_seconds; null = queue empty)"
 if (( DRY )); then echo "=== DRY RUN COMPLETE $(ts): nothing mutated"; exit 0; fi
+if (( EGG_REGISTERED != 1 )) && [[ " ${ONLY_SERVICES:-api worker scheduler scrapers scrapers-browser} " == *" scrapers "* ]]; then
+  echo
+  echo "**MANDATORY NEXT STEP: the Scrapyd egg is NOT registered. HTTP scraping is stalled until you run:**"
+  echo "**  ! bash -c 'source /root/.railway/accounts.sh && cd /srv/crawmatic/crawmatic && sudo -n -u mahmoud -H env RAILWAY_API_TOKEN=\"\$RAILWAY_TOKEN_RAILWAY2\" PATH=$NVM_BIN:\$PATH railway ssh -s scrapers -e $ENVNAME -p $PROJECT -- python /app/apps/scrapers/register_egg.py'**"
+  echo "=== NOT DONE $(ts): egg re-register is outstanding"; exit 1
+fi
 if (( FAILS == 0 )); then echo "=== DEPLOY VERIFIED $(ts) ($SKIPPED check(s) skipped - see SKIP lines)"; else echo "=== $FAILS CHECK(S) FAILED $(ts)"; exit 1; fi
