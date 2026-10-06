@@ -105,3 +105,21 @@ def test_proxy_session_seed_is_per_match() -> None:
         "proxy session seed must be per-match, or 'rotate_per_request' does not "
         "rotate per request"
     )
+
+
+def test_breaker_defers_count_on_their_own_key() -> None:
+    """2026-10-06: BREAKER_OPEN defers have their own (larger) budget, so a
+    breaker trip never spends a target's rate-limit defer cycles."""
+    from scrape_core.defer_budget import BREAKER_DEFER_KEY_PREFIX
+
+    redis = _FakeRedis()
+    for _ in range(5):
+        consume_defer_budget(
+            redis,
+            scrape_job_id=JOB,
+            match_id=MATCH,
+            max_cycles=60,
+            key_prefix=BREAKER_DEFER_KEY_PREFIX,
+        )
+    assert redis.store == {defer_budget_key(JOB, MATCH, key_prefix=BREAKER_DEFER_KEY_PREFIX): 5}
+    assert defer_budget_key(JOB, MATCH) not in redis.store

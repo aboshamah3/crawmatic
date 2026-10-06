@@ -1051,7 +1051,9 @@ class GenericPriceSpider(scrapy.Spider):
         ):
             yield result
         if defer:
-            await redispatch_job(self._admission_context(), target)
+            await redispatch_job(
+                self._admission_context(), target, error_code=decision.skip_error_code
+            )
 
     def _build_result(
         self,

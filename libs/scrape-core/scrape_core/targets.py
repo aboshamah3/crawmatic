@@ -149,7 +149,7 @@ from scrape_core.limiter import (
 )
 from scrape_core.observability import log_event
 from scrape_core.reactor import deferred_delay
-from scrape_core.defer_budget import consume_defer_budget
+from scrape_core.defer_budget import BREAKER_DEFER_KEY_PREFIX, consume_defer_budget
 from scrape_core.result_builder import build_scrape_result
 
 logger = logging.getLogger(__name__)
@@ -603,8 +603,6 @@ def _mark_target_deferred_breaker_open(
     the dispatch, every later one is an ``ON CONFLICT`` no-op that the
     one delivery covers (``dispatch_job`` selects every DEFERRED target).
     """
-    from app_shared.config import get_settings
-
     with workspace_txn(workspace_id) as session:
         mark_target(
             session,
@@ -614,17 +612,36 @@ def _mark_target_deferred_breaker_open(
             status=ScrapeTargetStatus.DEFERRED,
             error_code=ScrapeErrorCode.BREAKER_OPEN,
         )
-        write_outbox_message(
-            session,
-            workspace_id=workspace_id,
-            task_name=SCRAPE_DISPATCH_JOB,
-            queue="scrape_dispatch",
-            kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(workspace_id)},
-            dedup_key=f"breaker-defer:{scrape_job_id}",
-            available_after_seconds=(
-                get_settings().SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS
-            ),
-        )
+        _write_breaker_defer_dispatch(session, workspace_id, scrape_job_id)
+
+
+def _write_breaker_defer_dispatch(
+    session: Any, workspace_id: uuid.UUID, scrape_job_id: uuid.UUID
+) -> None:
+    """The one debounced ``dispatch_job`` outbox row per job a breaker defer
+    schedules (``breaker-defer:<job>``; later writes in the window are
+    ``ON CONFLICT`` no-ops)."""
+    from app_shared.config import get_settings
+
+    write_outbox_message(
+        session,
+        workspace_id=workspace_id,
+        task_name=SCRAPE_DISPATCH_JOB,
+        queue="scrape_dispatch",
+        kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(workspace_id)},
+        dedup_key=f"breaker-defer:{scrape_job_id}",
+        available_after_seconds=get_settings().SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS,
+    )
+
+
+def _schedule_breaker_defer_dispatch(
+    workspace_id: uuid.UUID, scrape_job_id: uuid.UUID
+) -> None:
+    """:func:`_write_breaker_defer_dispatch` in its own transaction, for the
+    errback path whose DEFERRED mark rides on the pipeline item --
+    **Blocking**, only inside :func:`scrape_core.db.run_in_thread`."""
+    with workspace_txn(workspace_id) as session:
+        _write_breaker_defer_dispatch(session, workspace_id, scrape_job_id)
 
 
 def _mark_target_rate_limited_failed(
@@ -2106,7 +2123,12 @@ async def acquire_fetch_permission(
         await as_awaitable(deferred_delay(delay))
 
 
-async def redispatch_job(ctx: AdmissionContext, target: SpiderTarget) -> None:
+async def redispatch_job(
+    ctx: AdmissionContext,
+    target: SpiderTarget,
+    *,
+    error_code: ScrapeErrorCode | None = None,
+) -> None:
     """Re-enqueue this target's job on `scrape_dispatch` so a fresh
     `dispatch_job` run picks its DEFERRED targets back up.
 
@@ -2114,6 +2136,10 @@ async def redispatch_job(ctx: AdmissionContext, target: SpiderTarget) -> None:
     ceiling path, where the target's DEFERRED mark rides on the failed
     attempt's own item (`ScrapeResult.defer_target`) so the status can't
     lose a race against a separate write.
+
+    ``error_code=BREAKER_OPEN`` (2026-10-06, P5): the re-dispatch is the
+    one debounced outbox row per job instead of an enqueue per target, and
+    the cached breaker verdict is dropped -- same as the attempt-1 path.
     """
     scrape_job_id = ctx.scrape_job_id
     if scrape_job_id is None:
@@ -2124,12 +2150,18 @@ async def redispatch_job(ctx: AdmissionContext, target: SpiderTarget) -> None:
         )
         return
 
-    await await_in_thread(
-        enqueue,
-        SCRAPE_DISPATCH_JOB,
-        queue="scrape_dispatch",
-        kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(ctx.workspace_id)},
-    )
+    if error_code is ScrapeErrorCode.BREAKER_OPEN:
+        reset_breaker_gate_cache()
+        await await_in_thread(
+            _schedule_breaker_defer_dispatch, ctx.workspace_id, scrape_job_id
+        )
+    else:
+        await await_in_thread(
+            enqueue,
+            SCRAPE_DISPATCH_JOB,
+            queue="scrape_dispatch",
+            kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(ctx.workspace_id)},
+        )
     log_event(
         logger,
         "rate_limit.retry_deferred",
@@ -2169,15 +2201,42 @@ async def defer_rate_limited_target(
 
     if error_code is ScrapeErrorCode.BREAKER_OPEN:
         # 2026-10-06 (P5 + A9). A breaker defer is not this target being
-        # blocked: it spends NO defer cycle (a trip outlasting a few
-        # dispatch passes used to fail targets that were never allowed to
-        # try; the job and per-target deadlines still bound it), its
+        # blocked: it spends none of SCRAPE_MAX_DEFER_CYCLES (a trip
+        # outlasting a few dispatch passes used to fail targets that were
+        # never allowed to try) but its own SCRAPE_MAX_BREAKER_DEFER_CYCLES
+        # -- the ONLY bound on this loop: a persisted strategy cursor is
+        # never re-charged by the attempt ladder, and the per-target
+        # deadline re-anchors on `started_at` at every claim. Its
         # re-dispatch is one debounced outbox row per job (see
         # `_mark_target_deferred_breaker_open`), and the process's cached
         # breaker verdict is dropped so the next gate read sees the durable
         # row -- a breaker that has closed is honoured at once, not up to
         # `PROXY_BREAKER_STATE_CACHE_SECONDS` later.
+        from app_shared.config import get_settings
+
         reset_breaker_gate_cache()
+        if not consume_defer_budget(
+            get_redis_client(),
+            scrape_job_id=scrape_job_id,
+            match_id=target.match_id,
+            max_cycles=get_settings().SCRAPE_MAX_BREAKER_DEFER_CYCLES,
+            key_prefix=BREAKER_DEFER_KEY_PREFIX,
+        ):
+            await await_in_thread(
+                _mark_target_rate_limited_failed,
+                ctx.workspace_id,
+                scrape_job_id,
+                target.match_id,
+                ScrapeErrorCode.BREAKER_OPEN,
+            )
+            log_event(
+                logger,
+                "proxy_breaker.defer_budget_exhausted",
+                workspace_id=ctx.workspace_id,
+                scrape_job_id=scrape_job_id,
+                match_id=target.match_id,
+            )
+            return
         await await_in_thread(
             _mark_target_deferred_breaker_open,
             ctx.workspace_id,

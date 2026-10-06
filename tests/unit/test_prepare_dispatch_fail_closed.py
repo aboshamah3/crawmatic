@@ -367,7 +367,7 @@ class _DeferHarness:
         self.outbox: dict[tuple[object, str], dict[str, object]] = {}
         self.outbox_writes = 0
         self.enqueued: list[object] = []
-        self.defer_budget_calls = 0
+        self.redis = _HealthyRedis()
         self.sessions: list[object] = []
 
         async def _sync_await_in_thread(fn, *args, **kwargs):
@@ -396,30 +396,35 @@ class _DeferHarness:
                 },
             )
 
-        def _consume_defer_budget(*_a, **_kw):
-            self.defer_budget_calls += 1
-            return True
-
         monkeypatch.setattr(targets_mod, "await_in_thread", _sync_await_in_thread)
         monkeypatch.setattr(targets_mod, "workspace_txn", _workspace_txn)
         monkeypatch.setattr(targets_mod, "mark_target", _mark_target)
         monkeypatch.setattr(targets_mod, "write_outbox_message", _write_outbox_message)
         monkeypatch.setattr(targets_mod, "enqueue", lambda *a, **kw: self.enqueued.append(kw))
-        monkeypatch.setattr(targets_mod, "consume_defer_budget", _consume_defer_budget)
-        monkeypatch.setattr(targets_mod, "get_redis_client", lambda: _HealthyRedis())
+        monkeypatch.setattr(targets_mod, "get_redis_client", lambda: self.redis)
         monkeypatch.setattr(
             "app_shared.config.get_settings",
             lambda: SimpleNamespace(
                 SCRAPE_MAX_DEFER_CYCLES=3,
+                SCRAPE_MAX_BREAKER_DEFER_CYCLES=60,
                 SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS=60,
             ),
         )
 
-    def defer(self, ctx: object, error_code: ScrapeErrorCode, n: int) -> list[uuid.UUID]:
+    def counters(self, prefix: str) -> list[int]:
+        return [v for k, v in self.redis.counters.items() if k.startswith(prefix + ":")]
+
+    def defer(
+        self,
+        ctx: object,
+        error_code: ScrapeErrorCode,
+        n: int,
+        match_ids: list[uuid.UUID] | None = None,
+    ) -> list[uuid.UUID]:
         import asyncio
         from types import SimpleNamespace
 
-        match_ids = [uuid.uuid4() for _ in range(n)]
+        match_ids = match_ids or [uuid.uuid4() for _ in range(n)]
 
         async def _run() -> None:
             for match_id in match_ids:
@@ -471,10 +476,37 @@ def test_300_breaker_deferred_targets_schedule_one_dispatch(
     ]
 
 
-def test_a_breaker_defer_spends_no_defer_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_breaker_defer_spends_no_rate_limit_defer_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It counts on its own, larger budget instead (next test)."""
     harness = _DeferHarness(monkeypatch)
-    harness.defer(_ctx(), ScrapeErrorCode.BREAKER_OPEN, 5)
-    assert harness.defer_budget_calls == 0
+    target = uuid.uuid4()
+    harness.defer(_ctx(), ScrapeErrorCode.BREAKER_OPEN, 5, match_ids=[target] * 5)
+    assert harness.counters("defercycles") == []
+    assert harness.counters("breakerdefercycles") == [5]
+
+
+def test_a_breaker_defer_loop_is_bounded_by_its_own_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix round 2026-10-06: nothing else bounds it. A target whose cursor
+    is persisted is never re-charged by the attempt ladder, and its
+    deadline anchor (`started_at`) restarts on every claim, so without
+    this a DIRECT-first target escalating to proxy re-deferred every
+    ~60 s until the 12 h job deadline. The 61st defer fails it with
+    BREAKER_OPEN and schedules nothing."""
+    from app_shared.enums import ScrapeTargetStatus
+
+    harness = _DeferHarness(monkeypatch)
+    ctx = _ctx()
+    target = uuid.uuid4()
+    harness.defer(ctx, ScrapeErrorCode.BREAKER_OPEN, 61, match_ids=[target] * 61)
+
+    statuses = [status for _m, status, _c in harness.marked]
+    assert statuses == [ScrapeTargetStatus.DEFERRED] * 60 + [ScrapeTargetStatus.FAILED]
+    assert harness.marked[-1][2] is ScrapeErrorCode.BREAKER_OPEN
+    assert harness.outbox_writes == 60
 
 
 def test_a_breaker_defer_drops_the_cached_breaker_verdict(
@@ -500,6 +532,45 @@ def test_a_rate_limit_defer_keeps_its_budget_and_direct_enqueue(
     and still re-enqueues directly."""
     harness = _DeferHarness(monkeypatch)
     harness.defer(_ctx(), ScrapeErrorCode.RATE_LIMITED, 2)
-    assert harness.defer_budget_calls == 2
+    assert harness.counters("defercycles") == [1, 1]
     assert len(harness.enqueued) == 2
     assert harness.outbox == {}
+
+
+def test_the_retry_path_breaker_redispatch_also_fans_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The errback path marks DEFERRED through the pipeline and then calls
+    `redispatch_job`; for BREAKER_OPEN that re-dispatch is the same one
+    debounced outbox row per job, not one enqueue per target (P5)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    harness = _DeferHarness(monkeypatch)
+    ctx = _ctx()
+
+    async def _run() -> None:
+        for _ in range(300):
+            await targets_mod.redispatch_job(
+                ctx,
+                SimpleNamespace(match_id=uuid.uuid4()),
+                error_code=ScrapeErrorCode.BREAKER_OPEN,
+            )
+
+    asyncio.run(_run())
+
+    assert harness.enqueued == []
+    assert list(harness.outbox) == [(ctx.workspace_id, f"breaker-defer:{ctx.scrape_job_id}")]
+    assert harness.marked == []  # the pipeline owns the mark on this path
+
+
+def test_the_spider_tells_redispatch_why() -> None:
+    import inspect
+    from pathlib import Path
+
+    source = Path(
+        inspect.getfile(targets_mod)
+    ).parents[3].joinpath(
+        "apps/scrapers/price_monitor/spiders/generic_price_spider.py"
+    ).read_text()
+    assert "target, error_code=decision.skip_error_code" in source

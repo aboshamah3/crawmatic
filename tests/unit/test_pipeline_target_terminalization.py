@@ -611,3 +611,34 @@ def test_no_finalize_enqueue_when_no_item_carries_a_scrape_job_id(monkeypatch: A
     # (this file's own concern; SPEC-09 T029's ad-hoc PRICE_ANALYSIS_RECOMPUTE
     # enqueues are covered separately by test_recompute_triggers_pipeline.py).
     assert [c for c in enqueue.calls if c["name"] == SCRAPE_FINALIZE_JOBS] == []
+
+
+def test_a_breaker_defer_spends_the_breaker_budget_not_the_rate_limit_one(
+    monkeypatch: Any,
+) -> None:
+    """2026-10-06: the retry path's BREAKER_OPEN defer counts against
+    SCRAPE_MAX_BREAKER_DEFER_CYCLES on its own key, never against
+    SCRAPE_MAX_DEFER_CYCLES."""
+    from scrape_core.defer_budget import BREAKER_DEFER_KEY_PREFIX
+
+    _session, _txn, mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        pipelines_mod,
+        "consume_defer_budget",
+        lambda *args, **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(_FakeSettings, "SCRAPE_MAX_DEFER_CYCLES", 3, raising=False)
+    monkeypatch.setattr(_FakeSettings, "SCRAPE_MAX_BREAKER_DEFER_CYCLES", 60, raising=False)
+    item = _make_result(
+        success=False,
+        error_code=ScrapeErrorCode.BREAKER_OPEN,
+        defer_target=True,
+    )
+
+    _flush_batch(WORKSPACE_ID, [item])
+
+    assert [(c["max_cycles"], c.get("key_prefix")) for c in calls] == [
+        (60, BREAKER_DEFER_KEY_PREFIX)
+    ]
+    assert mark_target.calls[0]["status"] == ScrapeTargetStatus.DEFERRED

@@ -29,16 +29,27 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["defer_budget_key", "consume_defer_budget"]
+__all__ = ["BREAKER_DEFER_KEY_PREFIX", "defer_budget_key", "consume_defer_budget"]
+
+#: Key prefix of the separate BREAKER_OPEN defer budget (2026-10-06): a
+#: breaker trip is not the target being blocked, so it must not spend the
+#: target's rate-limit cycles, but it still needs a bound of its own
+#: (`SCRAPE_MAX_BREAKER_DEFER_CYCLES`).
+BREAKER_DEFER_KEY_PREFIX = "breakerdefercycles"
 
 #: Comfortably longer than a job's lifetime; the key is job-scoped, so it
 #: only needs to outlive the job that owns it.
 _KEY_TTL_SECONDS = 86_400
 
 
-def defer_budget_key(scrape_job_id: uuid.UUID | str, match_id: uuid.UUID | str) -> str:
+def defer_budget_key(
+    scrape_job_id: uuid.UUID | str,
+    match_id: uuid.UUID | str,
+    *,
+    key_prefix: str = "defercycles",
+) -> str:
     """Redis key holding how many times this target has been deferred."""
-    return f"defercycles:{scrape_job_id}:{match_id}"
+    return f"{key_prefix}:{scrape_job_id}:{match_id}"
 
 
 def consume_defer_budget(
@@ -47,6 +58,7 @@ def consume_defer_budget(
     scrape_job_id: uuid.UUID | str,
     match_id: uuid.UUID | str,
     max_cycles: int,
+    key_prefix: str = "defercycles",
 ) -> bool:
     """``True`` -> defer this target; ``False`` -> the budget is spent, fail it.
 
@@ -57,7 +69,7 @@ def consume_defer_budget(
     """
     if max_cycles <= 0:
         return False
-    key = defer_budget_key(scrape_job_id, match_id)
+    key = defer_budget_key(scrape_job_id, match_id, key_prefix=key_prefix)
     try:
         count = redis.incr(key)
         if count == 1:

@@ -133,7 +133,7 @@ from app_shared.redis_client import get_redis_client
 from app_shared.strategy.stats_buffer import record_attempt
 from app_shared.strategy.methods import is_method_health_failure
 
-from scrape_core.defer_budget import consume_defer_budget
+from scrape_core.defer_budget import BREAKER_DEFER_KEY_PREFIX, consume_defer_budget
 from app_shared.task_names import (
     PRICE_ANALYSIS_RECOMPUTE,
     SCRAPE_DISPATCH_JOB,
@@ -1230,7 +1230,17 @@ def _flush_batch(
                 get_redis_client(),
                 scrape_job_id=item.scrape_job_id,
                 match_id=item.match_id,
-                max_cycles=get_settings().SCRAPE_MAX_DEFER_CYCLES,
+                # 2026-10-06: a BREAKER_OPEN defer spends its own budget,
+                # never the target's rate-limit cycles (see
+                # `SCRAPE_MAX_BREAKER_DEFER_CYCLES`).
+                **(
+                    {
+                        "max_cycles": get_settings().SCRAPE_MAX_BREAKER_DEFER_CYCLES,
+                        "key_prefix": BREAKER_DEFER_KEY_PREFIX,
+                    }
+                    if item.error_code == ScrapeErrorCode.BREAKER_OPEN
+                    else {"max_cycles": get_settings().SCRAPE_MAX_DEFER_CYCLES}
+                ),
             ):
                 # 2026-08-02: the next attempt was rate-ceiling-gated, so
                 # this failure is NOT terminal -- the target is handed back
