@@ -907,3 +907,69 @@ def test_per_variant_route_now_carries_old_price(
     assert item["old_price"] == "120.0000"
     assert item["product_variant_id"] == str(variant.id)
     assert item["match_status"] == "ACTIVE"
+
+
+# --- archived matches are excluded by default (risk review 2026-10-06, P6) ---
+
+
+def _seed_active_and_archived(session: FakeAlertsListSession):
+    variant = _make_variant()
+    competitor = _make_competitor(name="Competitor One")
+    base = datetime.now(timezone.utc)
+    active = _make_match(
+        variant_id=variant.id, competitor=competitor, url="https://c1.example/a", created_at=base
+    )
+    archived = _make_match(
+        variant_id=variant.id, competitor=competitor, url="https://c1.example/b",
+        created_at=base + timedelta(seconds=1),
+    )
+    archived.status = MatchStatus.ARCHIVED
+    paused = _make_match(
+        variant_id=variant.id, competitor=competitor, url="https://c1.example/c",
+        created_at=base + timedelta(seconds=2),
+    )
+    paused.status = MatchStatus.PAUSED
+    session.seed(variant, competitor, active, archived, paused)
+    app.dependency_overrides[get_current_principal] = _override_principal(
+        session, scopes=["alerts:read"]
+    )
+    return active, archived, paused
+
+
+def test_bulk_competitor_prices_excludes_archived_matches_by_default(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    active, _archived, paused = _seed_active_and_archived(session)
+
+    body = client.get("/v1/variants/competitor-prices").json()
+
+    assert [i["match_id"] for i in body["items"]] == [str(active.id), str(paused.id)]
+    assert {i["match_status"] for i in body["items"]} == {"ACTIVE", "PAUSED"}
+
+
+def test_bulk_competitor_prices_include_archived_flag_returns_them(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    active, archived, paused = _seed_active_and_archived(session)
+
+    body = client.get(
+        "/v1/variants/competitor-prices", params={"include_archived": "true"}
+    ).json()
+
+    assert [i["match_id"] for i in body["items"]] == [str(active.id), str(archived.id), str(paused.id)]
+
+
+def test_bulk_competitor_prices_archived_filter_pages_cleanly(
+    client: TestClient, session: FakeAlertsListSession
+) -> None:
+    """The filter sits inside the keyset page, so a page never comes back
+    short because archived rows were dropped after the LIMIT."""
+    active, _archived, paused = _seed_active_and_archived(session)
+
+    first = client.get("/v1/variants/competitor-prices", params={"limit": 1}).json()
+    assert [i["match_id"] for i in first["items"]] == [str(active.id)]
+    second = client.get(
+        "/v1/variants/competitor-prices", params={"limit": 1, "cursor": first["next_cursor"]}
+    ).json()
+    assert [i["match_id"] for i in second["items"]] == [str(paused.id)]
+    assert second["next_cursor"] is None

@@ -26,7 +26,7 @@ from app_shared.catalog.consistency import (
     assert_refs_in_workspace,
 )
 from app_shared.catalog.upsert import plan_upsert
-from app_shared.enums import MatchPriority, ScrapeJobStatus, ScrapeScope
+from app_shared.enums import MatchPriority, MatchStatus, ScrapeJobStatus, ScrapeScope
 from app_shared.jobs.service import create_scope_job
 from app_shared.messaging import enqueue
 from app_shared.models.alerts import VariantPriceState
@@ -263,6 +263,7 @@ def _stitch_competitor_prices(
 def list_all_competitor_prices(
     limit: int | None = None,
     cursor: str | None = None,
+    include_archived: bool = False,
     principal_ctx: tuple = Depends(require_scopes("alerts:read")),
 ) -> CompetitorPriceListResponse:
     """`GET /v1/variants/competitor-prices` — every match's latest price.
@@ -272,6 +273,15 @@ def list_all_competitor_prices(
     carries `product_variant_id` so the client can group), keyset-paginated
     over `(created_at, id)` — a client snapshots the whole table in
     `ceil(n / limit)` calls instead of one per variant. Scope `alerts:read`.
+
+    ARCHIVED matches (removed by the merchant, never scraped again) are
+    left out unless `include_archived=true` (risk review 2026-10-06, P6:
+    the SaaS read-model sync snapshots this route every few minutes and
+    archived rows only grow). The filter sits inside the keyset page, so a
+    page is never short because rows were dropped after the LIMIT. The
+    keyset walk is served by `ix_cpm_ws_created_id`
+    `(workspace_id, created_at, id)`. Contract:
+    `docs/contracts/api-variants-competitor-prices.md`.
     """
     session, principal = principal_ctx
     assert isinstance(principal, Principal)
@@ -279,6 +289,8 @@ def list_all_competitor_prices(
 
     page_limit = clamp_limit(limit)
     stmt = scoped_select(CompetitorProductMatch, ws)
+    if not include_archived:
+        stmt = stmt.where(CompetitorProductMatch.status != MatchStatus.ARCHIVED)
     if cursor is not None:
         try:
             after = decode_cursor(cursor)

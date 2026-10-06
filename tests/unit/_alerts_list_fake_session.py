@@ -70,6 +70,10 @@ def _eval_clause(
         return actual in _resolve_bind_value(right)
     if op is sa_operators.eq:
         return actual == _resolve_bind_value(clause.right)
+    if op is sa_operators.ne:
+        return actual != _resolve_bind_value(clause.right)
+    if op is operator.gt:
+        return actual > _resolve_bind_value(clause.right)
     if op is sa_operators.is_:
         if isinstance(clause.right, Null):
             return actual is None
