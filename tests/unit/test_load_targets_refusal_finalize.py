@@ -30,7 +30,7 @@ from sqlalchemy.pool import StaticPool
 from app_shared.enums import ScrapeErrorCode, ScrapeTargetStatus
 from app_shared.jobs.targets import (
     REFUSAL_FINALIZABLE_TARGET_STATUSES,
-    mark_targets_started,
+    claim_targets_started,
 )
 from app_shared.models.jobs import ScrapeJobTarget
 from scrape_core import targets as targets_mod
@@ -83,18 +83,20 @@ def test_a_target_refused_after_the_claim_is_finalized_with_the_refusal_code(
     kept = _add(db_session, ScrapeTargetStatus.PENDING)
 
     # Production order: the pickup claims the batch first...
-    mark_targets_started(
+    claimed = claim_targets_started(
         db_session,
         workspace_id=_WORKSPACE_ID,
         scrape_job_id=_JOB_ID,
         match_ids=[refused, kept],
     )
+    assert claimed == {refused, kept}
     # ...then the ladder refuses one of them.
     targets_mod._finalize_refused_targets(
         db_session,
         workspace_id=_WORKSPACE_ID,
         scrape_job_id=_JOB_ID,
         refusals_by_match={refused: ScrapeErrorCode.ATTEMPT_BUDGET_EXHAUSTED},
+        claimed_match_ids=claimed,
     )
 
     row = _row(db_session, refused)
@@ -108,21 +110,70 @@ def test_a_target_refused_after_the_claim_is_finalized_with_the_refusal_code(
 @pytest.mark.parametrize(
     "status", [ScrapeTargetStatus.PENDING, ScrapeTargetStatus.DEFERRED]
 )
-def test_an_unclaimed_refused_target_is_finalized_too(
+def test_a_claimed_pending_or_deferred_target_is_finalized(
     db_session: Session, status: ScrapeTargetStatus
 ) -> None:
     match_id = _add(db_session, status)
+    claimed = claim_targets_started(
+        db_session, workspace_id=_WORKSPACE_ID, scrape_job_id=_JOB_ID, match_ids=[match_id]
+    )
 
     targets_mod._finalize_refused_targets(
         db_session,
         workspace_id=_WORKSPACE_ID,
         scrape_job_id=_JOB_ID,
         refusals_by_match={match_id: ScrapeErrorCode.TARGET_DEADLINE_EXCEEDED},
+        claimed_match_ids=claimed,
     )
 
     row = _row(db_session, match_id)
     assert row.status == ScrapeTargetStatus.FAILED
     assert row.error_code == ScrapeErrorCode.TARGET_DEADLINE_EXCEEDED
+
+
+def test_a_refused_target_another_load_holds_is_left_to_that_load(
+    db_session: Session,
+) -> None:
+    """2026-10-06 (A9): only rows THIS load claimed are finalized.
+
+    A duplicate spider run (a re-dispatch racing a live run) loads a
+    target the live run already holds STARTED; its claim matches nothing
+    for that row. Its ladder may still refuse it -- e.g. it reads the
+    budget the live run has just charged -- and the old guard (every
+    non-terminal status) then failed a target that was mid-fetch."""
+    held = _add(db_session, ScrapeTargetStatus.STARTED)
+    claimed = claim_targets_started(
+        db_session, workspace_id=_WORKSPACE_ID, scrape_job_id=_JOB_ID, match_ids=[held]
+    )
+    assert claimed == set()
+
+    targets_mod._finalize_refused_targets(
+        db_session,
+        workspace_id=_WORKSPACE_ID,
+        scrape_job_id=_JOB_ID,
+        refusals_by_match={held: ScrapeErrorCode.ATTEMPT_BUDGET_EXHAUSTED},
+        claimed_match_ids=claimed,
+    )
+
+    row = _row(db_session, held)
+    assert row.status == ScrapeTargetStatus.STARTED
+    assert row.error_code is None
+
+
+def test_claim_returns_exactly_the_rows_it_moved(db_session: Session) -> None:
+    pending = _add(db_session, ScrapeTargetStatus.PENDING)
+    deferred = _add(db_session, ScrapeTargetStatus.DEFERRED)
+    started = _add(db_session, ScrapeTargetStatus.STARTED)
+    done = _add(db_session, ScrapeTargetStatus.COMPLETED)
+
+    claimed = claim_targets_started(
+        db_session,
+        workspace_id=_WORKSPACE_ID,
+        scrape_job_id=_JOB_ID,
+        match_ids=[pending, deferred, started, done],
+    )
+
+    assert claimed == {pending, deferred}
 
 
 @pytest.mark.parametrize(
@@ -144,6 +195,9 @@ def test_a_refusal_never_overwrites_a_finished_target(
         workspace_id=_WORKSPACE_ID,
         scrape_job_id=_JOB_ID,
         refusals_by_match={match_id: ScrapeErrorCode.ATTEMPT_BUDGET_EXHAUSTED},
+        # Even if a caller wrongly listed it, a terminal row is never
+        # overwritten: the status guard still applies.
+        claimed_match_ids={match_id},
     )
 
     row = _row(db_session, match_id)
@@ -167,6 +221,8 @@ def test_load_targets_finalizes_refusals_through_the_helper() -> None:
     source = inspect.getsource(targets_mod.load_targets)
     assert "_finalize_refused_targets(" in source
     assert "only_if_status=PICKUP_ELIGIBLE_TARGET_STATUSES" not in source
+    # ...and hands it the rows its own claim moved (2026-10-06).
+    assert "claimed_match_ids=claimed_match_ids" in source
 
 
 # --- a load-made selection is persisted on the cursor ------------------

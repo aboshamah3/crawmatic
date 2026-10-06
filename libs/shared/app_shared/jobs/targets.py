@@ -40,6 +40,7 @@ __all__ = [
     "REFUSAL_FINALIZABLE_TARGET_STATUSES",
     "aggregate_counts",
     "mark_target",
+    "claim_targets_started",
     "mark_targets_started",
     "stamp_target_timestamps",
 ]
@@ -251,10 +252,24 @@ def mark_targets_started(
 
     Returns the number of targets actually transitioned.
     """
+    stmt = _started_claim_stmt(workspace_id, scrape_job_id, match_ids, only_if_status)
+    if stmt is None:
+        return 0
+    return session.execute(stmt).rowcount or 0
+
+
+def _started_claim_stmt(
+    workspace_id: uuid.UUID | str,
+    scrape_job_id: uuid.UUID | str,
+    match_ids: Sequence[uuid.UUID | str],
+    only_if_status: Iterable[ScrapeTargetStatus],
+) -> Any:
+    """The one ``UPDATE ... SET status='STARTED'`` both claim forms run,
+    or ``None`` when there is nothing it could match."""
     eligible = tuple(only_if_status)
     if not match_ids or not eligible:
-        return 0
-    stmt = (
+        return None
+    return (
         update(ScrapeJobTarget)
         .where(
             ScrapeJobTarget.workspace_id == workspace_id,
@@ -267,7 +282,29 @@ def mark_targets_started(
             started_at=func.now(),
         )
     )
-    return session.execute(stmt).rowcount or 0
+
+
+def claim_targets_started(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID | str,
+    scrape_job_id: uuid.UUID | str,
+    match_ids: Sequence[uuid.UUID | str],
+    only_if_status: Iterable[ScrapeTargetStatus] = PICKUP_ELIGIBLE_TARGET_STATUSES,
+) -> set[uuid.UUID]:
+    """:func:`mark_targets_started`, returning WHICH match ids it moved.
+
+    Same single ``UPDATE`` (``RETURNING match_id``), same idempotency and
+    terminal-safety. The caller needs the set, not the count, to finalize
+    only what it owns (2026-10-06): a row another load already holds
+    ``STARTED`` is not in it, so a duplicate run cannot terminalize a
+    target that is mid-fetch elsewhere.
+    """
+    stmt = _started_claim_stmt(workspace_id, scrape_job_id, match_ids, only_if_status)
+    if stmt is None:
+        return set()
+    rows = session.execute(stmt.returning(ScrapeJobTarget.match_id)).all()
+    return {uuid.UUID(str(row[0])) for row in rows}
 
 
 def mark_target(

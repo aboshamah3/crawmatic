@@ -603,7 +603,7 @@ def test_load_targets_performs_the_pickup_on_the_loads_own_session(
 
     monkeypatch.setattr("app_shared.config.get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(targets_mod, "workspace_txn", _FakeWorkspaceTxn(session))
-    monkeypatch.setattr(targets_mod, "mark_targets_started", _recorder)
+    monkeypatch.setattr(targets_mod, "claim_targets_started", _recorder)
 
     with pytest.raises(_StopAfterPickup):
         targets_mod.load_targets(_WORKSPACE_ID, [match.id], scrape_job_id=_JOB_ID)
@@ -630,8 +630,8 @@ def test_load_targets_without_a_job_id_performs_no_pickup(
     monkeypatch.setattr(targets_mod, "workspace_txn", _FakeWorkspaceTxn(session))
     monkeypatch.setattr(
         targets_mod,
-        "mark_targets_started",
-        lambda *a, **k: calls.append(k) or 0,
+        "claim_targets_started",
+        lambda *a, **k: calls.append(k) or set(),
     )
 
     with pytest.raises(Exception):  # noqa: B017 - the un-faked load continues and fails
@@ -665,7 +665,8 @@ def test_started_transition_is_reachable_from_production_code() -> None:
     import inspect
 
     source = inspect.getsource(targets_mod.load_targets)
-    assert "mark_targets_started(" in source
+    # 2026-10-06: the claim form that also returns which rows it moved.
+    assert "claim_targets_started(" in source
 
 
 def test_sqlite_fixture_really_persisted_a_row(db_session: Session) -> None:

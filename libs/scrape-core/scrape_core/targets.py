@@ -51,6 +51,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlsplit
 
@@ -91,7 +92,7 @@ from app_shared.enums import (
 from app_shared.jobs.targets import (
     REFUSAL_FINALIZABLE_TARGET_STATUSES,
     mark_target,
-    mark_targets_started,
+    claim_targets_started,
 )
 from app_shared.limiter.fleet import prime_fleet_limits_cache, resolve_fleet_limits
 from app_shared.limiter.limits import resolve_limits
@@ -517,6 +518,7 @@ def _finalize_refused_targets(
     workspace_id: uuid.UUID,
     scrape_job_id: uuid.UUID,
     refusals_by_match: dict[uuid.UUID, ScrapeErrorCode],
+    claimed_match_ids: Collection[uuid.UUID],
 ) -> None:
     """Fail every target the attempt ladder refused, with the refusal's code.
 
@@ -529,8 +531,16 @@ def _finalize_refused_targets(
     re-sent it every ~15 minutes until the job deadline. ``mark_target``
     stays the single writer, and a terminal target still keeps the outcome
     it earned.
+
+    Only rows in ``claimed_match_ids`` -- the ones THIS load's
+    :func:`claim_targets_started` moved -- are finalized (2026-10-06). A
+    refused row it did not claim is ``STARTED`` by another, live load (a
+    duplicate run); failing it would terminalize a target mid-fetch. It is
+    still dropped from this load; its owner finishes it.
     """
     for refused_match_id, refusal_code in refusals_by_match.items():
+        if refused_match_id not in claimed_match_ids:
+            continue
         mark_target(
             session,
             workspace_id=workspace_id,
@@ -913,7 +923,7 @@ def load_targets(
         #   * it marks only match_ids that actually resolved in-workspace
         #     -- a match_id that does not exist here is not work anyone is
         #     about to do, and claiming it started would be a lie;
-        #   * `mark_targets_started` is the BATCH form (exactly one
+        #   * `claim_targets_started` is the BATCH form (exactly one
         #     `UPDATE`, whatever `len(match_ids)`), so this bounded load
         #     stays bounded (Principle IV) -- the per-match `mark_target`
         #     shape would have added one statement per target to the
@@ -925,13 +935,18 @@ def load_targets(
         # `COALESCE(started_at, now())` cannot move a timestamp that is
         # already set -- so a duplicate spider run leaves every
         # `started_at` exactly where the first run put it.
+        #
+        # 2026-10-06: the claim returns WHICH rows it moved, so the refusal
+        # pass below finalizes only targets this load owns.
+        claimed_match_ids: set[uuid.UUID] = set()
         if scrape_job_id is not None:
-            started = mark_targets_started(
+            claimed_match_ids = claim_targets_started(
                 session,
                 workspace_id=workspace_id,
                 scrape_job_id=scrape_job_id,
                 match_ids=[match.id for match in matches],
             )
+            started = len(claimed_match_ids)
             if started:
                 log_event(
                     logger,
@@ -1324,6 +1339,7 @@ def load_targets(
                 workspace_id=workspace_id,
                 scrape_job_id=scrape_job_id,
                 refusals_by_match=refusals_by_match,
+                claimed_match_ids=claimed_match_ids,
             )
 
         targets: list[SpiderTarget] = []
