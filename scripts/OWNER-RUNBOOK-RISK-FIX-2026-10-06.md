@@ -110,3 +110,58 @@ Verify (read-only, after the next nightly run): `proxy_circuit_breakers.observed
 `breaker-defer:<job>` row per job.
 
 Rollback: redeploy the previous engine deployment; no schema change to undo.
+
+## Task 8: catalog index and API read shape (P6, P7)
+
+What ships (with the Task 6 deploy, same branch): one more additive migration
+`e2b8d4f6a1c3` on top of `d7a1f3c5e902`, so **the single head is now `e2b8d4f6a1c3`** (Task 6
+step 1 and the `/version` check in step 6 expect it instead of `d7a1f3c5e902`). It builds
+`ix_cpm_ws_created_id` on `competitor_product_matches (workspace_id, created_at, id)` with
+`CREATE INDEX CONCURRENTLY` (no write lock; a few seconds at today's ~5k matches). Code changes
+ship in `api` (competitor-prices archived filter, candidates cap, title-stage ordering); the loader
+runs from this box.
+
+The deploy script was fixed in place: `/srv/crawmatic/deploy-engine-security-2026-10-02.sh` now
+runs its alembic preflight, collision dry run and manifest build with
+`/srv/crawmatic/crawmatic/.venv` (the `crawmatic-wt-security-2026-10-02` worktree can go),
+expects `NEW_HEAD=e2b8d4f6a1c3`, and accepts a live head of `a7c41e9d2b56`, `d7a1f3c5e902` or
+`e2b8d4f6a1c3`. An in-repo mirror with the branch default set to this branch is at
+`scripts/deploy-engine-risk-fix-2026-10-06.sh`; either works with the Task 6 commands:
+
+    cd /srv/crawmatic/crawmatic && uv run alembic heads      # expect: e2b8d4f6a1c3 (head)
+    ! DEPLOY_SHA=$(git -C /srv/crawmatic/crawmatic rev-parse fix/risk-review-engine-2026-10-06) bash /srv/crawmatic/crawmatic/scripts/deploy-engine-risk-fix-2026-10-06.sh --dry-run
+    ! SET_JWT_GRACE=1 DEPLOY_SHA=$(git -C /srv/crawmatic/crawmatic rev-parse fix/risk-review-engine-2026-10-06) bash /srv/crawmatic/crawmatic/scripts/deploy-engine-risk-fix-2026-10-06.sh
+
+Steps after the deploy:
+
+1. Confirm the index built valid (read-only DSN from Task 6):
+
+       ! psql "$(cat /root/.crawmatic/engine-prod-readonly-dsn)" -Atc "SELECT c.relname, i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'ix_cpm_ws_created_id'"
+       # expect: ix_cpm_ws_created_id|t
+       # 'f' = an interrupted CONCURRENTLY build: DROP INDEX CONCURRENTLY ix_cpm_ws_created_id; then re-run the migrate service
+
+2. API behaviour change to know about: `GET /v1/variants/competitor-prices` leaves out ARCHIVED
+   matches unless `include_archived=true` (contract `docs/contracts/api-variants-competitor-prices.md`).
+   The SaaS read-model sync and the monitoring price map call this route; archived (merchant
+   removed) matches drop out of their snapshots after the deploy. The per-variant route is
+   unchanged. The candidates route (`docs/contracts/admin-index-candidates.md`) now does at most
+   50 variants per request and the SaaS already follows `next_cursor`.
+
+3. Next catalog index load (whenever the crawl index is refreshed). The loader now refuses
+   (exit 2, nothing written) when the database volume has under `--min-free-gb` (default 6 GiB)
+   free, so the wrapper needs the volume size. Read it in the Railway dashboard (engine project ->
+   `postgres` -> Volume, size in GB), then:
+
+       ! DB_VOLUME_GB=<volume GiB> bash /srv/crawmatic/crawmatic/scripts/load-catalog-index-prod.sh
+       # optional: MIN_FREE_GB=8 to demand more headroom; MIN_FREE_GB=0 turns the check off
+
+   The summary JSON (`/srv/crawmatic/evidence/catalog-index-load-2026-10-02/load-summary.json`)
+   now carries `rows_before`, `rows_after` and `db_free_gb_before`; both tables are
+   `VACUUM (ANALYZE)`d after the old generation is deleted.
+
+4. DR: `scripts/dr/RUNBOOK.md` "Restoring for real" step 6. After any restore, the catalog index
+   tables are empty (their data is excluded from dumps) while `catalog_index_loads` still says
+   active: run step 3's command against the restored database before re-enabling SaaS discovery.
+
+Rollback: redeploy the previous `api` deployment. The migration downgrades cleanly
+(`DROP INDEX CONCURRENTLY IF EXISTS ix_cpm_ws_created_id`); leaving the index in place is harmless.
