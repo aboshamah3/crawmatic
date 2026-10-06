@@ -322,7 +322,7 @@ def test_usage_requires_since_and_until():
     assert resp.status_code == 422
 
 
-def test_slugify_truncates_the_name_not_the_ref():
+def test_slugify_is_display_only_and_bounded():
     """`f"{base}-{ref}"[:200]` used to truncate from the END, which is
     where `external_ref` lives -- since `name` is capped at 200 chars,
     two different refs on a 200-char name collided into the same slug,
@@ -330,15 +330,7 @@ def test_slugify_truncates_the_name_not_the_ref():
     workspace. Truncating `base` (never `ref`) fixes this."""
     from app.routers.admin import _slugify
 
-    long_name = "A" * 200
-    slug_alpha = _slugify(long_name, "ref-alpha")
-    slug_beta = _slugify(long_name, "ref-beta")
-
-    assert slug_alpha != slug_beta
-    assert slug_alpha.endswith("ref-alpha")
-    assert slug_beta.endswith("ref-beta")
-    assert len(slug_alpha) <= 200
-    assert len(slug_beta) <= 200
+    assert len(_slugify("A" * 200)) <= 200
 
 
 def test_provision_duplicate_external_ref_is_409(client, session):
@@ -355,7 +347,8 @@ def test_provision_duplicate_external_ref_is_409(client, session):
         return original_flush(*args, **kwargs)
 
     session.flush = _flush_raising_once
-    session.rollback = lambda *a, **k: None
+    # A real rollback discards the unflushed Workspace; the fake has no undo log.
+    session.rollback = lambda *a, **k: session._rows.pop(type(session.added[0]), None)
 
     resp = client.post(
         "/v1/admin/workspaces",
@@ -364,3 +357,131 @@ def test_provision_duplicate_external_ref_is_409(client, session):
     )
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "DUPLICATE_EXTERNAL_REF"
+
+
+def _provision(client, name, ref):
+    return client.post(
+        "/v1/admin/workspaces",
+        json={"name": name, "external_ref": ref},
+        headers=SERVICE_HEADERS,
+    )
+
+
+def _keys(session):
+    return [o for o in session.added if type(o).__name__ == "ApiKey"]
+
+
+def test_same_ref_different_name_is_same_workspace_one_key(client, session):
+    first = _provision(client, "Acme", "proj_1")
+    second = _provision(client, "Totally Different", "proj_1")
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json()["workspace_id"] == first.json()["workspace_id"]
+    assert second.json()["api_key"] is None
+    assert len(_keys(session)) == 1
+    assert len([o for o in session.added if type(o).__name__ == "Workspace"]) == 1
+
+
+def test_refs_differing_only_in_punctuation_are_two_workspaces(client, session):
+    a = _provision(client, "Shop", "Store_1")
+    b = _provision(client, "Shop", "store.1")
+    assert a.status_code == b.status_code == 201
+    assert a.json()["workspace_id"] != b.json()["workspace_id"]
+    assert len(_keys(session)) == 2
+
+
+def test_name_ref_boundary_split_is_two_workspaces(client, session):
+    a = _provision(client, "a-b", "c")
+    b = _provision(client, "a", "b-c")
+    assert a.status_code == b.status_code == 201
+    assert a.json()["workspace_id"] != b.json()["workspace_id"]
+
+
+def test_slug_collisions_get_numeric_suffixes(client, session):
+    for ref in ("r1", "r2", "r3"):
+        assert _provision(client, "Acme Store", ref).status_code == 201
+    slugs = [o.slug for o in session.added if type(o).__name__ == "Workspace"]
+    assert slugs == ["acme-store", "acme-store-2", "acme-store-3"]
+
+
+def test_backfill_script_emits_guarded_updates():
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "scripts/security/backfill_workspace_external_ref.py"
+    spec = importlib.util.spec_from_file_location("backfill_ref", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ws = str(uuid.uuid4())
+    (stmt,) = mod.build_statements([[ws, "proj'1"]])
+    assert "external_ref IS NULL" in stmt and "'proj''1'" in stmt
+    with pytest.raises(ValueError):
+        mod.build_statements([[ws, "a"], [ws, "b"]])
+
+
+# --- legacy (pre-E5, external_ref IS NULL) adoption: P6 review finding 3 ----
+
+
+def _seed_legacy(session, ref, *, slug=None):
+    from app_shared.enums import ApiKeyStatus, WorkspaceStatus
+    from app_shared.models.identity import ApiKey, Workspace
+
+    ws = Workspace(
+        id=uuid.uuid4(), name="Acme", slug=slug or f"acme-{uuid.uuid4().hex[:6]}",
+        external_ref=None, status=WorkspaceStatus.ACTIVE,
+    )
+    session.seed(ws)
+    session.seed(
+        ApiKey(
+            id=uuid.uuid4(), workspace_id=ws.id, name=f"saas-bootstrap:{ref}",
+            key_prefix="ck_x", key_hash="h", scopes=[], status=ApiKeyStatus.REVOKED,
+        )
+    )
+    return ws
+
+
+def _provision_nocred(client, name, ref):
+    # No credential header: require_service_token is overridden, and with no
+    # identity the abuse limiter never counts the request (full-suite safe).
+    return client.post("/v1/admin/workspaces", json={"name": name, "external_ref": ref})
+
+
+def test_reprovision_adopts_legacy_workspace_without_new_key(client, session):
+    legacy = _seed_legacy(session, "proj_1", slug="acme-proj-1")
+    resp = _provision_nocred(client, "Acme Renamed", "proj_1")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["workspace_id"] == str(legacy.id)
+    assert resp.json()["api_key"] is None
+    assert legacy.external_ref == "proj_1"
+    assert [o for o in session.added if type(o).__name__ in ("Workspace", "ApiKey")] == []
+    # Second call now hits the unique external_ref lookup.
+    again = _provision_nocred(client, "Acme", "proj_1")
+    assert again.status_code == 200
+    assert again.json()["workspace_id"] == str(legacy.id)
+
+
+def test_legacy_adoption_is_exact_on_the_raw_ref(client, session):
+    # Same legacy slug spelling ("shop-store-1") but a different raw ref:
+    # must NOT adopt -- that is the punctuation collision E5 removes.
+    legacy = _seed_legacy(session, "Store_1", slug="shop-store-1")
+    resp = _provision_nocred(client, "Shop", "store.1")
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["workspace_id"] != str(legacy.id)
+    assert legacy.external_ref is None
+
+
+def test_already_adopted_workspace_is_not_readopted_for_its_key(client, session):
+    legacy = _seed_legacy(session, "proj_9")
+    legacy.external_ref = "proj_9_other"
+    resp = _provision_nocred(client, "Acme", "proj_9")
+    assert resp.status_code == 201
+    assert resp.json()["workspace_id"] != str(legacy.id)
+
+
+def test_ambiguous_legacy_ref_is_409_and_creates_nothing(client, session):
+    _seed_legacy(session, "proj_2")
+    _seed_legacy(session, "proj_2")
+    resp = _provision_nocred(client, "Acme", "proj_2")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "DUPLICATE_EXTERNAL_REF"
+    assert session.added == []

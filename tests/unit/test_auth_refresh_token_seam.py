@@ -240,3 +240,54 @@ def test_refresh_token_expiry_is_taken_from_settings(seams: _Seams) -> None:
 
     inserted = [o for o in seams.added_on("auth") if isinstance(o, RefreshToken)][0]
     assert inserted.expires_at >= before + timedelta(seconds=1209600 - 5)
+
+
+# =====================================================================
+# Security plan 2026-10-02 (E10): refresh-token families
+# =====================================================================
+
+
+def test_login_pair_starts_a_new_family(seams: _Seams, user: User) -> None:
+    auth_router._issue_pair(user=user)
+    auth_router._issue_pair(user=user)
+
+    inserted = [o for o in seams.added_on("auth") if isinstance(o, RefreshToken)]
+    assert len(inserted) == 2
+    assert inserted[0].family_id is not None and inserted[1].family_id is not None
+    assert inserted[0].family_id != inserted[1].family_id
+
+
+def test_rotation_keeps_the_family_of_the_rotated_token(
+    monkeypatch: pytest.MonkeyPatch, seams: _Seams, user: User
+) -> None:
+    family = uuid.uuid4()
+    seams.rotated = {"id": uuid.uuid4(), "user_id": user.id, "family_id": family}
+
+    auth_router.refresh(auth_router.RefreshRequest(refresh_token="presented-raw-token"))
+
+    inserted = [o for o in seams.added_on("auth") if isinstance(o, RefreshToken)]
+    assert [o.family_id for o in inserted] == [family]
+
+
+def test_refresh_reuse_revokes_the_whole_family(monkeypatch, user: User) -> None:
+    """A token that was already rotated is presented again -> family revoked, 401."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app_shared.security.tokens import REVOKE_REUSED_REFRESH_FAMILY_SQL
+
+    seams = _Seams(rotated=None, user=user)
+    monkeypatch.setattr(auth_router, "get_auth_session", seams._factory("auth"))
+
+    with pytest.raises(HTTPException) as raised:
+        auth_router.refresh(auth_router.RefreshRequest(refresh_token="already-rotated"))
+    assert raised.value.status_code == 401
+
+    statements = seams.statements_on("auth")
+    assert any("family_id = (" in s for s in statements), (
+        "a replayed (already rotated) refresh token must revoke its family"
+    )
+    assert "revoked_at IS NOT NULL" in REVOKE_REUSED_REFRESH_FAMILY_SQL
+    assert "AND revoked_at IS NULL" in REVOKE_REUSED_REFRESH_FAMILY_SQL
+    # The family revoke is committed in the same auth-seam transaction.
+    assert all(s.commits == 1 for s in seams.opened)
+    assert seams.added_on("auth") == []

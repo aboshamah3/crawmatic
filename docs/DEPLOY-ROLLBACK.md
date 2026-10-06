@@ -198,6 +198,25 @@ the head I think it did" — hit it after the `migrate` step and confirm
 `db_migration_head` is `f2a6c1d80b37` (or later) before deploying `api`,
 per the section above.
 
+**It needs a bearer (security plan 2026-10-02, owner decision H1).** An
+anonymous `GET /version` answers only `{"status":"ok"}`; every field above
+(`git_sha`, both migration heads, `manifest_id`, the digests) is returned
+only when the request carries `Authorization: Bearer <INDEX_SERVICE_TOKEN>`
+(timing-safe compare; if `INDEX_SERVICE_TOKEN` is unset on `api`, nobody
+gets the full payload). Never put the token on a command line. Pass it to
+curl through a header file read from the 0600 token file:
+
+```bash
+curl -s -m 15 -H @<(printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' < /root/.crawmatic/index-service-token)") \
+  "$API/version" | python3 -m json.tool
+```
+
+The deploy scripts (`scripts/deploy-*.sh`, `/srv/crawmatic/deploy-core-*.sh`)
+do this through their `version_json` helper, reading `$INDEX_SERVICE_TOKEN`
+or `$INDEX_TOKEN_FILE` (default `/root/.crawmatic/index-service-token`).
+They warn when neither exists, because a hardened `api` would then make every
+SHA/head check read empty and the waits would time out.
+
 **Its `git_sha` field has a known gap that matters for "which image am I
 rolling back TO."** `git_sha` reads `GIT_SHA` (set at build time by this
 repo's own `images` CI job) or falls back to `RAILWAY_GIT_COMMIT_SHA`,
@@ -248,7 +267,8 @@ branch.
   itself, including the full defect writeup and why it is idempotent and
   safe to re-run.
 - `apps/api/app/routers/version.py` — `/version`'s implementation and the
-  `git_sha: "unknown"` fallback behavior.
+  `git_sha: "unknown"` fallback behavior, and the bearer gate on everything
+  except `{"status":"ok"}`.
 - `docs/ops/RUNBOOK_STOP_DISPATCH_AND_SPEND.md` — the companion runbook for
   stopping dispatch/spend without corrupting in-flight jobs; read alongside
   this one if a rollback is happening because something is actively

@@ -30,8 +30,12 @@ network call (FR-021, contracts/robots-middleware.md "Testability").
 
 from __future__ import annotations
 
+import http.client
 import inspect
+import ipaddress
 import logging
+import socket
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -41,11 +45,18 @@ from urllib.robotparser import RobotFileParser
 from scrapy.exceptions import IgnoreRequest
 
 from app_shared.enums import RobotsPolicy
+from app_shared.url_safety import UnsafeUrlError, UnsafeUrlReason
 
 from scrape_core.db import run_in_thread
 from scrape_core.errors import ROBOTS_BLOCKED_ERROR_CODE
+from scrape_core.safety.fetch import Resolver, system_resolver, validate_resolved_target
 
-__all__ = ["RobotsPolicyMiddleware", "RobotsBlockedError", "default_robots_fetcher"]
+__all__ = [
+    "RobotsPolicyMiddleware",
+    "RobotsBlockedError",
+    "UnsafeTargetError",
+    "default_robots_fetcher",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -66,27 +77,149 @@ class RobotsBlockedError(IgnoreRequest):
         self.error_code = ROBOTS_BLOCKED_ERROR_CODE
 
 
-def default_robots_fetcher(robots_url: str, user_agent: str = "price_monitor") -> str | None:
-    """Best-effort robots.txt fetch for real (non-fixture) runs.
+#: Hard cap on how much of a robots.txt body is read (Google's own limit
+#: is 500 KiB; anything past this is ignored, never buffered).
+_ROBOTS_MAX_BYTES = 512 * 1024
+_ROBOTS_TIMEOUT_SECONDS = 5.0
 
-    Never called by unit tests (a fixture-backed fetcher is always
-    injected there, per contracts/robots-middleware.md "Testability").
+#: Module-level seam so tests can inject a fake DNS answer while still
+#: exercising the real `validate_resolved_target` guard.
+_system_resolver: Resolver = system_resolver
+
+
+class UnsafeTargetError(UnsafeUrlError):
+    """The robots.txt host failed the fetch-time SSRF guard."""
+
+    def __init__(
+        self,
+        message: str,
+        reason: UnsafeUrlReason = UnsafeUrlReason.PRIVATE_OR_INTERNAL_IP,
+    ) -> None:
+        super().__init__(reason, message)
+
+
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host else host
+
+
+def _resolve_validated_ip(host: str, port: int) -> str:
+    """Resolve `host` once, validate every answer, return the IP to dial.
+
+    Reuses (never re-implements) `scrape_core.safety.fetch.
+    validate_resolved_target` -- the same guard behind the spider
+    middleware, the browser guard and the strategy discovery probe. The
+    resolver is wrapped so the addresses the guard approved are exactly
+    the addresses we connect to: no second lookup, no rebinding window.
+    Raises `UnsafeUrlError` (incl. `UnsafeTargetError`) or `OSError`.
+    """
+    answers: list[str] = []
+
+    def capturing_resolver(name: str) -> list[str]:
+        resolved = list(_system_resolver(name))
+        answers.extend(resolved)
+        return resolved
+
+    validate_resolved_target(
+        f"http://{_url_host(host)}:{port}/robots.txt", resolver=capturing_resolver
+    )
+    if not answers:
+        raise UnsafeTargetError(f"no validated address for {host!r}")
+    return answers[0]
+
+
+def _resolve_loopback_ip_for_test(host: str) -> str:
+    """Test-only resolution: loopback answers only, everything else refused."""
+    resolved = list(_system_resolver(host))
+    if not resolved or not all(ipaddress.ip_address(ip).is_loopback for ip in resolved):
+        raise UnsafeTargetError(f"test mode only allows loopback, got {host!r}")
+    return resolved[0]
+
+
+def _open_connection(
+    scheme: str, ip: str, port: int, host: str
+) -> http.client.HTTPConnection:
+    """Connect to the already-validated `ip`; TLS SNI + cert check use `host`."""
+    if scheme == "https":
+        context = ssl.create_default_context()
+        raw = socket.create_connection((ip, port), timeout=_ROBOTS_TIMEOUT_SECONDS)
+        try:
+            tls = context.wrap_socket(raw, server_hostname=host)
+        except BaseException:
+            raw.close()
+            raise
+        conn = http.client.HTTPSConnection(
+            ip, port, context=context, timeout=_ROBOTS_TIMEOUT_SECONDS
+        )
+        conn.sock = tls
+        return conn
+    conn = http.client.HTTPConnection(ip, port, timeout=_ROBOTS_TIMEOUT_SECONDS)
+    conn.sock = socket.create_connection((ip, port), timeout=_ROBOTS_TIMEOUT_SECONDS)
+    return conn
+
+
+def default_robots_fetcher(
+    robots_url: str,
+    user_agent: str = "price_monitor",
+    *,
+    _allow_loopback_for_test: bool = False,
+) -> str | None:
+    """Best-effort robots.txt fetch for real (non-fixture) runs, SSRF-guarded.
+
     Must only ever be invoked off the reactor thread (`process_request`
     below always calls this via `run_in_thread`). Returns `None` (fail
-    open — no robots.txt means "allow", the conventional robots.txt
-    absence semantics) on any fetch error.
-    """
-    import urllib.request
+    open -- no robots.txt means "allow", the conventional absence
+    semantics) on any fetch error, any non-2xx status, any redirect
+    (3xx is never followed: a redirect is the classic SSRF pivot), or a
+    host the SSRF guard refuses. The connection is made to the validated
+    IP with `Host:` (and TLS SNI/verification) set to the hostname, and
+    at most `_ROBOTS_MAX_BYTES` of body are read.
 
+    `_allow_loopback_for_test` is keyword-only and test-only: it admits
+    loopback answers (and only loopback) so a local fixture server can be
+    reached. Production callers never pass it.
+    """
+    conn: http.client.HTTPConnection | None = None
     try:
-        request = urllib.request.Request(  # noqa: S310
-            robots_url,
-            headers={"User-Agent": user_agent},
+        parts = urlsplit(robots_url)
+        scheme = (parts.scheme or "").lower()
+        host = parts.hostname
+        if scheme not in ("http", "https") or not host:
+            return None
+        default_port = 443 if scheme == "https" else 80
+        port = parts.port or default_port
+
+        if _allow_loopback_for_test:
+            ip = _resolve_loopback_ip_for_test(host)
+        else:
+            ip = _resolve_validated_ip(host, port)
+
+        host_header = _url_host(host) if port == default_port else f"{_url_host(host)}:{port}"
+        path = parts.path or "/robots.txt"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+
+        conn = _open_connection(scheme, ip, port, host)
+        conn.request(
+            "GET",
+            path,
+            headers={"Host": host_header, "User-Agent": user_agent, "Accept": "text/plain, */*"},
         )
-        with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
-            return response.read().decode("utf-8", errors="replace")
+        response = conn.getresponse()
+        if not 200 <= response.status < 300:
+            return None
+        body = response.read(_ROBOTS_MAX_BYTES)
+        return body.decode("utf-8", errors="replace")
+    except UnsafeUrlError as exc:
+        logger.warning("robots: fetch refused by SSRF guard url=%s reason=%s", robots_url, exc.reason)
+        return None
     except Exception:  # noqa: BLE001 - best-effort only, never raise from here
         return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class RobotsPolicyMiddleware:

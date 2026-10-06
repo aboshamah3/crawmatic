@@ -26,6 +26,8 @@ import re
 import unicodedata
 from collections.abc import Iterable
 
+from app_shared.domains import canonical_domain
+
 __all__ = [
     "KIND_BARCODE",
     "KIND_MODEL",
@@ -181,7 +183,11 @@ def normalise_domain(value: object) -> str:
 
 def host_of(value: object) -> str:
     """The bare host of a domain or URL (`salla.sa/store` -> `salla.sa`)."""
-    return normalise_domain(value).split("/", 1)[0].split(":", 1)[0]
+    host = normalise_domain(value).split("/", 1)[0].split(":", 1)[0]
+    try:
+        return canonical_domain(host)
+    except ValueError:
+        return host
 
 
 def store_domain_of_url(url: object) -> str:

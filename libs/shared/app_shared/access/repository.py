@@ -141,15 +141,29 @@ def _policy_visibility_map(
     return {row.id: row.workspace_id for row in rows}
 
 
+class GlobalPolicyNotAssignable(Exception):
+    """A tenant principal tried to assign a global (``workspace_id IS NULL``) policy."""
+
+    def __init__(self, policy_id: uuid.UUID | str) -> None:
+        self.policy_id = policy_id
+        super().__init__(f"policy {policy_id} is global; only an operator may assign it")
+
+
 def assert_policy_assignable(
-    session: Session, workspace_id: uuid.UUID | str, policy_id: uuid.UUID | str | None
+    session: Session,
+    workspace_id: uuid.UUID | str,
+    policy_id: uuid.UUID | str | None,
+    *,
+    allow_global: bool = False,
 ) -> None:
     """Assignment-time visibility check for ``DomainAccessRule.access_policy_id``
     (and any other caller assigning an ``AccessPolicy``).
 
     ``policy_id is None`` -> OK (clearing an assignment is always
-    allowed). Otherwise: visible (own or global) -> OK; dangling ->
-    `MissingReference`; cross-workspace -> `CrossWorkspaceReference`.
+    allowed). Otherwise: own workspace -> OK; global -> OK only with
+    ``allow_global=True`` (operator/service principal), else
+    `GlobalPolicyNotAssignable`; dangling -> `MissingReference`;
+    cross-workspace -> `CrossWorkspaceReference`.
     """
     if policy_id is None:
         return
@@ -159,5 +173,7 @@ def assert_policy_assignable(
         raise MissingReference(policy_id)
 
     actual_workspace_id = visibility[policy_id]
+    if actual_workspace_id is None and not allow_global:
+        raise GlobalPolicyNotAssignable(policy_id)
     if actual_workspace_id is not None and actual_workspace_id != workspace_id:
         raise CrossWorkspaceReference(policy_id, workspace_id, actual_workspace_id)

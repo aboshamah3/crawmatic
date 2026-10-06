@@ -58,6 +58,8 @@ class Workspace(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(Text(), nullable=False)
     slug: Mapped[str] = mapped_column(Text(), nullable=False, unique=True)
     status: Mapped[WorkspaceStatus] = enum_column(WorkspaceStatus, nullable=False)
+    # The SaaS project id: the provisioning idempotency key (security E5).
+    external_ref: Mapped[str | None] = mapped_column(Text(), nullable=True, unique=True)
     default_scrape_profile_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )
@@ -110,6 +112,11 @@ class RefreshToken(Base):
     expires_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), nullable=False)
+    # Rotation family (security plan 2026-10-02, E10). NULL only on rows
+    # issued before the column existed; see ROTATE_REFRESH_TOKEN_SQL.
+    family_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
 
 
 class ApiKey(Base, WorkspaceScopedBase, TimestampMixin):

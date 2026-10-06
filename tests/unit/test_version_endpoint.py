@@ -52,9 +52,22 @@ def _clear_overrides() -> Iterator[None]:
     app.dependency_overrides.clear()
 
 
+_INDEX_TOKEN = "v" * 48
+
+
+def _authorized_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Owner decision H1: the full /version payload needs the index bearer."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        version, "get_settings", lambda: SimpleNamespace(INDEX_SERVICE_TOKEN=_INDEX_TOKEN)
+    )
+    return TestClient(app, headers={"Authorization": f"Bearer {_INDEX_TOKEN}"})
+
+
 @pytest.fixture()
-def client() -> TestClient:
-    return TestClient(app)
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return _authorized_client(monkeypatch)
 
 
 def _override_session(session: _FakeSession) -> None:
@@ -64,7 +77,7 @@ def _override_session(session: _FakeSession) -> None:
     app.dependency_overrides[version._get_db_session] = _fake_dependency
 
 
-def test_version_requires_no_auth_header(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_version_answers_200_to_the_index_service_caller(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(version, "_code_migration_head", lambda: "abc123")
     _override_session(_FakeSession(row=_FakeRow("abc123")))
 
@@ -147,3 +160,54 @@ def test_version_path_excluded_from_admin_internal_tags() -> None:
     from app.openapi_public import INTERNAL_TAGS
 
     assert "version" not in INTERNAL_TAGS
+
+
+# --- security plan 2026-10-02, owner decision H1 ---------------------------
+
+
+def _anonymous_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("GIT_SHA", "deadbeefcafe0123456789")
+    monkeypatch.setattr(
+        version, "get_settings", lambda: SimpleNamespace(INDEX_SERVICE_TOKEN=_INDEX_TOKEN)
+    )
+    monkeypatch.setattr(version, "_code_migration_head", lambda: "abc123")
+    _override_session(_FakeSession(row=_FakeRow("abc123")))
+
+
+def test_version_without_a_token_has_no_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    _anonymous_setup(monkeypatch)
+    resp = TestClient(app).get("/version")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+    assert "deadbeef" not in resp.text and "abc123" not in resp.text
+
+
+def test_version_with_a_wrong_token_has_no_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    _anonymous_setup(monkeypatch)
+    resp = TestClient(app).get("/version", headers={"Authorization": "Bearer " + "x" * 48})
+    assert resp.json() == {"status": "ok"}
+
+
+def test_version_with_the_index_token_reports_the_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    _anonymous_setup(monkeypatch)
+    body = (
+        TestClient(app)
+        .get("/version", headers={"Authorization": f"Bearer {_INDEX_TOKEN}"})
+        .json()
+    )
+    assert body["git_sha"] == "deadbeefcafe0123456789"
+    assert body["db_migration_head"] == "abc123"
+
+
+def test_version_is_anonymous_only_when_no_index_token_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    _anonymous_setup(monkeypatch)
+    monkeypatch.setattr(version, "get_settings", lambda: SimpleNamespace(INDEX_SERVICE_TOKEN=None))
+    resp = TestClient(app).get("/version", headers={"Authorization": "Bearer "})
+    assert resp.json() == {"status": "ok"}

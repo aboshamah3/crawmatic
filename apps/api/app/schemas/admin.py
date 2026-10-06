@@ -16,7 +16,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app_shared.enums import ApiKeyStatus, WorkspaceStatus
+from app_shared.enums import ApiKeyStatus, LegalStatus, RobotsPolicy, WorkspaceStatus
 
 
 class WorkspaceProvisionRequest(BaseModel):
@@ -32,7 +32,8 @@ class WorkspaceProvisionResponse(BaseModel):
     """The one and only time the bootstrap key is returned in plaintext."""
 
     workspace_id: uuid.UUID
-    api_key: str
+    #: None when the external_ref already had a workspace (idempotent replay).
+    api_key: str | None = None
     external_ref: str
 
 
@@ -199,3 +200,22 @@ class ProfileRegexUnquarantineResponse(BaseModel):
     was_quarantined: bool
     quarantined_at: datetime | None
     regex_timeout_count: int
+
+
+class CompetitorApprovalRequest(BaseModel):
+    """`PATCH /v1/admin/workspaces/{id}/competitors/{id}/approval` body (E7).
+
+    The operator-only way to set the robots bypass / legal approval that
+    tenant routes reject with 403 OPERATOR_APPROVAL_REQUIRED.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    robots_policy: RobotsPolicy | None = None
+    legal_status: LegalStatus | None = None
+
+
+class CompetitorApprovalResponse(BaseModel):
+    competitor_id: uuid.UUID
+    robots_policy: RobotsPolicy
+    legal_status: LegalStatus

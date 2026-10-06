@@ -111,8 +111,8 @@ class _FakeResult:
     def all(self) -> list[Any]:
         return []
 
-    def first(self) -> None:
-        return None
+    def first(self) -> Any:
+        return self._scalar_one
 
     def scalar_one_or_none(self) -> Any:
         return self._scalar_one
@@ -125,12 +125,21 @@ class _FakeSession:
         self.added: list[list[Any]] = []
         self.executed: list[Any] = []
         self.target_row: Any = None
+        self.competitor_domain: str | None = "shop.example.com"
 
     def add_all(self, items: Any) -> None:
         self.added.append(list(items))
 
     def execute(self, stmt: Any) -> Any:
         self.executed.append(stmt)
+        if "competitors" in str(stmt):
+            # E4 host-binding lookup: (competitor.domain) row for the match.
+            row = (
+                SimpleNamespace(domain=self.competitor_domain)
+                if self.competitor_domain is not None
+                else None
+            )
+            return _FakeResult(row)
         return _FakeResult(self.target_row)
 
 
@@ -409,6 +418,26 @@ def test_cross_mode_handoff_persists_cursor_and_reenters_dispatch(
     dispatches = [call for call in enqueue.calls if call["name"] == SCRAPE_DISPATCH_JOB]
     assert len(dispatches) == 1
     assert [call for call in enqueue.calls if call["name"] == SCRAPE_FINALIZE_JOBS] == []
+
+
+def test_handoff_url_on_foreign_host_is_not_persisted(monkeypatch: Any) -> None:
+    """E4: a strategy-repaired canonical URL off the competitor's host is dropped."""
+    session, _txn, _mark_target, _enqueue, _redis = _install_fakes(monkeypatch)
+    item = _make_result(success=False, chain_complete=False)
+    item.next_strategy_method_id = uuid.uuid4()
+    item.canonical_url = "https://evil.example.net/steal"
+    session.target_row = SimpleNamespace(
+        current_strategy_method_id=None,
+        strategy_attempt_ordinal=0,
+        chain_token=None,
+        strategy_url_override="https://old.example/",
+        dispatched_at=object(),
+    )
+
+    _flush_batch(WORKSPACE_ID, [item])
+
+    assert session.target_row.strategy_url_override is None
+    assert session.target_row.current_strategy_method_id == item.next_strategy_method_id
 
 
 def test_handoffs_of_one_job_share_one_delayed_dispatch(monkeypatch: Any) -> None:

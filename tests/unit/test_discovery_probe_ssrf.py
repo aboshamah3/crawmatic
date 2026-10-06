@@ -34,13 +34,19 @@ import requests
 
 from app.workers import tasks_strategy as ts
 
+# `_probe_get` sends each validated hop through `_pinned_get(url, ip, ...)`
+# (audit E2, see test_discovery_probe_pinned_ip.py); stub that seam with a
+# requests.get-shaped fake.
+def _route(fake):
+    return lambda url, ip, **kwargs: fake(url, **kwargs)
+
 # --- 1. a host resolving to a private address is refused, no fetch made ---
 
 fetched = []
 def _boom(*args, **kwargs):
     fetched.append(args)
-    raise AssertionError("requests.get must never be reached for an unsafe target")
-ts.requests.get = _boom
+    raise AssertionError("no fetch may be made for an unsafe target")
+ts._pinned_get = _route(_boom)
 
 ts._probe_resolver = lambda host: ["10.0.0.7"]
 assert ts._fetch_direct("https://rebind.example.com/p/1", retry=False) is None, "direct leg"
@@ -81,7 +87,7 @@ def _ok(url, **kwargs):
     calls.append(url)
     assert kwargs.get("allow_redirects") is False, kwargs
     return _Resp()
-ts.requests.get = _ok
+ts._pinned_get = _route(_ok)
 ts._probe_resolver = lambda host: ["93.184.216.34"]
 assert ts._fetch_direct("https://shop.example.com/p/1", retry=False) == "<html>ok</html>"
 assert calls == ["https://shop.example.com/p/1"], calls
@@ -98,7 +104,7 @@ def _redirect_then_private(url, **kwargs):
 def _resolver(host):
     return ["93.184.216.34"] if host == "shop.example.com" else ["10.1.2.3"]
 
-ts.requests.get = _redirect_then_private
+ts._pinned_get = _route(_redirect_then_private)
 ts._probe_resolver = _resolver
 assert ts._fetch_direct("https://shop.example.com/p/1", retry=False) is None
 assert hops == ["https://shop.example.com/p/1"], hops
@@ -111,7 +117,7 @@ def _redirect_then_public(url, **kwargs):
     return _Resp(200, "<html>followed</html>")
 
 hops.clear()
-ts.requests.get = _redirect_then_public
+ts._pinned_get = _route(_redirect_then_public)
 ts._probe_resolver = lambda host: ["93.184.216.34"]
 assert ts._fetch_direct("https://shop.example.com/p/1", retry=False) == "<html>followed</html>"
 assert hops == ["https://shop.example.com/p/1", "https://cdn.example.com/p/1"], hops
@@ -120,7 +126,7 @@ assert hops == ["https://shop.example.com/p/1", "https://cdn.example.com/p/1"], 
 
 ts._build_proxy_kwargs = lambda session, workspace_id: {"proxies": {}, "headers": {}}
 ts.paid_requests_allowed = lambda *a, **k: (True, None)
-ts.requests.get = _boom
+ts._pinned_get = _route(_boom)
 ts._probe_resolver = lambda host: ["192.168.5.5"]
 import uuid
 assert ts._fetch_via_proxy(None, uuid.uuid4(), "https://rebind.example.com/p/1") is None

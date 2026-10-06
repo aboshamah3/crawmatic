@@ -7,9 +7,11 @@ metadata," so a correct local fix can't silently be absent from what is
 actually deployed, and a green test run can be tied to the exact SHA +
 migration head that produced it.
 
-`GET /version` — unauthenticated, same posture as `/health` (an
-ops-facing diagnostic surface has to be curl-able without a bearer
-credential to be useful during an incident) but, unlike `/health`
+`GET /version` — SECURITY PLAN 2026-10-02 (owner decision H1): an
+anonymous caller gets only ``{"status": "ok"}``; the full payload below
+requires ``Authorization: Bearer <INDEX_SERVICE_TOKEN>`` (timing-safe
+compare). Deploy scripts send that bearer from an env var / 0600 env
+file. Historically this was unauthenticated, same posture as `/health`,, unlike `/health`
 (SPEC-01, contracts/health.md — MUST NOT touch the database), this
 endpoint DOES read the database: that is the whole point. It queries
 exactly one system table (`alembic_version`) — never tenant/workspace
@@ -64,15 +66,17 @@ ever constructing a `Settings`.
 
 from __future__ import annotations
 
+import hmac
 import os
 from collections.abc import Iterator
 from pathlib import Path
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app_shared.config import get_settings
 from app_shared.database import get_session
 from app_shared.release import get_release_identity
 
@@ -157,8 +161,44 @@ def _code_migration_head() -> str | None:
         return None
 
 
-@router.get("/version", response_model=VersionResponse)
-def version(session: Session = Depends(_get_db_session)) -> VersionResponse:
+class VersionPublicResponse(BaseModel):
+    """What an anonymous caller gets: liveness only, no build identity."""
+
+    status: str = "ok"
+
+
+_BEARER = "Bearer "
+
+
+def _is_index_service_caller(authorization: str | None) -> bool:
+    """True only for a bearer equal to ``INDEX_SERVICE_TOKEN`` (timing-safe).
+
+    Owner decision H1 (security plan 2026-10-02): the build identity
+    (git SHA, migration heads, manifest/digests) is reconnaissance data,
+    so it is served only to the operator/deploy tooling that holds
+    ``INDEX_SERVICE_TOKEN``. Unset or blank token -> nobody qualifies.
+    """
+    token = (get_settings().INDEX_SERVICE_TOKEN or "").strip()
+    if not token or not authorization or not authorization.startswith(_BEARER):
+        return False
+    presented = authorization[len(_BEARER) :].strip()
+    if not presented:
+        return False
+    return hmac.compare_digest(
+        presented.encode("utf-8", "surrogateescape"), token.encode("utf-8", "surrogateescape")
+    )
+
+
+@router.get("/version", response_model=VersionResponse | VersionPublicResponse)
+def version(
+    session: Session = Depends(_get_db_session),
+    authorization: str | None = Header(default=None),
+) -> VersionResponse | VersionPublicResponse:
+    if not _is_index_service_caller(authorization):
+        # Anonymous (or wrong-token) callers: 200 liveness, nothing else,
+        # and no database read.
+        return VersionPublicResponse()
+
     code_head = _code_migration_head()
     db_head: str | None = None
     db_error: str | None = None

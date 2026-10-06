@@ -99,6 +99,30 @@ def get_user_status(redis: object, session_factory: SessionFactory, user_id: obj
     return _get_cached_status(redis, session_factory, f"status:user:{user_id}", _load)
 
 
+def get_user_role(redis: object, session_factory: SessionFactory, user_id: object) -> str:
+    """Return the cached (or freshly-read) ``users.role`` for ``user_id``.
+
+    Security plan 2026-10-02 (E10): authorization uses the role stored on
+    the user row, never the ``role`` claim the token was minted with, so a
+    demotion takes effect on the next request (within
+    ``STATUS_CACHE_TTL_SECONDS``, or at once after :func:`invalidate_user`)
+    instead of surviving until the access token expires. Same fail-safe
+    contract as the status lookups: any failure or a missing row returns
+    :data:`STATUS_UNAVAILABLE`, which is no valid role.
+    """
+
+    def _load(session: Session) -> str | None:
+        user = session.execute(
+            select(User).where(User.id == user_id)  # noqa: workspace-scope
+        ).scalar_one_or_none()
+        if user is None:
+            return None
+        role = user.role
+        return str(getattr(role, "value", role))
+
+    return _get_cached_status(redis, session_factory, f"role:user:{user_id}", _load)
+
+
 def get_workspace_status(
     redis: object, session_factory: SessionFactory, workspace_id: object
 ) -> str:
@@ -121,6 +145,10 @@ def invalidate_user(redis: object, user_id: object) -> None:
     """Clear the cached status for ``user_id`` for immediate propagation on suspend."""
     try:
         redis.delete(f"status:user:{user_id}")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        redis.delete(f"role:user:{user_id}")  # type: ignore[attr-defined]
     except Exception:
         pass
 

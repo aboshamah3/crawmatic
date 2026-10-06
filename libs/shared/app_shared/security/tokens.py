@@ -20,13 +20,39 @@ import secrets
 # presented token was already rotated, expired, or revoked (or never
 # existed) -> reject with the uniform auth error. No session-scoped lock
 # is used (correct under PgBouncer transaction pooling, FR-010/SC-002).
+#
+# Security plan 2026-10-02 (E10): every refresh token belongs to a
+# `family_id` (one login = one family; each rotation inherits it). A row
+# from before the column existed has a NULL family; rotating it adopts the
+# caller-supplied fresh `:new_family_id`, so the rotated row and its
+# successor share a family from then on.
 ROTATE_REFRESH_TOKEN_SQL = """
 UPDATE refresh_tokens
-   SET revoked_at = now()
+   SET revoked_at = now(),
+       family_id = COALESCE(family_id, :new_family_id)
  WHERE token_hash = :token_hash
    AND revoked_at IS NULL
    AND expires_at > now()
-RETURNING id, user_id
+RETURNING id, user_id, family_id
+"""
+
+# Reuse detection (E10): run when the rotation above matched zero rows. If
+# the presented token exists but was ALREADY revoked (rotated or logged
+# out), someone is replaying a superseded token -- revoke every still-live
+# token in its family, so whichever party holds the current one (the
+# legitimate client or the thief) has to log in again. An expired or
+# unknown token matches nothing here (no family is touched).
+REVOKE_REUSED_REFRESH_FAMILY_SQL = """
+UPDATE refresh_tokens
+   SET revoked_at = now()
+ WHERE family_id = (
+         SELECT family_id
+           FROM refresh_tokens
+          WHERE token_hash = :token_hash
+            AND revoked_at IS NOT NULL
+            AND family_id IS NOT NULL
+       )
+   AND revoked_at IS NULL
 """
 
 # The idempotent revocation predicate used by POST /v1/auth/logout: revokes

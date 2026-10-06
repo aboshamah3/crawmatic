@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -46,6 +46,8 @@ from app_shared.models.competitors_matches import CompetitorProductMatch
 from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.models.observations import PriceObservation
 from app_shared.models.proxy_breaker import GLOBAL_BREAKER_SCOPE, ProxyCircuitBreaker
+
+from app.index_auth import require_index_token
 
 router = APIRouter(tags=["health"])
 
@@ -174,11 +176,19 @@ def _oldest_pending_target_age_seconds(session: Session, *, now: datetime) -> fl
     return (now - oldest).total_seconds()
 
 
-@router.get("/health/scraping", response_model=ScrapingHealthResponse)
+@router.get(
+    "/health/scraping",
+    response_model=ScrapingHealthResponse,
+    # Security plan 2026-10-02: this reports internal pipeline state
+    # (breaker, freshness, backlog age), so it needs a service bearer --
+    # INDEX_SERVICE_TOKEN or SAAS_SERVICE_TOKEN, fail-closed when neither
+    # is configured. `/live`, `/ready` and `/health` stay public.
+    dependencies=[Depends(require_index_token)],
+)
 def health_scraping() -> ScrapingHealthResponse:
     """Scraping-pipeline signal (EPA B8/F16). NEVER gates `/ready` — see
-    this module's docstring. Always answers 200; `status` carries the
-    verdict."""
+    this module's docstring. Always answers 200 to an authorized caller;
+    `status` carries the verdict."""
     now = datetime.now(UTC)
     try:
         with get_session() as session:

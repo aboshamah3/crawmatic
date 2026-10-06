@@ -85,6 +85,7 @@ from app_shared.profiles.repository import assert_profile_assignable, profile_vi
 from app_shared.repository import scoped_get, scoped_select
 from app_shared.task_names import PRICE_ANALYSIS_RECOMPUTE
 from app_shared.url_pattern import derive_match_url_fields
+from app_shared.domains import url_host_belongs_to_domain
 from app_shared.url_safety import UnsafeUrlError, validate_competitor_url
 
 from app.deps import Principal, require_scopes
@@ -124,6 +125,28 @@ def _unsafe_url(exc: UnsafeUrlError) -> HTTPException:
         status_code=422,
         detail={"error": {"code": "UNSAFE_URL", "message": str(exc), "reason": exc.reason.value}},
     )
+
+
+def _match_host_not_competitor(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"error": {"code": "MATCH_HOST_NOT_COMPETITOR", "message": message}},
+    )
+
+
+def _assert_url_belongs_to_competitor(
+    session: Session, workspace_id: uuid.UUID, competitor_id: uuid.UUID, url: str
+) -> None:
+    row = session.execute(
+        select(Competitor.domain).where(
+            Competitor.workspace_id == workspace_id, Competitor.id == competitor_id
+        )
+    ).first()
+    domain = row.domain if row is not None else None
+    if domain is None or not url_host_belongs_to_domain(url, domain):
+        raise _match_host_not_competitor(
+            "The match URL's host must be the competitor's domain or one of its subdomains."
+        )
 
 
 def _duplicate_match(message: str) -> HTTPException:
@@ -416,6 +439,7 @@ def create_match(
 
     variant = _resolve_variant(session, ws, payload)
     _resolve_competitor(session, ws, payload.competitor_id)
+    _assert_url_belongs_to_competitor(session, ws, payload.competitor_id, payload.competitor_url)
     _check_scrape_profile_assignable(session, ws, payload.scrape_profile_id)
     _check_protected_link_cap(
         session,
@@ -587,6 +611,59 @@ def _resolve_variant_maps(
     return by_external_id, by_sku, by_id
 
 
+def _reject_foreign_hosts(
+    session: Session,
+    workspace_id: uuid.UUID,
+    row_dicts: list[dict],
+    safe: list[dict],
+    rejected: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """E3 for bulk-upsert: drop rows whose URL host is not the competitor's domain.
+
+    Same rule as ``POST /v1/matches`` (`_assert_url_belongs_to_competitor`):
+    the host must be the competitor's canonical domain or a subdomain of it.
+    Offending rows are reported per row in ``rejected`` with code
+    ``MATCH_HOST_NOT_COMPETITOR`` (FR-013 reject-and-report: the rest of the
+    batch still lands). Competitors outside this workspace are left alone
+    here so the existing 404/403 reference checks still fire for them.
+    ``prepare_match_urls`` keeps ``safe`` in input order minus the
+    ``UNSAFE_URL`` rows, which is how each safe row's original index is
+    recovered.
+    """
+    if not safe:
+        return safe, []
+    unsafe_indices = {item["index"] for item in rejected}
+    safe_indices = [i for i in range(len(row_dicts)) if i not in unsafe_indices]
+    competitor_ids = {row["competitor_id"] for row in safe}
+    domains = {
+        row.id: row.domain
+        for row in session.execute(
+            select(Competitor.id, Competitor.domain).where(
+                Competitor.workspace_id == workspace_id,
+                Competitor.id.in_(competitor_ids),
+            )
+        ).all()
+    }
+    kept: list[dict] = []
+    host_rejected: list[dict] = []
+    for index, row in zip(safe_indices, safe, strict=True):
+        competitor_id = row["competitor_id"]
+        if competitor_id in domains and not url_host_belongs_to_domain(
+            row["competitor_url"], domains[competitor_id]
+        ):
+            host_rejected.append(
+                {
+                    "index": index,
+                    "code": "MATCH_HOST_NOT_COMPETITOR",
+                    "reason": "host_not_competitor_domain",
+                    "url": row["competitor_url"],
+                }
+            )
+            continue
+        kept.append(row)
+    return kept, host_rejected
+
+
 @router.post("/bulk-upsert", response_model=MatchBulkUpsertResult, status_code=200)
 def bulk_upsert_matches(
     payload: MatchBulkUpsertRequest,
@@ -612,6 +689,9 @@ def bulk_upsert_matches(
     row_dicts = [item.model_dump() for item in payload.matches]
 
     safe, rejected = prepare_match_urls(row_dicts)
+    safe, host_rejected = _reject_foreign_hosts(session, ws, row_dicts, safe, rejected)
+    if host_rejected:
+        rejected = sorted([*rejected, *host_rejected], key=lambda item: item["index"])
     deduped = list(dedup_last_wins(safe, match_conflict_key))
 
     external_ids, skus, variant_ids = variant_lookup_keys(deduped)
@@ -773,6 +853,9 @@ def update_match(
             validate_competitor_url(new_url)
         except UnsafeUrlError as exc:
             raise _unsafe_url(exc) from exc
+        _assert_url_belongs_to_competitor(
+            session, principal.workspace_id, match.competitor_id, new_url
+        )
         normalized_url, url_pattern, url_pattern_version = derive_match_url_fields(new_url)
         match.competitor_url = new_url
         match.normalized_competitor_url = normalized_url

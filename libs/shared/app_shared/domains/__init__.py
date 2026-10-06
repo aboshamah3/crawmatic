@@ -23,4 +23,14 @@ An admin UI over that audit trail is the one piece still outstanding; a
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from app_shared.domains.canonical import (
+    canonical_domain,
+    plan_competitor_domain_rewrite,
+    url_host_belongs_to_domain,
+)
+
+__all__: list[str] = [
+    "canonical_domain",
+    "plan_competitor_domain_rewrite",
+    "url_host_belongs_to_domain",
+]

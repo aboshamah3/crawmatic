@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, conint
 
 from app_shared.enums import AccessStrategy, ProxyProviderStatus, ProxyType
 
@@ -210,8 +210,8 @@ class DomainAccessRuleCreate(BaseModel):
     url_pattern: str | None = None
     url_pattern_override: str | None = None
     access_policy_id: uuid.UUID
-    max_concurrent_requests: int = Field(ge=1)
-    max_requests_per_minute: int = Field(ge=0)
+    max_concurrent_requests: conint(ge=1, le=16)  # type: ignore[valid-type]  # A3 ceiling
+    max_requests_per_minute: conint(ge=1, le=300)  # type: ignore[valid-type]  # A3 ceiling
     cooldown_seconds: int = Field(ge=0)
     block_detection_rules: dict[str, Any] | None = None
     enabled: bool = True
@@ -227,8 +227,8 @@ class DomainAccessRuleUpdate(BaseModel):
     url_pattern: str | None = None
     url_pattern_override: str | None = None
     access_policy_id: uuid.UUID | None = None
-    max_concurrent_requests: int | None = Field(default=None, ge=1)
-    max_requests_per_minute: int | None = Field(default=None, ge=0)
+    max_concurrent_requests: conint(ge=1, le=16) | None = None  # type: ignore[valid-type]
+    max_requests_per_minute: conint(ge=1, le=300) | None = None  # type: ignore[valid-type]
     cooldown_seconds: int | None = Field(default=None, ge=0)
     block_detection_rules: dict[str, Any] | None = None
     enabled: bool | None = None

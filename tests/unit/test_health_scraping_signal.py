@@ -135,9 +135,21 @@ def _reset_ready_generation_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ready, "_generation_lock", threading.Lock())
 
 
+_SERVICE_TOKEN = "t" * 48
+
+
 @pytest.fixture()
-def client() -> TestClient:
-    return TestClient(app)
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """A client that presents the service bearer `/health/scraping` requires."""
+    import app.index_auth as index_auth
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        index_auth,
+        "get_settings",
+        lambda: SimpleNamespace(INDEX_SERVICE_TOKEN=_SERVICE_TOKEN, SAAS_SERVICE_TOKEN=None),
+    )
+    return TestClient(app, headers={"Authorization": f"Bearer {_SERVICE_TOKEN}"})
 
 
 def test_ready_returns_200_while_health_scraping_reports_degraded(
@@ -200,3 +212,18 @@ def _utcnow():
     from datetime import UTC, datetime
 
     return datetime.now(UTC)
+
+
+def test_health_scraping_requires_the_service_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Security plan 2026-10-02: no/wrong bearer -> 401, nothing is queried."""
+
+    def _never(*_a, **_k):
+        raise AssertionError("an unauthorized caller must not reach the database")
+
+    monkeypatch.setattr(health, "get_session", _never)
+    anonymous = TestClient(app)
+    assert anonymous.get("/health/scraping").status_code == 401
+    wrong = anonymous.get("/health/scraping", headers={"Authorization": "Bearer nope"})
+    assert wrong.status_code == 401
