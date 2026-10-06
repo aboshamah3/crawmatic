@@ -73,7 +73,7 @@ must go back. See `docs/DEPLOY-ROLLBACK.md`.
 
 Code only, no migration (the new trip reason `HOURLY_CEILING` fits the existing
 `proxy_circuit_breakers.trip_reason` VARCHAR(32)). Ships with the next engine deploy of
-`workers`, `scheduler`, `scrapers` and `scrapers-browser` (the breaker, dispatcher and spider
+`worker`, `scheduler`, `scrapers` and `scrapers-browser` (the breaker, dispatcher and spider
 all changed). No env var is required; every new setting has a code default:
 
 | Setting | Default | Meaning |
