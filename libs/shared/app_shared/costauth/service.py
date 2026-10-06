@@ -43,10 +43,13 @@ fundamental first:
    evidence that the fleet's cost brake is running at all, and a fleet
    whose brake has stopped reporting has no business starting new work of
    any kind. An OPEN breaker, however, denies only transports that can
-   spend proxy money (everything but the ``DIRECT`` rung, unknown
-   transports included): the breaker measures proxied requests and stops
-   proxy spend, and denying free direct sites with it (2026-10-04, 835
-   targets of a false trip) only widened the outage.
+   spend proxy money (decided by ACCESS METHOD when the request names
+   one -- ``PLAYWRIGHT_DIRECT`` sends no proxied request although it
+   bills the ``BROWSER`` rung -- else by rung, where only ``DIRECT`` is
+   proxy-free; unknown transports count as paid): the breaker measures
+   proxied requests and stops proxy spend, and denying free direct sites
+   with it (2026-10-04, 835 targets of a false trip) only widened the
+   outage.
 3. **Domain state**, via C2 (:func:`app_shared.domains.state_lookup.
    get_domain_state` + :func:`~app_shared.domains.state_lookup.
    authorization_rules_for_state`). See "Reconciling C2's nested rules
@@ -469,6 +472,12 @@ class AuthorizationRequest:
     currency: str = "USD"
     scrape_job_id: uuid.UUID | None = None
     dedupe_key: str | None = None
+    #: The :class:`~app_shared.enums.AccessMethod` value the dispatch will
+    #: attempt first, when known. Only the breaker gate reads it (2026-10-06,
+    #: A9): ``transport`` is the BUDGET rung and cannot tell an unproxied
+    #: browser from a proxied one, so without this an OPEN breaker refused
+    #: free ``PLAYWRIGHT_DIRECT`` work. Not persisted.
+    access_method: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.workspace_id, (list, tuple, set, frozenset, dict)):
@@ -825,7 +834,9 @@ class CostAuthorizationService:
                     return grant
 
             entitlement_version = self._check_entitlement(session, workspace_id, now)
-            breaker_decision = self._check_breaker(session, now, req.transport)
+            breaker_decision = self._check_breaker(
+                session, now, req.access_method or req.transport
+            )
             self._check_domain(session, req)
 
             # 7. Lock the budget rows. FLEET first, then TENANT — always,
@@ -1271,9 +1282,11 @@ class CostAuthorizationService:
         under which "we have no idea what we are spending" is the honest
         answer.
 
-        An OPEN breaker denies every transport except the ``DIRECT`` rung
-        (see the module docstring). A transport this build cannot classify
-        counts as paid.
+        An OPEN breaker denies every transport that can send a proxied
+        request (see the module docstring and :func:`_spends_no_proxy`).
+        ``transport`` is an access method when the request knows one, else
+        a budget rung. A transport this build cannot classify counts as
+        paid.
         """
         row = session.execute(
             select(ProxyCircuitBreaker).where(
@@ -1293,7 +1306,7 @@ class CostAuthorizationService:
                 f"breaker evidence is {int(age)}s old "
                 f"(max {self._breaker_max_evidence_age_seconds}s)",
             )
-        if row.state is not ProxyBreakerState.CLOSED and not _is_direct_rung(transport):
+        if row.state is not ProxyBreakerState.CLOSED and not _spends_no_proxy(transport):
             raise CostAuthorizationDenied(
                 DenialReason.BREAKER_OPEN,
                 f"breaker is {row.state.value}"
@@ -2130,12 +2143,28 @@ def _normalized_rung(transport: object) -> str:
     return name
 
 
-def _is_direct_rung(transport: object) -> bool:
-    """True only for a transport that bills as the free ``DIRECT`` rung."""
-    try:
-        return _normalized_rung(transport) == "DIRECT"
-    except ValueError:
-        return False
+#: Access methods that never send a proxied request -- the breaker's unit
+#: (``access.breaker.collect_observation`` counts only ``PROXY_HTTP`` and
+#: ``PLAYWRIGHT_PROXY``). ``PLAYWRIGHT_DIRECT`` is here although it bills
+#: the ``BROWSER`` rung: browser-seconds are a budget dimension, not proxy
+#: spend.
+_PROXY_FREE_ACCESS_METHODS = frozenset(
+    {"DIRECT_HTTP", "DIRECT_HTTP_RETRY", "PLAYWRIGHT_DIRECT"}
+)
+
+
+def _spends_no_proxy(transport: object) -> bool:
+    """True only for a transport that provably sends no proxied request.
+
+    Decided by ACCESS METHOD when ``transport`` is one (2026-10-06, A9);
+    a bare budget rung is proxy-free only if it is ``DIRECT`` -- the
+    ``BROWSER`` rung covers both browser methods, so it counts as paid.
+    Anything unclassifiable counts as paid.
+    """
+    name = str(getattr(transport, "value", transport) or "").strip().upper()
+    if name in _RUNG_FOR_ACCESS_METHOD:
+        return name in _PROXY_FREE_ACCESS_METHODS
+    return name == "DIRECT"
 
 
 def reservation_rung(transport: object) -> str:

@@ -1207,3 +1207,59 @@ def test_a_breaker_denial_outlasts_the_breakers_auto_close_cooldown() -> None:
 
 def test_a_non_breaker_transient_denial_keeps_the_configured_window() -> None:
     _run_f2(_OTHER_TRANSIENT_DENIAL_KEEPS_ITS_WINDOW_CHECK)
+
+
+# --- 2026-10-06 (A9): the breaker gate sees the batch's ACCESS METHOD ------
+#
+# `transport` on the AuthorizationRequest is the budget rung, and BROWSER
+# covers both browser methods, so an OPEN breaker refused free
+# PLAYWRIGHT_DIRECT batches. The request now carries the batch's first
+# access method for the breaker gate to decide by.
+_ACCESS_METHOD_CHECK = """
+import sys
+import uuid
+
+sys.path.insert(0, "apps/workers")
+
+from app_shared.costauth import AuthorizationPurpose
+from app_shared.enums import ScrapeProfileMode
+from app_shared.jobs.batching import Batch
+
+import app.workers.tasks_jobs as tasks_jobs
+
+
+class _Identity:
+    key = "identity-key"
+
+
+def request_for(initial_transport):
+    batch = Batch(
+        batch_index=0,
+        mode=ScrapeProfileMode.BROWSER,
+        domain="example.test",
+        match_ids=[uuid.uuid4()],
+        initial_transport=initial_transport,
+        cheap_transport=initial_transport,
+    )
+    return tasks_jobs._batch_authorization_request(
+        batch,
+        workspace_id=uuid.uuid4(),
+        scrape_job_id=uuid.uuid4(),
+        purpose=AuthorizationPurpose.BROWSER_ESCALATION,
+        identity=_Identity(),
+    )
+
+
+req = request_for("PLAYWRIGHT_DIRECT")
+assert req.transport == "BROWSER", req.transport
+assert req.access_method == "PLAYWRIGHT_DIRECT", req.access_method
+assert request_for("PLAYWRIGHT_PROXY").access_method == "PLAYWRIGHT_PROXY"
+# Unknown first rung: no access method, so the gate falls back to the
+# (fail-closed) rung.
+assert request_for(None).access_method is None
+print("OK")
+"""
+
+
+def test_a_batch_authorization_request_carries_its_access_method() -> None:
+    _run_f2(_ACCESS_METHOD_CHECK)

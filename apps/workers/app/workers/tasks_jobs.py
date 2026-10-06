@@ -425,6 +425,9 @@ def _batch_authorization_request(
         estimated_browser_seconds=rung.estimated_browser_seconds,
         scrape_job_id=scrape_job_id,
         dedupe_key=identity.key,
+        # 2026-10-06 (A9): the breaker gate decides by access method, so an
+        # OPEN breaker still lets an unproxied browser batch through.
+        access_method=batch.initial_transport,
     )
 
 

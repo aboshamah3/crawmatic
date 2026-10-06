@@ -55,15 +55,20 @@ def _check(row: object, transport: str) -> str:
     return service._check_breaker(_Session(row), _NOW, transport)
 
 
-@pytest.mark.parametrize("transport", ["DIRECT", "DIRECT_HTTP", "DIRECT_HTTP_RETRY"])
-def test_an_open_breaker_still_authorizes_direct_work(transport: str) -> None:
+@pytest.mark.parametrize(
+    "transport", ["DIRECT", "DIRECT_HTTP", "DIRECT_HTTP_RETRY", "PLAYWRIGHT_DIRECT"]
+)
+def test_an_open_breaker_still_authorizes_work_that_spends_no_proxy(transport: str) -> None:
+    """2026-10-06 (A9): decided by ACCESS METHOD, not budget rung.
+    PLAYWRIGHT_DIRECT bills the BROWSER rung (browser-seconds) but sends
+    no proxied request, which is all the breaker measures."""
     assert _check(_row(ProxyBreakerState.OPEN), transport) == "OPEN"
 
 
-@pytest.mark.parametrize(
-    "transport", ["PROXY", "PROXY_HTTP", "BROWSER", "PLAYWRIGHT_PROXY", "PLAYWRIGHT_DIRECT"]
-)
+@pytest.mark.parametrize("transport", ["PROXY", "PROXY_HTTP", "BROWSER", "PLAYWRIGHT_PROXY"])
 def test_an_open_breaker_denies_every_transport_that_can_be_paid(transport: str) -> None:
+    """A bare ``BROWSER`` rung could be either browser method, so it
+    stays denied: only a known access method proves "no proxy"."""
     with pytest.raises(CostAuthorizationDenied) as excinfo:
         _check(_row(ProxyBreakerState.OPEN), transport)
     assert excinfo.value.reason == DenialReason.BREAKER_OPEN
@@ -93,4 +98,62 @@ def test_an_unknown_transport_is_treated_as_paid() -> None:
     """Fail closed: a transport the gate cannot classify is not free."""
     with pytest.raises(CostAuthorizationDenied) as excinfo:
         _check(_row(ProxyBreakerState.OPEN), "CARRIER_PIGEON")
+    assert excinfo.value.reason == DenialReason.BREAKER_OPEN
+
+
+# --- authorize() hands the gate the access method when it has one ---------
+
+
+class _StopAfterBreaker(Exception):
+    pass
+
+
+def _authorize_with(row: object, *, transport: str, access_method: str | None) -> None:
+    import uuid
+    from contextlib import contextmanager
+
+    from app_shared.costauth.service import AuthorizationPurpose, AuthorizationRequest
+
+    service = CostAuthorizationService(breaker_max_evidence_age_seconds=900)
+
+    @contextmanager
+    def _session(_workspace_id: object):
+        yield _Session(row)
+
+    def _domain(*_args: object) -> None:
+        raise _StopAfterBreaker
+
+    service._tenant_session = _session  # type: ignore[method-assign]
+    service._now = lambda: _NOW  # type: ignore[method-assign]
+    service._check_entitlement = lambda *_a: 1  # type: ignore[method-assign]
+    service._check_domain = _domain  # type: ignore[method-assign]
+    service.authorize(
+        AuthorizationRequest(
+            workspace_id=uuid.uuid4(),
+            domain="example.test",
+            transport=transport,
+            access_method=access_method,
+            provider="browser",
+            estimated_bytes=0,
+            estimated_cost_micro_units=0,
+            purpose=AuthorizationPurpose.REFRESH,
+        )
+    )
+
+
+def test_authorize_lets_a_playwright_direct_browser_batch_past_an_open_breaker() -> None:
+    with pytest.raises(_StopAfterBreaker):
+        _authorize_with(
+            _row(ProxyBreakerState.OPEN),
+            transport="BROWSER",
+            access_method="PLAYWRIGHT_DIRECT",
+        )
+
+
+@pytest.mark.parametrize("access_method", ["PLAYWRIGHT_PROXY", None])
+def test_authorize_denies_a_proxied_or_unknown_browser_batch(access_method: str | None) -> None:
+    with pytest.raises(CostAuthorizationDenied) as excinfo:
+        _authorize_with(
+            _row(ProxyBreakerState.OPEN), transport="BROWSER", access_method=access_method
+        )
     assert excinfo.value.reason == DenialReason.BREAKER_OPEN
