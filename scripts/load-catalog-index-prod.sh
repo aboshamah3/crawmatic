@@ -29,7 +29,7 @@ REPO=/srv/crawmatic/crawmatic
 # 2026-10-06 risk-fix deploy moves prod to e2b8d4f6a1c3.
 OK_HEADS=" a7c41e9d2b56 b3d9e5a17c42 c4e8f2a6b913 d7a1f3c5e902 e2b8d4f6a1c3 "
 # Size of the engine postgres volume in GiB (Railway dashboard: postgres ->
-# Volume). Required: the loader refuses under MIN_FREE_GB free.
+# Volume). Required unless MIN_FREE_GB=0: the loader refuses under MIN_FREE_GB free.
 DB_VOLUME_GB=${DB_VOLUME_GB:-}
 MIN_FREE_GB=${MIN_FREE_GB:-6}
 API=${API:-https://api-production-7193.up.railway.app}
@@ -56,7 +56,13 @@ grep -q "multibrand_evidence=" "$MERGED/pool_fit.csv" \
   || { echo "!! pool_fit.csv carries no multi-brand promotions: Part 0 Task 2 has not run"; exit 1; }
 DBH=$(curl -s -m 15 "$API/version" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("db_migration_head") or "")')
 [[ -n "$DBH" && "$OK_HEADS" == *" $DBH "* ]] || { echo "!! prod db head is '$DBH', expected one of:$OK_HEADS(deploy first)"; exit 1; }
-[[ "$DB_VOLUME_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "!! set DB_VOLUME_GB to the postgres volume size in GiB (Railway: postgres -> Volume)"; exit 1; }
+if [[ "$MIN_FREE_GB" =~ ^0+([.]0+)?$ ]]; then
+  echo "note: MIN_FREE_GB=0, the loader's free-space check is off"
+  VOLUME_ARGS=()
+else
+  [[ "$DB_VOLUME_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "!! set DB_VOLUME_GB to the postgres volume size in GiB (Railway: postgres -> Volume), or MIN_FREE_GB=0 to skip the check"; exit 1; }
+  VOLUME_ARGS=(--volume-gb "$DB_VOLUME_GB")
+fi
 [[ -s "$TOKEN_FILE" ]] || { echo "!! $TOKEN_FILE missing: deploy first"; exit 1; }
 
 sudo -n -u mahmoud test -x "$NVM_BIN/railway" || { echo "!! railway CLI not found at $NVM_BIN (set MAHMOUD_NODE_BIN)"; exit 1; }
@@ -93,7 +99,7 @@ systemd-run --user --collect --wait --pipe -p OOMPolicy=kill -p MemoryMax=1500M 
   -E CATALOG_INDEX_DATABASE_URL --working-directory="$REPO" \
   "$REPO/.venv/bin/python" scripts/load_catalog_index.py \
     --index "$MERGED/products.sqlite" --pool-fit "$MERGED/pool_fit.csv" --allow-remote \
-    --volume-gb "$DB_VOLUME_GB" --min-free-gb "$MIN_FREE_GB" \
+    "${VOLUME_ARGS[@]}" --min-free-gb "$MIN_FREE_GB" \
   | tail -1 | tee "$EVIDENCE/load-summary.json"
 rc=${PIPESTATUS[0]}
 echo "database size after: $(dbsize)"

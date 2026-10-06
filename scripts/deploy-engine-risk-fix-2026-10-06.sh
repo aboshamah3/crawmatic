@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# IN-REPO MIRROR (2026-10-06) of /srv/crawmatic/deploy-engine-security-2026-10-02.sh,
-# reused for the risk-review fix branch. Same steps; differences from the original:
-# BRANCH defaults to fix/risk-review-engine-2026-10-06 (pass DEPLOY_SHA either way).
-# Either copy works; keep them in step if one is edited.
-#
-# OWNER-RUN. Crawmatic ENGINE production deploy of the 2026-10-02 security fixes
-# (branch fix/security-complete-2026-10-02, base 4522a39 == prod engine SHA).
+# OWNER-RUN. Crawmatic ENGINE production deploy of the 2026-10-06 risk-review fixes
+# (branch fix/risk-review-engine-2026-10-06, which carries the 2026-10-02 security
+# fixes and the BIWEEKLY cadence; base 468418d == live prod engine SHA).
+# Derived from /srv/crawmatic/deploy-engine-security-2026-10-02.sh (same steps); that
+# script stays the 10-02 security-only release and is NOT used for this one.
 # NOT run by Claude: the auto-mode classifier denies every Railway mutation.
 #
-#     ! bash /srv/crawmatic/deploy-engine-security-2026-10-02.sh --dry-run   # prints every action, mutates nothing
-#     ! bash /srv/crawmatic/deploy-engine-security-2026-10-02.sh             # the real thing
+#     ! bash /srv/crawmatic/crawmatic/scripts/deploy-engine-risk-fix-2026-10-06.sh --dry-run   # prints every action, mutates nothing
+#     ! bash /srv/crawmatic/crawmatic/scripts/deploy-engine-risk-fix-2026-10-06.sh             # the real thing
 #
 # Order:
 #   0  preflight: clean checkout of the named commit, alembic single head, railway2 token,
@@ -41,22 +39,22 @@
 #     TEST_COMPETITOR_ID + TEST_VARIANT_ID (foreign-host check),
 #     TEST_MATCH_ID (a match on a robots-respecting fixture competitor, scrape check)
 #
-# Rollback: redeploy 4522a39 (previous release identity in
-# /srv/crawmatic/evidence/deploy-catalog-index-2026-10-02/) to the services; the three
-# migrations downgrade cleanly (proven on scratch PG) but prefer the DR set for schema
+# Rollback: redeploy 468418d (the live engine commit before this release; previous
+# deployments in the Railway dashboard) to the services; the four migrations
+# (b3d9e5a17c42, c4e8f2a6b913, d7a1f3c5e902, e2b8d4f6a1c3) downgrade cleanly but prefer the DR set for schema
 # rollback (crawmatic/docs/DEPLOY-ROLLBACK.md). Note b3d9e5a17c42's domain rewrite is not
 # reversible by downgrade (canonical domains stay canonical).
 # =============================================================================
 set -euo pipefail
 
 DRY=0
-for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; -h|--help) sed -n 2,53p "$0"; exit 0 ;; *) echo "unknown arg: $a"; exit 2 ;; esac; done
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; -h|--help) sed -n 2,47p "$0"; exit 0 ;; *) echo "unknown arg: $a"; exit 2 ;; esac; done
 
 PROJECT=69dc4bda-0d97-4290-a82f-822ed97d3fb8     # Crawmatic engine (railway2)
 ENVNAME=production
 REPO=/srv/crawmatic/crawmatic
 BRANCH=fix/risk-review-engine-2026-10-06
-BASE_SHA=4522a39
+BASE_SHA=468418d
 OLD_HEAD=a7c41e9d2b56
 NEW_HEAD=e2b8d4f6a1c3   # 2026-10-06 risk fix: e2b8d4f6a1c3 (cpm keyset index) sits on d7a1f3c5e902
 API=${API:-https://api-production-7193.up.railway.app}
@@ -66,7 +64,7 @@ DRYRUN_DSN_FILE=${DRYRUN_DSN_FILE:-/root/.crawmatic/engine-prod-readonly-dsn}
 WS_KEY_FILE=${WS_KEY_FILE:-/root/.crawmatic/test-workspace-key}
 GRACE_BUFFER_SECONDS=${GRACE_BUFFER_SECONDS:-600}
 ACCESS_TTL_SECONDS=900                            # ACCESS_TOKEN_TTL_SECONDS default (libs/shared/app_shared/config.py)
-EVIDENCE=/srv/crawmatic/evidence/deploy-engine-security-2026-10-02
+EVIDENCE=/srv/crawmatic/evidence/deploy-engine-risk-fix-2026-10-06
 LOG=$EVIDENCE/DEPLOY-LOG.txt
 
 mkdir -p "$EVIDENCE"

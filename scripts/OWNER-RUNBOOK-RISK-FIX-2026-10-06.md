@@ -121,16 +121,22 @@ step 1 and the `/version` check in step 6 expect it instead of `d7a1f3c5e902`). 
 ship in `api` (competitor-prices archived filter, candidates cap, title-stage ordering); the loader
 runs from this box.
 
-The deploy script was fixed in place: `/srv/crawmatic/deploy-engine-security-2026-10-02.sh` now
-runs its alembic preflight, collision dry run and manifest build with
-`/srv/crawmatic/crawmatic/.venv` (the `crawmatic-wt-security-2026-10-02` worktree can go),
-expects `NEW_HEAD=e2b8d4f6a1c3`, and accepts a live head of `a7c41e9d2b56`, `d7a1f3c5e902` or
-`e2b8d4f6a1c3`. An in-repo mirror with the branch default set to this branch is at
-`scripts/deploy-engine-risk-fix-2026-10-06.sh`; either works with the Task 6 commands:
+**Deploy with the in-repo script `scripts/deploy-engine-risk-fix-2026-10-06.sh`, not the 10-02
+script.** It is the 10-02 security deploy script retargeted to this release: branch
+`fix/risk-review-engine-2026-10-06`, base `468418d` (live engine), `NEW_HEAD=e2b8d4f6a1c3`, a live
+head of `a7c41e9d2b56`, `d7a1f3c5e902` or `e2b8d4f6a1c3` accepted, venv
+`/srv/crawmatic/crawmatic/.venv`. These commands **replace Task 6 steps 2 and 3** (the 10-02 script
+expects head `d7a1f3c5e902` and refuses this branch's tip). The original
+`/srv/crawmatic/deploy-engine-security-2026-10-02.sh` only had its venv repointed to
+`/srv/crawmatic/crawmatic/.venv` (so the `crawmatic-wt-security-2026-10-02` worktree can go) and
+remains the security-only release script:
 
     cd /srv/crawmatic/crawmatic && uv run alembic heads      # expect: e2b8d4f6a1c3 (head)
     ! DEPLOY_SHA=$(git -C /srv/crawmatic/crawmatic rev-parse fix/risk-review-engine-2026-10-06) bash /srv/crawmatic/crawmatic/scripts/deploy-engine-risk-fix-2026-10-06.sh --dry-run
     ! SET_JWT_GRACE=1 DEPLOY_SHA=$(git -C /srv/crawmatic/crawmatic rev-parse fix/risk-review-engine-2026-10-06) bash /srv/crawmatic/crawmatic/scripts/deploy-engine-risk-fix-2026-10-06.sh
+
+   Resume after a failed service: the same script with `ONLY_SERVICES="<remaining services>"
+   SKIP_MIGRATE=1 SKIP_DR_BACKUP=1` and the same `DEPLOY_SHA`.
 
 Steps after the deploy:
 
@@ -154,6 +160,7 @@ Steps after the deploy:
 
        ! DB_VOLUME_GB=<volume GiB> bash /srv/crawmatic/crawmatic/scripts/load-catalog-index-prod.sh
        # optional: MIN_FREE_GB=8 to demand more headroom; MIN_FREE_GB=0 turns the check off
+       # (then DB_VOLUME_GB is not needed)
 
    The summary JSON (`/srv/crawmatic/evidence/catalog-index-load-2026-10-02/load-summary.json`)
    now carries `rows_before`, `rows_after` and `db_free_gb_before`; both tables are
