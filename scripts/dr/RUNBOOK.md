@@ -322,6 +322,34 @@ one service); resolving that is part of the owner gate in §7.
    so replaying an event that already landed is safe; skipping one is not.
    Then diff `evidence_listing.txt` against the evidence volume to see which
    blobs, if any, did not survive.
+6. **Reload the catalog index generation after the restore** (added
+   2026-10-06, risk review P7). Dumps carry the schema of
+   `catalog_index_products` / `catalog_index_codes` but **not their rows**
+   (`DR_DATA_EXCLUDED_TABLES` in `dr_lib.sh`, ~1.6 GB rebuilt from the crawl).
+   `catalog_index_loads` IS restored, so `/v1/admin/index/status` reports the
+   old `active` generation and its counts while both tables are empty, and
+   every lookup / candidates call returns no candidates until a reload.
+   Reload one fresh generation from the crawl index (the loader retires the
+   restored `active` row when the new one activates; `--min-free-gb` refuses
+   on a nearly full volume):
+
+   ```bash
+   # restored PRODUCTION engine (owner-run; reads the postgres service's PG* itself)
+   ! DB_VOLUME_GB=<postgres volume GiB> bash /srv/crawmatic/crawmatic/scripts/load-catalog-index-prod.sh
+
+   # any other restored target: DSN in the environment only, never argv
+   CATALOG_INDEX_DATABASE_URL=postgresql://<owner role>@<host>:<port>/<db> \
+     /srv/crawmatic/crawmatic/.venv/bin/python /srv/crawmatic/crawmatic/scripts/load_catalog_index.py \
+       --index /srv/crawmatic/outreach/leads/matching/full_crawl/merged/products.sqlite \
+       --pool-fit /srv/crawmatic/outreach/leads/matching/full_crawl/merged/pool_fit.csv \
+       --volume-gb <volume GiB> --min-free-gb 6 [--allow-remote]
+   ```
+
+   Done when the loader prints `"status": "ok"` with `rows_after.products`
+   in the millions, and `/v1/admin/index/status` shows the new generation.
+   If the crawl index on this host was lost too, the SaaS discovery feature
+   stays empty (no data loss: every accepted candidate is a real
+   `competitor_product_matches` row, which the dump does carry).
 
 #### Replaying the migration chain onto an empty database — the RLS no-op trap
 
