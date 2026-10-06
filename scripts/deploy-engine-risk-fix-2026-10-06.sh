@@ -137,7 +137,7 @@ git -C "$REPO" rev-parse --verify -q "$BRANCH" >/dev/null || { echo "!! branch $
 SHA=$(git -C "$REPO" rev-parse "${DEPLOY_SHA:-$BRANCH}")
 git -C "$REPO" merge-base --is-ancestor "$BASE_SHA" "$SHA" || { echo "!! $SHA does not descend from base $BASE_SHA"; exit 1; }
 echo "will deploy commit $SHA ($(git -C "$REPO" log -1 --format=%s "$SHA"))"
-git -C "$REPO" log --oneline "$BASE_SHA..$SHA" | head -40
+git -C "$REPO" log --oneline --max-count=40 "$BASE_SHA..$SHA"   # no `| head`: with 40+ commits head's SIGPIPE killed the run under pipefail
 CLEAN=$(mktemp -d /tmp/engine-riskfix-deploy.XXXXXX); rmdir "$CLEAN"
 git -C "$REPO" worktree add --detach "$CLEAN" "$SHA" >/dev/null
 chown -R mahmoud:mahmoud "$CLEAN"
