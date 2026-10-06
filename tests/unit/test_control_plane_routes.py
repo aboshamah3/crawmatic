@@ -275,6 +275,24 @@ def test_a_monitor_rule_creates_a_workspace_refresh_rule(
     assert refresh[0].next_run_at is not None
 
 
+def test_a_biweekly_monitor_rule_schedules_every_fourteen_days(
+    client, session, workspace_id
+):
+    """BIWEEKLY is the SaaS's cheapest sold cadence (2026-09-14 pricing
+    ladder): once every two weeks, so exactly twice WEEKLY's interval."""
+    resp = client.post(
+        f"{_base(workspace_id)}/rules",
+        json=_rule_body(external_id="monitor-biweekly", cadence="BIWEEKLY"),
+        headers=SERVICE_HEADERS,
+    )
+    assert resp.status_code == 201
+    refresh = [o for o in session.added if isinstance(o, RefreshRule)]
+    assert len(refresh) == 1
+    assert refresh[0].interval_minutes == 14 * 24 * 60 == 20160
+    state = client.get(f"{_base(workspace_id)}/state", headers=SERVICE_HEADERS).json()
+    assert state["rules"][0]["cadence"] == "BIWEEKLY"
+
+
 def test_a_monitor_rule_adopts_an_existing_workspace_refresh_rule(
     client, session, workspace_id
 ):

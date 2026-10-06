@@ -104,6 +104,7 @@ class RuleCadence(str, Enum):
     TWICE_DAILY = "TWICE_DAILY"
     DAILY = "DAILY"
     WEEKLY = "WEEKLY"
+    BIWEEKLY = "BIWEEKLY"
 
 
 class SaasEntitlementStatus(str, Enum):
