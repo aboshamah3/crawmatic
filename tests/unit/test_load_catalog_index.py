@@ -132,7 +132,8 @@ class _Cursor:
 class _Conn:
     """Scripted psycopg connection: answers by SQL text, records everything."""
 
-    def __init__(self, *, db_bytes=10 * GB, counts=((4, 9), (2, 5))):
+    def __init__(self, *, db_bytes=10 * GB, counts=((4, 9), (2, 5)), fail_vacuum=False):
+        self.fail_vacuum = fail_vacuum
         self.log: list = []
         self.autocommit = False
         self.db_bytes = db_bytes
@@ -144,6 +145,8 @@ class _Conn:
         if "count(*) FROM catalog_index_products" in sql:
             products, codes = self.counts[0] if len(self.counts) == 1 else self.counts.pop(0)
             return [(products, codes)]
+        if self.fail_vacuum and sql.startswith("VACUUM"):
+            raise RuntimeError("canceling statement due to statement timeout")
         if "coalesce(max(generation), 0) + 1" in sql:
             return [(3,)]
         return []
@@ -153,6 +156,9 @@ class _Conn:
 
     def commit(self):
         self.log.append(("commit",))
+
+    def rollback(self):
+        self.log.append(("rollback",))
 
     def statements(self):
         return [entry[1] for entry in self.log if entry[0] == "sql"]
@@ -204,6 +210,19 @@ def test_load_vacuums_both_tables_after_the_generation_delete_and_reports_counts
     assert summary["rows_before"] == {"products": 4, "codes": 9}
     assert summary["rows_after"] == {"products": 1, "codes": 2}
     assert summary["db_free_gb_before"] == 40.0
+
+
+def test_a_vacuum_failure_after_activation_still_yields_success_and_a_warning(tmp_path, caplog):
+    conn = _Conn(db_bytes=10 * GB, counts=((4, 9), (1, 2)), fail_vacuum=True)
+    events = []
+    with caplog.at_level("WARNING", logger="load_catalog_index"):
+        summary = loader.load(conn, _index(tmp_path), VERDICTS, allow_small=True,
+                              volume_gb=50, min_free_gb=6, log=events.append)
+    assert summary["generation"] == 3 and summary["rows_after"] == {"products": 1, "codes": 2}
+    assert any("VACUUM" in r.getMessage() and "statement timeout" in r.getMessage()
+               for r in caplog.records if r.levelname == "WARNING")
+    assert any(e.get("event") == "vacuum_failed" for e in events)
+    assert conn.autocommit is False
 
 
 def test_main_takes_min_free_gb_default_6_and_volume_gb(monkeypatch):

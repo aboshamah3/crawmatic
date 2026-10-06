@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -256,7 +257,19 @@ def load(conn, index_path: Path, verdicts: dict[str, str], *, batch: int = 5000,
             cur.execute("DELETE FROM catalog_index_codes WHERE generation <> %s", (generation,))
             cur.execute("DELETE FROM catalog_index_products WHERE generation <> %s", (generation,))
         conn.commit()
-        _vacuum(conn)
+        # The new generation is already live and the old one deleted (both committed): a
+        # VACUUM failure only leaves dead tuples for autovacuum, so it must not fail the run.
+        try:
+            _vacuum(conn)
+        except Exception as exc:  # noqa: BLE001 - any driver error, the load itself succeeded
+            logging.getLogger("load_catalog_index").warning(
+                "VACUUM (ANALYZE) failed after the generation %s was activated; the load "
+                "succeeded, autovacuum will reclaim the space: %s", generation, exc)
+            log({"event": "vacuum_failed", "level": "WARNING", "error": str(exc)})
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
         rows_after = _row_counts(conn)
         conn.commit()
         log({"event": "after", "rows": rows_after})
