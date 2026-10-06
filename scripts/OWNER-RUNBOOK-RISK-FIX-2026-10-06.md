@@ -59,7 +59,7 @@ Steps:
 6. Verify:
    - authenticated `/version` reports the shipped `git_sha` and `db_migration_head = d7a1f3c5e902`;
      bearer-less `/version` returns only `{"status":"ok"}`;
-   - a SaaS BIWEEKLY monitor rule (`PUT .../control-plane/rules` with `cadence: BIWEEKLY`) is
+   - a SaaS BIWEEKLY monitor rule (`POST <control-plane base>/rules` with `cadence: BIWEEKLY`) is
      accepted and creates a refresh rule with `interval_minutes = 20160`;
    - next nightly run: no `breaker` regressions (10-05 behaviour: breaker-denied paid attempts
      deferred, unresolved access policy closes the target).
