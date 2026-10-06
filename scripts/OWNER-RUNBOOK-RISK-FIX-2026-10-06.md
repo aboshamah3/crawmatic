@@ -78,10 +78,11 @@ all changed). No env var is required; every new setting has a code default:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `PROXY_BREAKER_HOURLY_CEILING` | unset (None) | Fixed trailing-1h proxied-request ceiling. Unset = measured: max(FLOOR, P95_FACTOR x the trailing week's p95 hourly count). |
-| `PROXY_BREAKER_HOURLY_CEILING_FLOOR` | `3000` | Floor of the measured ceiling. Set to empty/None (with no fixed ceiling) to disable the hourly-ceiling trip. |
+| `PROXY_BREAKER_HOURLY_CEILING` | unset (None) | Fixed trailing-1h proxied-request ceiling. Unset = measured: max(FLOOR, P95_FACTOR x the p95 hourly count of the 168 complete hours before the current one, hours that tripped the breaker left out). |
+| `PROXY_BREAKER_HOURLY_CEILING_FLOOR` | `3000` | Floor of the measured ceiling. To disable the hourly-ceiling trip, leave `PROXY_BREAKER_HOURLY_CEILING` unset and set this to an empty value, `none` or `null` (any case); both settings parse those spellings as None. |
 | `PROXY_BREAKER_HOURLY_CEILING_P95_FACTOR` | `3.0` | Multiplier on the week's p95 hour. |
-| `SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS` | `60` | Debounce of the one outbox `dispatch_job` per job (`dedup_key=breaker-defer:<job>`) that BREAKER_OPEN defers now schedule. |
+| `SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS` | `60` | Debounce of the one outbox `dispatch_job` per job (`dedup_key=breaker-defer:<job>`) that BREAKER_OPEN defers now schedule (attempt-1 and retry paths). |
+| `SCRAPE_MAX_BREAKER_DEFER_CYCLES` | `60` | BREAKER_OPEN defers one target may take in one job (about an hour at the 60 s debounce); the next one fails it `FAILED`/`BREAKER_OPEN`. Counted on its own Redis key (`breakerdefercycles:<job>:<match>`), separate from `SCRAPE_MAX_DEFER_CYCLES`. |
 
 Changed meaning of an existing setting: `PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS` (86400) is
 now the CAP on the 1h horizon; the horizon itself is the day's measured busy hours
@@ -90,14 +91,19 @@ now the CAP on the 1h horizon; the horizon itself is the day's measured busy hou
 Behaviour to expect after deploy:
 - A trip with reason `HOURLY_CEILING` means the trailing hour exceeded the ceiling printed in
   `proxy_circuit_breakers.detail`; the row's `observed` JSON now carries
-  `proxied_requests_7d_p95_hourly`. Auto-close works as before.
+  `proxied_requests_7d_p95_hourly` and `tripped_hours` (the UTC hours of the last week's trips,
+  which the p95 leaves out so a recurring runaway cannot raise its own ceiling). Auto-close
+  works as before. The week-by-hour query runs once per process per hour.
 - If the fleet grows abruptly (e.g. 5+ new Mushtryati-sized tenants in one nightly window
   before a week of history exists), the measured ceiling can trip on the first big night.
   Raise `PROXY_BREAKER_HOURLY_CEILING_FLOOR` (or set a fixed `PROXY_BREAKER_HOURLY_CEILING`)
   before onboarding such a batch.
 - An OPEN breaker no longer refuses PLAYWRIGHT_DIRECT batches at the dispatcher.
-- BREAKER_OPEN defers no longer burn `SCRAPE_MAX_DEFER_CYCLES`; they are bounded by the per-target
-  and job deadlines instead.
+- BREAKER_OPEN defers no longer burn `SCRAPE_MAX_DEFER_CYCLES`; they are bounded by
+  `SCRAPE_MAX_BREAKER_DEFER_CYCLES` alone (a persisted strategy cursor is never re-charged by the
+  attempt ladder, and the per-target deadline re-anchors on every claim, so neither bounds them).
+  A trip longer than about an hour therefore fails the affected proxied targets with
+  `BREAKER_OPEN` rather than holding the job open to its 12 h deadline.
 
 Verify (read-only, after the next nightly run): `proxy_circuit_breakers.observed` contains
 `proxied_requests_7d_p95_hourly`; during any trip, `outbox_messages` holds at most one PENDING
