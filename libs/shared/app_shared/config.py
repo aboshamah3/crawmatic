@@ -476,6 +476,11 @@ class Settings(BaseSettings):
     # a bound a persistently blocked domain cycles forever and its job
     # never finalizes.
     SCRAPE_MAX_DEFER_CYCLES: int = 3
+    # 2026-10-06 (P5): a BREAKER_OPEN defer does not count against
+    # SCRAPE_MAX_DEFER_CYCLES and re-dispatches through the outbox, one row
+    # per job (`breaker-defer:<job>`) delayed by this debounce, instead of
+    # one `dispatch_job` enqueue per deferred target.
+    SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS: int = 60
 
     # --- EPA C1 (F08): per-TARGET deadline + physical attempt budget ------
     # `SCRAPE_JOB_MAX_RUNTIME_SECONDS` (12h) and `SCRAPE_MAX_DEFER_CYCLES`

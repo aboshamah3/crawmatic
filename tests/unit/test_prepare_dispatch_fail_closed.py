@@ -340,3 +340,166 @@ def test_breaker_is_not_consulted_for_a_direct_plan(
     _prepare_dispatch(_target(_policy(AccessStrategy.DIRECT_ONLY)), 1, {}, {})
 
     assert calls == []
+
+
+# --- 2026-10-06 (P5 + A9): a breaker trip fans in, not out ----------------
+#
+# Every BREAKER_OPEN defer used to `enqueue` its own `dispatch_job` (no
+# dedup): a trip with ~300 granted targets spawned ~300 dispatchers for the
+# same job. Each defer also burned one of the target's
+# SCRAPE_MAX_DEFER_CYCLES, so a trip outlasting a few dispatch cycles
+# failed targets that had never been allowed to try. BREAKER_OPEN defers
+# now go through the outbox under one per-job dedup key with a debounce
+# (mirroring the pipeline's `strategy-handoff` path), spend no defer
+# cycle, and drop the process's cached breaker verdict.
+
+
+class _DeferHarness:
+    """Records what one or more defers wrote, with the outbox's
+    pending-row dedup (`ON CONFLICT (workspace_id, dedup_key) DO NOTHING`
+    on PENDING rows) applied to what it records."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        self.marked: list[tuple[uuid.UUID, object, object]] = []
+        self.outbox: dict[tuple[object, str], dict[str, object]] = {}
+        self.outbox_writes = 0
+        self.enqueued: list[object] = []
+        self.defer_budget_calls = 0
+        self.sessions: list[object] = []
+
+        async def _sync_await_in_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        @contextmanager
+        def _workspace_txn(_workspace_id):
+            session = object()
+            self.sessions.append(session)
+            yield session
+
+        def _mark_target(session, *, match_id, status, error_code, **_kw):
+            self.marked.append((match_id, status, error_code))
+
+        def _write_outbox_message(session, *, workspace_id, task_name, queue, kwargs,
+                                  dedup_key=None, available_after_seconds=0, **_kw):
+            self.outbox_writes += 1
+            assert session is self.sessions[-1], "outbox row outside the mark's txn"
+            self.outbox.setdefault(
+                (workspace_id, dedup_key),
+                {
+                    "task_name": task_name,
+                    "queue": queue,
+                    "kwargs": kwargs,
+                    "delay": available_after_seconds,
+                },
+            )
+
+        def _consume_defer_budget(*_a, **_kw):
+            self.defer_budget_calls += 1
+            return True
+
+        monkeypatch.setattr(targets_mod, "await_in_thread", _sync_await_in_thread)
+        monkeypatch.setattr(targets_mod, "workspace_txn", _workspace_txn)
+        monkeypatch.setattr(targets_mod, "mark_target", _mark_target)
+        monkeypatch.setattr(targets_mod, "write_outbox_message", _write_outbox_message)
+        monkeypatch.setattr(targets_mod, "enqueue", lambda *a, **kw: self.enqueued.append(kw))
+        monkeypatch.setattr(targets_mod, "consume_defer_budget", _consume_defer_budget)
+        monkeypatch.setattr(targets_mod, "get_redis_client", lambda: _HealthyRedis())
+        monkeypatch.setattr(
+            "app_shared.config.get_settings",
+            lambda: SimpleNamespace(
+                SCRAPE_MAX_DEFER_CYCLES=3,
+                SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS=60,
+            ),
+        )
+
+    def defer(self, ctx: object, error_code: ScrapeErrorCode, n: int) -> list[uuid.UUID]:
+        import asyncio
+        from types import SimpleNamespace
+
+        match_ids = [uuid.uuid4() for _ in range(n)]
+
+        async def _run() -> None:
+            for match_id in match_ids:
+                await targets_mod.defer_rate_limited_target(
+                    ctx,
+                    SimpleNamespace(match_id=match_id),
+                    event="proxy_breaker.defer",
+                    error_code=error_code,
+                )
+
+        asyncio.run(_run())
+        return match_ids
+
+
+def _ctx() -> object:
+    from scrape_core.targets import AdmissionContext
+
+    return AdmissionContext(
+        workspace_id=uuid.uuid4(), scrape_job_id=uuid.uuid4(), requeue_state_by_match_id={}
+    )
+
+
+def test_300_breaker_deferred_targets_schedule_one_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app_shared.enums import ScrapeTargetStatus
+    from app_shared.task_names import SCRAPE_DISPATCH_JOB
+
+    harness = _DeferHarness(monkeypatch)
+    ctx = _ctx()
+
+    match_ids = harness.defer(ctx, ScrapeErrorCode.BREAKER_OPEN, 300)
+
+    assert harness.enqueued == []
+    assert list(harness.outbox) == [(ctx.workspace_id, f"breaker-defer:{ctx.scrape_job_id}")]
+    (row,) = harness.outbox.values()
+    assert row == {
+        "task_name": SCRAPE_DISPATCH_JOB,
+        "queue": "scrape_dispatch",
+        "kwargs": {
+            "scrape_job_id": str(ctx.scrape_job_id),
+            "workspace_id": str(ctx.workspace_id),
+        },
+        "delay": 60,
+    }
+    # Every target is still handed back DEFERRED with the breaker's code.
+    assert harness.marked == [
+        (m, ScrapeTargetStatus.DEFERRED, ScrapeErrorCode.BREAKER_OPEN) for m in match_ids
+    ]
+
+
+def test_a_breaker_defer_spends_no_defer_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = _DeferHarness(monkeypatch)
+    harness.defer(_ctx(), ScrapeErrorCode.BREAKER_OPEN, 5)
+    assert harness.defer_budget_calls == 0
+
+
+def test_a_breaker_defer_drops_the_cached_breaker_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next gate read goes to the durable row, so a breaker that has
+    since closed is seen at once rather than up to 30 s later."""
+    from app_shared.access import breaker
+
+    harness = _DeferHarness(monkeypatch)
+    breaker._gate_cache = breaker._GateCache(allowed=False, reason="OPEN", fetched_at=0.0)
+    try:
+        harness.defer(_ctx(), ScrapeErrorCode.BREAKER_OPEN, 1)
+        assert breaker._gate_cache is None
+    finally:
+        breaker.reset_gate_cache()
+
+
+def test_a_rate_limit_defer_keeps_its_budget_and_direct_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only BREAKER_OPEN changed: a rate-limit defer still spends a cycle
+    and still re-enqueues directly."""
+    harness = _DeferHarness(monkeypatch)
+    harness.defer(_ctx(), ScrapeErrorCode.RATE_LIMITED, 2)
+    assert harness.defer_budget_calls == 2
+    assert len(harness.enqueued) == 2
+    assert harness.outbox == {}

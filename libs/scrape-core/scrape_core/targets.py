@@ -57,6 +57,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import select
 
 from app_shared.access.breaker import log_denied as breaker_log_denied
+from app_shared.access.breaker import reset_gate_cache as reset_breaker_gate_cache
 from app_shared.access.budget import (
     check_domain_cooldown_gate,
     check_rate_ceilings,
@@ -101,6 +102,7 @@ from app_shared.models.competitors_matches import Competitor, CompetitorProductM
 from app_shared.models.identity import Workspace
 from app_shared.models.jobs import ScrapeJobTarget
 from app_shared.models.scrape_profiles import ScrapeProfile
+from app_shared.outbox.writer import write_outbox_message
 from app_shared.models.strategy import DomainStrategyMethod
 from app_shared.profiles.repository import GLOBAL_DEFAULT_PROFILE_NAME, profile_visibility_map
 from app_shared.profiles.resolution import (
@@ -569,6 +571,49 @@ def _mark_target_deferred_rate_limited(
             match_id=match_id,
             status=ScrapeTargetStatus.DEFERRED,
             error_code=error_code,
+        )
+
+
+def _mark_target_deferred_breaker_open(
+    workspace_id: uuid.UUID,
+    scrape_job_id: uuid.UUID,
+    match_id: uuid.UUID,
+) -> None:
+    """Hand a breaker-denied target back ``DEFERRED`` + ``BREAKER_OPEN`` and
+    schedule ONE re-dispatch for its job -- **Blocking** (DB round trip),
+    only ever inside :func:`scrape_core.db.run_in_thread`.
+
+    2026-10-06 (P5): each breaker defer used to ``enqueue`` its own
+    ``dispatch_job``, so a trip with ~300 granted targets spawned ~300
+    dispatchers for one job. The re-dispatch is now an outbox row in the
+    same transaction as the mark, keyed per JOB
+    (``breaker-defer:<job>``) and delayed by
+    ``SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS`` -- the pipeline's
+    ``strategy-handoff`` pattern: the first defer of the window schedules
+    the dispatch, every later one is an ``ON CONFLICT`` no-op that the
+    one delivery covers (``dispatch_job`` selects every DEFERRED target).
+    """
+    from app_shared.config import get_settings
+
+    with workspace_txn(workspace_id) as session:
+        mark_target(
+            session,
+            workspace_id=workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=match_id,
+            status=ScrapeTargetStatus.DEFERRED,
+            error_code=ScrapeErrorCode.BREAKER_OPEN,
+        )
+        write_outbox_message(
+            session,
+            workspace_id=workspace_id,
+            task_name=SCRAPE_DISPATCH_JOB,
+            queue="scrape_dispatch",
+            kwargs={"scrape_job_id": str(scrape_job_id), "workspace_id": str(workspace_id)},
+            dedup_key=f"breaker-defer:{scrape_job_id}",
+            available_after_seconds=(
+                get_settings().SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS
+            ),
         )
 
 
@@ -2103,6 +2148,32 @@ async def defer_rate_limited_target(
             "targets: rate-limit defer with no scrape_job_id -- "
             "cannot mark DEFERRED or re-dispatch match_id=%s",
             target.match_id,
+        )
+        return
+
+    if error_code is ScrapeErrorCode.BREAKER_OPEN:
+        # 2026-10-06 (P5 + A9). A breaker defer is not this target being
+        # blocked: it spends NO defer cycle (a trip outlasting a few
+        # dispatch passes used to fail targets that were never allowed to
+        # try; the job and per-target deadlines still bound it), its
+        # re-dispatch is one debounced outbox row per job (see
+        # `_mark_target_deferred_breaker_open`), and the process's cached
+        # breaker verdict is dropped so the next gate read sees the durable
+        # row -- a breaker that has closed is honoured at once, not up to
+        # `PROXY_BREAKER_STATE_CACHE_SECONDS` later.
+        reset_breaker_gate_cache()
+        await await_in_thread(
+            _mark_target_deferred_breaker_open,
+            ctx.workspace_id,
+            scrape_job_id,
+            target.match_id,
+        )
+        log_event(
+            logger,
+            event,
+            workspace_id=ctx.workspace_id,
+            scrape_job_id=scrape_job_id,
+            match_id=target.match_id,
         )
         return
 
