@@ -187,6 +187,7 @@ scrapy, no fastapi (``tests/unit/test_import_boundaries.py``).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from contextlib import AbstractContextManager, contextmanager
@@ -834,9 +835,7 @@ class CostAuthorizationService:
                     return grant
 
             entitlement_version = self._check_entitlement(session, workspace_id, now)
-            breaker_decision = self._check_breaker(
-                session, now, req.access_method or req.transport
-            )
+            breaker_decision = self._check_breaker(session, now, _breaker_transport(req))
             self._check_domain(session, req)
 
             # 7. Lock the budget rows. FLEET first, then TENANT — always,
@@ -2151,6 +2150,37 @@ def _normalized_rung(transport: object) -> str:
 _PROXY_FREE_ACCESS_METHODS = frozenset(
     {"DIRECT_HTTP", "DIRECT_HTTP_RETRY", "PLAYWRIGHT_DIRECT"}
 )
+
+
+def _breaker_transport(req: AuthorizationRequest) -> object:
+    """What the breaker gate classifies: the access method when it agrees
+    with the reserved rung, else the rung.
+
+    ``access_method`` can only let work past an OPEN breaker, so it must
+    not contradict ``transport`` (a ``DIRECT_HTTP`` claim on a ``PROXY``
+    reservation is a caller bug that would smuggle paid work through).
+    Under pytest that raises; elsewhere it logs
+    ``cost_authorization.access_method_mismatch`` and falls back to the
+    rung, which an OPEN breaker denies whenever the rung is paid.
+    """
+    if req.access_method is None:
+        return req.transport
+    try:
+        claimed = _normalized_rung(req.access_method)
+        reserved = _normalized_rung(req.transport)
+    except ValueError:
+        # Unclassifiable either way: `_spends_no_proxy` counts it as paid.
+        return req.access_method
+    if claimed == reserved:
+        return req.access_method
+    message = (
+        f"access_method {req.access_method!r} bills as {claimed} but the request "
+        f"reserves {reserved} ({req.transport!r})"
+    )
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise AssertionError(message)
+    logger.error("cost_authorization.access_method_mismatch: %s", message)
+    return req.transport
 
 
 def _spends_no_proxy(transport: object) -> bool:

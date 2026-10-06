@@ -157,3 +157,30 @@ def test_authorize_denies_a_proxied_or_unknown_browser_batch(access_method: str 
             _row(ProxyBreakerState.OPEN), transport="BROWSER", access_method=access_method
         )
     assert excinfo.value.reason == DenialReason.BREAKER_OPEN
+
+
+# --- fix round: access_method must agree with transport --------------------
+
+
+def test_a_direct_access_method_on_a_proxy_rung_raises_in_tests() -> None:
+    """A request claiming DIRECT_HTTP while reserving the PROXY rung is a
+    caller bug; under pytest it raises so the bug is caught."""
+    with pytest.raises(AssertionError, match="access_method"):
+        _authorize_with(
+            _row(ProxyBreakerState.CLOSED), transport="PROXY", access_method="DIRECT_HTTP"
+        )
+
+
+def test_a_mismatched_access_method_is_ignored_and_logged_in_production(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Outside tests it logs and falls back to the rung, so the claimed
+    access method cannot carry paid work past an OPEN breaker."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    with caplog.at_level("ERROR"):
+        with pytest.raises(CostAuthorizationDenied) as excinfo:
+            _authorize_with(
+                _row(ProxyBreakerState.OPEN), transport="PROXY", access_method="DIRECT_HTTP"
+            )
+    assert excinfo.value.reason == DenialReason.BREAKER_OPEN
+    assert "access_method_mismatch" in caplog.text
