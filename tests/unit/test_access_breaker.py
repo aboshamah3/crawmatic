@@ -20,11 +20,13 @@ from app_shared.access.breaker import (
     BreakerObservation,
     BreakerThresholds,
     busy_hours_horizon_seconds,
+    collect_observation,
     evaluate_and_persist,
     evaluate_thresholds,
     hourly_p95,
     paid_requests_allowed,
     reset_gate_cache,
+    reset_hourly_cache,
 )
 from app_shared.models.proxy_breaker import ProxyBreakerState, ProxyBreakerTrip
 
@@ -56,8 +58,10 @@ def _thresholds(**overrides: object) -> BreakerThresholds:
 @pytest.fixture(autouse=True)
 def _clean_gate_cache() -> None:
     reset_gate_cache()
+    reset_hourly_cache()
     yield
     reset_gate_cache()
+    reset_hourly_cache()
 
 
 # --- trip condition 1: absolute monthly spend -------------------------------
@@ -281,6 +285,22 @@ def test_a_fixed_hourly_ceiling_overrides_the_measured_one() -> None:
         _thresholds(hourly_ceiling=1_000),
     )
     assert verdict.reason is ProxyBreakerTrip.HOURLY_CEILING
+
+
+def test_the_ceiling_detail_names_its_source() -> None:
+    """A fixed ceiling says so instead of printing ``floor None``."""
+    fixed = evaluate_thresholds(
+        _observation(proxied_requests_1h=1_500),
+        _thresholds(hourly_ceiling=1_000, hourly_ceiling_floor=None),
+    )
+    assert "fixed" in (fixed.detail or "")
+    assert "None" not in (fixed.detail or "")
+    measured = evaluate_thresholds(
+        _observation(proxied_requests_1h=3_500, proxied_requests_7d_p95_hourly=600),
+        _thresholds(monthly_proxied_requests=None),
+    )
+    assert "floor 3000" in (measured.detail or "")
+    assert "p95 hour 600" in (measured.detail or "")
 
 
 def test_hourly_ceiling_floor_none_disables_the_condition() -> None:
@@ -707,3 +727,107 @@ def test_auto_close_never_runs_without_the_evaluator_lease() -> None:
 
     assert verdict is None
     assert row.state is ProxyBreakerState.OPEN
+
+
+# --- E4 fix round: tripped hours stay out of the p95; the week is cached ----
+
+
+def _hourly_week(now: datetime, night: list[int]) -> list[tuple[datetime, int]]:
+    """Seven nights of hourly counts, starting 22:00, ending before `now`."""
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    rows = []
+    for day in range(1, 8):
+        start = (hour - timedelta(days=day)).replace(hour=22)
+        rows.extend((start + timedelta(hours=i), count) for i, count in enumerate(night))
+    return [(bucket, count) for bucket, count in rows if bucket < hour]
+
+
+def test_tripped_loop_hours_do_not_raise_the_hourly_ceiling() -> None:
+    """A runaway that tripped 9 times this week (each trip records its
+    hour) must not have lifted the ceiling to its own rate: those hours
+    are left out of the p95, so the 10th loop hour still trips."""
+    now = datetime(2026, 10, 20, 12, 30, 0, tzinfo=UTC)
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    loop_hours = [(hour - timedelta(days=d)).replace(hour=14) for d in range(1, 8)] + [
+        (hour - timedelta(days=d)).replace(hour=15) for d in (1, 2)
+    ]
+    week = _hourly_week(now, _ONE_TENANT_NIGHT) + [(h, 3_500) for h in loop_hours]
+
+    def _evaluate(tripped_hours: list[datetime]) -> object:
+        reset_hourly_cache()
+        row = _FakeBreakerRow()
+        row.observed = {"tripped_hours": [h.isoformat() for h in tripped_hours]}
+        session = _EvalSession(
+            row, month=40_000, hour=3_500, day=(5_000, 4_000), week=40_000
+        )
+        session.hourly = week
+        return evaluate_and_persist(
+            session,
+            thresholds=_thresholds(monthly_proxied_requests=None),
+            now=now,
+        )
+
+    # Control: counted, the 9 loop hours ARE the p95 -> ceiling 10,500.
+    assert _evaluate([]).tripped is False
+    verdict = _evaluate(loop_hours)
+    assert verdict.tripped is True
+    assert verdict.reason is ProxyBreakerTrip.HOURLY_CEILING
+
+
+def test_a_trip_records_its_hours_and_keeps_a_week_of_them() -> None:
+    from app_shared.access.breaker import trip_breaker
+
+    now = datetime(2026, 10, 20, 12, 30, 0, tzinfo=UTC)
+    stale = now - timedelta(days=8)
+    kept = now - timedelta(days=2)
+    row = _FakeBreakerRow()
+    row.observed = {"tripped_hours": [stale.isoformat(), kept.replace(minute=0).isoformat()]}
+    session = _EvalSession(row)
+
+    trip_breaker(
+        session,
+        reason=ProxyBreakerTrip.HOURLY_CEILING,
+        detail="loop",
+        observed={"proxied_requests_1h": 3_500},
+        now=now,
+    )
+
+    hours = row.observed["tripped_hours"]
+    assert hours == sorted(
+        [
+            kept.replace(minute=0).isoformat(),
+            datetime(2026, 10, 20, 11, tzinfo=UTC).isoformat(),
+            datetime(2026, 10, 20, 12, tzinfo=UTC).isoformat(),
+        ]
+    )
+    assert row.observed["proxied_requests_1h"] == 3_500
+
+
+class _CountingSession(_EvalSession):
+    def __init__(self) -> None:
+        super().__init__(_FakeBreakerRow())
+        self.hourly_reads = 0
+
+    def execute(self, *_args: object, **_kw: object) -> _EvalResult:
+        session = self
+
+        class _Counting(_EvalResult):
+            def all(self) -> list[object]:
+                session.hourly_reads += 1
+                return session.hourly
+
+        return _Counting(self)
+
+
+def test_the_week_query_runs_once_per_hour_per_process() -> None:
+    now = datetime(2026, 10, 20, 12, 5, 0, tzinfo=UTC)
+    session = _CountingSession()
+    for minutes in (0, 5, 50):
+        session.scalars = [0, 0, 0]
+        session.firsts = [None]
+        collect_observation(session, now=now + timedelta(minutes=minutes))
+    assert session.hourly_reads == 1
+    session.scalars = [0, 0, 0]
+    session.firsts = [None]
+    collect_observation(session, now=now + timedelta(hours=1))
+    assert session.hourly_reads == 2

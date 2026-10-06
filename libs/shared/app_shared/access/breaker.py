@@ -114,6 +114,7 @@ __all__ = [
     "evaluate_thresholds",
     "paid_requests_allowed",
     "reset_gate_cache",
+    "reset_hourly_cache",
     "thresholds_from_settings",
     "BASELINE_WINDOW_SECONDS",
     "busy_hours_horizon_seconds",
@@ -432,11 +433,16 @@ def evaluate_thresholds(
             reason=ProxyBreakerTrip.HOURLY_CEILING,
             detail=(
                 f"{observation.proxied_requests_1h} proxied requests in the trailing "
-                f"hour > hourly ceiling {ceiling} (max of floor "
-                f"{thresholds.hourly_ceiling_floor} and "
-                f"{thresholds.hourly_ceiling_p95_factor} x week p95 hour "
-                f"{observation.proxied_requests_7d_p95_hourly}"
-                + (", fixed" if thresholds.hourly_ceiling is not None else "")
+                f"hour > hourly ceiling {ceiling} ("
+                + (
+                    "fixed PROXY_BREAKER_HOURLY_CEILING"
+                    if thresholds.hourly_ceiling is not None
+                    else (
+                        f"max of floor {thresholds.hourly_ceiling_floor} and "
+                        f"{thresholds.hourly_ceiling_p95_factor} x week p95 hour "
+                        f"{observation.proxied_requests_7d_p95_hourly}"
+                    )
+                )
                 + ")"
             ),
         )
@@ -504,7 +510,12 @@ def thresholds_from_settings(settings: Any) -> BreakerThresholds:
 # --------------------------------------------------------------------------
 
 
-def collect_observation(session: Any, *, now: datetime | None = None) -> BreakerObservation:
+def collect_observation(
+    session: Any,
+    *,
+    now: datetime | None = None,
+    excluded_hours: frozenset[datetime] = frozenset(),
+) -> BreakerObservation:
     """Aggregate the durable audit tables into a :class:`BreakerObservation`.
 
     Read-only. Counts only rows whose ``access_method`` is a **proxied**
@@ -513,9 +524,14 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
     means everywhere else in this codebase.
 
     This is the expensive call in the module (a handful of aggregates, one
-    of them a ``COUNT(DISTINCT url)`` and one a per-hour ``GROUP BY``), which is why it runs behind the
-    :func:`evaluate_and_persist` lease and never on the per-request
-    path.
+    of them a ``COUNT(DISTINCT url)`` and one a per-hour ``GROUP BY``), which
+    is why it runs behind the :func:`evaluate_and_persist` lease and never on
+    the per-request path. The per-hour week is cached per process per hour
+    (:func:`_hourly_week_rows`).
+
+    ``excluded_hours`` (UTC hour buckets) are left out of the p95 hour:
+    the hours a trip recorded (:func:`trip_breaker`), so a runaway that
+    tripped cannot raise its own ceiling.
     """
     from sqlalchemy import distinct, func, select
 
@@ -562,20 +578,8 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
         .where(paid, RequestAttempt.created_at >= since_7d)
     ).scalar_one()
 
-    # E4: the week's per-hour shape for the measured hourly ceiling. The
-    # current hour is excluded (a runaway must not raise its own ceiling);
-    # at most 168 rows, over the same created_at index as `count_7d`.
-    hour_bucket = func.date_trunc("hour", RequestAttempt.created_at)
-    hourly_rows = session.execute(
-        select(hour_bucket, func.count())
-        .select_from(RequestAttempt)
-        .where(
-            paid,
-            RequestAttempt.created_at >= since_7d,
-            RequestAttempt.created_at < since_1h,
-        )
-        .group_by(hour_bucket)
-    ).all()
+    # E4: the week's per-hour shape for the measured hourly ceiling.
+    hourly_rows = _hourly_week_rows(session, now, paid)
 
     discovery_row = session.execute(
         select(
@@ -596,13 +600,82 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
         proxied_requests_24h=int(count_24h or 0),
         proxied_requests_7d=int(count_7d or 0),
         proxied_requests_7d_p95_hourly=hourly_p95(
-            [int(row[1] or 0) for row in hourly_rows]
+            [count for bucket, count in hourly_rows if bucket not in excluded_hours]
         ),
         proxied_requests_24h_for_ratio=int(count_24h or 0),
         distinct_urls_24h=int(distinct_urls_24h or 0),
         max_discovery_runs_domain=discovery_row[0] if discovery_row else None,
         max_discovery_runs_per_domain_day=int(discovery_row[1]) if discovery_row else 0,
     )
+
+
+def _hour_floor(moment: datetime) -> datetime:
+    """``moment``'s UTC hour bucket (aware)."""
+    return _as_aware(moment).astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+#: ``(current hour, [(bucket, count), ...])`` -- the trailing week's
+#: per-hour proxied counts, read once per process per hour. The window is
+#: the 168 COMPLETE hours before the current one, so it cannot change
+#: until the hour does; re-running the GROUP BY on every 300 s evaluation
+#: bought nothing (E4 fix round, 2026-10-06).
+_hourly_cache: tuple[datetime, list[tuple[datetime, int]]] | None = None
+_hourly_lock = threading.Lock()
+
+
+def reset_hourly_cache() -> None:
+    """Drop the per-process week-by-hour cache (tests, fork-safety)."""
+    global _hourly_cache
+    with _hourly_lock:
+        _hourly_cache = None
+
+
+def _hourly_week_rows(session: Any, now: datetime, paid: Any) -> list[tuple[datetime, int]]:
+    """Per-hour proxied counts for [current hour - 168h, current hour).
+
+    The current hour is excluded (a runaway must not raise its own
+    ceiling). Buckets are truncated in UTC, so they compare equal to
+    :func:`_hour_floor` values whatever the session time zone. At most 168
+    rows, over the same ``created_at`` index as the 7d count.
+    """
+    from sqlalchemy import func, select
+
+    from app_shared.models.observations import RequestAttempt
+
+    global _hourly_cache
+    hour = _hour_floor(now)
+    cached = _hourly_cache
+    if cached is not None and cached[0] == hour:
+        return cached[1]
+
+    bucket = func.date_trunc("hour", func.timezone("UTC", RequestAttempt.created_at))
+    rows = session.execute(
+        select(bucket, func.count())
+        .select_from(RequestAttempt)
+        .where(
+            paid,
+            RequestAttempt.created_at >= hour - timedelta(hours=HOURS_PER_WEEK),
+            RequestAttempt.created_at < hour,
+        )
+        .group_by(bucket)
+    ).all()
+    result = [(_hour_floor(row[0]), int(row[1] or 0)) for row in rows]
+    with _hourly_lock:
+        _hourly_cache = (hour, result)
+    return result
+
+
+def _tripped_hours(row: Any) -> frozenset[datetime]:
+    """The UTC hour buckets earlier trips recorded on the row's ``observed``."""
+    observed = getattr(row, "observed", None)
+    raw = observed.get("tripped_hours") if isinstance(observed, dict) else None
+    hours: set[datetime] = set()
+    for value in raw or ():
+        try:
+            hours.add(_hour_floor(datetime.fromisoformat(str(value))))
+        except ValueError:
+            continue
+    return frozenset(hours)
 
 
 # --------------------------------------------------------------------------
@@ -659,6 +732,19 @@ def trip_breaker(
     now = now or datetime.now(UTC)
     row = _get_or_create_row(session, scope_key)
     was_closed = row.state is not ProxyBreakerState.OPEN and row.state != "OPEN"
+    # E4 fix round: remember which hours tripped (the two buckets the
+    # trailing hour spans), a week back, so the measured hourly ceiling
+    # leaves them out of its p95 and a recurring runaway cannot lift its
+    # own ceiling. Kept in `observed` (JSONB): no migration, and it
+    # survives a close because only a trip writes `observed`.
+    current = _hour_floor(now)
+    hours = {
+        hour
+        for hour in _tripped_hours(row) | {current - timedelta(hours=1), current}
+        if hour > current - timedelta(hours=HOURS_PER_WEEK)
+    }
+    observed = dict(observed or {})
+    observed["tripped_hours"] = sorted(hour.isoformat() for hour in hours)
     row.state = ProxyBreakerState.OPEN
     row.trip_reason = reason
     row.detail = detail
@@ -765,7 +851,9 @@ def evaluate_and_persist(
     if claimed is None:
         return None
 
-    observation = collect_observation(session, now=now)
+    observation = collect_observation(
+        session, now=now, excluded_hours=_tripped_hours(row)
+    )
     verdict = evaluate_thresholds(observation, thresholds)
     if verdict.tripped and verdict.reason is not None:
         trip_breaker(
