@@ -49,6 +49,7 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ("apps/api/app/routers/auth.py", "logout"): "refresh-token revocation by token hash",
     ("apps/api/app/routers/admin.py", "get_admin_session"): "platform-admin routes (usage export) aggregate across workspaces by design",
     ("apps/api/app/routers/control_plane.py", "get_control_plane_session"): "SaaS control plane (service token) writes entitlements for any workspace",
+    ("apps/api/app/routers/catalog_index.py", "get_catalog_index_session"): "catalog index routes (service/index token, no workspace principal); every workspace-owned read carries an explicit workspace_id predicate",
     ("apps/api/app/routers/ops_metrics.py", "_get_ops_session"): "fleet aggregates for /ops/metrics; the tenant role is probed separately (E8)",
     ("apps/scheduler/app/scheduler/scheduler_app.py", "_run_refresh_pass_tick"): "cross-tenant due refresh-rule claim (SPEC-13 R2)",
     ("apps/scheduler/app/scheduler/scheduler_app.py", "_run_durable_cadence_tick"): "fleet maintenance cadence ledger",
