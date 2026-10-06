@@ -128,3 +128,81 @@ def test_no_configured_token_fails_closed(client, monkeypatch):
 
 def test_index_routes_are_absent_from_the_public_openapi():
     assert not [p for p in build_public_openapi(app)["paths"] if "/index" in p]
+
+
+# --- risk review 2026-10-06 (P7): title-stage ordering, candidates work cap ---
+
+
+def test_title_stage_ranks_by_ts_rank_before_the_scan_limit():
+    """Without an ORDER BY the `LIMIT :scan` kept an arbitrary 200 of a
+    common phrase's matches, so the best titles could be cut before the
+    Jaccard re-rank ever saw them."""
+    from app_shared.catalog_index import lookup as lookup_module
+
+    sql = " ".join(lookup_module._TITLE_SQL.text.split())
+    order = sql.index("ORDER BY ts_rank(")
+    assert order < sql.index("LIMIT :scan")
+    ranked = sql[order:sql.index("LIMIT :scan")]
+    assert "plainto_tsquery('simple', :query_text)) DESC" in ranked
+    assert "to_tsvector('simple', coalesce(p.title, ''))" in ranked
+    # Deterministic tie-break, the same as the re-rank's own.
+    assert ranked.rstrip().endswith("p.price ASC, p.domain ASC")
+
+
+class _CandidatesSession:
+    """`FakeAlertsListSession` plus `get()` for `_require_workspace`."""
+
+    def __init__(self):
+        from unit._alerts_list_fake_session import FakeAlertsListSession
+
+        self.inner = FakeAlertsListSession()
+
+    def get(self, model, ident):
+        return object()
+
+    def execute(self, stmt):
+        return self.inner.execute(stmt)
+
+
+def _seed_variants(n: int) -> tuple[_CandidatesSession, list[uuid.UUID]]:
+    from app_shared.enums import VariantStatus
+    from app_shared.models.catalog import Product, ProductVariant
+
+    session = _CandidatesSession()
+    ids = []
+    for i in range(n):
+        product = Product(workspace_id=WS, title=f"Product {i}", brand="Brand")
+        product.id = uuid.uuid4()
+        variant = ProductVariant(
+            workspace_id=WS, product_id=product.id, title=f"Variant {i}",
+            status=VariantStatus.ACTIVE,
+        )
+        variant.id = uuid.uuid4()
+        session.inner.seed(product, variant)
+        ids.append(variant.id)
+    return session, sorted(ids)
+
+
+def test_candidates_route_caps_work_at_50_variants_and_returns_the_rest_by_cursor(
+    client, monkeypatch
+):
+    session, ids = _seed_variants(120)
+    looked_up: list[str] = []
+    monkeypatch.setattr(catalog_index, "active_generation", lambda s: 7)
+    monkeypatch.setattr(
+        catalog_index, "lookup", lambda s, query, **kw: looked_up.append(query.title) or []
+    )
+    app.dependency_overrides[catalog_index.get_catalog_index_session] = lambda: session
+    path = f"/v1/admin/index/workspaces/{WS}/candidates"
+
+    # Even when the caller asks for more, one request does at most 50 lookups.
+    first = client.get(path, headers=SAAS, params={"variant_limit": 200}).json()
+    assert first["variants_scanned"] == 50 and len(looked_up) == 50
+    assert first["next_cursor"] == str(ids[49])
+
+    second = client.get(path, headers=SAAS, params={"cursor": first["next_cursor"]}).json()
+    assert second["variants_scanned"] == 50 and second["next_cursor"] == str(ids[99])
+
+    third = client.get(path, headers=SAAS, params={"cursor": second["next_cursor"]}).json()
+    assert third["variants_scanned"] == 20 and third["next_cursor"] is None
+    assert len(looked_up) == 120

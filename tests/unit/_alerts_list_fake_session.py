@@ -92,6 +92,9 @@ class _FakeScalars:
     def all(self) -> list[Any]:
         return list(self._items)
 
+    def __iter__(self):
+        return iter(list(self._items))
+
     def first(self) -> Any | None:
         return self._items[0] if self._items else None
 
@@ -107,6 +110,9 @@ class _FakeExecResult:
 
     def scalars(self) -> _FakeScalars:
         return _FakeScalars(self._items)
+
+    def __iter__(self):
+        return iter(list(self._items))
 
     def scalar_one_or_none(self) -> Any | None:
         if len(self._items) > 1:

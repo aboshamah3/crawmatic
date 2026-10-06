@@ -12,7 +12,10 @@ only ever appends below an earlier one:
 3. `title`: only for a product with a brand and three or more
    distinctive words. Full-text AND of up to four words (brand first),
    kept only at `TITLE_MIN_JACCARD` token overlap and with no number
-   conflict. Pool stores only, unless `pool_only=False`.
+   conflict. Pool stores only, unless `pool_only=False`. The SQL ranks
+   by `ts_rank` (then price, domain) BEFORE `LIMIT SCAN_LIMIT`, so a
+   common phrase keeps its best-ranked rows for the re-rank, not an
+   arbitrary 200 (risk review 2026-10-06, P7).
 
 One candidate per store (`domain`): the cheapest for code stages, the
 best-scoring for the title stage. Every candidate is a PROPOSAL. Nothing
@@ -127,6 +130,9 @@ _TITLE_SQL = text(
     WHERE p.generation = :generation
       AND to_tsvector('simple', coalesce(p.title, '')) @@ plainto_tsquery('simple', :query_text)
     {_FILTERS}
+    ORDER BY ts_rank(to_tsvector('simple', coalesce(p.title, '')),
+                     plainto_tsquery('simple', :query_text)) DESC,
+             p.price ASC, p.domain ASC
     LIMIT :scan
     """
 ).bindparams(*_ARRAYS)

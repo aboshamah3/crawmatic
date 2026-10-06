@@ -15,7 +15,10 @@ Read-only, `require_index_token` (index token OR the SaaS token):
 Workspace-addressed, `require_service_token` (the SaaS token only):
 
 * `GET  /v1/admin/index/workspaces/{id}/candidates`: candidates for the
-  workspace's own active variants, paged by variant id. Filters out the
+  workspace's own active variants, paged by variant id: at most
+  `MAX_VARIANTS_PER_REQUEST` (50) variants are looked up per request,
+  `next_cursor` (the last variant id scanned) resumes the rest
+  (`docs/contracts/admin-index-candidates.md`). Filters out the
   workspace's own store, anything already matched in ANY status (a
   rejected candidate must not come back and be billed again) and hosts
   beyond the workspace's competitor-domain cap.
@@ -71,6 +74,12 @@ from app.schemas.catalog_index import (
 from app.service_auth import require_service_token
 
 router = APIRouter(prefix="/v1/admin/index", tags=["admin", "catalog-index"])
+
+#: Hard cap on the variants one candidates request looks up (risk review
+#: 2026-10-06, P7). Each variant costs up to three index queries; a larger
+#: `variant_limit` is clamped, never refused, and `next_cursor` carries the
+#: caller to the rest.
+MAX_VARIANTS_PER_REQUEST = 50
 
 _MATCH_CONFLICT = ["workspace_id", "product_variant_id", "competitor_id", "normalized_competitor_url"]
 
@@ -273,6 +282,7 @@ def workspace_candidates(
             generation=None, candidates=[], next_cursor=None, variants_scanned=0
         )
 
+    variant_limit = min(variant_limit, MAX_VARIANTS_PER_REQUEST)
     stmt = (
         scoped_select(ProductVariant, workspace_id)
         .where(ProductVariant.status == VariantStatus.ACTIVE)
