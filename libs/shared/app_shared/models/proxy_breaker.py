@@ -70,6 +70,10 @@ class ProxyBreakerTrip(StrEnum):
     VELOCITY_1H = "VELOCITY_1H"
     #: Trailing-24h rate, extrapolated to month end, blows the ceiling.
     VELOCITY_24H = "VELOCITY_24H"
+    #: Trailing-1h proxied requests over an absolute hourly ceiling, no
+    #: forecast involved (2026-10-06, E4). ``trip_reason`` is an
+    #: app-validated VARCHAR(32), so a new member needs no migration.
+    HOURLY_CEILING = "HOURLY_CEILING"
     #: Proxied requests per DISTINCT url too high — the runaway-loop
     #: signature (the same URL re-fetched over and over).
     REQUESTS_PER_URL = "REQUESTS_PER_URL"

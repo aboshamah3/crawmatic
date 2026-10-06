@@ -147,6 +147,15 @@ class Settings(BaseSettings):
     #: the breaker on a normal nightly burst (2026-10-04 21:21Z).
     PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS: int = 86_400
     PROXY_BREAKER_VELOCITY_24H_HORIZON_SECONDS: int = 604_800
+    #: 2026-10-06 (E4): the 1h rate is now held for the day's MEASURED busy
+    #: hours (24h count / 1h count, clamped 1-24); the 1H horizon above is
+    #: only its cap. And an absolute trailing-1h ceiling trips with no
+    #: forecast at all: `PROXY_BREAKER_HOURLY_CEILING` fixes it; unset
+    #: (None) it is max(FLOOR, P95_FACTOR x the trailing week's p95 hourly
+    #: proxied count). FLOOR=None with no fixed ceiling disables it.
+    PROXY_BREAKER_HOURLY_CEILING: int | None = None
+    PROXY_BREAKER_HOURLY_CEILING_FLOOR: int | None = 3_000
+    PROXY_BREAKER_HOURLY_CEILING_P95_FACTOR: float = 3.0
     #: Max proxied requests per DISTINCT url in the trailing 24h. The
     #: 2026-08-10 measurement was amazon 2,716 fetches / 1,097 urls =
     #: 2.48, so 8 is comfortably above healthy retry behaviour and well

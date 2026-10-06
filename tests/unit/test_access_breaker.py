@@ -19,8 +19,10 @@ import pytest
 from app_shared.access.breaker import (
     BreakerObservation,
     BreakerThresholds,
+    busy_hours_horizon_seconds,
     evaluate_and_persist,
     evaluate_thresholds,
+    hourly_p95,
     paid_requests_allowed,
     reset_gate_cache,
 )
@@ -87,10 +89,16 @@ def test_monthly_ceiling_none_disables_that_condition() -> None:
 
 
 def test_trips_on_1h_velocity_that_would_breach_within_a_day() -> None:
-    """7,000/h held for one day is 168k on top of 5k -- over 100k x 1.5."""
+    """7,000/h all day (24 busy hours) held for one day is 168k on top of
+    5k -- over 100k x 1.5. The hourly ceiling is switched off so the
+    forecast condition is what is measured here."""
     verdict = evaluate_thresholds(
-        _observation(proxied_requests_month=5_000, proxied_requests_1h=7_000),
-        _thresholds(),
+        _observation(
+            proxied_requests_month=5_000,
+            proxied_requests_1h=7_000,
+            proxied_requests_24h=7_000 * 24,
+        ),
+        _thresholds(hourly_ceiling_floor=None),
     )
     assert verdict.tripped is True
     assert verdict.reason is ProxyBreakerTrip.VELOCITY_1H
@@ -186,6 +194,130 @@ def test_velocity_does_not_trip_on_sustainable_rate() -> None:
         _thresholds(monthly_proxied_requests=1_000_000),
     )
     assert verdict.tripped is False
+
+
+# --- E4 (2026-10-06): absolute hourly ceiling + busy-hours horizon ----------
+
+#: One single-tenant night of 2026-10-04, by hour: the ~700-request burst
+#: hour, its tail, then nothing (24h = 1,900, matching the replay above).
+_ONE_TENANT_NIGHT = [700, 600, 300, 300]
+
+
+def _week_of(night: list[int]) -> list[int]:
+    """Seven identical nights as hourly counts (zero hours omitted, the
+    shape the hourly GROUP BY returns)."""
+    return [count for _ in range(7) for count in night]
+
+
+def test_a_3500_per_hour_loop_trips_on_the_first_evaluation_after_one_hour() -> None:
+    """E4: a 3,500/h runaway on top of one tenant's normal week.
+
+    The forecast holds the hour only for the measured busy hours of a day,
+    so it cannot see one hour of loop (~84k by month end, far under 375k).
+    The absolute ceiling -- max(3,000, 3 x the week's p95 hour) -- does,
+    on the first evaluation whose trailing hour holds the loop."""
+    now = datetime(2026, 10, 4, 21, 0, 0, tzinfo=UTC)
+    verdict = evaluate_thresholds(
+        BreakerObservation(
+            now=now,
+            month_started_at=datetime(2026, 10, 1, tzinfo=UTC),
+            proxied_requests_month=4_400 + 3_500,
+            proxied_requests_1h=3_500,
+            proxied_requests_24h=1_900 + 3_500,
+            proxied_requests_7d=9_000 + 3_500,
+            proxied_requests_7d_p95_hourly=hourly_p95(_week_of(_ONE_TENANT_NIGHT)),
+        ),
+        _thresholds(monthly_proxied_requests=250_000),
+    )
+    assert verdict.tripped is True
+    assert verdict.reason is ProxyBreakerTrip.HOURLY_CEILING
+    assert "3500" in (verdict.detail or "")
+    assert "3000" in (verdict.detail or "")
+
+
+def test_the_10_04_burst_hour_does_not_trip_at_ten_mushtryati_sized_tenants() -> None:
+    """E4: the 2026-10-04 replay with ten tenants refreshing in one window.
+
+    Every count is 10x the single-tenant replay, including the budget (a
+    fleet of ten is budgeted for ten). The burst hour is 7,000 -- over the
+    3,000 floor -- but every night of the week had one, so the ceiling is
+    3 x that week's p95 hour and a normal night stays under it."""
+    now = datetime(2026, 10, 4, 21, 21, 33, tzinfo=UTC)
+    week = _week_of([10 * count for count in _ONE_TENANT_NIGHT])
+    verdict = evaluate_thresholds(
+        BreakerObservation(
+            now=now,
+            month_started_at=datetime(2026, 10, 1, tzinfo=UTC),
+            proxied_requests_month=44_000,
+            proxied_requests_1h=7_000,
+            proxied_requests_24h=19_000,
+            proxied_requests_7d=90_000,
+            proxied_requests_24h_for_ratio=19_000,
+            distinct_urls_24h=18_300,
+            proxied_requests_7d_p95_hourly=hourly_p95(week),
+        ),
+        _thresholds(monthly_proxied_requests=2_500_000),
+    )
+    assert verdict.tripped is False
+
+
+def test_hourly_ceiling_has_a_floor_when_the_week_was_quiet() -> None:
+    """No history (new month of a new fleet): the floor alone applies."""
+    verdict = evaluate_thresholds(
+        _observation(proxied_requests_1h=2_999, proxied_requests_24h=2_999),
+        _thresholds(monthly_proxied_requests=None),
+    )
+    assert verdict.tripped is False
+    verdict = evaluate_thresholds(
+        _observation(proxied_requests_1h=3_001, proxied_requests_24h=3_001),
+        _thresholds(monthly_proxied_requests=None),
+    )
+    assert verdict.reason is ProxyBreakerTrip.HOURLY_CEILING
+
+
+def test_a_fixed_hourly_ceiling_overrides_the_measured_one() -> None:
+    verdict = evaluate_thresholds(
+        _observation(proxied_requests_1h=1_500, proxied_requests_7d_p95_hourly=5_000),
+        _thresholds(hourly_ceiling=1_000),
+    )
+    assert verdict.reason is ProxyBreakerTrip.HOURLY_CEILING
+
+
+def test_hourly_ceiling_floor_none_disables_the_condition() -> None:
+    verdict = evaluate_thresholds(
+        _observation(proxied_requests_1h=50_000),
+        _thresholds(monthly_proxied_requests=None, hourly_ceiling_floor=None),
+    )
+    assert verdict.tripped is False
+
+
+def test_hourly_p95_counts_the_quiet_hours_of_the_week() -> None:
+    """168 hourly buckets; hours absent from the GROUP BY are zeros."""
+    assert hourly_p95([]) == 0
+    # 8 busy hours of 168 sit above the 95th percentile (nearest rank 160).
+    assert hourly_p95([1_000] * 8) == 0
+    assert hourly_p95([1_000] * 9) == 1_000
+    assert hourly_p95([100] * 160 + [5_000] * 8) == 100
+
+
+@pytest.mark.parametrize(
+    ("count_1h", "count_24h", "hours"),
+    [
+        (700, 1_900, 1_900 / 700),  # the 10-04 night: ~2.7 busy hours
+        (700, 0, 1.0),  # an inconsistent 24h never shortens below 1h
+        (700, 700, 1.0),
+        (100, 100 * 30, 24.0),  # clamped to a day
+        (0, 5_000, 24.0),  # a quiet last hour: the whole day was busy
+    ],
+)
+def test_the_1h_horizon_is_the_days_measured_busy_hours(
+    count_1h: int, count_24h: int, hours: float
+) -> None:
+    assert busy_hours_horizon_seconds(count_1h, count_24h) == pytest.approx(hours * 3600)
+
+
+def test_the_configured_1h_horizon_caps_the_busy_hours() -> None:
+    assert busy_hours_horizon_seconds(100, 2_400, cap_seconds=3 * 3600) == 3 * 3600
 
 
 # --- trip condition 4: proxied requests per unique URL ----------------------
@@ -412,8 +544,8 @@ class _EvalResult:
     Dispatches per ACCESSOR rather than per statement, because that is what
     actually distinguishes the calls `evaluate_and_persist` makes: the row
     lookup uses `scalar_one_or_none`, the lease UPDATE and the discovery
-    aggregate use `first`, the two count aggregates use `scalar_one`, and
-    the 24h count/distinct pair uses `one`.
+    aggregate use `first`, the two count aggregates use `scalar_one`, the
+    24h count/distinct pair uses `one`, and the per-hour week uses `all`.
     """
 
     def __init__(self, session: "_EvalSession") -> None:
@@ -430,6 +562,10 @@ class _EvalResult:
 
     def first(self) -> object:
         return self._session.firsts.pop(0)
+
+    def all(self) -> list[object]:
+        """The trailing week's per-hour counts (E4 hourly ceiling)."""
+        return self._session.hourly
 
 
 class _EvalSession:
@@ -448,6 +584,7 @@ class _EvalSession:
         self.scalars = [month, hour, week]
         self.day_counts = day
         self.firsts = [("breaker-row",) if claimed else None, discovery]
+        self.hourly: list[tuple[object, int]] = []
         self.added: list[object] = []
 
     def execute(self, *_args: object, **_kw: object) -> _EvalResult:

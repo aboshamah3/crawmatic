@@ -40,6 +40,7 @@ disagrees with a buggy caller.
 |---|---|
 | `MONTHLY_SPEND` | month-to-date proxied requests vs absolute ceiling |
 | `VELOCITY_1H` / `VELOCITY_24H` | trailing rate held for a bounded horizon, then the trailing week's average, to month end |
+| `HOURLY_CEILING` | trailing-1h proxied requests vs max(floor, factor x the trailing week's p95 hour) -- no forecast |
 | `REQUESTS_PER_URL` | proxied requests / DISTINCT url (runaway-loop shape) |
 | `DISCOVERY_RUNS_PER_DOMAIN` | discovery runs per domain per day |
 
@@ -87,6 +88,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import math
 import logging
 import threading
 from dataclasses import dataclass, replace
@@ -114,6 +116,8 @@ __all__ = [
     "reset_gate_cache",
     "thresholds_from_settings",
     "BASELINE_WINDOW_SECONDS",
+    "busy_hours_horizon_seconds",
+    "hourly_p95",
     "trip_breaker",
     "velocity_forecast",
 ]
@@ -146,8 +150,20 @@ class BreakerThresholds:
     #: workload's own cycles (nightly and weekly refreshes). Holding a
     #: one-hour window for the whole rest of the month is what tripped
     #: the breaker on a normal nightly burst.
+    #:
+    #: 2026-10-06 (E4): the 1h window is held for the day's MEASURED busy
+    #: hours (see :func:`busy_hours_horizon_seconds`), and
+    #: ``velocity_1h_horizon_seconds`` is only the cap on that.
     velocity_1h_horizon_seconds: float = 86_400.0
     velocity_24h_horizon_seconds: float = 7 * 86_400.0
+    #: Absolute trailing-1h ceiling (E4). ``hourly_ceiling`` fixes it
+    #: outright; left ``None`` it is measured, ``max(hourly_ceiling_floor,
+    #: hourly_ceiling_p95_factor x the trailing week's p95 hour)``. With
+    #: both ``hourly_ceiling`` and ``hourly_ceiling_floor`` ``None`` the
+    #: condition is off.
+    hourly_ceiling: int | None = None
+    hourly_ceiling_floor: int | None = 3_000
+    hourly_ceiling_p95_factor: float = 3.0
     max_requests_per_url: float | None = None
     requests_per_url_min_sample: int = 500
     max_discovery_runs_per_domain_per_day: int | None = None
@@ -172,6 +188,10 @@ class BreakerObservation:
     proxied_requests_1h: int = 0
     proxied_requests_24h: int = 0
     proxied_requests_7d: int = 0
+    #: 95th-percentile hourly proxied count over the trailing week, the
+    #: current hour excluded and quiet hours counted as zero (E4, see
+    #: :func:`hourly_p95`). Sizes the measured hourly ceiling.
+    proxied_requests_7d_p95_hourly: int = 0
     #: Trailing-24h proxied requests and the DISTINCT urls behind them.
     proxied_requests_24h_for_ratio: int = 0
     distinct_urls_24h: int = 0
@@ -188,6 +208,7 @@ class BreakerObservation:
             "proxied_requests_1h": self.proxied_requests_1h,
             "proxied_requests_24h": self.proxied_requests_24h,
             "proxied_requests_7d": self.proxied_requests_7d,
+            "proxied_requests_7d_p95_hourly": self.proxied_requests_7d_p95_hourly,
             "proxied_requests_24h_for_ratio": self.proxied_requests_24h_for_ratio,
             "distinct_urls_24h": self.distinct_urls_24h,
             "max_discovery_runs_domain": self.max_discovery_runs_domain,
@@ -271,6 +292,61 @@ def velocity_forecast(
     return month_to_date + rate * held + baseline_rate * (remaining - held)
 
 
+#: Hourly buckets in the trailing week the p95 hour is taken over.
+HOURS_PER_WEEK = 168
+
+
+def busy_hours_horizon_seconds(
+    count_1h: int, count_24h: int, *, cap_seconds: float = 86_400.0
+) -> float:
+    """How long the 1h window's rate is held in the month-end forecast.
+
+    The day's measured busy hours -- trailing 24h count / trailing 1h
+    count, clamped to 1..24 -- in seconds, capped at ``cap_seconds``
+    (``PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS``). Holding the hour for
+    a fixed day (2026-10-05) assumed a burst lasts 24 hours, which made
+    the hourly trip point ~15k proxied requests; the workload's own day
+    says how long its busy period really lasts (2026-10-06, E4). A 24h
+    count below the hour's (an inconsistent snapshot) reads as one hour;
+    a quiet last hour holds a zero rate, so its horizon cannot matter.
+    """
+    if count_1h <= 0:
+        hours = 24.0
+    else:
+        hours = min(24.0, max(1.0, count_24h / count_1h))
+    return min(hours * 3600.0, max(0.0, cap_seconds))
+
+
+def hourly_p95(hourly_counts: list[int], *, buckets: int = HOURS_PER_WEEK) -> int:
+    """Nearest-rank 95th percentile of a week of hourly proxied counts.
+
+    ``hourly_counts`` holds the NON-empty hours only (what a ``GROUP BY``
+    hour returns); the rest of the ``buckets`` hours are zeros. Counting
+    quiet hours keeps a nightly burst from being its own percentile: a
+    busy hour only sets the p95 once it recurs in more than 5% of the
+    week's hours, i.e. it is the workload's normal shape, not one event.
+    """
+    counts = sorted(int(c) for c in hourly_counts)
+    total = max(buckets, len(counts))
+    padded = [0] * (total - len(counts)) + counts
+    if not padded:
+        return 0
+    rank = max(1, math.ceil(0.95 * len(padded)))
+    return padded[rank - 1]
+
+
+def hourly_ceiling(
+    observation: BreakerObservation, thresholds: BreakerThresholds
+) -> int | None:
+    """The absolute trailing-1h ceiling in force, or ``None`` when off."""
+    if thresholds.hourly_ceiling is not None:
+        return thresholds.hourly_ceiling
+    if thresholds.hourly_ceiling_floor is None:
+        return None
+    measured = thresholds.hourly_ceiling_p95_factor * observation.proxied_requests_7d_p95_hourly
+    return max(thresholds.hourly_ceiling_floor, math.ceil(measured))
+
+
 def evaluate_thresholds(
     observation: BreakerObservation, thresholds: BreakerThresholds
 ) -> BreakerVerdict:
@@ -305,7 +381,11 @@ def evaluate_thresholds(
                 ProxyBreakerTrip.VELOCITY_1H,
                 observation.proxied_requests_1h,
                 3600.0,
-                thresholds.velocity_1h_horizon_seconds,
+                busy_hours_horizon_seconds(
+                    observation.proxied_requests_1h,
+                    observation.proxied_requests_24h,
+                    cap_seconds=thresholds.velocity_1h_horizon_seconds,
+                ),
                 "1h",
             ),
             (
@@ -339,7 +419,29 @@ def evaluate_thresholds(
                     ),
                 )
 
-    # 4. Proxied requests per unique URL — the runaway-loop shape.
+    # 4. Absolute hourly ceiling (2026-10-06, E4) -- no forecast. The
+    # forecasts above hold an hour only for the day's busy hours, so a
+    # fresh runaway is invisible to them for hours (a 3,500/h loop ran
+    # ~8.7 h before the 1-day-horizon forecast tripped). Checked after
+    # them because a forecast names the month-end overrun, the stronger
+    # statement; this is the backstop that needs no history.
+    ceiling = hourly_ceiling(observation, thresholds)
+    if ceiling is not None and observation.proxied_requests_1h > ceiling:
+        return BreakerVerdict(
+            tripped=True,
+            reason=ProxyBreakerTrip.HOURLY_CEILING,
+            detail=(
+                f"{observation.proxied_requests_1h} proxied requests in the trailing "
+                f"hour > hourly ceiling {ceiling} (max of floor "
+                f"{thresholds.hourly_ceiling_floor} and "
+                f"{thresholds.hourly_ceiling_p95_factor} x week p95 hour "
+                f"{observation.proxied_requests_7d_p95_hourly}"
+                + (", fixed" if thresholds.hourly_ceiling is not None else "")
+                + ")"
+            ),
+        )
+
+    # 5. Proxied requests per unique URL — the runaway-loop shape.
     max_per_url = thresholds.max_requests_per_url
     if (
         max_per_url is not None
@@ -359,7 +461,7 @@ def evaluate_thresholds(
                 ),
             )
 
-    # 5. Discovery runs per domain per day.
+    # 6. Discovery runs per domain per day.
     max_discovery = thresholds.max_discovery_runs_per_domain_per_day
     if (
         max_discovery is not None
@@ -386,6 +488,9 @@ def thresholds_from_settings(settings: Any) -> BreakerThresholds:
         velocity_min_sample=settings.PROXY_BREAKER_VELOCITY_MIN_SAMPLE,
         velocity_1h_horizon_seconds=settings.PROXY_BREAKER_VELOCITY_1H_HORIZON_SECONDS,
         velocity_24h_horizon_seconds=settings.PROXY_BREAKER_VELOCITY_24H_HORIZON_SECONDS,
+        hourly_ceiling=settings.PROXY_BREAKER_HOURLY_CEILING,
+        hourly_ceiling_floor=settings.PROXY_BREAKER_HOURLY_CEILING_FLOOR,
+        hourly_ceiling_p95_factor=settings.PROXY_BREAKER_HOURLY_CEILING_P95_FACTOR,
         max_requests_per_url=settings.PROXY_BREAKER_MAX_REQUESTS_PER_URL,
         requests_per_url_min_sample=settings.PROXY_BREAKER_REQUESTS_PER_URL_MIN_SAMPLE,
         max_discovery_runs_per_domain_per_day=(
@@ -407,8 +512,8 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
     `access/engine._proxy_implied` uses, so "paid" means exactly what it
     means everywhere else in this codebase.
 
-    This is the expensive call in the module (three aggregates, one of
-    them a ``COUNT(DISTINCT url)``), which is why it runs behind the
+    This is the expensive call in the module (a handful of aggregates, one
+    of them a ``COUNT(DISTINCT url)`` and one a per-hour ``GROUP BY``), which is why it runs behind the
     :func:`evaluate_and_persist` lease and never on the per-request
     path.
     """
@@ -457,6 +562,21 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
         .where(paid, RequestAttempt.created_at >= since_7d)
     ).scalar_one()
 
+    # E4: the week's per-hour shape for the measured hourly ceiling. The
+    # current hour is excluded (a runaway must not raise its own ceiling);
+    # at most 168 rows, over the same created_at index as `count_7d`.
+    hour_bucket = func.date_trunc("hour", RequestAttempt.created_at)
+    hourly_rows = session.execute(
+        select(hour_bucket, func.count())
+        .select_from(RequestAttempt)
+        .where(
+            paid,
+            RequestAttempt.created_at >= since_7d,
+            RequestAttempt.created_at < since_1h,
+        )
+        .group_by(hour_bucket)
+    ).all()
+
     discovery_row = session.execute(
         select(
             StrategyDiscoveryRun.domain,
@@ -475,6 +595,9 @@ def collect_observation(session: Any, *, now: datetime | None = None) -> Breaker
         proxied_requests_1h=int(count_1h or 0),
         proxied_requests_24h=int(count_24h or 0),
         proxied_requests_7d=int(count_7d or 0),
+        proxied_requests_7d_p95_hourly=hourly_p95(
+            [int(row[1] or 0) for row in hourly_rows]
+        ),
         proxied_requests_24h_for_ratio=int(count_24h or 0),
         distinct_urls_24h=int(distinct_urls_24h or 0),
         max_discovery_runs_domain=discovery_row[0] if discovery_row else None,

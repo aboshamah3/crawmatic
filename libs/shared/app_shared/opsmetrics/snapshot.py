@@ -481,8 +481,9 @@ class SpendVelocity:
     the very function the breaker trips on, not a copy of it -- so the
     dashboard and the breaker never disagree about what "on course to
     blow the budget" means: month-to-date + the window's rate held for its
-    horizon (1h -> a day, 24h -> a week) + the trailing week's average
-    for the rest of the month (2026-10-05).
+    horizon (1h -> the day's measured busy hours, capped at a day, since
+    2026-10-06; 24h -> a week) + the trailing week's average for the rest
+    of the month (2026-10-05).
     """
 
     available: bool
@@ -535,7 +536,19 @@ class SpendVelocity:
 
     @property
     def forecast_month_end_1h(self) -> float:
-        return self._forecast(self.proxied_1h, 3600.0, self.velocity_1h_horizon_seconds)
+        from app_shared.access.breaker import busy_hours_horizon_seconds
+
+        # Same horizon the breaker holds the hour for (E4, 2026-10-06):
+        # the day's measured busy hours, capped by the configured horizon.
+        return self._forecast(
+            self.proxied_1h,
+            3600.0,
+            busy_hours_horizon_seconds(
+                self.proxied_1h,
+                self.proxied_24h,
+                cap_seconds=self.velocity_1h_horizon_seconds,
+            ),
+        )
 
     @property
     def forecast_month_end_24h(self) -> float:
