@@ -189,7 +189,22 @@ DSN_SRC=""
 if [[ -n "${DRYRUN_DATABASE_URL:-}" ]]; then DSN_SRC=env
 elif [[ -r "$DRYRUN_DSN_FILE" ]]; then DRYRUN_DATABASE_URL=$(tr -d '\r\n' < "$DRYRUN_DSN_FILE"); export DRYRUN_DATABASE_URL; DSN_SRC=$DRYRUN_DSN_FILE
 fi
-if [[ -z "$DSN_SRC" ]]; then
+if [[ -z "$DSN_SRC" && -n "${DRYRUN_EVIDENCE_FILE:-}" ]]; then
+  # The prod Postgres has no public/proxy endpoint, so the dry run can run offline on rows
+  # exported read-only over `railway ssh` (same planning functions, same output shape). Accept
+  # that evidence when it is fresh (< 6 h) and ends with the tool's own "OK: no collisions." line.
+  if [[ -r "$DRYRUN_EVIDENCE_FILE" ]] && grep -q '^OK: no collisions\.' "$DRYRUN_EVIDENCE_FILE" \
+     && [[ $(( $(date +%s) - $(stat -c %Y "$DRYRUN_EVIDENCE_FILE") )) -lt 21600 ]]; then
+    echo "dry run: accepted offline evidence $DRYRUN_EVIDENCE_FILE ($(stat -c %y "$DRYRUN_EVIDENCE_FILE" | cut -c1-19))"
+    DSN_SRC=evidence
+  else
+    echo "!! DRYRUN_EVIDENCE_FILE=$DRYRUN_EVIDENCE_FILE is missing, older than 6 h, or does not end with 'OK: no collisions.'"
+    (( DRY )) || exit 1
+  fi
+fi
+if [[ "$DSN_SRC" == evidence ]]; then
+  :
+elif [[ -z "$DSN_SRC" ]]; then
   echo "!! no prod DSN for the dry run. Put a (read-only) prod engine DSN in the environment as DRYRUN_DATABASE_URL"
   echo "   or in the 0600 file $DRYRUN_DSN_FILE (use the railway2 public/proxy URL, never printed). The migration"
   echo "   refuses on collisions anyway, but this script must stop BEFORE the migrate service is uploaded."
