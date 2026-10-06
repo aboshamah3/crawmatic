@@ -481,6 +481,13 @@ class Settings(BaseSettings):
     # per job (`breaker-defer:<job>`) delayed by this debounce, instead of
     # one `dispatch_job` enqueue per deferred target.
     SCRAPE_BREAKER_DEFER_DISPATCH_DEBOUNCE_SECONDS: int = 60
+    # BREAKER_OPEN defers count on their OWN per-(job, target) budget; the
+    # next one past it fails the target FAILED/BREAKER_OPEN. Nothing else
+    # bounds them: a persisted strategy cursor is never re-charged by the
+    # attempt ladder and the per-target deadline re-anchors on every claim.
+    # 60 is about an hour of re-dispatches at the 60 s debounce -- past the
+    # breaker's 1 h auto-close cooldown.
+    SCRAPE_MAX_BREAKER_DEFER_CYCLES: int = 60
 
     # --- EPA C1 (F08): per-TARGET deadline + physical attempt budget ------
     # `SCRAPE_JOB_MAX_RUNTIME_SECONDS` (12h) and `SCRAPE_MAX_DEFER_CYCLES`
@@ -1315,6 +1322,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"JWT_ALGORITHM must be one of {', '.join(allowed)} (got {value!r})"
             )
+        return value
+
+    @field_validator(
+        "PROXY_BREAKER_HOURLY_CEILING", "PROXY_BREAKER_HOURLY_CEILING_FLOOR", mode="before"
+    )
+    @classmethod
+    def _optional_int_none_spellings(cls, value: object) -> object:
+        """``""``/``"none"``/``"null"`` (any case) -> ``None`` (2026-10-06).
+
+        The runbook disables the hourly ceiling by clearing these; without
+        this an empty env value fails ``int_parsing`` and every service
+        crashes at boot.
+        """
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+            return None
         return value
 
     @field_validator("SCRAPYD_HTTP_URLS", "SCRAPYD_BROWSER_URLS", mode="before")

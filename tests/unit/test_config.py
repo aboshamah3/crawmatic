@@ -223,3 +223,29 @@ def test_strategy_signals_domain_join_honors_env_override(monkeypatch: pytest.Mo
     settings = Settings(_env_file=None)
 
     assert settings.STRATEGY_SIGNALS_DOMAIN_JOIN is True
+
+
+@pytest.mark.parametrize("raw", ["", "none", "None", "NULL", " null "])
+@pytest.mark.parametrize(
+    "name", ["PROXY_BREAKER_HOURLY_CEILING", "PROXY_BREAKER_HOURLY_CEILING_FLOOR"]
+)
+def test_hourly_ceiling_settings_accept_an_empty_or_none_env_value(
+    monkeypatch: pytest.MonkeyPatch, name: str, raw: str
+) -> None:
+    """2026-10-06 (E4): the runbook disables the hourly ceiling with an
+    empty/None value; that must parse to None, not crash every service
+    at boot with int_parsing."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(name, raw)
+    assert getattr(Settings(_env_file=None), name) is None
+
+
+def test_hourly_ceiling_settings_still_parse_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PROXY_BREAKER_HOURLY_CEILING", "4500")
+    monkeypatch.setenv("PROXY_BREAKER_HOURLY_CEILING_FLOOR", "2000")
+    settings = Settings(_env_file=None)
+    assert settings.PROXY_BREAKER_HOURLY_CEILING == 4500
+    assert settings.PROXY_BREAKER_HOURLY_CEILING_FLOOR == 2000
