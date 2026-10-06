@@ -65,7 +65,7 @@ class _FakeSettings:
 @pytest.fixture(autouse=True)
 def _patch_session_plumbing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(deps, "get_session", _fake_get_session)
-    monkeypatch.setattr(deps, "set_workspace_context", _fake_set_workspace_context)
+    monkeypatch.setattr(deps, "bind_workspace_context", _fake_set_workspace_context)
     monkeypatch.setattr(deps, "get_redis_client", lambda: object())
     monkeypatch.setattr(deps, "get_settings", lambda: _FakeSettings())
 

@@ -218,6 +218,52 @@ def set_workspace_context(session: Session, workspace_id: object) -> None:
     )
 
 
+def bind_workspace_context(session: Session, workspace_id: object) -> None:
+    """Arrange for ``app.workspace_id`` to be set at the start of EVERY transaction
+    ``session`` opens, without touching the database now.
+
+    Incident 2026-10-06 (engine api, 17:37-23:08Z): :func:`set_workspace_context`
+    executes a statement, and a statement checks a pooled connection out. The
+    API's auth dependency called it *before* yielding, in a worker thread, so a
+    request held a connection while it waited for a second worker thread to run
+    its handler. Under a burst wider than the connection pool (the SaaS read-model
+    sync: 4 projects x 5 walks = 20 requests at once) the thread pool filled with
+    requests blocked on ``pool.connect()`` while the 7 connection holders could not
+    get a thread -- a priority inversion that only the 15 s ``pool_timeout`` broke,
+    with Postgres idle throughout. SaaS gave up at 5 s, every pass, for six hours.
+
+    This registers a session-level ``after_begin`` listener instead: SQLAlchemy
+    fires it on each ``Connection`` the moment the session begins a transaction on
+    it (before the statement that triggered the begin), so the ``SELECT
+    set_config(..., true)`` runs on the handler's own thread, first thing, inside
+    the same transaction, with the same bound-parameter SQL as
+    :func:`set_workspace_context`. Nothing is checked out until the handler's first
+    statement. Because the listener fires per transaction, the context is also
+    re-applied after a mid-request ``commit()``/``rollback()``, which a one-shot
+    ``SET LOCAL`` cannot survive.
+
+    Must be called on a session that has not yet begun a transaction (a fresh one
+    from :func:`get_session`); it refuses otherwise rather than silently leave the
+    current transaction without a context, which under forced RLS reads as zero
+    rows. Callers that already hold a transaction keep using
+    :func:`set_workspace_context`.
+    """
+    if session.in_transaction():
+        raise RuntimeError(
+            "bind_workspace_context() must be called before the session begins a "
+            "transaction; use set_workspace_context() on an already-open transaction."
+        )
+    wsid = str(workspace_id)
+
+    def _apply(_session: Session, _transaction: object, connection: object) -> None:
+        connection.execute(  # type: ignore[attr-defined]
+            text("SELECT set_config('app.workspace_id', :wsid, true)"),
+            {"wsid": wsid},
+        )
+
+    event.listen(session, "after_begin", _apply)
+
+
 @contextmanager
 def override_statement_timeout(session: Session, timeout_ms: int) -> Iterator[None]:
     """Raise (or lower) ``statement_timeout`` for the rest of this transaction only.

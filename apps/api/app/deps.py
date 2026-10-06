@@ -23,8 +23,12 @@ order:
    workspace is a role-authorized act, never a bypass); a SUPER_ADMIN
    (JWT ``workspace_id`` null) MUST supply an explicit, role-authorized
    ``X-Workspace-Id``.
-5. Open the request transaction and call ``set_workspace_context`` before
-   any workspace-owned query runs.
+5. Open the request session and bind the workspace context to it
+   (``bind_workspace_context``): the ``set_config`` runs at the start of
+   each transaction the handler opens, so the dependency itself never
+   checks a pooled connection out before yielding (2026-10-06 incident:
+   a connection held across the yield while the handler waited for a
+   worker thread deadlocked the api under the SaaS sync burst).
 
 The pre-auth credential lookups (api-key-by-prefix, user-status-by-id)
 run through ``get_auth_session()`` (BYPASSRLS) — the same narrow,
@@ -45,7 +49,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app_shared.config import get_settings
-from app_shared.database import get_auth_session, get_session, set_workspace_context
+from app_shared.database import bind_workspace_context, get_auth_session, get_session
 from app_shared.enums import ApiKeyStatus, UserRole
 from app_shared.models import ApiKey
 from app_shared.redis_client import get_redis_client
@@ -289,11 +293,13 @@ def get_current_principal(
     """FastAPI dependency: resolve the principal, open the request txn, set context.
 
     Yields ``(session, principal)`` where ``principal.workspace_id`` is
-    the single, authorized workspace context already applied to
-    ``session`` via :func:`app_shared.database.set_workspace_context`
-    (FR-017). Route handlers perform all workspace-owned reads/writes
-    through this session, never a fresh one, so RLS sees the resolved
-    context.
+    the single, authorized workspace context bound to ``session`` via
+    :func:`app_shared.database.bind_workspace_context` (FR-017): the
+    ``set_config`` statement runs on the handler's thread at the start of
+    every transaction the session opens, so no pooled connection is
+    checked out before the yield. Route handlers perform all
+    workspace-owned reads/writes through this session, never a fresh one,
+    so RLS sees the resolved context.
     """
     credential = _extract_bearer_credential(authorization)
 
@@ -313,7 +319,7 @@ def get_current_principal(
     )
 
     with get_session() as session:
-        set_workspace_context(session, workspace_id)
+        bind_workspace_context(session, workspace_id)
         yield session, principal
         session.commit()
 
