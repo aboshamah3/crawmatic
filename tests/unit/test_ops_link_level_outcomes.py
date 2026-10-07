@@ -100,3 +100,28 @@ def test_thresholds_come_from_settings_with_the_constants_as_defaults() -> None:
     assert tuned.domain_success_min_attempts == 100
     assert tuned.wasted_paid_rate_high == 0.5
     assert tuned.wasted_paid_min_attempts == 300
+
+
+def test_deadline_failed_counts_never_fetched_target_deadline_code() -> None:
+    """E1 (2026-10-07): TARGET_DEADLINE_EXCEEDED with attempt_count = 0 is folded
+    into the same `deadline_failed` figure the alert reads."""
+    from app_shared.opsmetrics.snapshot import _LINK_OUTCOMES_SQL
+
+    assert "JOB_DEADLINE_EXCEEDED" in _LINK_OUTCOMES_SQL
+    assert "TARGET_DEADLINE_EXCEEDED" in _LINK_OUTCOMES_SQL
+    # attempt_count = 0 is expressed as "no request_attempts row for the target".
+    assert "NOT EXISTS" in _LINK_OUTCOMES_SQL
+    assert "ra.match_id = t.match_id" in _LINK_OUTCOMES_SQL
+    assert "ra.scrape_job_id = t.scrape_job_id" in _LINK_OUTCOMES_SQL
+
+
+def test_deadline_failed_alert_message_names_the_per_target_code() -> None:
+    snap = OpsSnapshot(
+        collected_at=NOW,
+        link_outcomes_24h=(
+            LinkOutcomes(domain="noon.com", completed=0, failed=40, skipped=0, deadline_failed=40),
+        ),
+    )
+    (alert,) = _by_id(evaluate(snap), "jobs.deadline_failed_targets")
+    assert "attempt_count = 0" in alert.message
+    assert alert.observed["deadline_failed"] == 40

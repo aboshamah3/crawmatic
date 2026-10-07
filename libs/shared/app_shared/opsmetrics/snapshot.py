@@ -1460,7 +1460,8 @@ GROUP BY 1, 2
 """
 
 #: E9.1: terminal targets per domain in the window, deadline failures split
-#: out. `scrape_job_targets` has no domain; attribution is match ->
+#: out (``deadline_failed`` = JOB_DEADLINE_EXCEEDED plus never-fetched
+#: TARGET_DEADLINE_EXCEEDED, folded into one figure). `scrape_job_targets` has no domain; attribution is match ->
 #: competitor, the same join `_SUCCESSFUL_PRICES_SQL` uses.
 _LINK_OUTCOMES_SQL = """
 SELECT c.domain AS domain,
@@ -1468,7 +1469,18 @@ SELECT c.domain AS domain,
        count(*) FILTER (WHERE t.status = 'FAILED')    AS failed,
        count(*) FILTER (WHERE t.status = 'SKIPPED')   AS skipped,
        count(*) FILTER (WHERE t.status = 'FAILED'
-                          AND t.error_code = 'JOB_DEADLINE_EXCEEDED') AS deadline_failed
+                          AND (t.error_code = 'JOB_DEADLINE_EXCEEDED'
+                               OR (t.error_code = 'TARGET_DEADLINE_EXCEEDED'
+                                   -- E1 (2026-10-07): attempt_count = 0, i.e. no
+                                   -- request_attempts row for this target. The
+                                   -- one-day look-back keeps partition pruning.
+                                   AND NOT EXISTS (
+                                       SELECT 1 FROM request_attempts ra
+                                       WHERE ra.workspace_id = t.workspace_id
+                                         AND ra.scrape_job_id = t.scrape_job_id
+                                         AND ra.match_id = t.match_id
+                                         AND ra.created_at >= CAST(:since AS timestamptz) - interval '1 day'
+                                   )))) AS deadline_failed
 FROM scrape_job_targets t
 JOIN competitor_product_matches cpm
   ON cpm.workspace_id = t.workspace_id AND cpm.id = t.match_id

@@ -1249,7 +1249,10 @@ _J_DEADLINE = (
     "E9.1 (2026-09-29): targets the job deadline fails write no request "
     "attempt, so every attempt-based rule is blind to them -- and they were "
     "the night's largest failure (~940 a night: amazon.sa 629, noon.com 297). "
-    "A link that was never tried is a failure the customer sees."
+    "A link that was never tried is a failure the customer sees. E1 "
+    "(2026-10-07): the count also folds in TARGET_DEADLINE_EXCEEDED targets "
+    "with attempt_count = 0 (the per-target 15-min gate firing on a target "
+    "that never fetched)."
 )
 
 
@@ -1265,7 +1268,7 @@ def _r_deadline_failed_targets(snapshot: OpsSnapshot, _t: Thresholds) -> list[Al
             "jobs.deadline_failed_targets",
             Severity.HIGH,
             Category.RELIABILITY,
-            f"{total} target(s) were failed by the job deadline in 24h without "
+            f"{total} target(s) were failed by a deadline (job, or per-target with attempt_count = 0) in 24h without "
             "ever being fetched.",
             _J_DEADLINE,
             observed={"deadline_failed": total, "by_domain": by_domain},
