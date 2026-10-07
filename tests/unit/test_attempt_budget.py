@@ -26,6 +26,8 @@ keeps the bound from becoming a trap:
 from __future__ import annotations
 
 import uuid
+
+import pytest
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -372,3 +374,104 @@ def test_ladder_without_a_budget_is_unchanged() -> None:
     assert selection is not None
     assert selection.method.access_method is AccessMethod.DIRECT_HTTP
     assert selection.attempt_ordinal == 1
+
+
+# --- E1 (2026-10-07): the deadline anchors on first start only ---------------
+
+
+class _TargetStub:
+    def __init__(self, *, started_at, created_at) -> None:
+        self.started_at = started_at
+        self.created_at = created_at
+        self.match_id = uuid.uuid4()
+
+
+class _SettingsStub:
+    SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS = 5
+    SCRAPE_TARGET_DEADLINE_SECONDS = 900
+    SCRAPE_RECOVERY_PROBE_FRACTION = 0.1
+
+
+_WORKER_SCRIPT = """
+import sys, uuid
+sys.path.insert(0, "apps/workers")
+from datetime import datetime, timedelta, timezone
+from app.workers.tasks_jobs import _target_attempt_budget
+
+class T:
+    def __init__(self, started_at, created_at):
+        self.started_at, self.created_at, self.match_id = started_at, created_at, uuid.uuid4()
+
+class S:
+    SCRAPE_TARGET_MAX_PHYSICAL_ATTEMPTS = 5
+    SCRAPE_TARGET_DEADLINE_SECONDS = 900
+    SCRAPE_RECOVERY_PROBE_FRACTION = 0.1
+
+now = datetime.now(timezone.utc)
+def exceeded(started_at, created_at):
+    b = _target_attempt_budget(object(), settings=S(), scrape_job_id=uuid.uuid4(),
+                               target=T(started_at, created_at), domain="noon.com", playbook=None)
+    return b.deadline_exceeded()
+
+print(exceeded(None, now - timedelta(hours=8)),
+      exceeded(now - timedelta(minutes=20), now - timedelta(minutes=20)),
+      exceeded(now - timedelta(minutes=5), now - timedelta(minutes=5)))
+"""
+
+
+def test_worker_never_started_target_is_not_failed_by_the_target_deadline() -> None:
+    """E1 (2026-10-07), `tasks_jobs._target_attempt_budget`: only a STARTED target
+    can overrun the per-target deadline; a started one past 15 min still does."""
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        **os.environ,
+        "DATABASE_URL": "postgresql+psycopg://crawmatic:crawmatic@pgbouncer:6432/crawmatic",
+        "REDIS_URL": "redis://redis:6379/0",
+        "SCRAPYD_HTTP_URLS": "http://scrapers:6800",
+        "SCRAPYD_BROWSER_URLS": "http://scrapers-browser:6800",
+        "SCRAPYD_USERNAME": "scrapyd",
+        "SCRAPYD_PASSWORD": "change-me",
+        "JWT_SECRET": "test-jwt-secret",
+        "ENCRYPTION_KEYS": "1:DDdqY9HwOBbYpfuS_6K-Z_fa75VD5fxAt0HNkdYP940=",
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", _WORKER_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr[-800:]
+    assert out.stdout.split() == ["False", "True", "False"]
+
+
+def _core_budget(target, monkeypatch):
+    from scrape_core import targets as targets_mod
+
+    monkeypatch.setattr(targets_mod, "_settings", lambda: _SettingsStub())
+    return targets_mod._target_attempt_budget(
+        object(),
+        scrape_job_id=uuid.uuid4(),
+        job_target=target,
+        match_id=target.match_id,
+        domain="noon.com",
+        playbook=None,
+    )
+
+
+def test_core_never_started_target_is_not_failed_by_the_target_deadline(monkeypatch) -> None:
+    old = datetime.now(timezone.utc) - timedelta(hours=8)
+    budget = _core_budget(_TargetStub(started_at=None, created_at=old), monkeypatch)
+    assert budget.deadline_exceeded() is False
+
+
+def test_core_started_target_past_15_minutes_is_still_failed(monkeypatch) -> None:
+    started = datetime.now(timezone.utc) - timedelta(minutes=20)
+    budget = _core_budget(_TargetStub(started_at=started, created_at=started), monkeypatch)
+    assert budget.deadline_exceeded() is True
+
+
+def test_core_recently_started_target_is_within_its_deadline(monkeypatch) -> None:
+    started = datetime.now(timezone.utc) - timedelta(minutes=5)
+    budget = _core_budget(_TargetStub(started_at=started, created_at=started), monkeypatch)
+    assert budget.deadline_exceeded() is False

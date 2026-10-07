@@ -629,11 +629,13 @@ def _target_attempt_budget(
     """
     if redis is None or scrape_job_id is None:
         return None
-    anchor = (
-        getattr(target, "started_at", None)
-        or getattr(target, "created_at", None)
-        or datetime.now(timezone.utc)
-    )
+    # E1 (2026-10-07): the per-target deadline anchors on first start
+    # ONLY. A target never started (`started_at IS NULL`) has had no
+    # fetch yet, so it cannot have overrun anything; anchoring on
+    # `created_at` killed queued targets on their first re-plan with
+    # TARGET_DEADLINE_EXCEEDED and no attempt. Anchor on "now" instead,
+    # so the gate cannot fire for it (the 12 h job deadline still bounds it).
+    anchor = getattr(target, "started_at", None) or datetime.now(timezone.utc)
     fraction = (
         playbook.recovery_probe_fraction
         if playbook is not None and playbook.recovery_probe_fraction is not None
