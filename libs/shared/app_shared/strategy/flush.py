@@ -343,7 +343,11 @@ def _upsert_stats(
             "attempt_count": new_attempt,
             "success_count": new_success,
             "failure_count": table.failure_count + stmt.excluded.failure_count,
-            "success_rate": cast(new_success, Numeric(5, 4)) / func.nullif(new_attempt, 0),
+            # Cast the numerator to unbounded NUMERIC (so the division is not integer
+            # division) and leave the quotient to the column's NUMERIC(5, 4) on
+            # assignment. Casting the *count* to NUMERIC(5, 4) overflowed (max < 10)
+            # for any method with >= 10 cumulative successes.
+            "success_rate": cast(new_success, Numeric) / func.nullif(new_attempt, 0),
             "avg_response_time_ms": (
                 (func.coalesce(table.avg_response_time_ms, 0) * table.attempt_count)
                 + literal(drained.rt_ms_sum)
