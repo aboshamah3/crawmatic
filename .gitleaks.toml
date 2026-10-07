@@ -87,3 +87,22 @@ regexes = [
   '''(?i)(placeholder|example|dummy|changeme|your[-_]?(key|token|secret)|xxxx+|<[a-z_]+>|\bfake\b|\bsample\b)''',
   '''(?i)^0{16,}$''',
 ]
+
+# ── Assessed false positives (2026-10-07) ──────────────────────────────────
+# Per-path AND per-rule, never global: the same rule still fires everywhere
+# else. Each entry is a constant or test fixture, not a credential.
+
+[[allowlists]]
+description = "DATAIMPULSE_DEFAULT_BASE_URL constant (a public gateway URL, not a credential) matched by the DATAIMPULSE_* env-assignment rule"
+targetRules = ["dataimpulse-env-credential"]
+paths = ['''(^|/)libs/shared/app_shared/netledger/provider_usage_clients\.py$''']
+
+[[allowlists]]
+description = "JWT unit-test fixtures: throwaway legacy-token strings built in-process"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)tests/unit/test_jwt\.py$''']
+
+[[allowlists]]
+description = "DR credential-routing test writes dummy tok-*-SECRET values into a tmp accounts file"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)tests/unit/test_dr_credential_routing\.py$''']

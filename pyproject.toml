@@ -46,6 +46,7 @@ dev = [
 markers = [
     "integration: needs the docker-compose DB/pgbouncer stack; skipped by -m 'not integration'",
     "browser: needs a real Chromium (playwright install chromium); run inside the scrapers-browser image",
+    "abuse_limiter_live: keeps the real AbuseLimitMiddleware probe (tests/conftest.py otherwise stands it down for unit tests)",
     "load: local stub-based load/concurrency test (no real Redis/Postgres); run explicitly with -m load",
     "benchmark: seeds a large synthetic dataset and measures wall-clock/statement cost against a real Postgres; run explicitly with -m benchmark (never in the unit gate)",
 ]

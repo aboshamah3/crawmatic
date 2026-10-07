@@ -39,6 +39,8 @@ OTHER_BEARER = {"Authorization": "Bearer a-different-credential"}
 WS_A = str(uuid.uuid4())
 WS_B = str(uuid.uuid4())
 
+pytestmark = pytest.mark.abuse_limiter_live
+
 
 class _FakeScript:
     def __init__(self, redis: "FakeAsyncRedis") -> None:

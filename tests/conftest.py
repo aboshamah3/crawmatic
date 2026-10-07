@@ -137,6 +137,38 @@ def isolated_unit_environment() -> Iterator[dict[str, str | None]]:
 
 
 @pytest.fixture(autouse=True)
+def _abuse_limiter_stands_down_for_unit_tests(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the fail-closed abuse limiter from 429-ing unit tests.
+
+    With `.env.example` copied to `.env` (CI), `Settings` builds, so the
+    shared `app`'s `AbuseLimitMiddleware` is live; its Redis is the dead
+    `127.0.0.1:1` above, and a limited write that cannot reach its counter is
+    refused with 429 BY DESIGN. That is production behaviour and stays as is.
+
+    Unit tests are not the place to exercise it, so for every test except
+    `integration`-marked ones and tests marked `abuse_limiter_live`
+    (`tests/unit/test_abuse_limit.py` is, module-wide) the middleware's
+    "is a store configured?" probe answers False -- the same answer a process
+    without a `.env` gives. Only the probe is patched: middleware built with
+    an injected `redis_factory` ignores it, and the fail-closed code path is
+    never edited.
+    """
+    if (
+        request.node.get_closest_marker("integration") is not None
+        or request.node.get_closest_marker("abuse_limiter_live") is not None
+    ):
+        return
+    try:
+        from app import abuse_limit
+    except Exception:  # noqa: BLE001 - app not importable is the test's failure
+        return
+    monkeypatch.setattr(abuse_limit, "_store_is_configured", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _real_environment_for_integration_tests(
     request: pytest.FixtureRequest,
     isolated_unit_environment: dict[str, str | None],

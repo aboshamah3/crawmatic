@@ -182,7 +182,7 @@ def test_admin_can_approve(session, monkeypatch) -> None:
     # its counter DB is unreachable here (fail-closed 429). The request sends
     # no credential (require_service_token is overridden), so the limiter has
     # no identity to count and passes it through -- as test_admin_router does.
-    monkeypatch.setattr(abuse_limit, "_database_is_configured", lambda: True)
+    monkeypatch.setattr(abuse_limit, "_store_is_configured", lambda: False)
     resp = TestClient(app).patch(
         f"/v1/admin/workspaces/{WS}/competitors/{comp.id}/approval",
         json={"robots_policy": "IGNORE_AFTER_APPROVAL", "legal_status": "APPROVED"},

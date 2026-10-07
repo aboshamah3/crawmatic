@@ -176,6 +176,46 @@ SAAS_CALLS: tuple[tuple[str, str, str, tuple[str, ...] | None], ...] = (
         "monitoringClient.runVariantJob",
         ("jobs:write",),
     ),
+    # ── engineControlPlane.ts — SaaS control-plane reconciler (SERVICE token) ──
+    # The SaaS flipped every ENGINE_CONTROL_PLANE_SUPPORT flag to true on
+    # 2026-09-04 and the engine serves all six (routers/control_plane.py), so
+    # they are live contract, not pending support.
+    (
+        "GET",
+        "/v1/admin/workspaces/{workspace_id}/control-plane/state",
+        "engineControlPlane.getWorkspaceState",
+        None,
+    ),
+    (
+        "POST",
+        "/v1/admin/workspaces/{workspace_id}/control-plane/rules",
+        "engineControlPlane.createRule",
+        None,
+    ),
+    (
+        "PUT",
+        "/v1/admin/workspaces/{workspace_id}/control-plane/rules/{external_id}",
+        "engineControlPlane.updateRule",
+        None,
+    ),
+    (
+        "POST",
+        "/v1/admin/workspaces/{workspace_id}/control-plane/{entity_type}/{external_id}/quarantine",
+        "engineControlPlane.quarantineEntity",
+        None,
+    ),
+    (
+        "DELETE",
+        "/v1/admin/workspaces/{workspace_id}/control-plane/{entity_type}/{external_id}",
+        "engineControlPlane.deleteEntity",
+        None,
+    ),
+    (
+        "PUT",
+        "/v1/admin/workspaces/{workspace_id}/control-plane/entitlement",
+        "engineControlPlane.replicateEntitlement",
+        None,
+    ),
 )
 
 
@@ -627,18 +667,14 @@ def test_auth_failures_are_the_statuses_the_saas_collapses() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (7) THE W1.1 CONTROL-PLANE CONTRACT — asserted as ABSENT, and pinned
+# (7) THE W1.1 CONTROL-PLANE CONTRACT — now LIVE, pinned via SAAS_CALLS
 #
 # `saas/app/src/server/engine/engineControlPlane.ts` declares six calls behind
-# `ENGINE_CONTROL_PLANE_SUPPORT`, every flag `false`. This block is the engine
-# side of that: it proves the flags are honest TODAY, and it states the
-# uniqueness contract (E1) the endpoints must satisfy the day they are built.
-#
-# Two directions of failure, both covered:
-#   * somebody flips a SaaS flag without building the endpoint  -> the SaaS
-#     twin of this test (contract.test.ts) goes red;
-#   * somebody builds an endpoint here without telling the SaaS -> the
-#     absence assertions below go red, which is the prompt to flip the flag.
+# `ENGINE_CONTROL_PLANE_SUPPORT`; the SaaS flipped every flag to true on
+# 2026-09-04 and the engine serves them. Route existence and the
+# service-token (no API-key scope) shape of all six are therefore asserted by
+# the SAAS_CALLS parametrisations above; this block keeps the declared-call
+# list and the identity-contract checks (E1) the endpoints must satisfy.
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONTROL_PLANE_CONTRACT: tuple[tuple[str, str, str], ...] = (
@@ -673,45 +709,6 @@ CONTROL_PLANE_CONTRACT: tuple[tuple[str, str, str], ...] = (
 # `saas/.../reconciler.ts` RECONCILED_ENTITY_TYPES. Pinned because the strings
 # ride in a URL path segment.
 RECONCILED_ENTITY_TYPES = ("rule", "entitlement")
-
-
-@pytest.mark.parametrize(
-    "call,method,path",
-    CONTROL_PLANE_CONTRACT,
-    ids=[c for c, _, _ in CONTROL_PLANE_CONTRACT],
-)
-def test_control_plane_endpoint_is_still_absent(call: str, method: str, path: str) -> None:
-    """PENDING ENGINE SUPPORT, asserted rather than assumed.
-
-    When this test fails, the endpoint has been BUILT — and the correct
-    response is not to delete this assertion but to move the call into
-    SAAS_CALLS above, flip `ENGINE_CONTROL_PLANE_SUPPORT.<call>` in the SaaS,
-    and let the SaaS twin's flag test go green with it. Until all three
-    happen, the reconciler must keep reporting the workspace as `failing`,
-    which is the truth.
-    """
-    found = _find_route(path, method)
-    assert found is None, (
-        f"{method} {path} now EXISTS. The SaaS still has "
-        f"ENGINE_CONTROL_PLANE_SUPPORT.{call} = false, so the reconciler is "
-        f"reporting this workspace as failing while the engine can serve it. "
-        f"Flip the flag and move this call into SAAS_CALLS."
-    )
-
-
-def test_no_entitlement_concept_exists_in_the_engine_yet() -> None:
-    """(E2): the engine stores no entitlement, so it cannot deny on staleness.
-
-    `engineControlPlane.ts`'s header claims `grep -ril entitlement` over the
-    engine returns zero files. That claim is load-bearing — it is why the
-    reconciler refuses to report entitlement replication as applied — so it is
-    checked here rather than trusted.
-    """
-    routes = [r.path for r in _iter_api_routes()]
-    assert not [p for p in routes if "entitlement" in p.lower()], (
-        "an entitlement route appeared; the SaaS's replicateEntitlement flag must "
-        "be revisited together with it"
-    )
 
 
 def test_refresh_rules_cannot_express_the_w11_identity_contract() -> None:
