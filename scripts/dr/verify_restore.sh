@@ -173,6 +173,17 @@ main() {
     timed "restore + assert [$target]" verify_target "$target" || true
   done
 
+  # Optional targets (outreach, O5) absent from the set are a RECORDED SKIP,
+  # never a quiet success: the report must show that nothing proves the
+  # outreach database is restorable in this set. Present targets were verified
+  # by the loop above with the same restore mechanism as engine/SaaS.
+  local opt
+  for opt in "${DR_OPTIONAL_TARGETS[@]}"; do
+    if ! jq -e --arg n "$opt" '.targets | has($n)' "$SET_DIR/manifest.json" >/dev/null; then
+      skip "[$opt] not present in $set_name (optional target skipped at backup time: no railway4 credential, no public TCP proxy, or DR_SKIP_TARGETS) — its restore is NOT proven"
+    fi
+  done
+
   # The three things a `pg_restore` alone does not recover.
   timed "sidecars (netledger buffer, result spool, evidence listing)" verify_sidecars || true
   timed "config snapshot"        verify_config_snapshot || true

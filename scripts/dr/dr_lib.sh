@@ -87,7 +87,44 @@ DR_DATA_EXCLUDED_TABLES=(public.catalog_index_products public.catalog_index_code
 DR_TARGETS=(
   "engine|69dc4bda-0d97-4290-a82f-822ed97d3fb8|postgres|RAILWAY_TOKEN_RAILWAY2"
   "saas|91debd0f-1dc4-4b7f-aa74-b9874ac27071|Postgres|RAILWAY_TOKEN_RW003"
+  # O5 (full risk review 2026-10-07): the outreach project moved to the railway4
+  # account (rw004@plyon.app) on 2026-09-11 and was never added here. Its
+  # Postgres holds prospects, report pages, WhatsApp threads, opt-outs and
+  # bookings. The token is referenced by VARIABLE NAME only
+  # (RAILWAY_TOKEN_RAILWAY4 in $DR_RAILWAY_ACCOUNTS); no value lives in this repo.
+  "outreach|cf7d41bd-8a77-4831-bab4-7edd03a6a1d5|Postgres|RAILWAY_TOKEN_RAILWAY4"
 )
+
+# Targets that are OPTIONAL: a missing credential or a missing public TCP proxy
+# is a logged SKIP for that target only, never a failure and never a reason to
+# lose the other targets' dumps. engine and saas stay mandatory (a failure
+# there still raises DR-ALERT and a PARTIAL set).
+#
+# WHY outreach is optional: its production Postgres has NO public TCP proxy
+# (the host reaches it only through `railway ssh`, which needs an SSH key on
+# the railway4 account). The dump path below uses the same
+# RAILWAY_TCP_PROXY_* bridge as the other targets, so it works only once the
+# owner enables a TCP proxy on that service (RUNBOOK §Outreach target). Until
+# then it SKIPs LOUDLY (WARN) every run.
+DR_OPTIONAL_TARGETS=(outreach)
+
+# Switch: DR_SKIP_TARGETS="outreach" (space or comma separated) removes a
+# target from the run entirely, e.g. while the railway4 account is being
+# re-keyed. Unset by default, so outreach is attempted.
+DR_SKIP_TARGETS="${DR_SKIP_TARGETS:-}"
+
+# Exit status a target subshell uses to say "skipped, not failed".
+DR_SKIP_RC=75
+
+dr_target_is_optional() {  # $1 = name
+  local t; for t in "${DR_OPTIONAL_TARGETS[@]}"; do [[ "$t" == "$1" ]] && return 0; done
+  return 1
+}
+
+dr_target_is_disabled() {  # $1 = name
+  local t; for t in ${DR_SKIP_TARGETS//,/ }; do [[ "$t" == "$1" ]] && return 0; done
+  return 1
+}
 
 # Session settings applied to EVERY session that produces or verifies a
 # checksum. `md5(row::text)` renders values with the session's formatting
@@ -166,16 +203,21 @@ dr_gpg_decrypt_stdout() { # $1 = input path
 # lookup failed — it used to go to /dev/null, which turned a moved project into
 # six silent days without backups. It is captured to a private temp file,
 # scrubbed (PG* values, DSNs and the token itself), and put on the alert line.
-dr_load_pgenv() {  # $1 = project id, $2 = service, $3 = token variable name
-  local project="$1" service="$2" token_var="${3:-}" vars token errf err
+dr_load_pgenv() {  # $1 = project id, $2 = service, $3 = token variable name, $4 = "optional" to SKIP (return 75) on missing creds/proxy
+  local project="$1" service="$2" token_var="${3:-}" optional="${4:-}" vars token errf err
   [[ "$token_var" =~ ^[A-Z][A-Z0-9_]*$ ]] \
     || dr_die "no valid token variable name for project=$project service=$service (DR_TARGETS field 4)"
   # shellcheck disable=SC1090
   source "$DR_RAILWAY_ACCOUNTS" >/dev/null 2>&1 \
     || dr_die "cannot source $DR_RAILWAY_ACCOUNTS"
   token="${!token_var:-}"
-  [[ -n "$token" ]] \
-    || dr_die "$token_var not exported by $DR_RAILWAY_ACCOUNTS"
+  if [[ -z "$token" ]]; then
+    if [[ "$optional" == optional ]]; then
+      dr_log WARN "SKIP: $token_var not exported by $DR_RAILWAY_ACCOUNTS (optional target, project=$project) — this target is NOT being backed up"
+      return "$DR_SKIP_RC"
+    fi
+    dr_die "$token_var not exported by $DR_RAILWAY_ACCOUNTS"
+  fi
 
   errf=$(mktemp "${TMPDIR:-/tmp}/dr-railway-err.XXXXXX"); chmod 600 "$errf"
   if ! vars=$(RAILWAY_API_TOKEN="$token" \
@@ -187,7 +229,10 @@ dr_load_pgenv() {  # $1 = project id, $2 = service, $3 = token variable name
   fi
   rm -f "$errf"; token=""
 
-  get() { grep -m1 -E "^$1=" <<<"$vars" | cut -d= -f2-; }
+  # `|| true`: a variable that is simply absent (the outreach Postgres has no
+  # TCP proxy) must reach the explicit incomplete-set / SKIP check below, not
+  # kill the target here via grep's exit 1 under errexit + pipefail.
+  get() { { grep -m1 -E "^$1=" <<<"$vars" || true; } | cut -d= -f2-; }
   PGUSER=$(get PGUSER);       export PGUSER
   PGPASSWORD=$(get PGPASSWORD); export PGPASSWORD
   PGDATABASE=$(get PGDATABASE); export PGDATABASE
@@ -196,6 +241,11 @@ dr_load_pgenv() {  # $1 = project id, $2 = service, $3 = token variable name
   export PGCONNECT_TIMEOUT=20
   vars=""; unset vars
 
+  if [[ "$optional" == optional && -n "$PGUSER" && -n "$PGPASSWORD" && -n "$PGDATABASE" && ( -z "$PGHOST" || -z "$PGPORT" ) ]]; then
+    dr_clear_pgenv
+    dr_log WARN "SKIP: project=$project service=$service has no public TCP proxy (RAILWAY_TCP_PROXY_DOMAIN/PORT empty) — this target is NOT being backed up until the owner enables one (RUNBOOK, Outreach target)"
+    return "$DR_SKIP_RC"
+  fi
   [[ -n "$PGUSER" && -n "$PGPASSWORD" && -n "$PGDATABASE" && -n "$PGHOST" && -n "$PGPORT" ]] \
     || dr_die "incomplete PG* set for project=$project service=$service (names only: PGUSER/PGPASSWORD/PGDATABASE/RAILWAY_TCP_PROXY_DOMAIN/RAILWAY_TCP_PROXY_PORT)"
 }
@@ -211,23 +261,37 @@ dr_load_pgenv() {  # $1 = project id, $2 = service, $3 = token variable name
 # always did. A failed target's partial ciphertext is removed so the set never
 # carries a file that the manifest does not describe.
 #
-# Sets DR_FAILED_TARGETS (array of names). Returns 0 even when some failed;
+# Sets DR_FAILED_TARGETS and DR_SKIPPED_TARGETS (arrays of names). A SKIP is
+# only possible for an optional target (see DR_OPTIONAL_TARGETS) or one named
+# in DR_SKIP_TARGETS. Returns 0 even when some failed;
 # the caller decides what a partial set means.
 dr_dump_all_targets() {  # $1 = stage dir, $2 = work dir
-  local stage="$1" work="$2" entry name project service token_var rc
+  local stage="$1" work="$2" entry name project service token_var rc optional
   DR_FAILED_TARGETS=()
+  DR_SKIPPED_TARGETS=()
   for entry in "${DR_TARGETS[@]}"; do
     IFS='|' read -r name project service token_var <<<"$entry"
+    if dr_target_is_disabled "$name"; then
+      dr_log WARN "[$name] SKIP: disabled by DR_SKIP_TARGETS — this target is NOT being backed up"
+      DR_SKIPPED_TARGETS+=("$name")
+      continue
+    fi
+    optional=""; dr_target_is_optional "$name" && optional="optional"
     dr_log INFO "[$name] loading credentials via Railway bridge ($token_var; names only)"
     set +e
     (
       set -e
-      dr_load_pgenv "$project" "$service" "$token_var"
+      dr_load_pgenv "$project" "$service" "$token_var" "$optional"
       dr_dump_target "$name" "$stage" "$work"
     )
     rc=$?
     set -e
     dr_clear_pgenv
+    if (( rc == DR_SKIP_RC )) && [[ -n "$optional" ]]; then
+      rm -f "$stage/$name.dump.gpg" "$work/$name.meta.json"
+      DR_SKIPPED_TARGETS+=("$name")
+      continue
+    fi
     if (( rc != 0 )); then
       rm -f "$stage/$name.dump.gpg" "$work/$name.meta.json"
       DR_FAILED_TARGETS+=("$name")

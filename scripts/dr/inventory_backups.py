@@ -48,6 +48,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+# Targets a dr backup set is expected to carry (O5 added "outreach"). A set
+# file is named `<target>.dump.gpg`; the inventory labels each row with it.
+KNOWN_DR_TARGETS = ("engine", "saas", "outreach")
+_DUMP_SUFFIX = ".dump.gpg"
+
 _PRE_VARIANT_PREFIX = "pre_variant_"
 _LATEST_DR_SETS_KEPT = 2
 _HASH_CHUNK = 1024 * 1024
@@ -96,6 +101,36 @@ def _classify_generation(rel_parts: tuple[str, ...]) -> str:
     if first.startswith(_PRE_VARIANT_PREFIX):
         return "pre-variant"
     return "other"
+
+
+def _dr_target(rel_parts: tuple[str, ...]) -> str | None:
+    """`dr/sets/<set>/<target>.dump.gpg` -> `<target>`; anything else -> None."""
+    if len(rel_parts) >= 4 and rel_parts[0] == "dr" and rel_parts[1] == "sets":
+        name = rel_parts[-1]
+        if name.endswith(_DUMP_SUFFIX):
+            return name[: -len(_DUMP_SUFFIX)]
+    return None
+
+
+def dr_target_coverage(rows: list[dict], root: Path) -> dict[str, dict[str, list[str]]]:
+    """Per dr set: which known targets it holds and which are missing.
+
+    Read-only; derived from the rows `build_inventory` returned.
+    """
+    root = Path(root)
+    sets: dict[str, set[str]] = {}
+    for row in rows:
+        if row.get("generation") != "dr" or not row.get("target"):
+            continue
+        parts = Path(row["path"]).relative_to(root).parts
+        sets.setdefault(_dr_set_id(parts), set()).add(row["target"])
+    return {
+        set_id: {
+            "present": sorted(have),
+            "missing": [t for t in KNOWN_DR_TARGETS if t not in have],
+        }
+        for set_id, have in sorted(sets.items())
+    }
 
 
 def _dr_set_id(rel_parts: tuple[str, ...]) -> str:
@@ -191,6 +226,7 @@ def build_inventory(root: Path, archive: Path) -> list[dict]:
                 "in_archive": in_archive,
                 "sha256_matches_archive": sha256_matches_archive,
                 "generation": row.generation,
+                "target": _dr_target(row.rel_parts),
                 "keep_reason": keep_reason,
             }
         )
@@ -215,13 +251,14 @@ def _human_bytes(n: int) -> str:
 
 
 def _print_table(rows: list[dict]) -> None:
-    header = f"{'GEN':<12} {'KEEP_REASON':<22} {'ARCHIVED':<9} {'SHA_OK':<7} {'BYTES':>12}  PATH"
+    header = f"{'GEN':<12} {'TARGET':<9} {'KEEP_REASON':<22} {'ARCHIVED':<9} {'SHA_OK':<7} {'BYTES':>12}  PATH"
     print(header)
     print("-" * len(header))
     for row in rows:
         sha_ok = "-" if row["sha256_matches_archive"] is None else str(row["sha256_matches_archive"])
         print(
             f"{row['generation']:<12} "
+            f"{(row.get('target') or '-'):<9} "
             f"{(row['keep_reason'] or '-'):<22} "
             f"{str(row['in_archive']):<9} "
             f"{sha_ok:<7} "
@@ -295,6 +332,14 @@ def main(argv: list[str] | None = None) -> int:
         f"DELETABLE rows={len(deletable)} bytes={deletable_bytes} "
         f"({_human_bytes(deletable_bytes)})"
     )
+
+    coverage = dr_target_coverage(rows, args.root)
+    if coverage:
+        print()
+        print("-- dr set target coverage (known: " + ", ".join(KNOWN_DR_TARGETS) + ") --")
+        for set_id, cov in coverage.items():
+            missing = ",".join(cov["missing"]) or "-"
+            print(f"{set_id}: present={','.join(cov['present'])} missing={missing}")
 
     if args.docker:
         _print_docker_context(rows)

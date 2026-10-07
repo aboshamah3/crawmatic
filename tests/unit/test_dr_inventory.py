@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.dr.inventory_backups import build_inventory  # noqa: E402
+from scripts.dr.inventory_backups import build_inventory, dr_target_coverage  # noqa: E402
 
 
 def test_inventory_marks_archive_coverage(tmp_path: Path):
@@ -40,3 +40,26 @@ def test_inventory_marks_archive_coverage(tmp_path: Path):
     assert by_name["prod-20260901T000000Z.dump"]["sha256_matches_archive"] is True
     assert by_name["prod-20260907T021502Z.dump"]["in_archive"] is False
     assert by_name["prod-20260907T021502Z.dump"]["keep_reason"] == "newest-not-archived"
+
+
+def test_inventory_labels_dr_targets_and_reports_missing_outreach(tmp_path: Path):
+    root = tmp_path / "backups"
+    s1 = root / "dr" / "sets" / "set-20261007T000000Z"
+    s1.mkdir(parents=True)
+    for name in ("engine", "saas", "outreach"):
+        (s1 / f"{name}.dump.gpg").write_bytes(b"x")
+    (s1 / "manifest.json").write_bytes(b"{}")
+    s2 = root / "dr" / "sets" / "set-20261007T040000Z"
+    s2.mkdir(parents=True)
+    for name in ("engine", "saas"):
+        (s2 / f"{name}.dump.gpg").write_bytes(b"x")
+    archive = tmp_path / "empty.tgz"
+    with tarfile.open(archive, "w:gz"):
+        pass
+    rows = build_inventory(root=root, archive=archive)
+    targets = {Path(r["path"]).name: r["target"] for r in rows if "outreach" in r["path"]}
+    assert targets == {"outreach.dump.gpg": "outreach"}
+    assert next(r for r in rows if r["path"].endswith("manifest.json"))["target"] is None
+    cov = dr_target_coverage(rows, root)
+    assert cov["set-20261007T000000Z"]["missing"] == []
+    assert cov["set-20261007T040000Z"]["missing"] == ["outreach"]

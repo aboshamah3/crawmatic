@@ -231,6 +231,7 @@ dr_pull_report() {
 
 main_pull() {
   dr_log INFO "=== pull run $RUN_TS start (mode=pull) ==="
+  dr_log WARN "pull mode covers ONLY what the Railway dr-backup service dumps (engine + SaaS). The outreach database (railway4 project) is NOT in pull mode; run --mode dump for it (RUNBOOK, Outreach target)."
   command -v curl >/dev/null || dr_die "curl not on PATH"
   command -v jq   >/dev/null || dr_die "jq not on PATH"
   install -d -m 700 "$DR_ROOT" "$DR_SETS_DIR" "$DR_REPORTS_DIR"
@@ -281,18 +282,23 @@ main_dump() {
   # names the missing targets in the manifest and the run still exits non-zero
   # with a DR-ALERT line, so a partial set is never mistaken for a healthy one.
   dr_dump_all_targets "$STAGE" "$WORK"
-  if (( ${#DR_FAILED_TARGETS[@]} == ${#DR_TARGETS[@]} )); then
-    dr_die "every target failed (${DR_FAILED_TARGETS[*]}) — no backup set written"
+  # Skipped targets (optional + no credential/proxy, or DR_SKIP_TARGETS) are
+  # neither failures nor backups: the set is "all failed" only when nothing
+  # at all was dumped.
+  if (( ${#DR_FAILED_TARGETS[@]} + ${#DR_SKIPPED_TARGETS[@]} >= ${#DR_TARGETS[@]} )); then
+    dr_die "no target was dumped (failed: ${DR_FAILED_TARGETS[*]:-none}; skipped: ${DR_SKIPPED_TARGETS[*]:-none}) — no backup set written"
   fi
 
   jq -n --arg id "$set_name" --arg created "$(dr_ts)" \
         --arg host "$(hostname)" --arg tool "scripts/dr/backup_prod.sh --mode dump" \
         --argjson failed "$(printf '%s\n' "${DR_FAILED_TARGETS[@]}" | jq -R . | jq -s 'map(select(length > 0))')" \
+        --argjson skipped "$(printf '%s\n' "${DR_SKIPPED_TARGETS[@]}" | jq -R . | jq -s 'map(select(length > 0))')" \
         --slurpfile metas <(cat "$WORK"/*.meta.json) '
      {backup_set: $id, created_utc: $created, host: $host, tool: $tool,
       encryption: "gpg --symmetric --cipher-algo AES256 (key: host-local file, mode 0600)",
       private_network: false,
       failed_targets: $failed,
+      skipped_targets: $skipped,
       targets: ($metas | map({key: .name, value: .}) | from_entries)}' \
      > "$STAGE/manifest.json"
   chmod 600 "$STAGE/manifest.json"

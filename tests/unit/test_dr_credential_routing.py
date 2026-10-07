@@ -25,6 +25,7 @@ DR_LIB = REPO_ROOT / "scripts" / "dr" / "dr_lib.sh"
 
 ENGINE_PROJECT = "69dc4bda-0d97-4290-a82f-822ed97d3fb8"
 SAAS_PROJECT = "91debd0f-1dc4-4b7f-aa74-b9874ac27071"
+OUTREACH_PROJECT = "cf7d41bd-8a77-4831-bab4-7edd03a6a1d5"
 
 # The stub: each project answers only to the token of the account that owns
 # it today, exactly as Railway did when the incident was reproduced.
@@ -37,8 +38,10 @@ RAILWAY_STUB = textwrap.dedent(
     done
     echo "$project $RAILWAY_API_TOKEN" >> "$STUB_CALLS"
     case "$project:$RAILWAY_API_TOKEN" in
-      {ENGINE_PROJECT}:tok-railway2-SECRET|{SAAS_PROJECT}:tok-rw003-SECRET)
+      {ENGINE_PROJECT}:tok-railway2-SECRET|{SAAS_PROJECT}:tok-rw003-SECRET|{OUTREACH_PROJECT}:tok-railway4-SECRET)
         printf 'PGUSER=u\\nPGPASSWORD=pw-SECRET\\nPGDATABASE=db\\n'
+        # The outreach Postgres has NO public TCP proxy in production.
+        if [ "$STUB_NO_PROXY" = 1 ] && [ "$project" = {OUTREACH_PROJECT} ]; then exit 0; fi
         printf 'RAILWAY_TCP_PROXY_DOMAIN=h.example\\nRAILWAY_TCP_PROXY_PORT=5432\\n'
         exit 0;;
       *)
@@ -49,7 +52,15 @@ RAILWAY_STUB = textwrap.dedent(
 )
 
 
-def _harness(tmp_path: Path, body: str, *, rw003: bool = True) -> subprocess.CompletedProcess[str]:
+def _harness(
+    tmp_path: Path,
+    body: str,
+    *,
+    rw003: bool = True,
+    railway4: bool = False,
+    no_proxy: bool = False,
+    env_extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     stub = bindir / "railway"
@@ -59,16 +70,19 @@ def _harness(tmp_path: Path, body: str, *, rw003: bool = True) -> subprocess.Com
     lines = ["export RAILWAY_TOKEN_RAILWAY2=tok-railway2-SECRET"]
     if rw003:
         lines.append("export RAILWAY_TOKEN_RW003=tok-rw003-SECRET")
+    if railway4:
+        lines.append("export RAILWAY_TOKEN_RAILWAY4=tok-railway4-SECRET")
     accounts.write_text("\n".join(lines) + "\n")
     script = textwrap.dedent(
         f"""\
         set -euo pipefail
         export DR_RAILWAY_ACCOUNTS={accounts}
         export STUB_CALLS={tmp_path / "calls"}
+        export STUB_NO_PROXY={1 if no_proxy else 0}
         source {DR_LIB}
         """
     ) + textwrap.dedent(body)
-    env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path), "TMPDIR": str(tmp_path)}
+    env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path), "TMPDIR": str(tmp_path), **(env_extra or {})}
     return subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60
     )
@@ -82,11 +96,13 @@ def _targets(tmp_path: Path) -> dict[str, list[str]]:
 
 def test_each_target_names_the_token_of_the_account_that_owns_it(tmp_path: Path) -> None:
     targets = _targets(tmp_path)
-    assert set(targets) == {"engine", "saas"}
+    assert set(targets) == {"engine", "saas", "outreach"}
     for fields in targets.values():
         assert len(fields) == 4, f"name|project|service|token_var expected, got {fields}"
     assert targets["engine"][1:] == [ENGINE_PROJECT, "postgres", "RAILWAY_TOKEN_RAILWAY2"]
     assert targets["saas"][1:] == [SAAS_PROJECT, "Postgres", "RAILWAY_TOKEN_RW003"]
+    # O5: outreach lives on the railway4 account since 2026-09-11.
+    assert targets["outreach"][1:] == [OUTREACH_PROJECT, "Postgres", "RAILWAY_TOKEN_RAILWAY4"]
 
 
 def test_saas_credentials_load_with_the_rw003_token(tmp_path: Path) -> None:
@@ -178,6 +194,7 @@ def test_a_die_inside_a_target_keeps_errexit_semantics(tmp_path: Path) -> None:
         """,
     )
     assert proc.returncode == 0, proc.stderr
+    # outreach has no railway4 token in this harness: SKIPPED, not failed.
     assert "failed=engine saas" in proc.stdout
     assert not list(work.glob("*.meta.json"))
 
@@ -188,3 +205,85 @@ def test_backup_prod_uses_the_isolating_loop() -> None:
     assert "failed_targets" in text, "a partial set must name what is missing"
     assert "2>/dev/null) \\" not in (DR_LIB.read_text())
     assert os.access(REPO_ROOT / "scripts" / "dr" / "backup_prod.sh", os.X_OK)
+
+
+def _run_all(tmp_path: Path, **kw: object) -> subprocess.CompletedProcess[str]:
+    stage = tmp_path / "stage"
+    work = tmp_path / "work"
+    stage.mkdir()
+    work.mkdir()
+    return _harness(
+        tmp_path,
+        f"""\
+        dr_dump_target() {{
+          echo "dumped $1" >> {tmp_path / "dumps"}
+          echo '{{}}' > "$3/$1.meta.json"
+        }}
+        dr_dump_all_targets {stage} {work}
+        echo "failed=${{DR_FAILED_TARGETS[*]:-}}"
+        echo "skipped=${{DR_SKIPPED_TARGETS[*]:-}}"
+        """,
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_outreach_is_dumped_with_the_railway4_token(tmp_path: Path) -> None:
+    proc = _run_all(tmp_path, railway4=True)
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "dumps").read_text().split() == [
+        "dumped", "engine", "dumped", "saas", "dumped", "outreach",
+    ]
+    assert "failed=" in proc.stdout and "skipped=\n" in proc.stdout + "\n"
+    calls = (tmp_path / "calls").read_text().splitlines()
+    assert f"{OUTREACH_PROJECT} tok-railway4-SECRET" in calls
+    assert "SECRET" not in proc.stderr + proc.stdout
+
+
+def test_missing_railway4_token_skips_outreach_only(tmp_path: Path) -> None:
+    proc = _run_all(tmp_path, railway4=False)
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "dumps").read_text().split() == [
+        "dumped", "engine", "dumped", "saas",
+    ]
+    assert "failed=\n" in proc.stdout
+    assert "skipped=outreach" in proc.stdout
+    assert "SKIP: RAILWAY_TOKEN_RAILWAY4 not exported" in proc.stdout + proc.stderr
+    assert "DR-ALERT" not in proc.stderr, "a skipped optional target must not alert"
+    assert not (tmp_path / "work" / "outreach.meta.json").exists()
+
+
+def test_outreach_without_a_public_tcp_proxy_skips_with_a_loud_warning(tmp_path: Path) -> None:
+    proc = _run_all(tmp_path, railway4=True, no_proxy=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "skipped=outreach" in proc.stdout
+    assert "no public TCP proxy" in proc.stdout + proc.stderr
+    assert "failed=\n" in proc.stdout
+
+
+def test_dr_skip_targets_switch_disables_outreach_without_touching_the_others(
+    tmp_path: Path,
+) -> None:
+    proc = _run_all(tmp_path, railway4=True, env_extra={"DR_SKIP_TARGETS": "outreach"})
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "dumps").read_text().split() == [
+        "dumped", "engine", "dumped", "saas",
+    ]
+    assert "skipped=outreach" in proc.stdout
+    assert "disabled by DR_SKIP_TARGETS" in proc.stdout + proc.stderr
+    # the token must never even be looked up for a disabled target
+    assert OUTREACH_PROJECT not in (tmp_path / "calls").read_text()
+
+
+def test_required_targets_cannot_be_skipped_by_a_missing_token(tmp_path: Path) -> None:
+    """engine/saas keep fail-loud semantics: missing token = FAILED + alert."""
+    proc = _run_all(tmp_path, rw003=False, railway4=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "failed=saas" in proc.stdout
+    assert "skipped=\n" in proc.stdout
+    assert "[saas] target FAILED" in proc.stderr
+
+
+def test_backup_manifest_names_skipped_targets_and_all_skipped_is_fatal() -> None:
+    text = (REPO_ROOT / "scripts" / "dr" / "backup_prod.sh").read_text()
+    assert "skipped_targets" in text
+    assert "DR_SKIPPED_TARGETS" in text

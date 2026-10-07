@@ -1,4 +1,4 @@
-# Disaster Recovery Runbook — Crawmatic engine + SaaS
+# Disaster Recovery Runbook — Crawmatic engine + SaaS (+ outreach, O5)
 
 EPA task **W5.4** (READY-010, plan §P0.8). Written 2026-08-25.
 Rewritten 2026-09-08 by **C10 (F21)**: the backup now runs *inside Railway* on
@@ -65,6 +65,8 @@ Artifacts live under `/srv/crawmatic/backups/dr/` (dir 0700, every file 0600):
 ```
 sets/set-<UTC>/engine.dump.gpg      pg_dump -Fc, AES-256
 sets/set-<UTC>/saas.dump.gpg        pg_dump -Fc, AES-256
+sets/set-<UTC>/outreach.dump.gpg    pg_dump -Fc, AES-256 (OPTIONAL target, see §5a; absent
+                                    until the owner prerequisite there is met)
 sets/set-<UTC>/sidecars.tar.gz.gpg  netledger buffer + result spool + evidence listing
 sets/set-<UTC>/manifest.json        per-table row counts + content checksums + sha256
                                     + alembic head + bytes_exported/bytes_on_wire
@@ -431,6 +433,75 @@ makes room, and the job refuses to run at all below its free-space floor.
 
 ---
 
+## 5a. Outreach target (O5, added 2026-10-07)
+
+**What it is.** A third dump target, `outreach` (prospects, report pages,
+WhatsApp threads, opt-outs, bookings). Before O5 nothing backed it up: the
+outreach project moved to the **railway4** account (`rw004@plyon.app`) on
+2026-09-11 and was never added to `dr_lib.sh:DR_TARGETS`.
+
+**How it is wired (same mechanism as engine and SaaS).**
+
+| Field | Value |
+|---|---|
+| `DR_TARGETS` row | `outreach\|cf7d41bd-8a77-4831-bab4-7edd03a6a1d5\|Postgres\|RAILWAY_TOKEN_RAILWAY4` |
+| Credential source | variable `RAILWAY_TOKEN_RAILWAY4`, exported by `/root/.railway/accounts.sh` (`$DR_RAILWAY_ACCOUNTS`). Only the variable NAME is in the repo. |
+| Connection | `railway variables` -> `PG*` env only (never on argv), then the same REPEATABLE READ snapshot, `pg_dump -Fc --snapshot`, gpg AES-256 pipe |
+| Disk guard, retention, naming, SHA256SUMS, manifest | identical: `DR_MIN_FREE_BYTES`, the shared `dr_prune_sets` windows, `outreach.dump.gpg` in the same `set-<UTC>/` |
+| Verification | `verify_restore.sh` iterates every target in the manifest, so `outreach` is restored into the same scratch Postgres container and gets the same assertions (sha256, table list, exact row counts, content checksums, alembic head). Outreach is Alembic-migrated, so its head is recorded and compared. |
+| Inventory | `inventory_backups.py` labels each `<target>.dump.gpg` row with a TARGET column and prints `present=`/`missing=` per dr set against `engine,saas,outreach`. |
+
+**Optional by design.** A missing railway4 credential or a missing public TCP
+proxy is a logged `SKIP` (WARN line, exit status unaffected) for **outreach
+only**; the engine and SaaS dumps are never affected, and the manifest lists
+`skipped_targets`. `verify_restore.sh` records a SKIP row "outreach restore is
+NOT proven" for a set without it. engine and SaaS remain mandatory (a failure
+there is still `DR-ALERT` + PARTIAL set).
+
+**Switch.** `DR_SKIP_TARGETS=outreach` (space or comma separated list) removes
+a target from a run, e.g. while the railway4 account is being re-keyed. Put it
+in the cron environment, not in the script. Unset = outreach is attempted.
+
+**OWNER PREREQUISITE (nothing below can be done by the agent; a real outreach
+dump has never been run).**
+
+1. `RAILWAY_TOKEN_RAILWAY4` must be exported by `/root/.railway/accounts.sh`
+   (it is today; verify with `bash -c '. /root/.railway/accounts.sh; [ -n "${RAILWAY_TOKEN_RAILWAY4:-}" ] && echo set'`, which prints the word, not the value).
+2. **The outreach Postgres has no public TCP proxy** (outreach `railway.md`, the
+   pre-0034 backup section: "no `DATABASE_PUBLIC_URL` and no TCP proxy, and none
+   was created"). The host
+   dump path needs `RAILWAY_TCP_PROXY_DOMAIN`/`PORT`, exactly like the other two.
+   Until the owner takes ONE of the decisions below, the outreach target SKIPs
+   loudly on every run and **outreach remains unbacked-up**:
+   - **A (matches engine/SaaS; simplest).** Enable a TCP proxy on the outreach
+     `Postgres` service in Railway (railway4 account). Cost: public egress
+     per run (the 2026-09-16 manual `pre0034` plain dump gzipped to about 1.1 MB,
+     so small, though the live volume was ~987 MB), and it exposes the DB port
+     publicly, protected by its password only. Recommended with
+     `DR_SKIP_TARGETS` unset and a less frequent outreach cadence if wanted.
+   - **B (no public port).** Register an SSH key on the railway4 account and
+     dump through `railway4 ssh --service Postgres -- pg_dump ...` (as the
+     2026-09-16 manual dump did). That needs a new dump transport in
+     `dr_lib.sh` (the snapshot/count machinery assumes a network `psql`) and
+     the tooling policy currently denies `railway ssh` in some modes; not
+     implemented here.
+   - **C (inside Railway).** Add the outreach DB to a `dr-backup` service in
+     the railway4 project over `*.railway.internal` (the C10 design). Not built.
+3. **Pull mode (§7) does not cover outreach.** The Railway `dr-backup` service
+   lives in the engine project; if `$DR_PULL_CONFIG` exists the host script
+   pulls only engine + SaaS and logs a WARN. Until option C exists, outreach
+   needs `--mode dump` on the host.
+4. First real run is the owner's: `flock -n /run/crawmatic-dr-backup.lock scripts/dr/backup_prod.sh --mode dump`, then `scripts/dr/verify_restore.sh`, and
+   confirm the outreach row in the report is PASS (not SKIP). Needs `df` free
+   space above `DR_MIN_FREE_BYTES`; the host disk was at 98% on 2026-10-07.
+
+**Restoring outreach for real** follows §5 "Restoring for real" with
+`outreach.dump.gpg` as the file; the target database is the outreach
+`Postgres` service, server major 18 (pre-0034 manual dumps showed 18.6).
+Outreach is Alembic-migrated; `alembic_version` is the head compared.
+
+---
+
 ## 6. Open owner gates (restated for the READY register)
 
 | # | Gate | Blocks |
@@ -443,6 +514,7 @@ makes room, and the job refuses to run at all below its free-space floor.
 | 6 | One **manual disaster exercise** (region/account loss, real restore, services repointed) | GA |
 | 7 | **Provision the `dr-backup` service** (§7): create it + its volume, set `$DR_GPG_PASSPHRASE` / `$DR_PULL_TOKEN` / the `*_PG*` references, run one manual backup, run `verify_restore.sh` against it, confirm public egress drops toward 0 | the 0.853 GB/day egress saving, and the private-network backup itself |
 | 8 | Mount the queue volume on `dr-backup` (or an equivalent) so the netledger buffer and result spool are actually captured | sidecars are `SKIP`ped in every drill until then |
+| 9 | **Outreach backup target (O5, §5a)**: enable a TCP proxy on the outreach Postgres (or build option B/C) and confirm `RAILWAY_TOKEN_RAILWAY4`; run one real dump + `verify_restore.sh` | outreach (prospects, WhatsApp threads, opt-outs, bookings) has NO backup until then |
 
 ---
 
