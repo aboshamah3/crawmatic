@@ -1,12 +1,12 @@
-"""Fail-secure, Postgres-authoritative abuse limits for the expensive routes.
+"""Abuse limits for the expensive routes, counted on the async Redis client.
 
-EPA W5.5-L1 item 2, engine half.
+EPA W5.5-L1 item 2, engine half; store moved to Redis by the 2026-10-07 full
+risk review (B3, folds in E8).
 
 `app.rate_limit` already exists and is deliberately **fail-open**: it guards
 *cost*, per credential, across the whole public API, and turning a Redis blip
 into a total outage of a paid API would be worse than a minute of unmetered
-reads. That reasoning is correct for what it guards and wrong for what this
-module guards.
+reads.
 
 These are the **abuse-able** surfaces — the ones where a single authenticated
 caller can make the platform spend money, spawn work, or export data in bulk:
@@ -19,58 +19,80 @@ caller can make the platform spend money, spawn work, or export data in bulk:
 * the rest of the SaaS control plane (`/v1/admin/*`), which provisions
   workspaces and mints keys.
 
-For those, a limiter that disappears when its store is unreachable is not a
-limiter — an attacker who can cause a store failure gets an unmetered API,
-and a system under attack is exactly when store failures happen. So this one
-**fails CLOSED**: a store error refuses the request.
+FAILURE POSTURE (B3 / decision D4):
 
-STORAGE: Postgres, authoritative, per C3's no-dual-write precedent. Redis at
-127.0.0.1:56379 is a cache in this system and a cache never grants — a
-counter an attacker can evict is a counter an attacker can reset. One
-statement per attempt (`INSERT ... ON CONFLICT DO UPDATE ... RETURNING`),
-serialised by the unique index, because read-then-write is a race that two
-concurrent callers both win — and a deliberate flood is not where that race
-is rare, it is where it is the normal case.
+* **Writes fail CLOSED.** A store error on a POST/PUT/PATCH/DELETE refuses the
+  request with 429. An attacker who can cause a store failure must not get an
+  unmetered write surface, and a system under attack is exactly when store
+  failures happen. This is the Hard-Stop rule of the 2026-10-07 run: do not
+  relax it without an owner decision.
+* **Reads fail OPEN** (GET/HEAD/OPTIONS), with a warning log. A read on these
+  surfaces spawns no work and mints nothing; refusing the SaaS's own admin
+  reads because Redis blinked turned a cache outage into a control-plane
+  outage.
 
-CAPABILITY PROBE: the counter table arrives in a migration this task may not
-write (the alembic lane is held). Until it exists the limiter is **INERT**,
-not fail-closed — see :func:`_table_available`. Failing closed on a table
-that was never created would 503 the entire API the moment this code deploys
-ahead of its migration, which is a self-inflicted outage, not a safety
-control. Once the table exists, every failure is closed. The probe is
-memoised per process and the "missing" answer is logged loudly and once.
+STORAGE: Redis, through `app.rate_limit.get_async_admission_redis_client()`
+(`redis.asyncio`, 0.25 s connect/socket timeouts, one 0.3 s deadline per
+admission check) and the same atomic INCR + EXPIRE-on-first-hit Lua script.
+The previous store was a Postgres upsert + commit run with a *synchronous*
+SQLAlchemy session inside `async def dispatch`: two statements per
+`/v1/admin/**` request on the handlers' own connection pool, blocking the
+event loop for up to the pool timeout, with every SaaS admin call
+serialised on one hot row that was never pruned (E8). The
+`api_abuse_limit_counters` table and its migration are left in place, unused
+(no destructive migration in this change); nothing writes it any more.
+
+BUCKETS: `abuse:{surface}:{sha256(credential)}[:ws:{workspace_id}]:{window}`.
+Requests under `/v1/admin/workspaces/{id}/...` are counted per workspace:
+all SaaS→engine admin traffic arrives on ONE service credential, so a
+credential-only bucket made every tenant share one 600/min budget and let a
+single busy workspace starve the rest. Anything else keeps the
+credential-only bucket.
 
 IDENTITY: `sha256(credential)`, never the credential — the same rule
 `app.rate_limit` states, for the same reason (bucket keys reach logs and
 metrics). An unauthenticated request is not counted here; it is about to fail
-auth anyway, and spending a database round-trip on it would make
-unauthenticated traffic *cheaper* to amplify.
+auth anyway, and spending a round-trip on it would make unauthenticated
+traffic *cheaper* to amplify.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app_shared.database import get_session
-
-from app.rate_limit import rate_limit_identity
+from app.rate_limit import (
+    _REDIS_ADMISSION_DEADLINE_SECONDS,
+    _counts_from_script_result,
+    _get_incr_and_expire_script,
+    get_async_admission_redis_client,
+    rate_limit_identity,
+)
 
 logger = logging.getLogger(__name__)
 
-#: The counter table. Created by the migration whose body is staged in
-#: `alembic/PENDING_MIGRATION_w55l1.py.txt` (the alembic lane was held by
-#: another worker when this landed).
+#: The former Postgres counter table. Kept (with its migration and ORM model)
+#: so no destructive migration is needed; the limiter no longer reads or
+#: writes it. Dropping it is a separate, owner-gated change.
 COUNTER_TABLE = "api_abuse_limit_counters"
+
+#: Methods that fail OPEN on a store error. Everything else fails closed.
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: `/v1/admin/workspaces/{id}` and anything below it. The id must look like
+#: an identifier (UUIDs and slugs do); anything else falls back to the
+#: credential-only bucket instead of minting a key from arbitrary path text.
+_WORKSPACE_PATH = re.compile(r"^/v1/admin/workspaces/([A-Za-z0-9_-]{1,64})(?:/|$)")
 
 
 @dataclass(frozen=True)
@@ -118,99 +140,6 @@ def surface_for(method: str, path: str) -> Surface | None:
     return None
 
 
-_EXISTS_SQL = text("SELECT to_regclass(:qualified_name) IS NOT NULL").bindparams(
-    qualified_name=f"public.{COUNTER_TABLE}"
-)
-
-_INCREMENT_SQL = text(
-    f"""
-    INSERT INTO {COUNTER_TABLE} (bucket_key, window_starts_at, count)
-    VALUES (:bucket_key, :window_starts_at, 1)
-    ON CONFLICT (bucket_key, window_starts_at)
-    DO UPDATE SET count = {COUNTER_TABLE}.count + 1
-    RETURNING count
-    """
-)
-
-
-class CounterUnavailable(RuntimeError):
-    """The counter table exists but could not be written. Refuse the request."""
-
-
-def _database_is_configured() -> bool:
-    """Can this process even construct ``Settings``?
-
-    Not a health check and NOT the fail-closed path. `Settings` failing to
-    build means there is no `.env` in this process at all — the shape of a
-    unit test that imports the shared `app` object without full config. A
-    middleware that turned a missing dev-config file into a 429 on every
-    limited route would be a self-inflicted outage of the test suite, and
-    `app.rate_limit` already takes exactly this position for exactly this
-    reason ("an unconstructable `Settings` disables the limiter rather than
-    raising through `dispatch`").
-
-    This is not a hole in production: `app.main` calls
-    `assert_production_safe()` at import, so a production API process that
-    could not build `Settings` never starts serving at all. Once `Settings`
-    exists, every store failure below fails CLOSED.
-    """
-    try:
-        from app_shared.config import get_settings
-
-        return bool(get_settings().DATABASE_URL)
-    except Exception:  # noqa: BLE001 - see docstring
-        logger.warning(
-            "abuse limiter disabled: this process cannot construct Settings",
-            exc_info=True,
-        )
-        return False
-
-
-def _table_available(session) -> bool:
-    """Does the counter table exist yet?
-
-    A **capability** answer, not a health answer: ``False`` means "this
-    deployment has not run the migration", which makes the limiter inert.
-    Any *error* asking the question is treated as ``True`` — the table may
-    well be there and we simply could not look, and guessing "absent" would
-    silently disable a safety control on a transient blip.
-    """
-    try:
-        return bool(session.execute(_EXISTS_SQL).scalar())
-    except Exception:  # noqa: BLE001 - see docstring
-        logger.warning("abuse-limit capability probe failed; assuming present", exc_info=True)
-        return True
-
-
-def record_attempt(session, *, bucket_key: str, window_starts_at: datetime) -> int | None:
-    """Count one attempt and return the resulting count.
-
-    ``None`` means the table does not exist (limiter inert). Raises
-    :class:`CounterUnavailable` when it exists and the write failed — the
-    caller must refuse.
-
-    The increment happens for EVERY attempt, admitted or refused. If refused
-    attempts did not count, a caller sitting at the ceiling would be refused,
-    would not increment, and would be admitted on the next request — a limit
-    that permanently grants one request per window.
-    """
-    if not _table_available(session):
-        return None
-    try:
-        count = session.execute(
-            _INCREMENT_SQL,
-            {"bucket_key": bucket_key, "window_starts_at": window_starts_at},
-        ).scalar_one()
-        session.commit()
-        return int(count)
-    except Exception as exc:  # noqa: BLE001 - converted to a refusal by the caller
-        try:
-            session.rollback()
-        except Exception:  # noqa: BLE001 - a dead session cannot be rolled back
-            pass
-        raise CounterUnavailable(str(exc)) from exc
-
-
 def window_start_for(now: float, window_seconds: int) -> datetime:
     """Truncate ``now`` (epoch seconds) to the start of its fixed window.
 
@@ -224,25 +153,86 @@ def window_start_for(now: float, window_seconds: int) -> datetime:
     )
 
 
+def workspace_for(path: str) -> str | None:
+    """The workspace id of a `/v1/admin/workspaces/{id}/...` path, else ``None``."""
+    match = _WORKSPACE_PATH.match(path)
+    return match.group(1) if match else None
+
+
+def bucket_key_for(surface: Surface, identity: str, path: str, window_index: int) -> str:
+    """The Redis key one attempt is counted against."""
+    workspace_id = workspace_for(path)
+    scope = f"{identity}:ws:{workspace_id}" if workspace_id else identity
+    return f"abuse:{surface.name}:{scope}:{window_index}"
+
+
+def fails_open(method: str) -> bool:
+    """Does a store error ADMIT this request? Reads only (see module docstring)."""
+    return method.upper() in _READ_METHODS
+
+
+def _store_is_configured() -> bool:
+    """Can this process even construct ``Settings`` (and so a Redis client)?
+
+    Not a health check and NOT the fail-closed path. `Settings` failing to
+    build means there is no `.env` in this process at all — the shape of a
+    unit test that imports the shared `app` object without full config. A
+    middleware that turned a missing dev-config file into a 429 on every
+    limited write would be a self-inflicted outage of the test suite, and
+    `app.rate_limit` takes exactly this position for exactly this reason.
+
+    Not a hole in production: `app.main` calls `assert_production_safe()` at
+    import, so a production API process that could not build `Settings`
+    never starts serving. The middleware asks this ONCE per instance and
+    caches the answer — it is never a per-request probe.
+    """
+    try:
+        from app_shared.config import get_settings
+
+        return bool(get_settings().REDIS_URL)
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.warning(
+            "abuse limiter disabled: this process cannot construct Settings",
+            exc_info=True,
+        )
+        return False
+
+
+#: Backward-compatible name (tests outside this module monkeypatch it).
+_database_is_configured = _store_is_configured
+
+
 class AbuseLimitMiddleware(BaseHTTPMiddleware):
-    """Fail-closed, per-credential limits on the abuse-able surfaces."""
+    """Per-credential (per-workspace on admin workspace routes) abuse limits.
+
+    Non-blocking: one `redis.asyncio` script call per limited request, under
+    a hard deadline. Writes fail closed on a store error; reads fail open.
+    """
 
     def __init__(
         self,
         app,
         *,
-        session_factory: Callable[[], object] | None = None,
+        redis_factory: Callable[[], object] | None = None,
         enabled: bool = True,
     ) -> None:
         super().__init__(app)
         # An INJECTED factory is the caller's own store, so the
-        # "can this process build Settings?" question does not apply to it —
-        # it exists only to decide whether the DEFAULT `get_session` is usable
-        # here. Keeping the two apart is what lets the tests exercise the
-        # fail-closed branch without a `.env`.
-        self._injected_factory = session_factory
-        self._session_factory = session_factory or get_session
+        # "can this process build Settings?" question does not apply to it.
+        self._injected_factory = redis_factory
+        self._redis_factory = redis_factory or get_async_admission_redis_client
         self._enabled = enabled
+        #: Cached answer of `_store_is_configured` (``None`` = not asked yet).
+        self._store_configured: bool | None = None
+
+    def _is_active(self) -> bool:
+        if not self._enabled:
+            return False
+        if self._injected_factory is not None:
+            return True
+        if self._store_configured is None:
+            self._store_configured = _store_is_configured()
+        return self._store_configured
 
     def _refuse(self, surface: Surface, retry_after: int, *, reason: str) -> JSONResponse:
         return JSONResponse(
@@ -262,12 +252,24 @@ class AbuseLimitMiddleware(BaseHTTPMiddleware):
             },
         )
 
+    async def _record_attempt(self, key: str, surface: Surface) -> int:
+        """Count one attempt atomically and return the resulting count.
+
+        The increment happens for EVERY attempt, admitted or refused: the
+        script INCRs before it compares. If refused attempts did not count, a
+        caller sitting at the ceiling would be admitted again next request.
+        Raises on any store error; the caller picks the posture.
+        """
+        redis_client = self._redis_factory()
+        script = _get_incr_and_expire_script(redis_client)
+        coro = script(keys=[key], args=[surface.window_seconds * 2, surface.limit])
+        result = await asyncio.wait_for(coro, timeout=_REDIS_ADMISSION_DEADLINE_SECONDS)
+        return _counts_from_script_result(result, 1)[0]
+
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        if not self._enabled:
-            return await call_next(request)
-        if self._injected_factory is None and not _database_is_configured():
+        if not self._is_active():
             return await call_next(request)
 
         surface = surface_for(request.method, request.url.path)
@@ -281,41 +283,29 @@ class AbuseLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         now = time.time()
-        window_starts_at = window_start_for(now, surface.window_seconds)
+        window_index = int(now) // surface.window_seconds
         retry_after = surface.window_seconds - (int(now) % surface.window_seconds)
         retry_after = retry_after or surface.window_seconds
-        bucket_key = f"abuse:{surface.name}:{identity}"
+        key = bucket_key_for(surface, identity, request.url.path, window_index)
 
         try:
-            with self._session_factory() as session:
-                count = record_attempt(
-                    session, bucket_key=bucket_key, window_starts_at=window_starts_at
+            count = await self._record_attempt(key, surface)
+        except Exception:  # noqa: BLE001 - posture decided by method below
+            if fails_open(request.method):
+                logger.warning(
+                    "abuse limiter store unavailable for %s; admitting READ "
+                    "(fail-open for reads only)",
+                    surface.name,
+                    exc_info=True,
                 )
-        except CounterUnavailable as exc:
+                return await call_next(request)
             logger.error(
-                "abuse limiter could not record an attempt for %s; refusing rather "
-                "than admitting unlimited traffic. Cause: %s",
-                surface.name,
-                exc,
-            )
-            return self._refuse(surface, retry_after, reason="counter-unavailable")
-        except Exception:  # noqa: BLE001 - a session we could not even open
-            logger.error(
-                "abuse limiter could not open a session for %s; refusing.",
+                "abuse limiter store unavailable for %s; refusing WRITE rather "
+                "than admitting unlimited traffic",
                 surface.name,
                 exc_info=True,
             )
-            return self._refuse(surface, retry_after, reason="session-unavailable")
-
-        if count is None:
-            # The migration has not run in this deployment. Inert, loudly.
-            logger.warning(
-                "abuse limiter is INERT: %s does not exist in this database, so "
-                "%s is unlimited. Run the pending migration.",
-                COUNTER_TABLE,
-                surface.name,
-            )
-            return await call_next(request)
+            return self._refuse(surface, retry_after, reason="counter-unavailable")
 
         if count > surface.limit:
             return self._refuse(surface, retry_after, reason="over-limit")
